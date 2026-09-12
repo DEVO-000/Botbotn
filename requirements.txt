@@ -1,4 +1,0 @@
-python-telegram-bot[job-queue]==21.6
-aiohttp>=3.9
-groq>=0.11
-pymongo>=4.6
