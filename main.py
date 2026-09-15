@@ -5449,9 +5449,18 @@ def _storage_restore_apply(payload: bytes, fallback_name: str = ""):
     """Восстанавливает данные из zip-бэкапа (или одиночного JSON).
 
     Перезаписывает ВСЕ известные файлы данных, найденные в архиве.
+    ВОЛНА 17: связка ключей Сейфа (vault_auth — пароль+вопросы) НЕ откатывается
+    снапшотом: если в восстановленном users.json её нет или она СТАРЕЕ (ts),
+    остаётся более свежая связка из текущей базы. Легаси-связки (вопросы
+    открытым текстом) здесь же дошифровываются.
     Возвращает (список восстановленных, список проблем)."""
     restored, problems = [], []
     known = {os.path.basename(str(p)): p for p in set(STORAGE_BACKUP_FILES)}
+    # ВОЛНА 17: снимок ДО восстановления — источник свежей связки ключей.
+    try:
+        _old_users = dict(load_data(USERS_FILE, {}) or {})
+    except Exception:
+        _old_users = {}
     zf = None
     try:
         zf = zipfile.ZipFile(io.BytesIO(payload))
@@ -5501,6 +5510,38 @@ def _storage_restore_apply(payload: bytes, fallback_name: str = ""):
             restored.append(base)
         except Exception as e:
             problems.append(f"{base}: не удалось восстановить ({e})")
+    # ВОЛНА 17: перенос/защита связки ключей Сейфа (до сброса кэшей).
+    _ukey = os.path.basename(str(USERS_FILE))
+    if _ukey in known:
+        try:
+            _new_users = load_data(known[_ukey], {}) or {}
+            if isinstance(_new_users, dict):
+                _merged_n = _sealed_n = 0
+                for _uid, _nu in _new_users.items():
+                    if not isinstance(_nu, dict):
+                        continue
+                    _ou = _old_users.get(_uid)
+                    _oa = _ou.get("vault_auth") if isinstance(_ou, dict) else None
+                    _na = _nu.get("vault_auth")
+                    _keep = _vault_auth_pick(_oa, _na)
+                    if _keep is not None and _keep is not _na:
+                        _nu["vault_auth"] = _keep
+                        _merged_n += 1
+                    else:
+                        _keep = _na if _keep is None else _keep
+                    # Легаси-связка (вопросы открытым текстом) → шифруем.
+                    if isinstance(_keep, dict) and "questions" in _keep:
+                        _sealed = _vault_auth_seal(_keep)
+                        if _sealed is not _keep:
+                            _nu["vault_auth"] = _sealed
+                            _sealed_n += 1
+                if _merged_n or _sealed_n:
+                    save_data(known[_ukey], _new_users)
+                    if _merged_n:
+                        restored.append(
+                            f"users.json (связка ключей Сейфа сохранена у {_merged_n})")
+        except Exception as e:
+            problems.append(f"users.json: связка ключей Сейфа не перенесена ({e})")
     # Сбрасываем кэши, чтобы бот сразу увидел восстановленные данные.
     try:
         _users_cache.clear()
@@ -5666,6 +5707,25 @@ async def _cdb_flush_tick(context):
             logger.warning(f"cdb tick: {report}")
     except Exception as e:
         logger.error(f"cdb tick crashed: {e}")
+
+
+def _vault_flush_soon(context, reason="сейф"):
+    """ВОЛНА 17: НЕМЕДЛЕННЫЙ слив базы в канал фоном после ключевых событий
+    Сейфа (настройка пароля+вопросов, смена, восстановление доступа, шифрование
+    пачки). Просьба пользователя: «бот должен запоминать пароль от сейфа и
+    три секретных вопроса» — раньше связка ключей могла не доехать до канала,
+    если бот перезапустился в первые 30 секунд после настройки. Фоновая задача
+    tracked в bot_data._bg_tasks, ошибки гасятся."""
+    try:
+        task = asyncio.create_task(
+            _cdb_flush(context, force=True, reason=reason))
+        _bd = getattr(getattr(context, "application", None), "bot_data", None)
+        if isinstance(_bd, dict):
+            _bd.setdefault("_bg_tasks", []).append(task)
+        return task
+    except Exception as e:
+        logger.warning(f"vault flush soon: {e}")
+        return None
 
 
 async def _cdb_recall(context, suppress_dirty: bool = True):
@@ -7026,7 +7086,16 @@ async def _cdb_ingest_post(context, post, doc, fname, chat_id):
                                     + (": " + "; ".join(problems[:3]) if problems else "."))
                             else:
                                 _CDB_DIRTY.clear()  # данные только что из канала
+                                # ВОЛНА 17: честная пометка — файлы Сейфа без
+                                # связки ключей в этом снапшоте.
+                                try:
+                                    _vw17 = _vault_restore_warning(
+                                        load_data(USERS_FILE, {}) or {})
+                                except Exception:
+                                    _vw17 = ""
                                 pin_notes = []
+                                if _vw17:
+                                    pin_notes.append(_vw17)
                                 try:
                                     await context.bot.unpin_all_chat_messages(chat_id=chat_id)
                                 except Exception as e:
@@ -7436,6 +7505,13 @@ async def _cdb_private_restore_cb(update: Update, context: ContextTypes.DEFAULT_
                 except Exception:
                     pass
                 return
+            # ВОЛНА 17: честная пометка — если у файлов Сейфа нет связки ключей.
+            try:
+                _vw = _vault_restore_warning(load_data(USERS_FILE, {}) or {})
+                if _vw:
+                    _notes.append(_vw)
+            except Exception:
+                pass
             _CDB_DIRTY.clear()  # данные только что из файла — заливать обратно нечего
             cfg = load_storage_config()  # ПОСЛЕ apply: каналы могли приехать из снапшота
             db_ids = get_db_channel_ids()
@@ -7755,16 +7831,156 @@ def _vault_check_password(user, rec, password: str) -> bool:
         return False
 
 
+# ВОЛНА 17: ТЕКСТЫ секретных вопросов шифруются в файле базы ключом бота
+# (AES-256-GCM). Просьба пользователя: «если они будут в файле с данными —
+# пусть тоже шифруются». Пароль Сейфа и так запечатан ответами (rec), а
+# тексты вопросов раньше лежали в users.json ОТКРЫТО — теперь тоже шифр.
+# Ключ выводится из BOT_TOKEN (PBKDF2-HMAC-SHA256, фикс. 120 000 раундов):
+# менять число раундов нельзя — ключ изменится и старые вопросы не прочтутся.
+_VAULT_KB_SALT = b"DEVORKS+vault-auth-seal-v17"
+_VAULT_KB_AAD = b"devorks-vault-auth-q"
+_VAULT_KB_ITERS = 120000
+_VAULT_KB_KEY_CACHE = None
+
+
+def _vault_kb_key():
+    """ВОЛНА 17: ключ бота для шифрования текстов вопросов в файле базы.
+    Смена BOT_TOKEN делает старые зашифрованные вопросы нечитаемыми —
+    тогда бот честно предложит задать вопросы заново (зная пароль)."""
+    global _VAULT_KB_KEY_CACHE
+    if _VAULT_KB_KEY_CACHE is not None:
+        return _VAULT_KB_KEY_CACHE
+    secret = (os.environ.get("BOT_TOKEN") or "DEVORKS+").encode("utf-8")
+    _VAULT_KB_KEY_CACHE = hashlib.pbkdf2_hmac(
+        "sha256", secret, _VAULT_KB_SALT, _VAULT_KB_ITERS, dklen=32)
+    return _VAULT_KB_KEY_CACHE
+
+
+def _vault_kb_seal(obj) -> dict:
+    """ВОЛНА 17: шифрует JSON-объект ключом бота → {"n", "d"} (hex) или {}."""
+    if AESGCM is None:
+        return {}
+    try:
+        nonce = os.urandom(12)
+        ct = AESGCM(_vault_kb_key()).encrypt(
+            nonce, json.dumps(obj, ensure_ascii=False).encode("utf-8"),
+            _VAULT_KB_AAD)
+        return {"n": nonce.hex(), "d": ct.hex()}
+    except Exception as e:
+        logger.warning(f"vault kb seal: {e}")
+        return {}
+
+
+def _vault_kb_open(enc):
+    """ВОЛНА 17: расшифровывает {"n","d"} обратно в объект (или бросает)."""
+    nonce = bytes.fromhex(str((enc or {}).get("n", "")))
+    data = bytes.fromhex(str((enc or {}).get("d", "")))
+    return json.loads(AESGCM(_vault_kb_key()).decrypt(
+        nonce, data, _VAULT_KB_AAD).decode("utf-8"))
+
+
+def _vault_auth_open(auth) -> dict:
+    """ВОЛНА 17: вид vault_auth с ОТКРЫТЫМ списком вопросов.
+    enc-форма (вопросы зашифрованы) расшифровывается ключом бота;
+    легаси-форма (вопросы в открытом виде, до волны 17) — как есть.
+    При сбое расшифровки (например, сменился BOT_TOKEN) questions=None."""
+    if not isinstance(auth, dict):
+        return {}
+    if "questions" in auth:
+        return auth
+    enc = auth.get("enc")
+    out = dict(auth)
+    if isinstance(enc, dict) and enc.get("n") and enc.get("d"):
+        try:
+            blob = _vault_kb_open(enc)
+            out["questions"] = list(blob.get("q") or [])
+        except Exception as e:
+            logger.warning(f"vault auth: вопросы не расшифрованы ({e})")
+            out["questions"] = None
+    else:
+        out["questions"] = None
+    return out
+
+
+def _vault_auth_seal(auth) -> dict:
+    """ВОЛНА 17: убирает ОТКРЫТЫЕ тексты вопросов из vault_auth, шифруя их
+    ключом бота (поле "enc"). rec (запечатанный пароль) уже шифр — не трогаем.
+    Если cryptography недоступна — честно оставляем как было (легаси-форма).
+    Возвращает НОВЫЙ словарь; вход не меняет."""
+    if not isinstance(auth, dict):
+        return auth
+    q = auth.get("questions")
+    if not (isinstance(q, list) and q):
+        return auth
+    enc = _vault_kb_seal({"q": q})
+    if not enc:
+        return auth
+    out = dict(auth)
+    out["enc"] = enc
+    out.pop("questions", None)
+    return out
+
+
+def _vault_auth_pick(old_auth, new_auth):
+    """ВОЛНА 17: какую связку ключей Сейфа оставить после восстановления —
+    САМУЮ СВЕЖУЮ по метке времени "ts" (ISO-строка, лексикографика = хронология).
+    old есть, new нет → old; new есть, old нет → new; обе → по ts (нет ts —
+    считается самой старой); ts равны → new. Пароль Сейфа больше НЕ ОТКАТЫВАЕТСЯ
+    восстановлением старого снапшота — просьба пользователя «бот должен
+    запоминать пароль и вопросы»."""
+    old_ok = isinstance(old_auth, dict) and old_auth.get("salt")
+    new_ok = isinstance(new_auth, dict) and new_auth.get("salt")
+    if old_ok and not new_ok:
+        return old_auth
+    if not old_ok and new_ok:
+        return new_auth
+    if not old_ok and not new_ok:
+        return None
+    to = str(old_auth.get("ts") or "")
+    tn = str(new_auth.get("ts") or "")
+    if to and not tn:
+        return old_auth
+    return new_auth if tn >= to else old_auth
+
+
 def _vault_auth_valid(user) -> bool:
-    """ВОЛНА 9: настроен ли ЕДИНЫЙ пароль Сейфа с 3 секретными вопросами."""
+    """ВОЛНА 9/17: настроен ли ЕДИНЫЙ пароль Сейфа с 3 секретными вопросами.
+    Принимает ОБЕ формы вопросов: легаси (открытый список) и enc (зашифрованные
+    ключом бота — волна 17)."""
     auth = getattr(user, "vault_auth", None)
-    return (
+    if not (
         isinstance(auth, dict)
         and auth.get("salt") and auth.get("verifier")
-        and isinstance(auth.get("questions"), list)
-        and len(auth["questions"]) >= VAULT_QUESTIONS_N
         and isinstance(auth.get("rec"), dict)
-    )
+    ):
+        return False
+    q = auth.get("questions")
+    if isinstance(q, list) and len(q) >= VAULT_QUESTIONS_N:
+        return True
+    enc = auth.get("enc")
+    return isinstance(enc, dict) and bool(enc.get("n")) and bool(enc.get("d"))
+
+
+def _vault_restore_warning(users: dict) -> str:
+    """ВОЛНА 17: честная пометка в отчёт восстановления: у пользователя есть
+    зашифрованные файлы Сейфа, но связка ключей (пароль+вопросы) в базе
+    отсутствует — файлы откроет только пароль, действовавший НА МОМЕНТ снапшота
+    (если и он утерян — шифры не откроются уже никогда, это физика AES)."""
+    try:
+        n = 0
+        for u in (users or {}).values():
+            if not isinstance(u, dict):
+                continue
+            if (isinstance(u.get("vault_files"), list) and u["vault_files"]
+                    and not isinstance(u.get("vault_auth"), dict)):
+                n += 1
+        if not n:
+            return ""
+        return ("🔐 В снапшоте нет пароля Сейфа для файлов " + str(n) + " польз. — "
+                "открыть их сможет только пароль, действовавший НА МОМЕНТ этого "
+                "снапшота (новый пароль их не откроет).")
+    except Exception:
+        return ""
 
 
 def _vault_check_safe_password(user, password: str) -> bool:
@@ -7933,10 +8149,11 @@ def _vault_menu_text(user):
 # MTProto под тем же бот-токеном (клиент Telethon) поднимает ОБЕ стороны
 # до 2 ГБ — это потолок Telegram для ботов (4 ГБ — только Premium у людей,
 # ботам Premium недоступен). Цепочка для большого файла:
-#   приём: серверная копия (copy_message) в канал-хранилище — без скачивания;
-#   «✅ Готово»: Telethon качает копию ПОТОКОМ → шифр DVF2 (куски 1 МБ,
+#   приём: ВОЛНА 17 — НЕ копируем никуда: источник — сообщение пользователя
+#   в личном чате (сырых файлов в каналах больше нет — по требованию);
+#   «✅ Готово»: Telethon качает сообщение ПОТОКОМ → шифр DVF2 (куски 1 МБ,
 #   AES-256-GCM) пишется во временный файл → контейнер в cloud-канал
-#   (≤49 МБ — Bot API, больше — MTProto) → черновик и временный файл стёрты;
+#   (≤49 МБ — Bot API, больше — MTProto) → при успехе оригинал из чата стёрт;
 #   выдача: Telethon качает шифр потоком → расшифровка на лету (в ОЗУ только
 #   куски) → временный файл → отправка пользователю (до 2 ГБ) → стёрт.
 # Файлы ≤20 МБ работают как раньше (DVF1 целиком в памяти) — ноль регрессий.
@@ -8358,10 +8575,36 @@ async def _mt_fetch_document_peer(client, peer, msg_id):
     return m, doc
 
 
-async def _mt_fetch_document(client, channel_id, msg_id):
-    """Достаёт сообщение канала и его документ (MTProto). Возвращает
-    (message, document) или (message_or_None, None)."""
-    peer = await _mt_resolve_channel(client, channel_id)
+async def _mt_resolve_peer(client, peer_id):
+    """ВОЛНА 17: надёжный InputPeer для КАНАЛА (id < 0) И ЛИЧНОГО чата
+    (id > 0 — обычный пользователь). Личный чат нужен для больших файлов
+    Сейфа: источник — сообщение пользователя в личке (сырых копий в каналах
+    больше нет). У юзера access_hash обязателен: берём из кэша сессии
+    (юзер только что писал боту — апдейты того же токена уже прогрели кэш),
+    иначе догреваем через get_dialogs и пробуем снова."""
+    pid = int(peer_id)
+    if pid < 0:
+        return await _mt_resolve_channel(client, pid)
+    try:
+        return await client.get_input_entity(pid)
+    except Exception:
+        pass
+    try:
+        await client.get_dialogs(limit=200)
+    except Exception:
+        pass
+    try:
+        return await client.get_input_entity(pid)
+    except Exception:
+        raise RuntimeError(
+            "личный чат не найден в кэше Telethon — попробуйте ещё раз "
+            "через минуту (кэш прогреется сам)")
+
+
+async def _mt_fetch_document(client, peer_id, msg_id):
+    """Достаёт сообщение (канал ИЛИ личный чат — волна 17) и его документ
+    (MTProto). Возвращает (message, document) или (message_or_None, None)."""
+    peer = await _mt_resolve_peer(client, peer_id)
     return await _mt_fetch_document_peer(client, peer, msg_id)
 
 
@@ -8513,10 +8756,12 @@ async def _mt_send_file_to_user(client, chat_id, path, size, caption,
 
 async def _vault_seal_item_mtproto(msg, context, user, item, password,
                                    progress_msg, idx, total):
-    """ВОЛНА 14: шифрует ОДИН большой файл (источник — черновая копия в
-    канале, сделанная при приёме). Поток: MTProto качает оригинал → шифр
-    DVF2 пишется во временный файл → контейнер в cloud-канал (≤49 МБ —
-    Bot API, больше — MTProto) → черновик и временные файлы стираются.
+    """ВОЛНА 14/17: шифрует ОДИН большой файл. Источник — САМО сообщение
+    пользователя в личном чате (волна 17: сырых копий в каналах больше нет —
+    поддерживается и старый ключ channel_id для незавершённых сессий).
+    Поток: MTProto качает оригинал → шифр DVF2 пишется во временный файл →
+    контейнер в канал (≤49 МБ — Bot API, больше — MTProto) → при УСПЕХЕ
+    оригинал стирается из личного чата и временные файлы удаляются.
     Возвращает запись user.vault_files; при сбое бросает исключение —
     оригинал остаётся в чате, чтобы пользователь его не потерял."""
     name = str(item.get("name") or "файл")
@@ -8529,13 +8774,14 @@ async def _vault_seal_item_mtproto(msg, context, user, item, password,
     if AESGCM is None:
         raise RuntimeError("нет библиотеки cryptography")
     mt = dict(item.get("mt_raw") or {})
-    raw_ch = int(mt.get("channel_id") or 0)
+    raw_ch = int(mt.get("peer_id") or mt.get("channel_id") or 0)
     raw_mid = int(mt.get("msg_id") or 0)
     if not raw_ch or not raw_mid:
-        raise RuntimeError("черновая копия файла потеряна")
+        raise RuntimeError("источник файла потерян — пришлите файл ещё раз")
     _m, doc = await _mt_fetch_document(client, raw_ch, raw_mid)
     if doc is None:
-        raise RuntimeError("черновая копия в канале не найдена")
+        raise RuntimeError(
+            "файл исчез из чата (сообщение удалено?) — пришлите файл ещё раз")
     doc_size = int(getattr(doc, "size", 0) or size or 0)
     if not _dvf2_disk_ok(doc_size):
         raise RuntimeError("мало свободного места на диске сервера")
@@ -8580,7 +8826,7 @@ async def _vault_seal_item_mtproto(msg, context, user, item, password,
             )
         if up is None:
             raise RuntimeError("контейнер не удалось загрузить в канал")
-        return {
+        rec = {
             "id": _vault_gen_id(user),
             "kind": kind, "mime": mime,
             "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
@@ -8595,9 +8841,9 @@ async def _vault_seal_item_mtproto(msg, context, user, item, password,
             "channel_id": up.get("channel_id"),
             "dvf2": True,
         }
-    finally:
-        # Черновая копия оригинала в канале больше не нужна НИКОГДА:
-        # ни при успехе (есть шифр), ни при сбое (оригинал остался в чате).
+        # ВОЛНА 17: источник (сообщение в личном чате) стираем ТОЛЬКО при
+        # успехе — шифр уже в канале, обещание «оригинал из чата сотру»
+        # выполнено. При сбое оригинал ОСТАЁТСЯ в чате (политика волны 11).
         item.pop("mt_raw", None)
         if raw_ch and raw_mid:
             try:
@@ -8605,6 +8851,8 @@ async def _vault_seal_item_mtproto(msg, context, user, item, password,
                     chat_id=raw_ch, message_id=raw_mid)
             except Exception:
                 pass
+        return rec
+    finally:
         try:
             _shutil.rmtree(job, ignore_errors=True)
         except Exception:
@@ -9221,20 +9469,23 @@ async def _vault_cleanup_chat(context, chat_id, batch, user=None, keep_ids=None)
                     save_user(user)
         except Exception as e:
             logger.warning(f"vault cleanup: след не очищен: {e}")
-    # ВОЛНА 14: черновые копии БОЛЬШИХ файлов (>20 МБ) лежат в канале-хранилище
-    # только пока идёт загрузка в Сейф. Отмена/выход/срыв сессии — копии
-    # стираем (best-effort): в канале не должно оставаться НИЧЕГО
-    # незашифрованного.
+    # ВОЛНА 14/17: сырых копий больших файлов в каналах-хранилищах больше НЕТ
+    # (источник — сообщение в личном чате). На случай незавершённых старых
+    # сессий поддерживаем ключ channel_id. Отмена/выход/срыв сессии —
+    # источники стираем (best-effort): незашифрованного нигде не остаётся.
     for _it in (batch or []):
         if not isinstance(_it, dict):
             continue
         _mt = _it.get("mt_raw")
-        if isinstance(_mt, dict) and _mt.get("channel_id") and _mt.get("msg_id"):
-            try:
-                await context.bot.delete_message(
-                    chat_id=int(_mt["channel_id"]), message_id=int(_mt["msg_id"]))
-            except Exception:
-                pass
+        if isinstance(_mt, dict):
+            _ch17 = int(_mt.get("peer_id") or _mt.get("channel_id") or 0)
+            _mi17 = int(_mt.get("msg_id") or 0)
+            if _ch17 and _mi17:
+                try:
+                    await context.bot.delete_message(
+                        chat_id=_ch17, message_id=_mi17)
+                except Exception:
+                    pass
             _it.pop("mt_raw", None)
     deleted = 0
     for _mid in ids:
@@ -9416,10 +9667,13 @@ async def vault_put_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "видео/фото уже сжаты своим форматом)."
         )
         return VAULT_PUT_WAIT
-    # ВОЛНА 14: от 20 МБ до 2 ГБ — гибрид Bot API + MTProto (Telethon).
-    # Оригинал НЕ скачивается (Bot API так не умеет): серверная копия уходит
-    # в канал-хранилище, а после «✅ Готово» бот скачает её потоком и
-    # зашифрует в DVF2 (куски по 1 МБ, AES-256-GCM).
+    # ВОЛНА 14/17: от 20 МБ до 2 ГБ — гибрид Bot API + MTProto (Telethon).
+    # Оригинал НЕ скачивается (Bot API так не умеет) и НИКУДА не копируется:
+    # ВОЛНА 17 — сырых копий в каналах больше НЕТ (пользователь видел в канале
+    # незашифрованные большие файлы и потребовал это убрать). Источник для
+    # шифрования — САМО сообщение пользователя в личном чате: после «✅ Готово»
+    # бот скачает его потоком через MTProto и зашифрует в DVF2 (куски по 1 МБ).
+    # В канал уйдёт ТОЛЬКО шифр.
     if fsize > VAULT_MAX_FILE_BYTES:
         if not _TELETHON_OK or not BOT_TOKEN:
             await msg.reply_text(
@@ -9450,32 +9704,23 @@ async def vault_put_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=update.effective_chat.id, action="typing")
         except Exception:
             pass
-        try:
-            _copy = await context.bot.copy_message(
-                chat_id=int(_cloud_ids[0]),
-                from_chat_id=msg.chat_id, message_id=msg.message_id,
-            )
-        except Exception as e:
-            logger.error(f"vault put: копия большого файла не удалась: {e}")
-            await msg.reply_text(
-                "❌ Не смог принять большой файл (сбой копирования в "
-                "хранилище). Попробуйте ещё раз.")
-            return VAULT_PUT_WAIT
         batch.append({
             "source": "mtproto", "name": name[:120], "kind": kind,
             "mime": str(getattr(att, "mime_type", "") or ""),
             "size": fsize,
             "chat_msg_id": int(getattr(msg, "message_id", 0) or 0),  # ВОЛНА 11
-            "mt_raw": {"channel_id": int(_cloud_ids[0]),
-                       "msg_id": int(getattr(_copy, "message_id", 0) or 0)},
+            # ВОЛНА 17: источник — личный чат (peer_id > 0), НЕ канал.
+            "mt_raw": {"peer_id": int(msg.chat_id),
+                       "msg_id": int(getattr(msg, "message_id", 0) or 0)},
         })
         _vault_trace_add(context, user, msg.chat_id, msg.message_id)  # ВОЛНА 12
         _ack = await msg.reply_text(
             f"📦 Принято: {_fmt_bytes(fsize)} — зашифрую ПОТОКОМ после "
-            "«✅ Готово» (большие файлы шифруются несколько минут — это "
-            "нормально, шифр уйдёт в канал, оригинал из чата сотру). "
-            "Подписать файл — ответьте (reply) на СВОЁ сообщение с ним "
-            "названием; пришлите ещё или нажмите «✅ Готово» ниже.",
+            "«✅ Готово» прямо из этого чата (большие файлы шифруются "
+            "несколько минут — это нормально; в канал уйдёт ТОЛЬКО шифр, "
+            "никаких незашифрованных копий, оригинал из чата сотру после "
+            "шифрования). Подписать файл — ответьте (reply) на СВОЁ "
+            "сообщение с ним названием; пришлите ещё или нажмите «✅ Готово» ниже.",
             reply_markup=_vault_put_kb(),
         )
         _vault_track_ack(context, _ack, user=user)
@@ -9855,7 +10100,8 @@ async def _vault_encrypt_batch(msg, context, user, password):
             except Exception:
                 pass
         # ВОЛНА 14: большой файл (>20 МБ) — потоковый путь DVF2 через
-        # MTProto. Оригинал лежит черновой копией в канале; здесь бот качает
+        # MTProto. ВОЛНА 17: источник — сообщение пользователя в ЛИЧНОМ чате
+        # (никаких сырых копий в каналах); здесь бот качает
         # его потоком, шифрует кусками по 1 МБ и заливает контейнер.
         if item.get("source") == "mtproto":
             try:
@@ -9946,6 +10192,9 @@ async def _vault_encrypt_batch(msg, context, user, password):
         if migrated:
             user.cloud_files = cloud_recs
     save_user(user)
+    # ВОЛНА 17: пароль+вопросы+новые шифры должны доехать до канала сразу —
+    # не ждём 30-сек тикер (при рестарте в этом окне Сейф «забывал»).
+    _vault_flush_soon(context, reason="шифрование пачки Сейфа")
     # was_setup: флоу первичной настройки — пароль Сейфа только что создан.
     was_setup = bool(context.user_data.get('vault_setup_pw'))
     for key in ('vault_put_mode', 'vault_batch', 'vault_migrate_ids',
@@ -10316,7 +10565,16 @@ async def _vault_rec_begin(msg, context, user):
         user.vault_rec_until = ""
         user.vault_rec_fails = 0
         save_user(user)
-    questions = auth.get("questions") or []
+    # ВОЛНА 17: вопросы могут быть зашифрованы в базе (enc) — открываем.
+    questions = _vault_auth_open(auth).get("questions") or []
+    if len(questions) < VAULT_QUESTIONS_N:
+        await msg.reply_text(
+            "❌ Не смог расшифровать секретные вопросы (например, сменился "
+            "BOT_TOKEN). Если помните текущий пароль — задайте новые вопросы: "
+            "🔐 Сейф → «❓ Сменить секретные вопросы».",
+            reply_markup=get_main_menu_keyboard(user),
+        )
+        return MAIN_MENU
     context.user_data['vault_rec_answers'] = []
     tries_left = max(0, VAULT_REC_MAX_ATTEMPTS - int(getattr(user, "vault_rec_fails", 0) or 0))
     _ack = await msg.reply_text(
@@ -10357,7 +10615,18 @@ async def vault_rec_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     answers.append(text)
     _vault_trace_add(context, user, msg.chat_id, msg.message_id)  # ВОЛНА 12
     auth = getattr(user, "vault_auth", None) or {}
-    questions = auth.get("questions") or []
+    # ВОЛНА 17: вопросы могут быть зашифрованы в базе (enc) — открываем.
+    questions = _vault_auth_open(auth).get("questions") or []
+    if len(questions) < VAULT_QUESTIONS_N:
+        await msg.reply_text(
+            "❌ Не смог расшифровать секретные вопросы (например, сменился "
+            "BOT_TOKEN). Набранные ответы стёрты. Если помните текущий "
+            "пароль — задайте новые вопросы: 🔐 Сейф → «❓ Сменить секретные "
+            "вопросы».",
+            reply_markup=get_main_menu_keyboard(user),
+        )
+        context.user_data.pop('vault_rec_answers', None)
+        return MAIN_MENU
     if len(answers) < VAULT_QUESTIONS_N:
         await msg.reply_text(f"Вопрос {len(answers) + 1} из {VAULT_QUESTIONS_N}:\n{questions[len(answers)]}")
         return VAULT_REC_ANSWER
@@ -10531,8 +10800,12 @@ async def vault_rec_newpass(update: Update, context: ContextTypes.DEFAULT_TYPE):
     key = _vault_derive_key(password, bytes.fromhex(auth["salt"]), auth["iters"])
     auth["verifier"] = _vault_verifier(key).hex()
     auth["rec"] = _vault_seal_password(password, answers)
-    user.vault_auth = auth
+    # ВОЛНА 17: свежая метка времени (для merge при восстановлении) + шифруем
+    # открытые вопросы, чтобы в файле базы лежал только шифр.
+    auth["ts"] = _utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    user.vault_auth = _vault_auth_seal(auth)
     save_user(user)
+    _vault_flush_soon(context, reason="новый пароль Сейфа (восстановление)")
     for key_name in ('vault_rec_oldpw', 'vault_rec_answers'):
         context.user_data.pop(key_name, None)
     # ВОЛНА 12: ответы, которыми распечатывали пароль, из чата стиряем —
@@ -10717,8 +10990,11 @@ async def vault_qs_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
         key = _vault_derive_key(password, bytes.fromhex(auth["salt"]), auth["iters"])
         auth["verifier"] = _vault_verifier(key).hex()
         auth["rec"] = _vault_seal_password(password, qs.get("a", [])[:VAULT_QUESTIONS_N])
-        user.vault_auth = auth
+        # ВОЛНА 17: вопросы уходят в базу ТОЛЬКО зашифрованными (ключ бота).
+        auth["ts"] = _utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        user.vault_auth = _vault_auth_seal(auth)
         save_user(user)
+        _vault_flush_soon(context, reason="первая настройка Сейфа")
         context.user_data.pop('vault_qs_data', None)
         context.user_data.pop('vault_setup_pw', None)
         await msg.reply_text("🛡️ Вопросы сохранены. Шифрую файлы паролем Сейфа…")
@@ -10736,8 +11012,11 @@ async def vault_qs_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return MAIN_MENU
     auth["questions"] = qs.get("q", [])[:VAULT_QUESTIONS_N]
     auth["rec"] = _vault_seal_password(pw, qs.get("a", [])[:VAULT_QUESTIONS_N])
-    user.vault_auth = auth
+    # ВОЛНА 17: свежая метка времени + вопросы — только шифром в базе.
+    auth["ts"] = _utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    user.vault_auth = _vault_auth_seal(auth)
     save_user(user)
+    _vault_flush_soon(context, reason="смена секретных вопросов")
     for key in ('vault_qs_data', 'vault_qs_pw', 'vault_attempts'):
         context.user_data.pop(key, None)
     # ВОЛНА 12: набранные вопросы/ответы больше не нужны в чате — стираем.
