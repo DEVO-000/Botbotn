@@ -8175,12 +8175,20 @@ try:
     )
     from telethon.errors import FloodWaitError as _FloodWaitError
     _TELETHON_OK = True
-except Exception:  # честная деградация: всё остальное работает без Telethon
+except Exception as _telethon_import_err:  # честная деградация без Telethon
     _TGClient = None
     _StringSession = None
     _InputPeerUser = None
     _InputPeerChannel = None
     _FloodWaitError = None
+    # ВОЛНА 19: молчаливый импорт маскировал причину — на Render было видно
+    # только «MTProto недоступен», а ПОЧЕМУ — только в логах сборки.
+    try:
+        logging.getLogger(__name__).error(
+            "telethon: библиотека не импортировалась — файлы >20 МБ "
+            f"недоступны. Причина: {_telethon_import_err!r}")
+    except Exception:
+        pass
 
 # api_id/api_hash: сначала переменные окружения, затем публичные данные
 # официального Telegram Desktop (открыты в его исходниках и используются
@@ -8191,6 +8199,24 @@ _TELEGRAM_API_HASH = (_env("TELEGRAM_API_HASH", "")
 
 _MT_CLIENT = None
 _MT_LOCK = None
+# ВОЛНА 19: ПОСЛЕДНЯЯ причина, почему MTProto-клиент недоступен. Раньше
+# пользователь видел безликое «MTProto недоступен (нет Telethon/BOT_TOKEN)»
+# даже когда Telethon установлен, а падало именно ПОДКЛЮЧЕНИЕ (сеть/сессия) —
+# из-за этого причина сбоя выглядела неправдоподобно и путала.
+_MT_LAST_ERR = ""
+
+
+def _mt_unavailable_reason() -> str:
+    """ВОЛНА 19: честная причина недоступности MTProto — для сообщений
+    пользователю и для логов. Вызывать, когда _mt_client() вернул None."""
+    global _MT_LAST_ERR
+    if not _TELETHON_OK:
+        return ("библиотека Telethon не установлена — пересоберите деплой "
+                "из нового zip (requirements.txt: telethon>=1.36)")
+    if not BOT_TOKEN:
+        return "нет токена бота (BOT_TOKEN)"
+    return _MT_LAST_ERR or ("клиент MTProto не смог подключиться к Telegram "
+                            "(сеть/сессия) — повторите через минуту")
 
 
 async def _mt_client():
@@ -8198,9 +8224,17 @@ async def _mt_client():
     первой операции с файлами >20 МБ и живёт до конца процесса. Сессия бота
     создаётся по токену (без телефона); после рестарта Render создаётся
     заново — это бесплатно и ни на что не влияет. Возвращает клиент или None
-    (Telethon не установлен / нет BOT_TOKEN / Telegram недоступен)."""
-    global _MT_CLIENT, _MT_LOCK
-    if not _TELETHON_OK or not BOT_TOKEN:
+    (Telethon не установлен / нет BOT_TOKEN / Telegram недоступен).
+    ВОЛНА 19: самовосстановление — если сессия из TELETHON_SESSION битая
+    (AuthKeyDuplicated/AuthKeyUnregistered/устарела), вторая попытка делается
+    с ЧИСТОЙ сессией, и клиент поднимается без вмешательства человека."""
+    global _MT_CLIENT, _MT_LOCK, _MT_LAST_ERR
+    if not _TELETHON_OK:
+        _MT_LAST_ERR = ("библиотека Telethon не установлена — пересоберите "
+                        "деплой из нового zip (requirements.txt: telethon>=1.36)")
+        return None
+    if not BOT_TOKEN:
+        _MT_LAST_ERR = "нет токена бота (BOT_TOKEN)"
         return None
     if _MT_LOCK is None:
         _MT_LOCK = asyncio.Lock()
@@ -8211,29 +8245,50 @@ async def _mt_client():
                     return _MT_CLIENT
             except Exception:
                 pass
+        env_session = (_env("TELETHON_SESSION", "") or "").strip()
+        # ВОЛНА 19: до двух попыток — (1) сессия из env (если задана) или
+        # чистая, (2) ОБЯЗАТЕЛЬНО чистая сессия. Битая env-сессия больше
+        # не ломает MTProto навсегда: чистая сессия бота авторизуется сама.
+        _session_candidates = [env_session, ""]
+        if not env_session:
+            _session_candidates = [""]
         client = None
-        try:
-            sess = _StringSession((_env("TELETHON_SESSION", "") or "").strip())
-            client = _TGClient(
-                sess, _TELEGRAM_API_ID, _TELEGRAM_API_HASH,
-                device_model="DEVORKS+ Bot", system_version="Linux",
-                app_version="14.0", flood_sleep_threshold=120,
-            )
-            await client.connect()
-            if not await client.is_user_authorized():
-                await client.start(bot_token=BOT_TOKEN)
-            _MT_CLIENT = client
-            _dvf2_tmp_sweep()
-            logger.info("mtproto: клиент поднялся — файлы до 2 ГБ доступны")
-            return _MT_CLIENT
-        except Exception as e:
-            logger.error(f"mtproto: клиент не поднялся: {e}")
-            if client is not None:
-                try:
-                    await client.disconnect()
-                except Exception:
-                    pass
-            return None
+        last_exc = None
+        for _sess_try, _sess_val in enumerate(_session_candidates, 1):
+            try:
+                sess = _StringSession(_sess_val)
+                client = _TGClient(
+                    sess, _TELEGRAM_API_ID, _TELEGRAM_API_HASH,
+                    device_model="DEVORKS+ Bot", system_version="Linux",
+                    app_version="14.0", flood_sleep_threshold=120,
+                )
+                await client.connect()
+                if not await client.is_user_authorized():
+                    await client.start(bot_token=BOT_TOKEN)
+                _MT_CLIENT = client
+                _dvf2_tmp_sweep()
+                _MT_LAST_ERR = ""
+                logger.info("mtproto: клиент поднялся — файлы до 2 ГБ доступны"
+                            + (f" (попытка {_sess_try}: чистая сессия)"
+                               if _sess_val == "" and env_session else ""))
+                return _MT_CLIENT
+            except Exception as e:
+                last_exc = e
+                logger.error(f"mtproto: клиент не поднялся "
+                             f"(попытка {_sess_try}/2, сессия="
+                             f"{'env' if _sess_val else 'чистая'}): {e}")
+                if client is not None:
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
+                    client = None
+                if _sess_try < len(_session_candidates):
+                    await asyncio.sleep(2)  # сразу рвать соединение не стоит
+        _MT_LAST_ERR = (f"клиент MTProto не смог подключиться к Telegram "
+                        f"({last_exc!r}) — повторите попытку через минуту; "
+                        "если повторяется — проверьте сеть сервера")
+        return None
 
 
 async def _mt_warmup():
@@ -8847,6 +8902,10 @@ def _vault_fail_reason(e):
             or "источник недоступен" in low):
         s = ("Telegram не дал боту доступ к источнику файла — пришлите файл "
              "ещё раз (обычно помогает сразу)")
+    elif "mtproto недоступен" in low:
+        s = ("потоковый режим больших файлов сейчас недоступен на сервере "
+             "(не поднялся MTProto-клиент) — повторите через минуту или "
+             "пересоберите деплой из нового zip")
     elif "файл исчез" in low or "message_id_invalid" in low:
         s = "файл исчез из чата (сообщение удалено?) — пришлите его ещё раз"
     elif "источник файла потерян" in low:
@@ -8885,6 +8944,24 @@ async def _vault_mt_precheck(context, item, ack_msg=None):
     try:
         client = await _mt_client()
         if client is None:
+            # ВОЛНА 19: предупреждаем ЗАРАНЕЕ — пока пользователь вводит пароль,
+            # а не только после «✅ Готово». Клиент может подняться к моменту
+            # шифрования (самовосстановление с чистой сессией), поэтому это
+            # именно предупреждение, а не отказ.
+            if ack_msg is not None:
+                _txt = str(getattr(ack_msg, "text", "") or "")
+                if _txt and "Потоковый режим" not in _txt:
+                    try:
+                        await context.bot.edit_message_text(
+                            _txt + "\n\n⚠️ Потоковый режим сейчас недоступен ("
+                            f"{_mt_unavailable_reason()}). Если после "
+                            "«✅ Готово» шифрование не удастся — попробуйте "
+                            "ещё раз через пару минут: клиент поднимается сам.",
+                            chat_id=ack_msg.chat_id,
+                            message_id=ack_msg.message_id,
+                        )
+                    except Exception:
+                        pass
             return
         mt = dict(item.get("mt_raw") or {})
         pid = int(mt.get("peer_id") or mt.get("channel_id") or 0)
@@ -8954,14 +9031,15 @@ async def _vault_seal_item_mtproto(msg, context, user, item, password,
 
 async def _vault_seal_item_mtproto_once(msg, context, user, item, password,
                                         progress_msg, idx, total):
-    """ВОЛНА 18: ОДНА попытка шифрования большого файла (обёртка повторяет)."""
+    """ВОЛНА 18: ОДНА попытка шифрования большого файла (обёртка повторяет).
+    ВОЛНА 19: Telethon обязателен ТОЛЬКО для файлов >20 МБ. Файлы ≤20 МБ
+    полностью обслуживаются Bot API (скачали по file_id → шифр DVF2 → канал),
+    даже если MTProto-клиент не поднялся, — раньше проверка клиента стояла
+    ПЕРЕД запасным путём и роняла малые файлы с «MTProto недоступен»."""
     name = str(item.get("name") or "файл")
     kind = str(item.get("kind") or "document")
     mime = str(item.get("mime") or "")
     size = int(item.get("size", 0) or 0)
-    client = await _mt_client()
-    if client is None:
-        raise RuntimeError("MTProto недоступен (нет Telethon/BOT_TOKEN)")
     if AESGCM is None:
         raise RuntimeError("нет библиотеки cryptography")
     mt = dict(item.get("mt_raw") or {})
@@ -8969,18 +9047,26 @@ async def _vault_seal_item_mtproto_once(msg, context, user, item, password,
     raw_mid = int(mt.get("msg_id") or 0)
     if not raw_ch or not raw_mid:
         raise RuntimeError("источник файла потерян — пришлите файл ещё раз")
-    # ВОЛНА 18: сначала MTProto (цепочка peer'ов: кэш → access_hash → hash=0),
-    # при полном провале и размере ≤20 МБ — запасное скачивание через Bot API
-    # по file_id (файл уже лежит в Telegram, Bot API умеет ≤20 МБ).
+    small = 0 < size <= VAULT_MAX_FILE_BYTES
+    client = await _mt_client()  # None — не приговор: ≤20 МБ пойдёт через Bot API
+    if client is None:
+        logger.warning(f"vault put: MTProto недоступен ({_mt_unavailable_reason()})"
+                       + (" — файл ≤20 МБ, шифрую через Bot API" if small
+                          else " — запасной Bot API-путь попробую, но файл больше 20 МБ"))
+    # ВОЛНА 18/19: сначала MTProto (цепочка peer'ов: кэш → access_hash →
+    # hash=0), при полном провале и размере ≤20 МБ — запасное скачивание
+    # через Bot API по file_id (файл уже лежит в Telegram, Bot API умеет
+    # ≤20 МБ). MTProto-шаг выполняется ТОЛЬКО если клиент есть.
     doc = None
     mt_err = None
-    try:
-        _m, doc = await _mt_fetch_document(
-            client, raw_ch, raw_mid, int(mt.get("ah") or 0))
-    except Exception as e:
-        mt_err = e
-        logger.warning(f"vault put: MTProto-источник не открылся ({e}); "
-                       "пробую запасной путь Bot API/file_id")
+    if client is not None:
+        try:
+            _m, doc = await _mt_fetch_document(
+                client, raw_ch, raw_mid, int(mt.get("ah") or 0))
+        except Exception as e:
+            mt_err = e
+            logger.warning(f"vault put: MTProto-источник не открылся ({e}); "
+                           "пробую запасной путь Bot API/file_id")
     botapi_payload = None
     if doc is None:
         fid = str(item.get("file_id") or "")
@@ -8990,6 +9076,13 @@ async def _vault_seal_item_mtproto_once(msg, context, user, item, password,
             except Exception as e:
                 logger.warning(f"vault put: Bot API-скачивание не удалось: {e}")
         if botapi_payload is None:
+            if client is None:
+                # ВОЛНА 19: честная причина вместо безликой формулировки.
+                raise RuntimeError(
+                    f"MTProto недоступен ({_mt_unavailable_reason()})"
+                    + ("" if small else
+                       " — файл больше 20 МБ, без потока его не взять; "
+                       "повторите позже или пришлите файл заново"))
             if mt_err is not None:
                 raise mt_err
             raise RuntimeError(
@@ -10488,30 +10581,48 @@ async def _vault_encrypt_batch(msg, context, user, password):
                          "📥 Положить (файлы пришлите заново).")
     if migrated:
         lines.append(f"🗂 Старые незашифрованные копии удалены: {migrated} — теперь файлы только в Сейфе.")
-    lines.append("")
-    lines.append("• В канале теперь только шифр — без пароля его не откроет никто.")
-    lines.append("• Пароль стёрт из чата и нигде не хранится.")
-    lines.append("• Даже имена файлов спрятаны в шифрах.")
+    # ВОЛНА 19: «В канале только шифр / пароль стёрт / имена в шифрах» —
+    # ТОЛЬКО когда реально зашифровался хоть один файл. Раньше блок печатался
+    # и при полном провале: чат пустел, а текст обещал «данные только в
+    # Сейфе», которого не было, — это выглядело как потеря данных.
+    if ok_n:
+        lines.append("")
+        lines.append("• В канале теперь только шифр — без пароля его не откроет никто.")
+        lines.append("• Пароль стёрт из чата и нигде не хранится.")
+        lines.append("• Даже имена файлов спрятаны в шифрах.")
     if was_setup:
-        lines.append("• Сейф настроен: пароль + 3 секретных вопроса сохранены.")
-    lines.append("")
-    lines.append("🔑 Забыли пароль? 🔐 Сейф → «🔑 Забыл пароль» — восстановление по вашим вопросам.")
+        if ok_n:
+            lines.append("• Сейф настроен: пароль + 3 секретных вопроса сохранены.")
+        else:
+            lines.append("• Сейф настроен (пароль + 3 секретных вопроса сохранены), "
+                         "но ни один файл не сохранился — положите их позже: "
+                         "🔐 Сейф → 📥 Положить.")
+    if ok_n:
+        lines.append("")
+        lines.append("🔑 Забыли пароль? 🔐 Сейф → «🔑 Забыл пароль» — восстановление по вашим вопросам.")
     # ВОЛНА 11: оригиналы успешно зашифрованных файлов стираем из чата —
     # «файл в памяти, в чат не попадёт» теперь буквально правда. Файлы, не
     # зашившиеся из-за сбоя, в чате ОСТАЮТСЯ (иначе пользователь их потеряет).
-    _done_items = [it for it in batch if isinstance(it, dict) and it.get("done")]
-    # ВОЛНА 12: оригиналы НЕзашифровавшихся файлов (сбой сети/канала) остают
-    # в чате — политика волны 11 — и остаются в персистентном следе, чтобы
-    # отменить/зачистить их позже можно было кнопкой отмены.
-    _failed_ids = [it.get("chat_msg_id") for it in batch
-                   if isinstance(it, dict) and not it.get("done") and it.get("chat_msg_id")]
-    try:
-        _cleaned = await _vault_cleanup_chat(context, msg.chat_id, _done_items,
-                                             user=user, keep_ids=_failed_ids)
-    except Exception:
-        _cleaned = 0
-    if _cleaned:
-        lines.append(f"🧹 Следов из чата стёрто: {_cleaned} (оригиналы и подсказки) — данные только в Сейфе.")
+    # ВОЛНА 19: при НУЛЕВОМ успехе не стираем НИЧЕГО (ни файлы, ни подсказки,
+    # ни след) — раньше зачистка запускалась всегда, и при полном провале
+    # чат пустел, хотя в Сейфе не оказалось ни одного файла.
+    if ok_n:
+        _done_items = [it for it in batch if isinstance(it, dict) and it.get("done")]
+        # ВОЛНА 12: оригиналы НЕзашифровавшихся файлов (сбой сети/канала) остают
+        # в чате — политика волны 11 — и остаются в персистентном следе, чтобы
+        # отменить/зачистить их позже можно было кнопкой отмены.
+        _failed_ids = [it.get("chat_msg_id") for it in batch
+                       if isinstance(it, dict) and not it.get("done") and it.get("chat_msg_id")]
+        try:
+            _cleaned = await _vault_cleanup_chat(context, msg.chat_id, _done_items,
+                                                 user=user, keep_ids=_failed_ids)
+        except Exception:
+            _cleaned = 0
+        if _cleaned:
+            lines.append(f"🧹 Следов из чата стёрто: {_cleaned} (оригиналы зашифрованных файлов и подсказки) — данные только в Сейфе.")
+    else:
+        lines.append("")
+        lines.append("🧹 Из чата ничего не стёрто — все ваши файлы и подсказки на месте.")
     await msg.reply_text("\n".join(lines), reply_markup=get_main_menu_keyboard(user))
     return MAIN_MENU
 
