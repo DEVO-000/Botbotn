@@ -425,6 +425,14 @@ VAULT_QS_WAIT = 123
 # подпись видна в списке Сейфа открытым текстом — чтобы не запутаться, где что
 # (содержимое и настоящее имя файла по-прежнему под шифром).
 VAULT_REN_WAIT = 124
+# ВОЛНА 13: шаг «сразу НАЗВАТЬ, что кладёшь» после кнопки «✅ Готово» —
+# одно название на всю загрузку, видно в «📦 Мои файлы».
+VAULT_LABEL_WAIT = 125
+
+# ВОЛНА 13: состояния, где текст = ПРОИЗВОЛЬНОЕ НАЗВАНИЕ (файла/загрузки).
+# Быстрые команды туда НЕ инжектируются: пользователь может назвать файл
+# «⏰ Таймер» — это имя файла, а не команда (глобальная отмена остаётся).
+_QUICK_SKIP_STATES = frozenset({VAULT_REN_WAIT, VAULT_LABEL_WAIT})
 
 # ==================================
 # === ВОЛНА 12: ГЛОБАЛЬНАЯ КНОПКА ОТМЕНЫ ===
@@ -452,7 +460,7 @@ _VAULT_SESSION_KEYS = (
     'vault_setup_pw', 'vault_qs_data', 'vault_qs_pw', 'vault_qs_stage',
     'vault_rec_answers', 'vault_rec_oldpw', 'vault_ren_id', 'vault_chat_acks',
     'cloud_file_mode', 'cloud_batch', 'cloud_note', 'cloud_ren_id',
-    'vault_pending',
+    'vault_pending', 'vault_batch_label',
 )
 
 # Глобальное хранилище для временных данных оплаты
@@ -5675,10 +5683,18 @@ async def _cdb_recall(context, suppress_dirty: bool = True):
     пришли из канала — заливать их обратно немедленно незачем).
 
     Возвращает (ok: bool, отчёт: str)."""
+    # ВОЛНА 13: снапшот мог быть ВСТАВЛЕН пользователем и закреплён в любом
+    # канале-хранилище («я буду вставлять файлы из канала последние») —
+    # сканируем db-каналы ПЕРВЫМИ, затем cloud-only; побеждает самый свежий.
     db_ids = get_db_channel_ids()
+    _seen_ids = set(db_ids)
+    for _c in get_cloud_channel_ids():
+        if _c not in _seen_ids:
+            _seen_ids.add(_c)
+            db_ids.append(_c)
     if not db_ids:
-        return False, ("Нет каналов в режиме 🗄️ База данных (или 🔀 Оба) — "
-                       "вспоминать нечего.")
+        return False, ("Нет каналов-хранилищ (🗄️ База данных / ☁️ Облако / "
+                       "🔀 Оба) — вспоминать нечего.")
     bot = context.bot
     best = None  # (created_utc, payload, fname, ch, pinned_msg_id, doc_file_id)
     for ch in db_ids:
@@ -6203,9 +6219,10 @@ async def cloud_help_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "ответите верно (3 попытки, затем пауза 30 минут) — зададите новый "
         "пароль, я перешифрую файлы, и данные снова доступны.\n\n"
         "Честные ограничения:\n"
-        f"• в Сейф принимаю файлы до {_fmt_bytes(VAULT_MAX_FILE_BYTES)} — больше "
-        "бот физически не может СКАЧАТЬ (жёсткий лимит Telegram для ботов, он "
-        "не обходится); большие файлы разбивайте на части или жмите сами в ZIP/7z;\n"
+        f"• в Сейф принимаю файлы до {_fmt_bytes(VAULT_MAX_FILE_BYTES)} сразу "
+        "и ДО 2 ГБ в режиме больших файлов (потоковое шифрование через "
+        "MTProto, несколько минут — прогресс видно в чате); больше 2 ГБ не "
+        "пропускает ни один бот Telegram — делите на части;\n"
         "• лимит файлов на человека задаёт разработчик (по умолчанию 50);\n"
         "• бот не может читать историю канала — только файлы, которые прошли через него."
     )
@@ -6873,6 +6890,192 @@ async def cloud_bigself_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return MAIN_MENU
 
 
+async def _cdb_ingest_post(context, post, doc, fname, chat_id):
+    """ВОЛНА 13: пользователь САМ вставил снапшот базы в канал.
+
+    Просьба пользователя: «бот опять ничего не помнит — лучше я буду в него
+    вставлять файлы из канала, последние, но он также их должен закрепить».
+    Бот видит пост с документом devorks_db_snapshot_…, скачивает его,
+    проверяет _meta.json и действует по правилу «ПОСЛЕДНИЙ АКТУАЛЬНЫЙ
+    ПОБЕЖДАЕТ» (без дублей и без откатов):
+    • штамп снапшота (created_utc из _meta.json) НОВЕЕ локального
+      cdb_last_flush → применяем базу, ЗАКРЕПЛЯЕМ пост (pin) и стираем
+      старые снапшоты этого канала — при старте бот прочитает именно
+      этот закреп;
+    • штамп НЕ новее → честно пропускаем: свежую базу старым файлом не
+      откатываем (та же защита, что у кнопки «📦 Вспомнить всё»).
+    Отчёт уходит разработчику в ЛС (у channel-постов нет автора). Свои
+    собственные снапшоты бот не видит: Telegram не присылает боту
+    channel_post о его же сообщениях — зацикливание невозможно.
+
+    ДОПОЛНИТЕЛЬНО (волна 13, честная доверенная цепочка): если снапшот
+    отправлен в канал, КОТОРОГО НЕТ в конфиге (конфиг потерян при переезде,
+    а бот всё ещё админ в канале) — бот ПОДКЛЮЧАЕТ этот канал сам (режим
+    «Оба») и применяет снапшот: пользователь не должен запирать
+    восстановление о потерянный конфиг. Правило «последний актуальный
+    побеждает» проверяется в ЛЮБОМ случае — свежую базу старым файлом не
+    откатить даже в новом канале."""
+    _reports = []
+    try:
+        fsize = int(getattr(doc, "file_size", 0) or 0)
+        if fsize > 20 * 1024 * 1024:
+            _reports.append(
+                f"❌ Снапшот «{fname}» ({_fmt_bytes(fsize)}) НЕ принят: бот не "
+                "может скачивать файлы больше 20 МБ (лимит Telegram для "
+                "ботов). Слейте базу кнопкой «💾 Слить базу в канал сейчас».")
+        else:
+            payload = None
+            try:
+                tg_file = await context.bot.get_file(doc.file_id)
+                buf = io.BytesIO()
+                await asyncio.wait_for(tg_file.download_to_memory(out=buf), timeout=300)
+                payload = buf.getvalue()
+            except Exception as e:
+                logger.error(f"cdb ingest: скачать «{fname}» не удалось: {e}")
+                _reports.append(f"❌ Снапшот «{fname}» не удалось скачать: {e}")
+            if payload is not None:
+                verified, stamp = False, ""
+                try:
+                    zf = zipfile.ZipFile(io.BytesIO(payload))
+                    if "_meta.json" not in zf.namelist():
+                        raise ValueError("нет _meta.json")
+                    try:
+                        stamp = str(json.loads(
+                            zf.read("_meta.json").decode("utf-8")
+                        ).get("created_utc") or "")
+                    except Exception:
+                        stamp = ""
+                    zf.close()
+                    verified = True
+                except Exception as e:
+                    _reports.append(
+                        f"❌ Файл «{fname}» — это НЕ снапшот DEVORKS+ (битый или "
+                        f"чужой zip: {e}). Ничего не применял и не закреплял.")
+                if verified:
+                    async with _get_cdb_flush_lock():
+                        cfg = load_storage_config()
+                        # ВОЛНА 13: канал не настроен → подключаем САМИ (режим «Оба»):
+                        # конфиг мог потеряться при переезде, а снапшот пользователь
+                        # прислал явно — это и есть восстановление.
+                        _adopted = False
+                        try:
+                            _known = {int(c.get("id")) for c in (cfg.get("channels") or [])
+                                      if isinstance(c, dict)}
+                        except Exception:
+                            _known = set()
+                        if int(chat_id) not in _known:
+                            _ch_title = str(getattr(getattr(post, "chat", None),
+                                                    "title", "") or "Канал-хранилище")
+                            _cfg2, _added = _storage_add_channel(
+                                int(chat_id), _ch_title, "both")
+                            if _added:
+                                _adopted = True
+                                cfg = load_storage_config()
+                        last = str(cfg.get("cdb_last_flush") or "")
+                        if stamp and last and stamp <= last:
+                            _reports.append(
+                                f"ℹ️ Снапшот «{fname}» (штамп {stamp}) НЕ применён: "
+                                f"он НЕ новее текущей базы ({last}). Правило "
+                                "«последний актуальный побеждает»: откатывать "
+                                "свежие данные старым файлом нельзя.")
+                        else:
+                            restored, problems = _storage_restore_apply(payload)
+                            if not restored:
+                                _reports.append(
+                                    "❌ Из снапшота «" + fname + "» ничего не "
+                                    "восстановлено"
+                                    + (": " + "; ".join(problems[:3]) if problems else "."))
+                            else:
+                                _CDB_DIRTY.clear()  # данные только что из канала
+                                pin_notes = []
+                                try:
+                                    await context.bot.unpin_all_chat_messages(chat_id=chat_id)
+                                except Exception as e:
+                                    logger.warning(f"cdb ingest: unpin_all {chat_id}: {e}")
+                                try:
+                                    await context.bot.pin_chat_message(
+                                        chat_id=chat_id,
+                                        message_id=int(post.message_id),
+                                        disable_notification=True,
+                                    )
+                                except Exception as e:
+                                    logger.error(f"cdb ingest: pin в {chat_id} НЕ УДАЛСЯ: {e}")
+                                    pin_notes.append(
+                                        "НЕ удалось ЗАКРЕПИТЬ снапшот — при старте бот "
+                                        "его не прочитает. Проверьте право бота на "
+                                        "закрепление сообщений в канале.")
+                                # Реестр указателей + удаление СТАРЫХ снапшотов
+                                # этого канала (правило: один актуальный снапшот).
+                                cfg = load_storage_config()  # ПОСЛЕ apply — конфиг мог приехать из снапшота
+                                reg = dict(cfg.get("cdb_registry") or {})
+                                sent = dict(cfg.get("cdb_sent") or {})
+                                _old_ids = []
+                                for _v in (sent.get(str(chat_id)) or []):
+                                    try:
+                                        _iv = int(_v)
+                                    except (TypeError, ValueError):
+                                        continue
+                                    if _iv not in _old_ids:
+                                        _old_ids.append(_iv)
+                                _prev = (reg.get(str(chat_id)) or {}).get("msg_id")
+                                try:
+                                    _prev = int(_prev)
+                                    if _prev and _prev not in _old_ids:
+                                        _old_ids.append(_prev)
+                                except (TypeError, ValueError):
+                                    pass
+                                pruned = 0
+                                for _old in _old_ids:
+                                    if int(_old) == int(post.message_id):
+                                        continue
+                                    try:
+                                        await context.bot.delete_message(
+                                            chat_id=chat_id, message_id=int(_old))
+                                        pruned += 1
+                                    except Exception:
+                                        pass
+                                reg[str(chat_id)] = {
+                                    "msg_id": int(post.message_id),
+                                    "file_id": getattr(doc, "file_id", None),
+                                    "ts": stamp,
+                                    "size": len(payload),
+                                }
+                                sent[str(chat_id)] = [int(post.message_id)]
+                                cfg["cdb_registry"] = reg
+                                cfg["cdb_sent"] = sent
+                                if stamp:
+                                    cfg["cdb_last_flush"] = stamp
+                                save_storage_config(cfg)
+                                _rep = (
+                                    f"📥 СНАПШОТ ИЗ КАНАЛА ПРИНЯТ И ЗАКРЕПЛЁН: {fname} "
+                                    f"({_fmt_bytes(len(payload))}, штамп {stamp or '?'})\n"
+                                    f"• Файлов данных восстановлено: {len(restored)}")
+                                if _adopted:
+                                    _rep += (f"\n➕ Канал {chat_id} не был настроен — "
+                                             "подключён автоматически (режим «Оба»).")
+                                if pruned:
+                                    _rep += (f" • 🧹 старых снапшотов стёрто: {pruned} "
+                                             "(остался один актуальный)")
+                                if problems:
+                                    _rep += f"\n⚠️ Проблемы: {'; '.join(problems[:3])}"
+                                for _pn in pin_notes:
+                                    _rep += f"\n⚠️ {_pn}"
+                                _reports.append(_rep)
+                                logger.info(
+                                    f"cdb ingest: снапшот из канала {chat_id} применён "
+                                    f"и закреплён: {fname} (штамп {stamp or '?'})")
+    except Exception as e:
+        logger.error(f"cdb ingest crashed: {e}")
+        _reports.append(f"❌ Снапшот из канала не принят (внутренняя ошибка): {e}")
+    for _t in _reports:
+        try:
+            if DEVELOPER_ID:
+                await context.bot.send_message(
+                    chat_id=int(str(DEVELOPER_ID).strip()), text=str(_t)[:3500])
+        except Exception:
+            pass
+
+
 async def _storage_channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """ВОЛНА 8: пост в канале-хранилище = файл от пользователя (большие файлы).
 
@@ -6880,12 +7083,24 @@ async def _storage_channel_post_handler(update: Update, context: ContextTypes.DE
     (BIG_UPLOAD_WINDOW_SEC) нажал «📤 Отправить в канал самому» — иначе пост
     игнорируется (никакой атрибуции «на глаз»: чужой пост нельзя записать
     первому встречному). Индексируем медиа любого размера: бот НЕ скачивает
-    файл — сохраняет только указатель (chat/message_id, file_id, размер)."""
+    файл — сохраняет только указатель (chat/message_id, file_id, размер).
+
+    ВОЛНА 13: документ с именем devorks_db_snapshot_… — это ВСТАВЛЕННЫЙ
+    пользователем снапшот базы: принимаем (latest-wins), ЗАКРЕПЛЯЕМ и
+    стираем старые снапшоты (_cdb_ingest_post) в любом канале-хранилище."""
     try:
         post = getattr(update, "channel_post", None) or getattr(update, "edited_channel_post", None)
         if post is None:
             return
         chat_id = post.chat_id
+        # ВОЛНА 13: сначала проверяем, не снапшот ли это базы — принимается
+        # в ЛЮБОМ канале, где бот админ (даже не настроенном: конфиг мог
+        # потеряться — бот подключит канал сам, см. _cdb_ingest_post).
+        _doc = getattr(post, "document", None)
+        _fname = str(getattr(_doc, "file_name", "") or "")
+        if _doc is not None and _fname.startswith(CDB_SNAPSHOT_PREFIX):
+            await _cdb_ingest_post(context, post, _doc, _fname, chat_id)
+            return
         if chat_id not in get_cloud_channel_ids():
             return
         # Кому записать? Ищем свежее окно ожидания для ЭТОГО канала.
@@ -6986,6 +7201,19 @@ try:  # AES-256-GCM из библиотеки cryptography (единственн
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 except Exception:  # pragma: no cover - честная деградация без библиотеки
     AESGCM = None
+
+# ВОЛНА 14: большие файлы (>20 МБ, до 2 ГБ) — гибрид Bot API + MTProto.
+# Контейнер DVF2: чанки по 1 МБ, каждый — свой AES-256-GCM с nonce,
+# выведенным из случайной 4-байтной приставки и НОМЕРА куска (AAD тоже
+# привязан к номеру — переставить/выкинуть кусок нельзя). Потоковое
+# шифрование/расшифровка: в ОЗУ никогда не лежит больше ~1 МБ данных.
+VAULT_DVF2_MAGIC = b"DVF2"
+VAULT_DVF2_VERSION = 1
+VAULT_DVF2_BLOCK = 1024 * 1024            # 1 МБ открытого текста на кусок
+VAULT_DVF2_TAG = 16                        # GCM-тег на кусок
+# Лимит MTProto-загрузки для ботов: 2000 МиБ (4 ГБ — только Premium у людей,
+# ботам Premium недоступен). Запас 4 МиБ — под накладные расходы контейнера.
+VAULT_MTPROTO_MAX_BYTES = (2000 - 4) * 1024 * 1024
 
 # Число итераций PBKDF2: чем больше — тем медленнее подбор пароля.
 # 600 000 ≈ OWASP-2023; на слабом хостинге можно снизить через env.
@@ -7243,6 +7471,859 @@ def _vault_menu_text(user):
     )
 
 
+# ============================================================
+# === ВОЛНА 14: ДО 2 ГБ — гибрид Bot API + MTProto (Telethon) ===
+# ============================================================
+# Bot API жёстко ограничен: скачивание ботом ≤20 МБ, отправка ≤50 МБ.
+# MTProto под тем же бот-токеном (клиент Telethon) поднимает ОБЕ стороны
+# до 2 ГБ — это потолок Telegram для ботов (4 ГБ — только Premium у людей,
+# ботам Premium недоступен). Цепочка для большого файла:
+#   приём: серверная копия (copy_message) в канал-хранилище — без скачивания;
+#   «✅ Готово»: Telethon качает копию ПОТОКОМ → шифр DVF2 (куски 1 МБ,
+#   AES-256-GCM) пишется во временный файл → контейнер в cloud-канал
+#   (≤49 МБ — Bot API, больше — MTProto) → черновик и временный файл стёрты;
+#   выдача: Telethon качает шифр потоком → расшифровка на лету (в ОЗУ только
+#   куски) → временный файл → отправка пользователю (до 2 ГБ) → стёрт.
+# Файлы ≤20 МБ работают как раньше (DVF1 целиком в памяти) — ноль регрессий.
+
+try:
+    import shutil as _shutil
+    import tempfile as _tempfile
+except Exception:  # pragma: no cover
+    _shutil = None
+    _tempfile = None
+
+_TELETHON_OK = False
+try:
+    from telethon import TelegramClient as _TGClient
+    from telethon.sessions import StringSession as _StringSession
+    from telethon.tl.types import (
+        InputPeerUser as _InputPeerUser,
+        InputPeerChannel as _InputPeerChannel,
+    )
+    from telethon.errors import FloodWaitError as _FloodWaitError
+    _TELETHON_OK = True
+except Exception:  # честная деградация: всё остальное работает без Telethon
+    _TGClient = None
+    _StringSession = None
+    _InputPeerUser = None
+    _InputPeerChannel = None
+    _FloodWaitError = None
+
+# api_id/api_hash: сначала переменные окружения, затем публичные данные
+# официального Telegram Desktop (открыты в его исходниках и используются
+# библиотеками как значения по умолчанию). Можно переопределить своими.
+_TELEGRAM_API_ID = int((_env("TELEGRAM_API_ID", "") or "2048"))
+_TELEGRAM_API_HASH = (_env("TELEGRAM_API_HASH", "")
+                      or "b18441a1ff607e10a989891a5462e627").strip()
+
+_MT_CLIENT = None
+_MT_LOCK = None
+
+
+async def _mt_client():
+    """Единственный MTProto-клиент бота (Telethon) — поднимается ЛЕНИВО при
+    первой операции с файлами >20 МБ и живёт до конца процесса. Сессия бота
+    создаётся по токену (без телефона); после рестарта Render создаётся
+    заново — это бесплатно и ни на что не влияет. Возвращает клиент или None
+    (Telethon не установлен / нет BOT_TOKEN / Telegram недоступен)."""
+    global _MT_CLIENT, _MT_LOCK
+    if not _TELETHON_OK or not BOT_TOKEN:
+        return None
+    if _MT_LOCK is None:
+        _MT_LOCK = asyncio.Lock()
+    async with _MT_LOCK:
+        if _MT_CLIENT is not None:
+            try:
+                if _MT_CLIENT.is_connected():
+                    return _MT_CLIENT
+            except Exception:
+                pass
+        client = None
+        try:
+            sess = _StringSession((_env("TELETHON_SESSION", "") or "").strip())
+            client = _TGClient(
+                sess, _TELEGRAM_API_ID, _TELEGRAM_API_HASH,
+                device_model="DEVORKS+ Bot", system_version="Linux",
+                app_version="14.0", flood_sleep_threshold=120,
+            )
+            await client.connect()
+            if not await client.is_user_authorized():
+                await client.start(bot_token=BOT_TOKEN)
+            _MT_CLIENT = client
+            _dvf2_tmp_sweep()
+            logger.info("mtproto: клиент поднялся — файлы до 2 ГБ доступны")
+            return _MT_CLIENT
+        except Exception as e:
+            logger.error(f"mtproto: клиент не поднялся: {e}")
+            if client is not None:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+            return None
+
+
+def _mt_peer_channel(ch_id):
+    """Bot API id канала (-100…) → InputPeerChannel. Ботам Telegram разрешает
+    access_hash=0 для каналов, где бот администратор — это наш случай."""
+    cid = int(ch_id)
+    raw = -cid - 1000000000000 if cid <= -1000000000000 else cid
+    return _InputPeerChannel(raw, 0)
+
+
+def _mt_peer_user(user_id):
+    """InputPeerUser для личного чата. Для ботов Telegram принимает
+    access_hash=0 от пользователей, которые писали боту."""
+    return _InputPeerUser(int(user_id), 0)
+
+
+def _dvf2_tmp_dir():
+    """Каталог временных файлов перекачки (системный tmp)."""
+    try:
+        return _tempfile.gettempdir()
+    except Exception:
+        return "/tmp"
+
+
+def _dvf2_tmp_sweep():
+    """Уборка после сбоев: временные файлы/каталоги dvf2_*, старше 24 ч,
+    стираются (если процесс умер посреди перекачки, файл не лежит вечно)."""
+    try:
+        now = time.time()
+        d = _dvf2_tmp_dir()
+        for fn in os.listdir(d):
+            if not fn.startswith("dvf2_"):
+                continue
+            p = os.path.join(d, fn)
+            try:
+                if now - os.path.getmtime(p) > 86400:
+                    if os.path.isdir(p):
+                        _shutil.rmtree(p, ignore_errors=True)
+                    else:
+                        os.unlink(p)
+            except Exception:
+                pass
+    except Exception as e:
+        logger.warning(f"dvf2: уборка tmp не удалась: {e}")
+
+
+def _dvf2_disk_ok(need_bytes):
+    """Хватит ли на диске места под временный файл (с запасом 64 МБ).
+    Если проверить не удалось — не блокируем: ошибку поймает запись."""
+    try:
+        free = _shutil.disk_usage(_dvf2_tmp_dir()).free
+    except Exception:
+        return True
+    try:
+        return free > int(need_bytes or 0) + 64 * 1024 * 1024
+    except Exception:
+        return True
+
+
+def _dvf2_make_job_dir():
+    """Отдельный каталог на время перекачки одного файла — чтобы имя файла
+    для Telegram можно было задать переименованием, а уборка была одной
+    командой (rmtree)."""
+    return _tempfile.mkdtemp(prefix="dvf2_job_")
+
+
+def _dvf2_safe_name(name):
+    """Имя файла без разделителей пути и управляющих символов."""
+    name = str(name or "").replace("/", "_").replace("\\", "_")
+    name = "".join(ch for ch in name if ord(ch) >= 32)
+    name = name.strip().lstrip(".") or "file.bin"
+    return name[:120]
+
+
+class _ProgressEdit:
+    """Редкие правки сообщения-прогресса (не чаще раза в 3.5 с — лимиты
+    editMessageText), чтобы потоковые операции 2 ГБ не упирались во флуд."""
+
+    def __init__(self, context, progress_msg, title=""):
+        self.context = context
+        self.msg = progress_msg
+        self.title = title or ""
+        self._last = 0.0
+
+    async def edit(self, text=None, force=False):
+        if self.msg is None:
+            return None
+        now = time.monotonic()
+        if not force and (now - self._last) < 3.5:
+            return None
+        self._last = now
+        try:
+            return await self.context.bot.edit_message_text(
+                text or self.title,
+                chat_id=self.msg.chat_id, message_id=self.msg.message_id,
+            )
+        except Exception:
+            return None
+
+
+class _Dvf2Encryptor:
+    """Потоковое шифрование DVF2 в файл: push() скармливает куски открытого
+    текста, finish() дописывает хвост и закрывает файл. В ОЗУ — не больше
+    одного куска (1 МБ) независимо от размера исходного файла.
+    Формат: DVF2|ver|iters(4)|salt(16)|np(4)|hdr_len(4)|hdr_ct|блоки…
+    hdr_ct = AESGCM(key, np+0xff*8, json{имя,тип,mime,дата,sz,bs});
+    блок i: nonce = np + i (8 байт BE), ct = AESGCM(key, nonce, кусок,
+    aad=b"DVF2-B"+i) — переставить/выбросить кусок нельзя."""
+
+    def __init__(self, password, meta, out_path):
+        self.salt = os.urandom(16)
+        self.np = os.urandom(4)
+        self.iters = VAULT_KDF_ITERS
+        self.key = _vault_derive_key(password, self.salt, self.iters)
+        m = dict(meta or {})
+        m["bs"] = VAULT_DVF2_BLOCK
+        self.meta = m
+        hdr = json.dumps(m, ensure_ascii=False).encode("utf-8")
+        nonce_hdr = self.np + b"\xff" * 8
+        ct = AESGCM(self.key).encrypt(
+            nonce_hdr, hdr, VAULT_DVF2_MAGIC + bytes([VAULT_DVF2_VERSION]))
+        header = (VAULT_DVF2_MAGIC + bytes([VAULT_DVF2_VERSION])
+                  + int(self.iters).to_bytes(4, "big") + self.salt + self.np
+                  + len(ct).to_bytes(4, "big") + ct)
+        self._hdr_len = len(header)
+        self._fh = open(out_path, "wb")
+        self._fh.write(header)
+        self._buf = bytearray()
+        self._idx = 0
+        self._total = 0
+        self._closed = False
+
+    def push(self, chunk):
+        self._buf.extend(chunk)
+        while len(self._buf) >= VAULT_DVF2_BLOCK:
+            self._push_block(bytes(self._buf[:VAULT_DVF2_BLOCK]))
+            del self._buf[:VAULT_DVF2_BLOCK]
+
+    def _push_block(self, block):
+        nonce = self.np + self._idx.to_bytes(8, "big")
+        ct = AESGCM(self.key).encrypt(
+            nonce, block, b"DVF2-B" + self._idx.to_bytes(8, "big"))
+        self._fh.write(ct)
+        self._total += len(ct)
+        self._idx += 1
+
+    def finish(self):
+        """Дописывает хвост (<1 МБ), закрывает файл. Возвращает полный
+        размер контейнера (заголовок + шифр)."""
+        if not self._closed:
+            if self._buf:
+                self._push_block(bytes(self._buf))
+                self._buf = bytearray()
+            self._fh.flush()
+            os.fsync(self._fh)
+            self._fh.close()
+            self._closed = True
+        return self._hdr_len + self._total
+
+    def abort(self):
+        """Аварийное закрытие (при сбое перекачки)."""
+        self._closed = True
+        try:
+            self._fh.close()
+        except Exception:
+            pass
+
+    def salt_hex(self):
+        return self.salt.hex()
+
+    def np_hex(self):
+        return self.np.hex()
+
+    def verifier_hex(self):
+        return _vault_verifier(self.key).hex()
+
+
+class _Dvf2Decryptor:
+    """Потоковая расшифровка DVF2: push() принимает куски шифра (какими их
+    отдаёт сеть), сам накапливает и разбирает заголовок, отдаёт открытый
+    текст куска́ми ≤1 МБ. finish() допечатывает хвост и проверяет размер.
+    Неверный пароль → ValueError уже на заголовке (контент не качается зря)."""
+
+    def __init__(self, password):
+        self._password = password
+        self._hdr = bytearray()
+        self.key = None
+        self.np = None
+        self.meta = None
+        self.bs = VAULT_DVF2_BLOCK
+        self._sz = 0
+        self._idx = 0
+        self._buf = bytearray()
+        self._out_total = 0
+
+    def push(self, chunk):
+        if self.meta is None:
+            self._hdr.extend(chunk)
+            return self._try_parse_header()
+        return self._push_ct(chunk)
+
+    def _try_parse_header(self):
+        if len(self._hdr) < 33:
+            return b""
+        if bytes(self._hdr[:4]) != VAULT_DVF2_MAGIC:
+            raise ValueError("это не контейнер Сейфа")
+        if self._hdr[4] != VAULT_DVF2_VERSION:
+            raise ValueError(f"неизвестная версия контейнера: {self._hdr[4]}")
+        iters = int.from_bytes(bytes(self._hdr[5:9]), "big")
+        salt = bytes(self._hdr[9:25])
+        np_ = bytes(self._hdr[25:29])
+        hdr_len = int.from_bytes(bytes(self._hdr[29:33]), "big")
+        if hdr_len <= 0 or hdr_len > 1024 * 1024:
+            raise ValueError("повреждённый контейнер")
+        if len(self._hdr) < 33 + hdr_len:
+            return b""
+        hdr_ct = bytes(self._hdr[33:33 + hdr_len])
+        rest = bytes(self._hdr[33 + hdr_len:])
+        self.key = _vault_derive_key(self._password, salt, iters)
+        self.np = np_
+        try:
+            plain = AESGCM(self.key).decrypt(
+                np_ + b"\xff" * 8, hdr_ct,
+                VAULT_DVF2_MAGIC + bytes([VAULT_DVF2_VERSION]))
+        except Exception:
+            raise ValueError("неверный пароль")
+        try:
+            meta = json.loads(plain.decode("utf-8"))
+        except Exception:
+            meta = {}
+        if not isinstance(meta, dict):
+            meta = {}
+        self.meta = meta
+        self.bs = int(meta.get("bs") or VAULT_DVF2_BLOCK)
+        self._sz = int(meta.get("sz") or 0)
+        if rest:
+            return self._push_ct(rest)
+        return b""
+
+    def _push_ct(self, chunk):
+        self._buf.extend(chunk)
+        out = bytearray()
+        while len(self._buf) >= self.bs + VAULT_DVF2_TAG:
+            out.extend(self._decrypt_block(bytes(self._buf[:self.bs + VAULT_DVF2_TAG])))
+            del self._buf[:self.bs + VAULT_DVF2_TAG]
+        return bytes(out)
+
+    def _decrypt_block(self, ct):
+        nonce = self.np + self._idx.to_bytes(8, "big")
+        try:
+            pt = AESGCM(self.key).decrypt(
+                nonce, ct, b"DVF2-B" + self._idx.to_bytes(8, "big"))
+        except Exception:
+            raise ValueError("неверный пароль")
+        self._idx += 1
+        self._out_total += len(pt)
+        return pt
+
+    def finish(self):
+        if self.meta is None:
+            raise ValueError("контейнер повреждён (нет заголовка)")
+        tail = bytearray()
+        if self._buf:
+            tail.extend(self._decrypt_block(bytes(self._buf)))
+            self._buf = bytearray()
+        if self._sz and self._out_total != self._sz:
+            raise ValueError(
+                f"контейнер неполный: ожидалось {self._sz} байт, "
+                f"получено {self._out_total}")
+        return bytes(tail)
+
+
+async def _mt_run_with_flood(coro_factory, tries=4):
+    """Запускает корутину, пережидая FloodWait (до tries раз)."""
+    last_err = None
+    for _ in range(max(1, tries)):
+        try:
+            return await coro_factory()
+        except _FloodWaitError as e:
+            wait = min(int(getattr(e, "seconds", 30) or 30) + 1, 900)
+            logger.warning(f"mtproto: FloodWait {wait} с")
+            last_err = e
+            await asyncio.sleep(wait)
+    raise RuntimeError(f"Telegram просит паузу {getattr(last_err, 'seconds', '?')} с")
+
+
+async def _mt_fetch_document(client, channel_id, msg_id):
+    """Достаёт сообщение канала и его документ (MTProto). Возвращает
+    (message, document) или (message_or_None, None)."""
+    peer = _mt_peer_channel(channel_id)
+    m = await _mt_run_with_flood(
+        lambda: client.get_messages(peer, ids=int(msg_id)))
+    if m is None:
+        return None, None
+    doc = getattr(m, "document", None) or getattr(m, "photo", None)
+    return m, doc
+
+
+async def _mt_download_stream(client, doc, doc_size, sink, progress=None, title=""):
+    """Качает документ ПОТОКОМ и скармливает sink() (шифратору или
+    расшифровщику). Обрывы и FloodWait — продолжаем с выровненного
+    смещения, ничего не теряя и не дублируя. Возвращает байт скачано."""
+    got = 0
+    attempts = 0
+    while True:
+        resume_off = got - (got % 4096)
+        skip = got - resume_off
+        try:
+            async for chunk in client.iter_download(
+                doc, offset=resume_off, request_size=524288,
+                file_size=int(doc_size or 0),
+            ):
+                if skip:
+                    if len(chunk) <= skip:
+                        skip -= len(chunk)
+                        continue
+                    chunk = chunk[skip:]
+                    skip = 0
+                sink(chunk)
+                got += len(chunk)
+                if progress is not None and doc_size:
+                    pct = min(99, got * 100 // int(doc_size))
+                    await progress.edit(
+                        f"{title}… {pct}% "
+                        f"({_fmt_bytes(got)} из {_fmt_bytes(doc_size)})")
+            break
+        except _FloodWaitError as e:
+            attempts += 1
+            wait = min(int(getattr(e, "seconds", 30) or 30) + 1, 900)
+            logger.warning(f"mtproto: FloodWait {wait} с при скачивании "
+                           f"(попытка {attempts})")
+            if attempts > 10:
+                raise RuntimeError("Telegram просит слишком долгую паузу")
+            await asyncio.sleep(wait)
+        except (ConnectionError, asyncio.TimeoutError, TimeoutError) as e:
+            attempts += 1
+            logger.warning(f"mtproto: обрыв скачивания ({e}), попытка {attempts}")
+            if attempts > 8:
+                raise RuntimeError("не удалось докачать файл (сеть)")
+            await asyncio.sleep(min(3 * attempts, 20))
+    return got
+
+
+async def _mt_upload_container(client, path, size, caption, filename=None):
+    """Заливает ГОТОВЫЙ шифр-контейнер в cloud-канал через MTProto
+    (Bot API не умеет больше 50 МБ). Каналы пробует по порядку.
+    Возвращает {"message_id", "file_id", "size", "channel_id"} или None."""
+    targets = get_cloud_channel_ids()
+    if not targets:
+        return None
+    upload_path = path
+    if filename:
+        try:
+            fixed = os.path.join(os.path.dirname(path), filename)
+            if fixed != path and os.path.exists(path):
+                os.replace(path, fixed)
+                upload_path = fixed
+        except Exception:
+            upload_path = path
+    for ch in targets:
+        try:
+            peer = _mt_peer_channel(ch)
+            sent = await _mt_run_with_flood(lambda: client.send_file(
+                peer, upload_path, force_document=True,
+                caption=(caption or "")[:1024] or None,
+                file_size=int(size or 0) or None,
+            ))
+            doc = getattr(sent, "document", None)
+            return {
+                "message_id": int(getattr(sent, "id", 0) or 0),
+                "file_id": None,
+                "size": int(getattr(doc, "size", 0) or size or 0),
+                "channel_id": ch,
+            }
+        except Exception as e:
+            logger.error(f"mtproto: заливка контейнера в канал {ch} не удалась: {e}")
+            continue
+    return None
+
+
+async def _mt_send_file_to_user(client, chat_id, path, size, caption,
+                                context, progress_msg):
+    """Отправляет РАСШИФРОВАННЫЙ файл пользователю через MTProto (до 2 ГБ)
+    с прогрессом. Имя файла = имя временного файла (переименован заранее).
+    Ботам разрешён InputPeerUser(id, 0) для тех, кто писал боту; если
+    Telethon не нашёл peer в кэше — подтягиваем hash из этого же чата."""
+    state = {"cur": 0, "total": int(size or 0)}
+
+    def _pcb(cur, total):
+        state["cur"] = int(cur or 0)
+        if total:
+            state["total"] = int(total)
+
+    stop = asyncio.Event()
+
+    async def _tick():
+        last = -1
+        while not stop.is_set():
+            await asyncio.sleep(6)
+            cur, total = state["cur"], state["total"]
+            if total and cur != last:
+                last = cur
+                try:
+                    await context.bot.edit_message_text(
+                        f"📤 Отправляю файл… {min(99, cur * 100 // total)}% "
+                        f"({_fmt_bytes(cur)} из {_fmt_bytes(total)})",
+                        chat_id=progress_msg.chat_id,
+                        message_id=progress_msg.message_id,
+                    )
+                except Exception:
+                    pass
+
+    peer = _mt_peer_user(chat_id)
+    tick_task = asyncio.create_task(_tick())
+    try:
+        try:
+            return await _mt_run_with_flood(lambda: client.send_file(
+                peer, path, force_document=True,
+                caption=(caption or "")[:1024] or None,
+                file_size=int(size or 0) or None,
+                progress_callback=_pcb,
+            ))
+        except Exception as e:
+            # Peer не в кэше Telethon — подтягиваем access_hash из чата
+            # с пользователем (бот ВИДИТ свои сообщения там) и повторяем.
+            logger.warning(f"mtproto: peer не разрешился ({e}), повторяю")
+            try:
+                await client.get_messages(peer, limit=1)
+                ent = await client.get_input_entity(int(chat_id))
+                return await _mt_run_with_flood(lambda: client.send_file(
+                    ent, path, force_document=True,
+                    caption=(caption or "")[:1024] or None,
+                    file_size=int(size or 0) or None,
+                    progress_callback=_pcb,
+                ))
+            except Exception as e2:
+                raise RuntimeError(f"не удалось отправить файл: {e2}")
+    finally:
+        stop.set()
+        tick_task.cancel()
+
+
+async def _vault_seal_item_mtproto(msg, context, user, item, password,
+                                   progress_msg, idx, total):
+    """ВОЛНА 14: шифрует ОДИН большой файл (источник — черновая копия в
+    канале, сделанная при приёме). Поток: MTProto качает оригинал → шифр
+    DVF2 пишется во временный файл → контейнер в cloud-канал (≤49 МБ —
+    Bot API, больше — MTProto) → черновик и временные файлы стираются.
+    Возвращает запись user.vault_files; при сбое бросает исключение —
+    оригинал остаётся в чате, чтобы пользователь его не потерял."""
+    name = str(item.get("name") or "файл")
+    kind = str(item.get("kind") or "document")
+    mime = str(item.get("mime") or "")
+    size = int(item.get("size", 0) or 0)
+    client = await _mt_client()
+    if client is None:
+        raise RuntimeError("MTProto недоступен (нет Telethon/BOT_TOKEN)")
+    if AESGCM is None:
+        raise RuntimeError("нет библиотеки cryptography")
+    mt = dict(item.get("mt_raw") or {})
+    raw_ch = int(mt.get("channel_id") or 0)
+    raw_mid = int(mt.get("msg_id") or 0)
+    if not raw_ch or not raw_mid:
+        raise RuntimeError("черновая копия файла потеряна")
+    _m, doc = await _mt_fetch_document(client, raw_ch, raw_mid)
+    if doc is None:
+        raise RuntimeError("черновая копия в канале не найдена")
+    doc_size = int(getattr(doc, "size", 0) or size or 0)
+    if not _dvf2_disk_ok(doc_size):
+        raise RuntimeError("мало свободного места на диске сервера")
+    job = _dvf2_make_job_dir()
+    tmp_enc = os.path.join(job, "container.bin")
+    enc = _Dvf2Encryptor(password, {
+        "n": name, "k": kind, "m": mime,
+        "t": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "sz": size or doc_size,
+    }, tmp_enc)
+    up = None
+    enc_total = 0
+    try:
+        prog = _ProgressEdit(
+            context, progress_msg, f"📦 [{idx}/{total}] «{name}»: качаю и шифрую")
+        try:
+            await _mt_download_stream(
+                client, doc, doc_size, enc.push, prog,
+                f"📦 [{idx}/{total}] «{name}»: качаю и шифрую")
+            enc_total = enc.finish()
+        except Exception:
+            enc.abort()
+            raise
+        await _ProgressEdit(context, progress_msg, "").edit(
+            f"📦 [{idx}/{total}] «{name}»: заливаю шифр в канал…", force=True)
+        if enc_total <= (49 * 1024 * 1024 - 1024 * 1024):
+            with open(tmp_enc, "rb") as fh:
+                enc_bytes = fh.read()
+            try:
+                up = await _storage_upload_document(
+                    context, enc_bytes,
+                    filename=f"vault_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{idx}.bin",
+                    caption="🔐 Сейф: зашифрованный файл (открыть без пароля невозможно).",
+                )
+            finally:
+                enc_bytes = b""
+        else:
+            up = await _mt_upload_container(
+                client, tmp_enc, enc_total,
+                caption="🔐 Сейф: зашифрованный файл (открыть без пароля невозможно).",
+                filename=f"vault_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{idx}.bin",
+            )
+        if up is None:
+            raise RuntimeError("контейнер не удалось загрузить в канал")
+        return {
+            "id": _vault_gen_id(user),
+            "kind": kind, "mime": mime,
+            "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "size_orig": size or doc_size,
+            "size_enc": int(up.get("size", 0) or enc_total),
+            "salt": enc.salt_hex(),
+            "verifier": enc.verifier_hex(),
+            "iters": enc.iters,
+            "nonce": enc.np_hex(),
+            "msg_id": int(up.get("message_id", 0)),
+            "file_id": up.get("file_id"),
+            "channel_id": up.get("channel_id"),
+            "dvf2": True,
+        }
+    finally:
+        # Черновая копия оригинала в канале больше не нужна НИКОГДА:
+        # ни при успехе (есть шифр), ни при сбое (оригинал остался в чате).
+        item.pop("mt_raw", None)
+        if raw_ch and raw_mid:
+            try:
+                await context.bot.delete_message(
+                    chat_id=raw_ch, message_id=raw_mid)
+            except Exception:
+                pass
+        try:
+            _shutil.rmtree(job, ignore_errors=True)
+        except Exception:
+            pass
+
+
+async def _vault_get_dvf2(msg, context, user, rec, password):
+    """ВОЛНА 14: выдача БОЛЬШОГО файла Сейфа (DVF2, >20 МБ до 2 ГБ).
+    Поток: MTProto качает шифр из канала → расшифровка на лету (в ОЗУ только
+    куски) → временный файл → отправка пользователю с прогрессом → временный
+    файл стёрт. САМ ШИФР на диск не пишется вовсе."""
+    if AESGCM is None:
+        await msg.reply_text("❌ На сервере нет библиотеки шифрования (cryptography).")
+        return MAIN_MENU
+    client = await _mt_client()
+    if client is None:
+        await msg.reply_text(
+            "❌ Режим больших файлов не активен: на сервере не установлен "
+            "Telethon (pip install telethon). Попросите разработчика включить.",
+            reply_markup=get_main_menu_keyboard(user),
+        )
+        return MAIN_MENU
+    channel_id = rec.get("channel_id") or get_storage_channel_id()
+    mid = int(rec.get("msg_id") or 0)
+    if not channel_id or not mid:
+        await msg.reply_text(
+            "❌ Шифр недоступен: файл лежал в канале, который больше не "
+            "подключён, либо указатель потерян.",
+            reply_markup=get_main_menu_keyboard(user),
+        )
+        return MAIN_MENU
+    try:
+        _m, doc = await _mt_fetch_document(client, channel_id, mid)
+    except Exception as e:
+        logger.error(f"vault get dvf2: не удалось открыть шифр: {e}")
+        doc = None
+    if doc is None:
+        await msg.reply_text(
+            "❌ Не смог скачать шифр из канала. Возможно, сообщение в канале "
+            "удалено вручную.",
+            reply_markup=get_main_menu_keyboard(user),
+        )
+        return MAIN_MENU
+    doc_size = int(getattr(doc, "size", 0) or rec.get("size_enc", 0) or 0)
+    orig_size = int(rec.get("size_orig", 0) or 0)
+    if not _dvf2_disk_ok(max(orig_size, doc_size)):
+        await msg.reply_text(
+            f"❌ На диске сервера сейчас меньше свободного места, чем нужно "
+            f"для файла ({_fmt_bytes(orig_size)}). Место освобождается после "
+            "перезапуска бота — попробуйте позже.",
+            reply_markup=get_main_menu_keyboard(user),
+        )
+        return MAIN_MENU
+    progress_msg = None
+    try:
+        progress_msg = await msg.reply_text(
+            "🔓 Качаю шифр и расшифровываю потоком… 0%")
+    except Exception:
+        progress_msg = None
+    prog = _ProgressEdit(context, progress_msg,
+                         "🔓 Качаю шифр и расшифровываю потоком")
+    job = _dvf2_make_job_dir()
+    dec = None
+    err_text = None
+    final_path = None
+    real_name = ""
+    try:
+        out_path = os.path.join(job, "data.bin")
+        with open(out_path, "wb") as fh:
+            dec = _Dvf2Decryptor(password)
+
+            def _sink(b):
+                out = dec.push(b)
+                if out:
+                    fh.write(out)
+
+            await _mt_download_stream(
+                client, doc, doc_size, _sink, prog,
+                "🔓 Качаю шифр и расшифровываю потоком")
+            tail = dec.finish()
+            if tail:
+                fh.write(tail)
+        meta = dec.meta or {}
+        real_name = _dvf2_safe_name(
+            meta.get("n") or f"vault_{rec.get('id', 'file')}.bin")
+        final_path = os.path.join(job, real_name)
+        try:
+            os.replace(out_path, final_path)
+        except Exception:
+            final_path = out_path
+        real_size = int(meta.get("sz") or 0) or orig_size or os.path.getsize(final_path)
+        _lbl = str(rec.get("label") or "").strip()
+        cap = (f"🔓 {_lbl} — {real_name}" if _lbl
+               else f"🔓 Расшифровано: {real_name}")
+        try:
+            await context.bot.send_chat_action(
+                chat_id=msg.chat_id, action="upload_document")
+        except Exception:
+            pass
+        await _ProgressEdit(context, progress_msg, "").edit(
+            "📤 Заливаю расшифрованный файл… 0%", force=True)
+        await _mt_send_file_to_user(
+            client, msg.chat_id, final_path, real_size, cap,
+            context, progress_msg or msg)
+    except ValueError as e:
+        err_text = str(e)
+    except Exception as e:
+        logger.error(f"vault get dvf2: выдача не удалась: {e}")
+        err_text = "сбой при перекачке файла"
+    finally:
+        try:
+            _shutil.rmtree(job, ignore_errors=True)
+        except Exception:
+            pass
+    context.user_data.pop('vault_get_id', None)
+    context.user_data.pop('vault_attempts', None)
+    if err_text is not None:
+        await msg.reply_text(
+            f"❌ Расшифровать/передать не удалось: {err_text}. Если забыли "
+            "пароль — файл открыть нельзя (запасного ключа не существует).",
+            reply_markup=get_main_menu_keyboard(user),
+        )
+        return MAIN_MENU
+    await msg.reply_text("✅ Готово. Файл расшифрован только что и только для вас.")
+    return MAIN_MENU
+
+
+async def _vault_reencrypt_dvf2(msg, context, user, rec, old_pw, new_pw):
+    """ВОЛНА 14: перешифровка БОЛЬШОГО файла (DVF2) новым паролем потоком:
+    старый шифр качается из канала и расшифровывается на лету во временный
+    файл, затем шифруется новым паролем и заливается обратно. Старый шифр
+    стирается ТОЛЬКО после успешной заливки нового. Возвращает True/False."""
+    up = None
+    enc = None
+    enc_total = 0
+    try:
+        client = await _mt_client()
+        if client is None or AESGCM is None:
+            raise RuntimeError("MTProto/криптография недоступны")
+        channel_id = rec.get("channel_id") or get_storage_channel_id()
+        mid = int(rec.get("msg_id") or 0)
+        if not channel_id or not mid:
+            raise RuntimeError("указатель на шифр потерян")
+        _m, doc = await _mt_fetch_document(client, channel_id, mid)
+        if doc is None:
+            raise RuntimeError("сообщение с шифром не найдено в канале")
+        doc_size = int(getattr(doc, "size", 0) or rec.get("size_enc", 0) or 0)
+        if not _dvf2_disk_ok(max(doc_size, int(rec.get("size_orig", 0) or 0))):
+            raise RuntimeError("мало места на диске сервера")
+        job = _dvf2_make_job_dir()
+        try:
+            tmp_dec = os.path.join(job, "data.bin")
+            dec = _Dvf2Decryptor(old_pw)
+            with open(tmp_dec, "wb") as fh:
+                def _sink(b):
+                    out = dec.push(b)
+                    if out:
+                        fh.write(out)
+
+                await _mt_download_stream(client, doc, doc_size, _sink)
+                tail = dec.finish()
+                if tail:
+                    fh.write(tail)
+            meta = dict(dec.meta or {})
+            tmp_enc = os.path.join(job, "container.bin")
+            enc = _Dvf2Encryptor(new_pw, meta, tmp_enc)
+            try:
+                with open(tmp_dec, "rb") as fh:
+                    while True:
+                        chunk = fh.read(VAULT_DVF2_BLOCK)
+                        if not chunk:
+                            break
+                        enc.push(chunk)
+                enc_total = enc.finish()
+            except Exception:
+                enc.abort()
+                raise
+            if enc_total <= (49 * 1024 * 1024 - 1024 * 1024):
+                with open(tmp_enc, "rb") as fh:
+                    enc_bytes = fh.read()
+                try:
+                    up = await _storage_upload_document(
+                        context, enc_bytes,
+                        filename=f"vault_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{rec.get('id', 'f')}.bin",
+                        caption="🔐 Сейф: зашифрованный файл (открыть без пароля невозможно).",
+                    )
+                finally:
+                    enc_bytes = b""
+            else:
+                up = await _mt_upload_container(
+                    client, tmp_enc, enc_total,
+                    caption="🔐 Сейф: зашифрованный файл (открыть без пароля невозможно).",
+                    filename=f"vault_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{rec.get('id', 'f')}.bin",
+                )
+            if up is None:
+                raise RuntimeError("новый шифр не удалось загрузить в канал")
+        finally:
+            try:
+                _shutil.rmtree(job, ignore_errors=True)
+            except Exception:
+                pass
+    except Exception as e:
+        logger.error(f"vault dvf2 reencrypt ({rec.get('id')}): {e}")
+        return False
+    old_msg_id = int(rec.get("msg_id") or 0)
+    old_channel = rec.get("channel_id") or get_storage_channel_id()
+    rec.update({
+        "salt": enc.salt_hex(),
+        "nonce": enc.np_hex(),
+        "verifier": enc.verifier_hex(),
+        "iters": enc.iters,
+        "msg_id": int(up.get("message_id", 0)),
+        "file_id": up.get("file_id"),
+        "channel_id": up.get("channel_id"),
+        "size_enc": int(up.get("size", 0) or enc_total),
+        "dvf2": True,
+    })
+    if old_msg_id:
+        try:
+            await context.bot.delete_message(
+                chat_id=old_channel, message_id=old_msg_id)
+        except Exception:
+            pass
+    return True
+
+
 def get_vault_menu_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📥 Положить файл/текст", callback_data="vault_put")],
@@ -7256,12 +8337,14 @@ def get_vault_menu_keyboard():
 
 
 def get_vault_files_keyboard(user):
-    """ВОЛНА 12: список файлов Сейфа с ПОДПИСЯМИ.
+    """ВОЛНА 12: список файлов Сейфа с ПОДПИСЯМИ; ВОЛНА 13: кнопка 🔎 —
+    раскрыть ПОЛНОЕ название (Telegram обрезает длинные надписи кнопок).
 
-    Подпись («label») пользователь задаёт сам — reply при загрузке или ✏️ в
-    списке: «чтобы не запутаться, где что». Видна открытым текстом только ВАМ
-    в вашем чате; настоящее имя файла и содержимое по-прежнему зашифрованы.
-    Без подписи — прежний вид «Файл #N» + размер + дата (zero-knowledge)."""
+    Подпись («label») пользователь задаёт сам — названием загрузки при
+    добавлении, reply при загрузке или ✏️ в списке: «чтобы не запутаться,
+    где что». Видна открытым текстом только ВАМ в вашем чате; настоящее имя
+    файла и содержимое по-прежнему зашифрованы. Без подписи — прежний вид
+    «Файл #N» + размер + дата (zero-knowledge)."""
     files = [f for f in (getattr(user, "vault_files", []) or []) if isinstance(f, dict)]
     kb = []
     for idx, rec in enumerate(files[:20], start=1):
@@ -7273,7 +8356,11 @@ def get_vault_files_keyboard(user):
                      f"{str(rec.get('ts', ''))[:10]}")
         kb.append([
             InlineKeyboardButton(f"📥 {title}", callback_data=f"vault_get_{rec.get('id')}"),
+            # ВОЛНА 13: 🔎 — карточка с ПОЛНЫМ названием (кнопка «⬅️ Свернуть»
+            # возвращает к списку — можно раскрыть другой файл).
+            InlineKeyboardButton("🔎", callback_data=f"vault_show_{rec.get('id')}"),
             InlineKeyboardButton("🔑", callback_data=f"vault_chp_{rec.get('id')}"),
+            # Карандаш НЕ убираем (просьба пользователя): ✏️ — подписать/переименовать.
             InlineKeyboardButton("✏️", callback_data=f"vault_ren_{rec.get('id')}"),
             InlineKeyboardButton("🗑", callback_data=f"vault_del_{rec.get('id')}"),
         ])
@@ -7292,9 +8379,10 @@ def _vault_files_text(user):
     lines = [
         f"📦 Ваши файлы ({len(files)} шт.):",
         "",
-        "✏️ ПОДПИСИ — чтобы не запутаться, где что: подпишите файл reply-сообщением "
-        "при загрузке или кнопкой ✏️ здесь. Подпись видна только вам; настоящее "
-        "имя и содержимое файла зашифрованы и появятся после ввода пароля.",
+        "🏷 Название задаётся при добавлении (шаг после «✅ Готово»), reply-сообщением "
+        "при загрузке или кнопкой ✏️ здесь — чтобы не запутаться, где что. Подпись "
+        "видна только вам; настоящее имя и содержимое файла зашифрованы и появятся "
+        "после ввода пароля. Длинное название целиком — кнопкой 🔎 у файла.",
         "",
     ]
     for idx, rec in enumerate(files[:20], start=1):
@@ -7305,8 +8393,8 @@ def _vault_files_text(user):
             f"(в шифре {_fmt_bytes(rec.get('size_enc', 0))}), {rec.get('ts', '')}"
         )
     lines.append("")
-    lines.append("📥 — достать (спросит пароль) • 🔑 — сменить пароль • "
-                 "✏️ — подписать • 🗑 — удалить.")
+    lines.append("📥 — достать (спросит пароль) • 🔎 — полное название • "
+                 "🔑 — сменить пароль • ✏️ — подписать • 🗑 — удалить.")
     return "\n".join(lines)
 
 
@@ -7314,11 +8402,15 @@ def _vault_help_text():
     return (
         "❓ Как работает Сейф\n\n"
         "1. Вы присылаете файл (документ/фото/видео/аудио, до 20 МБ) или текст "
-        "— можно сразу НЕСКОЛЬКО файлов пачкой. Когда закончите — напишите "
-        "«готово», бот попросит ПАРОЛЬ СЕЙФА.\n"
-        "   ✏️ Подпись файла (видна только вам в списке Сейфа — чтобы не "
-        "запутаться, где что): ответьте (reply) на своё сообщение с файлом "
-        "коротким названием, или позже — кнопкой ✏️ у файла в списке.\n"
+        "— можно сразу НЕСКОЛЬКО файлов пачкой. Когда закончите — нажмите "
+        "кнопку «✅ Готово» ПОД сообщением (или напишите «готово»).\n"
+        "   🏷 ЗАТЕМ бот попросит НАЗВАТЬ загрузку — название будет видно в "
+        "«📦 Мои файлы», чтобы не запутаться, где что (можно «⏭ Пропустить»). "
+        "После этого бот попросит ПАРОЛЬ СЕЙФА.\n"
+        "   ✏️ Подпись ОДНОГО файла (видна только вам в списке Сейфа): "
+        "ответьте (reply) на своё сообщение с файлом коротким названием, "
+        "или позже — кнопкой ✏️ у файла в списке. Длинное название целиком "
+        "смотрится кнопкой 🔎 у файла (карточка открывается и закрывается).\n"
         f"2. Пароль один на весь Сейф (минимум {VAULT_MIN_PASSWORD} символов — "
         "бот показывает, за сколько его разгадала бы супер-машина). Ключ "
         "выводится из него (PBKDF2, "
@@ -7345,10 +8437,13 @@ def _vault_help_text():
         "загруженных файлов и недописанные вопросы/ответы стираются из чата "
         "(это работает даже после перезапуска бота).\n\n"
         "Честные ограничения:\n"
-        f"• файл до {_fmt_bytes(VAULT_MAX_FILE_BYTES)} — лимит Telegram на "
-        "скачивание ботами (бот физически не может принять больше);\n"
-        "• файл чуть больше — сожмите сами в ZIP/7z (текст сожмётся в разы) "
-        "или пришлите частями пачкой;\n"
+        f"• файл до {_fmt_bytes(VAULT_MAX_FILE_BYTES)} — быстрый путь: "
+        "качается и шифруется мгновенно;\n"
+        f"• от {_fmt_bytes(VAULT_MAX_FILE_BYTES)} до 2 ГБ — режим больших "
+        "файлов: бот качает и шифрует ПОТОКОМ через MTProto, это занимает "
+        "несколько минут (прогресс видно в чате);\n"
+        "• больше 2 ГБ не может НИ ОДИН бот в Telegram (4 ГБ — только "
+        "Premium у людей, ботам он недоступен): делите файл на части;\n"
         "• вопросы — ваша страховка: КТО ЗНАЕТ ОТВЕТЫ, ТОТ ПОЛУЧИТ ДОСТУП. "
         "Придумывайте вопросы, ответ на которые знаете только вы."
     )
@@ -7382,7 +8477,8 @@ async def vault_menu_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop('vault_ren_id', None)
     context.user_data.pop('vault_attempts', None)
     for key in ('vault_batch', 'vault_migrate_ids', 'vault_setup_pw', 'vault_qs_data',
-                'vault_qs_pw', 'vault_qs_stage', 'vault_rec_answers', 'vault_rec_oldpw'):
+                'vault_qs_pw', 'vault_qs_stage', 'vault_rec_answers', 'vault_rec_oldpw',
+                'vault_batch_label'):
         context.user_data.pop(key, None)
     await update.message.reply_text(_vault_menu_text(user), reply_markup=get_vault_menu_keyboard())
     return MAIN_MENU
@@ -7407,7 +8503,8 @@ async def vault_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     for key in ('vault_put_mode', 'vault_get_id', 'vault_chp_id', 'vault_attempts',
                 'vault_ren_id',
                 'vault_batch', 'vault_migrate_ids', 'vault_setup_pw', 'vault_qs_data',
-                'vault_qs_pw', 'vault_qs_stage', 'vault_rec_answers', 'vault_rec_oldpw'):
+                'vault_qs_pw', 'vault_qs_stage', 'vault_rec_answers', 'vault_rec_oldpw',
+                'vault_batch_label'):
         context.user_data.pop(key, None)
     try:
         await query.edit_message_text(_vault_menu_text(user), reply_markup=get_vault_menu_keyboard())
@@ -7460,25 +8557,27 @@ async def vault_put_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await query.edit_message_text(
             "📥 Шифруем файлы в Сейфе\n\n"
-            f"Отправьте документ, фото, видео или аудио (до "
-            f"{_fmt_bytes(VAULT_MAX_FILE_BYTES)} каждый) — можно СРАЗУ НЕСКОЛЬКО "
-            "файлов ПАЧКОЙ; или НАПИШИТЕ текст — он станет зашифрованной "
-            "заметкой.\n\n"
-            "✏️ ПОДПИСЬ (чтобы не запутаться, где что): пришлите файл, потом "
-            "ОТВЕТЬТЕ (reply) на СВОЁ сообщение с файлом коротким названием — "
-            "например «Фото контрольной». Подпись будет ВИДНА в списке Сейфа "
-            "открытым текстом (содержимое файла при этом по-прежнему под "
-            "шифром). Подписать можно и позже — ✏️ у файла в списке.\n\n"
-            "Когда закончите — напишите «готово», и бот попросит ПАРОЛЬ "
-            "СЕЙФА. Он один на весь Сейф и нигде не хранится; при первой "
-            "настройке бот задаст 3 секретных вопроса для восстановления "
-            "доступа."
+            "Отправьте документ, фото, видео или аудио — можно СРАЗУ "
+            "НЕСКОЛЬКО файлов ПАЧКОЙ; или НАПИШИТЕ текст — он станет "
+            "зашифрованной заметкой.\n\n"
+            f"📏 Размеры: до {_fmt_bytes(VAULT_MAX_FILE_BYTES)} — мгновенно; "
+            "от 20 МБ до 2 ГБ — режим больших файлов (зашифрую ПОТОКОМ, "
+            "это займёт несколько минут — прогресс будет виден).\n\n"
+            "✅ ЗАКОНЧИЛИ? Нажмите кнопку «✅ Готово» ПОД сообщением — писать "
+            "«готово» не нужно (можно и написать, кнопка просто быстрее).\n\n"
+            "🏷 НАЗВАНИЕ: сразу после «Готово» бот попросит назвать то, что вы "
+            "кладёте, — название будет ВИДНО в «📦 Мои файлы», чтобы не "
+            "запутаться, где что. Каждый файл можно подписать и отдельно — "
+            "reply-ответом на СВОЁ сообщение с ним.\n\n"
+            "🔑 Дальше бот попросит ПАРОЛЬ СЕЙФА. Он один на весь Сейф и "
+            "нигде не хранится; при первой настройке бот задаст 3 секретных "
+            "вопроса для восстановления доступа."
         )
     except Exception:
         pass
     _ack = await query.message.reply_text(
-        "Жду файл или текст 👇 (закончить: «готово», выйти: «❌ Отмена»)",
-        reply_markup=ReplyKeyboardMarkup([["❌ Отмена"]], resize_keyboard=True),
+        "Жду файл или текст 👇 (закончить — кнопка «✅ Готово» ниже)",
+        reply_markup=_vault_put_kb(),
     )
     _vault_track_ack(context, _ack, user=user)
     return VAULT_PUT_WAIT
@@ -7615,6 +8714,21 @@ async def _vault_cleanup_chat(context, chat_id, batch, user=None, keep_ids=None)
                     save_user(user)
         except Exception as e:
             logger.warning(f"vault cleanup: след не очищен: {e}")
+    # ВОЛНА 14: черновые копии БОЛЬШИХ файлов (>20 МБ) лежат в канале-хранилище
+    # только пока идёт загрузка в Сейф. Отмена/выход/срыв сессии — копии
+    # стираем (best-effort): в канале не должно оставаться НИЧЕГО
+    # незашифрованного.
+    for _it in (batch or []):
+        if not isinstance(_it, dict):
+            continue
+        _mt = _it.get("mt_raw")
+        if isinstance(_mt, dict) and _mt.get("channel_id") and _mt.get("msg_id"):
+            try:
+                await context.bot.delete_message(
+                    chat_id=int(_mt["channel_id"]), message_id=int(_mt["msg_id"]))
+            except Exception:
+                pass
+            _it.pop("mt_raw", None)
     deleted = 0
     for _mid in ids:
         try:
@@ -7693,15 +8807,18 @@ async def vault_put_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     ts_fn = datetime.now().strftime("%Y-%m-%d_%H-%M")
 
-    # «готово» — закончить пачку и перейти к паролю Сейфа.
+    # «готово» — закончить пачку. ВОЛНА 13: дальше шаг НАЗВАНИЯ («сразу
+    # назвать, что кладу» — будет видно в «Мои файлы») и только потом пароль
+    # Сейфа. Кнопка «✅ Готово» ПОД сообщением делает то же самое (vault_done_cb).
     if att is None and low_raw in ("готово", "готово!", "готово.", "всё", "все", "done"):
         if not batch:
             await msg.reply_text(
                 "Пачка пуста: пришлите хотя бы один файл или напишите "
-                "текст-заметку. Завершить пачку — словом «готово»."
+                "текст-заметку. Завершить пачку — кнопкой «✅ Готово» или "
+                "словом «готово»."
             )
             return VAULT_PUT_WAIT
-        return await _vault_prompt_password(msg, user, context=context)
+        return await _vault_ask_label(msg, context, user)
 
     # ВОЛНА 12: ✏️ ПОДПИСЬ ФАЙЛА через reply. Текст-ОТВЕТ на своё сообщение
     # с файлом/заметкой из пачки становится подписью этого файла: она видна
@@ -7721,7 +8838,8 @@ async def vault_put_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _ack = await msg.reply_text(
                 f"✏️ Подпись сохранена: «{_target['label']}» — она будет видна "
                 "в списке Сейфа (сам файл по-прежнему под шифром). Пришлите "
-                "ещё файл/заметку или напишите «готово».")
+                "ещё файл/заметку или нажмите «✅ Готово» ниже.",
+                reply_markup=_vault_put_kb())
             _vault_track_ack(context, _ack, user=user)
             return VAULT_PUT_WAIT
 
@@ -7750,26 +8868,14 @@ async def vault_put_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _vault_trace_add(context, user, msg.chat_id, msg.message_id)  # ВОЛНА 12
         _ack = await msg.reply_text(
             f"📥 Принято: {len(batch)} шт. Пришлите ещё файл/заметку или "
-            "напишите «готово» — дальше попросит пароль Сейфа."
+            "нажмите «✅ Готово» ниже — дальше попросят название и пароль Сейфа.",
+            reply_markup=_vault_put_kb(),
         )
         _vault_track_ack(context, _ack, user=user)
         return VAULT_PUT_WAIT
 
     # Файл.
     fsize = int(getattr(att, "file_size", 0) or 0)
-    if fsize > VAULT_MAX_FILE_BYTES:
-        # Честное объяснение: не шифруем, потому что НЕ МОЖЕМ скачать.
-        await msg.reply_text(
-            f"🚫 Файл больше {_fmt_bytes(VAULT_MAX_FILE_BYTES)} — Telegram "
-            "вообще не даёт ботам скачивать такие файлы, значит зашифровать "
-            "их честно невозможно.\n\n"
-            "Что делать:\n"
-            "• сожмите файл сами в ZIP/7z (текст сожмётся в разы; видео/фото — "
-            "почти нет, они уже сжаты форматом — но качество не пострадает);\n"
-            "• или разбейте на части по 15–19 МБ и пришлите каждую отдельно — "
-            "сложу их в Сейф одной пачкой."
-        )
-        return VAULT_PUT_WAIT
     if kind == "photo":
         name = getattr(att, "file_name", None) or f"Фото_{ts_fn}.jpg"
     elif kind == "document":
@@ -7788,6 +8894,79 @@ async def vault_put_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if name and "." in name:
             _vext = name[name.rfind("."):].lower()[:12]
         name = _vcap[:100] + (_vext if _vext and not _vcap.lower().endswith(_vext) else "")
+
+    # ВОЛНА 14: больше ~2 ГБ — жёсткий потолок Telegram даже для MTProto
+    # (2000 МиБ для ботов; 4 ГБ — только Premium у людей, ботам недоступен).
+    if fsize > VAULT_MTPROTO_MAX_BYTES:
+        await msg.reply_text(
+            f"🚫 Файл больше {_fmt_bytes(VAULT_MTPROTO_MAX_BYTES)} (~2 ГБ) — "
+            "это жёсткий потолок Telegram для ботов, дальше физика не "
+            "пускает (4 ГБ — только Premium у людей, ботам он недоступен).\n\n"
+            "Что делать:\n"
+            "• разделите файл на части по ~1,5 ГБ и пришлите пачкой — "
+            "сложу всё в Сейф одной загрузкой;\n"
+            "• или сожмите то, что сжимается (тексты, PDF — в разы; "
+            "видео/фото уже сжаты своим форматом)."
+        )
+        return VAULT_PUT_WAIT
+    # ВОЛНА 14: от 20 МБ до 2 ГБ — гибрид Bot API + MTProto (Telethon).
+    # Оригинал НЕ скачивается (Bot API так не умеет): серверная копия уходит
+    # в канал-хранилище, а после «✅ Готово» бот скачает её потоком и
+    # зашифрует в DVF2 (куски по 1 МБ, AES-256-GCM).
+    if fsize > VAULT_MAX_FILE_BYTES:
+        if not _TELETHON_OK or not BOT_TOKEN:
+            await msg.reply_text(
+                f"🚫 Файл больше {_fmt_bytes(VAULT_MAX_FILE_BYTES)}: обычный "
+                "режим бота такие файлы скачать не может, а режим больших "
+                "файлов (MTProto) ещё не включён на сервере.\n\nЧто делать:\n"
+                "• попросите разработчика включить большие файлы "
+                "(на сервере: pip install telethon);\n"
+                "• пока — сожмите файл в ZIP/7z или разбейте на части "
+                "по 15–19 МБ и пришлите каждую отдельно — сложу их в Сейф "
+                "одной пачкой."
+            )
+            return VAULT_PUT_WAIT
+        _cloud_ids = get_cloud_channel_ids()
+        if not _cloud_ids:
+            await msg.reply_text(
+                "❌ Хранилище отключено. Попросите разработчика настроить каналы.")
+            return VAULT_PUT_WAIT
+        try:
+            await context.bot.send_chat_action(
+                chat_id=update.effective_chat.id, action="typing")
+        except Exception:
+            pass
+        try:
+            _copy = await context.bot.copy_message(
+                chat_id=int(_cloud_ids[0]),
+                from_chat_id=msg.chat_id, message_id=msg.message_id,
+            )
+        except Exception as e:
+            logger.error(f"vault put: копия большого файла не удалась: {e}")
+            await msg.reply_text(
+                "❌ Не смог принять большой файл (сбой копирования в "
+                "хранилище). Попробуйте ещё раз.")
+            return VAULT_PUT_WAIT
+        batch.append({
+            "source": "mtproto", "name": name[:120], "kind": kind,
+            "mime": str(getattr(att, "mime_type", "") or ""),
+            "size": fsize,
+            "chat_msg_id": int(getattr(msg, "message_id", 0) or 0),  # ВОЛНА 11
+            "mt_raw": {"channel_id": int(_cloud_ids[0]),
+                       "msg_id": int(getattr(_copy, "message_id", 0) or 0)},
+        })
+        _vault_trace_add(context, user, msg.chat_id, msg.message_id)  # ВОЛНА 12
+        _ack = await msg.reply_text(
+            f"📦 Принято: {_fmt_bytes(fsize)} — зашифрую ПОТОКОМ после "
+            "«✅ Готово» (большие файлы шифруются несколько минут — это "
+            "нормально, шифр уйдёт в канал, оригинал из чата сотру). "
+            "Подписать файл — ответьте (reply) на СВОЁ сообщение с ним "
+            "названием; пришлите ещё или нажмите «✅ Готово» ниже.",
+            reply_markup=_vault_put_kb(),
+        )
+        _vault_track_ack(context, _ack, user=user)
+        return VAULT_PUT_WAIT
+
     # Скачиваем В ПАМЯТЬ (≤20 МБ — разрешено Bot API).
     try:
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
@@ -7812,10 +8991,202 @@ async def vault_put_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _ack = await msg.reply_text(
         f"📥 Принято: {len(batch)} шт (файл в памяти, в чат не попадёт). "
         "Подписать файл — ответьте (reply) на СВОЁ сообщение с ним названием; "
-        "пришлите ещё или напишите «готово» — дальше попросит пароль Сейфа."
+        "пришлите ещё или нажмите «✅ Готово» ниже — дальше попросят название "
+        "и пароль Сейфа.",
+        reply_markup=_vault_put_kb(),
     )
     _vault_track_ack(context, _ack, user=user)
     return VAULT_PUT_WAIT
+
+
+# ============================================================
+# === ВОЛНА 13: «✅ Готово» КНОПКОЙ + НАЗВАНИЕ СРАЗУ + 🔎 ИМЯ ===
+# ============================================================
+
+def _vault_put_kb():
+    """ВОЛНА 13: кнопки ПОД сообщением загрузки в Сейф.
+    «✅ Готово» — закончить пачку БЕЗ ввода текста «готово» (просьба
+    пользователя: «кнопка готово должна быть снизу сообщения… а не писать
+    готово — лучше сразу кнопку нажать»). «❌ Отмена» — выйти и стереть
+    все следы из чата (то же, что текст «отмена»)."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Готово", callback_data="vault_done"),
+         InlineKeyboardButton("❌ Отмена", callback_data="vault_cancel")],
+    ])
+
+
+def _vault_kind_label(kind):
+    """Человекочитаемое имя типа файла Сейфа (для карточки 🔎)."""
+    return {"photo": "фото", "video": "видео", "audio": "аудио",
+            "voice": "голосовое"}.get(str(kind or ""), "документ")
+
+
+def _vault_item_label(item, batch_label=""):
+    """ВОЛНА 13: итоговая подпись элемента Сейфа.
+    Приоритет: reply-подпись КОНКРЕТНОГО файла → название ВСЕЙ загрузки
+    (шаг «сразу назвать, что кладу») → пусто («Файл #N» в списке).
+    Обрезка 80 символов — как у reply-подписи волны 12."""
+    return (str((item or {}).get("label") or "").strip()
+            or str(batch_label or "").strip())[:80]
+
+
+async def _vault_ask_label(msg, context, user):
+    """ВОЛНА 13: шаг «НАЗОВИТЕ, что кладёте» — после «✅ Готово» (кнопкой или
+    словом) и ДО пароля Сейфа. Одно название на всю загрузку; попадает в
+    «📦 Мои файлы» (кнопка-строка, текст списка, карточка 🔎). Пропустить
+    можно кнопкой «⏭ Пропустить» — останутся исходные имена/подписи файлов."""
+    _ack = await msg.reply_text(
+        "🏷 НАЗОВИТЕ, что вы кладёте в Сейф — одно название для всей загрузки "
+        f"(файлов в пачке: {len(context.user_data.get('vault_batch') or [])}).\n\n"
+        "Название будет ВИДНО в «📦 Мои файлы» — чтобы не запутаться, где что. "
+        "Например: «Контрольная по алгебре», «Документы на кружок».\n\n"
+        "Не нужно общее название — нажмите «⏭ Пропустить»: останутся исходные "
+        "имена файлов (подписать каждый отдельно можно и позже — ✏️ в списке).",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⏭ Пропустить", callback_data="vault_labelskip"),
+             InlineKeyboardButton("❌ Отмена", callback_data="vault_cancel")],
+        ]),
+    )
+    _vault_track_ack(context, _ack, user=user)
+    return VAULT_LABEL_WAIT
+
+
+async def vault_done_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 13: кнопка «✅ Готово» ПОД сообщением — закончить пачку без
+    набора текста. Дальше — шаг названия и пароль Сейфа."""
+    query = update.callback_query
+    await query.answer()
+    user = get_user(str(query.from_user.id))
+    if not user:
+        await query.answer("Сначала зарегистрируйтесь — /start", show_alert=True)
+        return MAIN_MENU
+    batch = context.user_data.get('vault_batch')
+    if not isinstance(batch, list) or not batch:
+        await query.answer(
+            "Пачка пуста — пришлите хотя бы один файл или текст-заметку.",
+            show_alert=True)
+        return VAULT_PUT_WAIT
+    return await _vault_ask_label(query.message, context, user)
+
+
+@timeout(CONVERSATION_TIMEOUT)
+async def vault_label_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 13: приём НАЗВАНИЯ загрузки Сейфа (одно на всю пачку)."""
+    msg = update.message
+    user = get_user(str(update.effective_user.id))
+    batch = context.user_data.get('vault_batch')
+    if not user or not isinstance(batch, list) or not batch:
+        context.user_data.pop('vault_batch_label', None)
+        await msg.reply_text(
+            "Сессия загрузки потеряна. Начните заново: ☁️ Облако → 🔐 Сейф.",
+            reply_markup=get_main_menu_keyboard(user) if user else None,
+        )
+        return MAIN_MENU
+    text = (msg.text or "").strip()
+    if not text:
+        await msg.reply_text(
+            "Напишите название ОДНИМ сообщением — например «Контрольная по "
+            "алгебре», — или нажмите «⏭ Пропустить».")
+        return VAULT_LABEL_WAIT
+    context.user_data['vault_batch_label'] = text[:80]
+    return await _vault_prompt_password(msg, user, context=context)
+
+
+async def vault_labelskip_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 13: «⏭ Пропустить» — без общего названия (исходные имена +
+    reply-подписи файлов остаются)."""
+    query = update.callback_query
+    await query.answer()
+    user = get_user(str(query.from_user.id))
+    if not user:
+        await query.answer("Сначала зарегистрируйтесь — /start", show_alert=True)
+        return MAIN_MENU
+    batch = context.user_data.get('vault_batch')
+    if not isinstance(batch, list) or not batch:
+        await query.answer("Пачка пуста — пришлите файлы.", show_alert=True)
+        return VAULT_PUT_WAIT
+    return await _vault_prompt_password(query.message, user, context=context)
+
+
+async def vault_cancel_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 13: кнопка «❌ Отмена» ПОД сообщением — то же, что текст
+    «отмена»: выйти из Сейфа и СТЕРЕТЬ все следы из чата (файлы, заметки,
+    подсказки; персистентный след чистится даже после рестарта бота)."""
+    query = update.callback_query
+    await query.answer()
+    user = get_user(str(query.from_user.id))
+    batch = context.user_data.get('vault_batch')
+    _batch_clean = batch if isinstance(batch, list) else None
+    for key in ('vault_put_mode', 'vault_batch', 'vault_migrate_ids',
+                'vault_batch_label'):
+        context.user_data.pop(key, None)
+    _cleaned = 0
+    try:
+        _cleaned = await _vault_cleanup_chat(
+            context, query.message.chat_id, _batch_clean, user=user)
+    except Exception:
+        _cleaned = 0
+    try:
+        await query.edit_message_text(
+            "Отменено — ничего не зашифровано и не загружено."
+            + (f"\n🧹 Из чата стёрто сообщений: {_cleaned}." if _cleaned else ""))
+    except Exception:
+        pass
+    if user:
+        await query.message.reply_text(
+            "Главное меню:", reply_markup=get_main_menu_keyboard(user))
+    return MAIN_MENU
+
+
+async def vault_show_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 13: кнопка «🔎» у файла — РАСКРЫТЬ полное название.
+
+    В кнопках списка длинные названия обрезает сам Telegram (около 25–30
+    символов). Карточка показывает название ЦЕЛИКОМ; «⬅️ Свернуть (к
+    списку)» закрывает карточку — можно раскрыть ДРУГОЙ файл (просьба:
+    «раскрыть его, а потом закрыть и посмотреть другой файл»)."""
+    query = update.callback_query
+    await query.answer()
+    user = get_user(str(query.from_user.id))
+    if not user:
+        await query.answer("Сначала зарегистрируйтесь — /start", show_alert=True)
+        return MAIN_MENU
+    vid = query.data.replace("vault_show_", "", 1)
+    rec = _vault_find_record(user, vid)
+    if not rec:
+        await query.answer("Файл не найден.", show_alert=True)
+        return MAIN_MENU
+    files = [f for f in (getattr(user, "vault_files", []) or []) if isinstance(f, dict)]
+    try:
+        idx = files.index(rec) + 1
+    except ValueError:
+        idx = 0
+    label = str(rec.get("label") or "").strip()
+    lines = ["🔎 ПОЛНОЕ НАЗВАНИЕ ФАЙЛА", ""]
+    if label:
+        lines.append(f"🏷 «{label}»")
+    else:
+        lines.append(f"Без подписи — «Файл #{idx}». Подписать можно кнопкой ✏️ ниже.")
+    lines.append("")
+    lines.append(
+        f"📦 Размер: {_fmt_bytes(rec.get('size_orig', 0))} "
+        f"(в шифре {_fmt_bytes(rec.get('size_enc', 0))})")
+    lines.append(
+        f"📅 Добавлено: {rec.get('ts', '')} • 🧩 тип: {_vault_kind_label(rec.get('kind'))}")
+    lines.append("")
+    lines.append("🔒 Настоящее имя файла и его содержимое под шифром — "
+                 "увидите после ввода пароля (📥 Достать).")
+    kb = [
+        [InlineKeyboardButton("⬅️ Свернуть (к списку)", callback_data="vault_files")],
+        [InlineKeyboardButton("📥 Достать", callback_data=f"vault_get_{vid}"),
+         InlineKeyboardButton("✏️ Подписать", callback_data=f"vault_ren_{vid}"),
+         InlineKeyboardButton("🗑 Удалить", callback_data=f"vault_del_{vid}")],
+    ]
+    try:
+        await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(kb))
+    except Exception:
+        await query.message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(kb))
+    return MAIN_MENU
 
 
 async def _vault_prompt_password(msg, user, note: str = "", context=None):
@@ -7947,8 +9318,12 @@ async def vault_put_password(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def _vault_encrypt_batch(msg, context, user, password):
     """ВОЛНА 9: шифрует пачку паролем Сейфа, грузит шифры в канал по кругу,
-    удаляет миграционные оригиналы. Возвращает состояние для ConversationHandler."""
+    удаляет миграционные оригиналы. Возвращает состояние для ConversationHandler.
+    ВОЛНА 13: файлы без СВОЕЙ reply-подписи получают название ВСЕЙ загрузки
+    (шаг «сразу назвать, что кладу») — видно в «📦 Мои файлы»."""
     batch = context.user_data.get('vault_batch') or []
+    # ВОЛНА 13: читаем название ДО чистки user_data ниже.
+    _batch_label = str(context.user_data.get('vault_batch_label') or "").strip()[:80]
     progress = None
     try:
         progress = await msg.reply_text(f"🔐 Шифрую и загружаю {len(batch)} файл(ов)…")
@@ -7965,6 +9340,27 @@ async def _vault_encrypt_batch(msg, context, user, password):
                 )
             except Exception:
                 pass
+        # ВОЛНА 14: большой файл (>20 МБ) — потоковый путь DVF2 через
+        # MTProto. Оригинал лежит черновой копией в канале; здесь бот качает
+        # его потоком, шифрует кусками по 1 МБ и заливает контейнер.
+        if item.get("source") == "mtproto":
+            try:
+                rec_mt = await _vault_seal_item_mtproto(
+                    msg, context, user, item, password,
+                    progress, i, len(batch))
+            except Exception as e:
+                logger.error(
+                    f"vault put: большой файл ({item.get('name')}): {e}")
+                rec_mt = None
+            if rec_mt is None:
+                fail_n += 1
+                continue
+            # ВОЛНА 13: без своей reply-подписи — название всей загрузки.
+            rec_mt["label"] = _vault_item_label(item, _batch_label)
+            files.append(rec_mt)
+            ok_n += 1
+            item["done"] = True  # ВОЛНА 11: шифр в канале — оригинал из чата сотрём
+            continue
         try:
             container = await asyncio.to_thread(
                 _vault_pack, password, item.get("payload") or b"", {
@@ -8008,8 +9404,9 @@ async def _vault_encrypt_batch(msg, context, user, password):
             "file_id": up.get("file_id"),
             "channel_id": up.get("channel_id"),
             # ВОЛНА 12: видная подпись («чтобы не запутаться, где что»).
+            # ВОЛНА 13: без своей подписи — название всей загрузки.
             # Содержимое и настоящее имя — по-прежнему под шифром.
-            "label": str(item.get("label") or "").strip()[:80],
+            "label": _vault_item_label(item, _batch_label),
         })
         ok_n += 1
         item["done"] = True  # ВОЛНА 11: шифр в канале — оригинал из чата сотрём
@@ -8038,13 +9435,16 @@ async def _vault_encrypt_batch(msg, context, user, password):
     # was_setup: флоу первичной настройки — пароль Сейфа только что создан.
     was_setup = bool(context.user_data.get('vault_setup_pw'))
     for key in ('vault_put_mode', 'vault_batch', 'vault_migrate_ids',
-                'vault_attempts', 'vault_setup_pw', 'vault_qs_data'):
+                'vault_attempts', 'vault_setup_pw', 'vault_qs_data',
+                'vault_batch_label'):
         context.user_data.pop(key, None)
     lines = []
     if ok_n:
         lines.append(f"✅ ЗАШИФРОВАНО И ЗАГРУЖЕНО: {ok_n} файл(ов).")
     else:
         lines.append("❌ Не удалось зашифровать/загрузить ни одного файла.")
+    if _batch_label and ok_n:
+        lines.append(f"🏷 Название загрузки: «{_batch_label}» — видно в «📦 Мои файлы».")
     if fail_n:
         lines.append(f"⚠️ Не удалось обработать: {fail_n} — попробуйте ещё раз позже.")
     if migrated:
@@ -8206,6 +9606,11 @@ async def vault_get_password(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "шифр стёрт из канала.",
         )
         return VAULT_CHPASS_NEW
+    # ВОЛНА 14: большой файл (>20 МБ, DVF2) — потоковый путь через MTProto.
+    # Обязателен ДО Bot API-пути: тот ограничен 20 МБ и не умеет контейнеры
+    # без file_id (большие шифры заливаются только MTProto).
+    if rec.get("dvf2"):
+        return await _vault_get_dvf2(msg, context, user, rec, password)
     # Пароль верный: скачиваем шифр из канала (в память).
     channel_id = rec.get("channel_id") or get_storage_channel_id()
     file_id = rec.get("file_id")
@@ -8546,6 +9951,14 @@ async def vault_rec_newpass(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             except Exception:
                 pass
+        # ВОЛНА 14: большие файлы (DVF2) перешифровываем ПОТОКОМ через
+        # MTProto — их нельзя скачать Bot API и нельзя держать в ОЗУ.
+        if rec.get("dvf2"):
+            if await _vault_reencrypt_dvf2(msg, context, user, rec, old_pw, password):
+                done += 1
+            else:
+                fail += 1
+            continue
         channel_id = rec.get("channel_id") or get_storage_channel_id()
         file_id = rec.get("file_id")
         if not channel_id or not file_id:
@@ -8879,6 +10292,32 @@ async def vault_chpass_new_password(update: Update, context: ContextTypes.DEFAUL
         )
         return VAULT_CHPASS_NEW
     old_password = context.user_data.get('vault_chp_old')
+    # ВОЛНА 14: большой файл (DVF2) — потоковая перешифровка через MTProto.
+    # ВАЖНО: раньше эта ветка должна стоять ДО проверки file_id — у записей
+    # DVF2 Bot API file_id нет (шифр заливался через MTProto).
+    if rec.get("dvf2"):
+        if not old_password:
+            for key in ('vault_chp_id', 'vault_chp_stage', 'vault_chp_old'):
+                context.user_data.pop(key, None)
+            await msg.reply_text("❌ Смена пароля сорвалась. Попробуйте заново позже.")
+            return MAIN_MENU
+        _ok_dvf2 = await _vault_reencrypt_dvf2(
+            msg, context, user, rec, old_password, password)
+        for key in ('vault_chp_id', 'vault_chp_stage', 'vault_chp_old'):
+            context.user_data.pop(key, None)
+        if not _ok_dvf2:
+            await msg.reply_text(
+                "❌ Не удалось перешифровать файл (скорее всего, сообщение "
+                "удалено из канала, или на сервере мало места). Пароль НЕ "
+                "изменён. Попробуйте позже.",
+                reply_markup=get_main_menu_keyboard(user),
+            )
+            return MAIN_MENU
+        save_user(user)
+        await msg.reply_text(
+            "✅ Пароль изменён. Большой файл перешифрован новым паролем, "
+            "старый шифр стёрт из канала (насколько это позволяет Telegram).")
+        return MAIN_MENU
     channel_id = rec.get("channel_id") or get_storage_channel_id()
     file_id = rec.get("file_id")
     if not old_password or not channel_id or not file_id:
@@ -9032,7 +10471,8 @@ async def vault_exit_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for key in ('vault_put_mode', 'vault_get_id', 'vault_chp_id', 'vault_attempts',
                 'vault_pending', 'vault_chp_stage', 'vault_chp_old', 'vault_ren_id',
                 'vault_batch', 'vault_migrate_ids', 'vault_setup_pw', 'vault_qs_data',
-                'vault_qs_pw', 'vault_qs_stage', 'vault_rec_answers', 'vault_rec_oldpw'):
+                'vault_qs_pw', 'vault_qs_stage', 'vault_rec_answers', 'vault_rec_oldpw',
+                'vault_batch_label'):
         context.user_data.pop(key, None)
     try:
         await query.edit_message_text("🔐 Сейф закрыт.")
@@ -9104,6 +10544,10 @@ def _storage_dev_status_text(cfg):
         lines.append("   📦 При обновлении/смене сервера: подключите ЛЮБОЙ 🗄️-канал —")
         lines.append("   бот сам вспомнит ВСЁ (данные + остальные каналы). Кнопка:")
         lines.append("   «📦 Вспомнить всё из канала».")
+        # ВОЛНА 13: путь «я сам вставляю снапшот в канал».
+        lines.append("   💡 Можно и просто перекинуть файл снапшота (devorks_db_snapshot_…)")
+        lines.append("   ПРЯМО В КАНАЛ — бот возьмёт ПОСЛЕДНИЙ актуальный, применит базу,")
+        lines.append("   сам его ЗАКРЕПИТ и сотрёт старые снапшоты (дубли не плодятся).")
     else:
         lines.append("")
         lines.append("🗄️ База в канале: ВЫКЛ (данные только на сервере/Supabase).")
@@ -20193,6 +21637,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await vault_qs_cb(update, context)
     elif data == "vault_exit":
         return await vault_exit_cb(update, context)
+    elif data == "vault_done":
+        # ВОЛНА 13: кнопка «✅ Готово» ПОД сообщением загрузки — закончить
+        # пачку без набора текста (дальше шаг названия и пароль Сейфа).
+        return await vault_done_cb(update, context)
+    elif data == "vault_cancel":
+        # ВОЛНА 13: кнопка «❌ Отмена» ПОД сообщением — выйти из Сейфа и
+        # стереть все следы загрузки из чата.
+        return await vault_cancel_cb(update, context)
+    elif data == "vault_labelskip":
+        # ВОЛНА 13: «⏭ Пропустить» на шаге названия загрузки Сейфа.
+        return await vault_labelskip_cb(update, context)
     elif data.startswith("vault_delyes_"):
         return await vault_del_yes_cb(update, context)
     elif data.startswith("vault_del_"):
@@ -20204,6 +21659,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await vault_ren_cb(update, context)
     elif data.startswith("vault_get_"):
         return await vault_get_password_start(update, context)
+    elif data.startswith("vault_show_"):
+        # ВОЛНА 13: карточка ПОЛНОГО названия файла — раскрыть/свернуть.
+        return await vault_show_cb(update, context)
     # === Хранилище: мультиканальность (волна 7) ===
     elif data.startswith("dev_ch_kind_"):
         return await dev_storage_channel_kind(update, context)
@@ -23910,6 +25368,13 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, vault_ren_save),
                 CallbackQueryHandler(handle_callback),
             ],
+            # === ВОЛНА 13: НАЗВАНИЕ загрузки Сейфа (шаг после «✅ Готово»;
+            #     быстрые команды сюда не инжектируются — _QUICK_SKIP_STATES,
+            #     глобальная отмена инжектируется как везде) ===
+            VAULT_LABEL_WAIT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, vault_label_receive),
+                CallbackQueryHandler(handle_callback),
+            ],
         },
         fallbacks=[
             CommandHandler("start", start),
@@ -23940,6 +25405,11 @@ def main():
         for _state, _handlers in states_dict.items():
             if _state == MAIN_MENU:
                 # Главное меню уже само обрабатывает все кнопки.
+                continue
+            if _state in _QUICK_SKIP_STATES:
+                # ВОЛНА 13: здесь текст = произвольное НАЗВАНИЕ файла/загрузки
+                # (✏️ подпись Сейфа, 🏷 название загрузки) — быстрые команды
+                # похитили бы имя и утащили пользователя в чужой раздел.
                 continue
             has_text_input = any(
                 isinstance(h, MessageHandler) for h in _handlers
