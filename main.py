@@ -8204,6 +8204,39 @@ _MT_LOCK = None
 # даже когда Telethon установлен, а падало именно ПОДКЛЮЧЕНИЕ (сеть/сессия) —
 # из-за этого причина сбоя выглядела неправдоподобно и путала.
 _MT_LAST_ERR = ""
+_MT_SESSION_FILE = None  # лениво через _data_file()
+
+
+def _mt_session_path() -> str:
+    """ВОЛНА 20: путь к файлу сохранённой MTProto-сессии бота. Живёт в
+    каталоге данных: сессия переживает рестарт Render, и бот перестаёт
+    создавать НОВУЮ авторизацию при каждом старте/попытке — именно частые
+    новые авторизации Telegram ограничивает FLOOD_WAIT'ом, что и роняло
+    большие файлы с «не поднялся MTProto-клиент»."""
+    global _MT_SESSION_FILE
+    if _MT_SESSION_FILE is None:
+        _MT_SESSION_FILE = _data_file("mt_session.txt")
+    return _MT_SESSION_FILE
+
+
+def _mt_load_saved_session() -> str:
+    try:
+        with open(_mt_session_path(), "r", encoding="utf-8") as fh:
+            return (fh.read() or "").strip()
+    except Exception:
+        return ""
+
+
+def _mt_save_session(sess_str: str) -> None:
+    try:
+        if not sess_str:
+            return
+        tmp = _mt_session_path() + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(sess_str)
+        os.replace(tmp, _mt_session_path())
+    except Exception as e:
+        logger.warning(f"mtproto: сессия не сохранена ({e})")
 
 
 def _mt_unavailable_reason() -> str:
@@ -8222,12 +8255,15 @@ def _mt_unavailable_reason() -> str:
 async def _mt_client():
     """Единственный MTProto-клиент бота (Telethon) — поднимается ЛЕНИВО при
     первой операции с файлами >20 МБ и живёт до конца процесса. Сессия бота
-    создаётся по токену (без телефона); после рестарта Render создаётся
-    заново — это бесплатно и ни на что не влияет. Возвращает клиент или None
-    (Telethon не установлен / нет BOT_TOKEN / Telegram недоступен).
-    ВОЛНА 19: самовосстановление — если сессия из TELETHON_SESSION битая
-    (AuthKeyDuplicated/AuthKeyUnregistered/устарела), вторая попытка делается
-    с ЧИСТОЙ сессией, и клиент поднимается без вмешательства человека."""
+    создаётся по токену (без телефона, без api_id от пользователя — берётся
+    публичный id Telegram Desktop). Возвращает клиент или None.
+    ВОЛНА 19: самовосстановление — битая env-сессия не ломает MTProto.
+    ВОЛНА 20: ПОЛНАЯ ЛЕСТНИЦА СЕССИЙ [сохранённая на диске → чистая →
+    чистая], таймауты 45/60 с на каждый сетевой шаг, особая обработка
+    FloodWaitError (ждём ровно столько, сколько велел Telegram), проверка
+    get_me() после входа и СОХРАНЕНИЕ рабочей сессии на диск — чтобы бот
+    перестал создавать новую авторизацию на каждую попытку и не загонял
+    себя в FLOOD_WAIT."""
     global _MT_CLIENT, _MT_LOCK, _MT_LAST_ERR
     if not _TELETHON_OK:
         _MT_LAST_ERR = ("библиотека Telethon не установлена — пересоберите "
@@ -8246,49 +8282,119 @@ async def _mt_client():
             except Exception:
                 pass
         env_session = (_env("TELETHON_SESSION", "") or "").strip()
-        # ВОЛНА 19: до двух попыток — (1) сессия из env (если задана) или
-        # чистая, (2) ОБЯЗАТЕЛЬНО чистая сессия. Битая env-сессия больше
-        # не ломает MTProto навсегда: чистая сессия бота авторизуется сама.
-        _session_candidates = [env_session, ""]
-        if not env_session:
-            _session_candidates = [""]
+        saved_session = _mt_load_saved_session()
+        if env_session:
+            ladder = [env_session, saved_session or "", ""]
+        elif saved_session:
+            ladder = [saved_session, ""]
+        else:
+            ladder = ["", ""]
         client = None
         last_exc = None
-        for _sess_try, _sess_val in enumerate(_session_candidates, 1):
+        for _try, _sess_val in enumerate(ladder, 1):
+            if _sess_val and _sess_val == env_session:
+                _tag = "env"
+            elif _sess_val:
+                _tag = "сохранённая"
+            else:
+                _tag = "чистая"
             try:
-                sess = _StringSession(_sess_val)
                 client = _TGClient(
-                    sess, _TELEGRAM_API_ID, _TELEGRAM_API_HASH,
+                    _StringSession(_sess_val), _TELEGRAM_API_ID, _TELEGRAM_API_HASH,
                     device_model="DEVORKS+ Bot", system_version="Linux",
                     app_version="14.0", flood_sleep_threshold=120,
                 )
-                await client.connect()
+                try:
+                    await asyncio.wait_for(client.connect(), timeout=45)
+                except asyncio.TimeoutError:
+                    raise RuntimeError(
+                        "подключение к Telegram не за 45 с (сеть сервера?)")
                 if not await client.is_user_authorized():
-                    await client.start(bot_token=BOT_TOKEN)
+                    try:
+                        await asyncio.wait_for(
+                            client.sign_in(bot_token=BOT_TOKEN), timeout=60)
+                    except asyncio.TimeoutError:
+                        raise RuntimeError(
+                            "авторизация бота не прошла за 60 с")
+                try:
+                    _me = await asyncio.wait_for(client.get_me(), timeout=30)
+                    logger.info("mtproto: бот авторизован как "
+                                f"@{getattr(_me, 'username', '?')}")
+                except Exception as _me_err:
+                    logger.warning(f"mtproto: get_me не ответила ({_me_err}) "
+                                   "— не критично")
                 _MT_CLIENT = client
+                try:
+                    _mt_save_session(str(client.session.save() or ""))
+                except Exception as _se:
+                    logger.warning(f"mtproto: сессию не запомнил ({_se})")
                 _dvf2_tmp_sweep()
                 _MT_LAST_ERR = ""
-                logger.info("mtproto: клиент поднялся — файлы до 2 ГБ доступны"
-                            + (f" (попытка {_sess_try}: чистая сессия)"
-                               if _sess_val == "" and env_session else ""))
+                logger.info(f"mtproto: клиент поднялся (попытка {_try}, "
+                            f"сессия {_tag}) — файлы до 2 ГБ доступны")
                 return _MT_CLIENT
-            except Exception as e:
-                last_exc = e
-                logger.error(f"mtproto: клиент не поднялся "
-                             f"(попытка {_sess_try}/2, сессия="
-                             f"{'env' if _sess_val else 'чистая'}): {e}")
+            except _FloodWaitError as fw:
+                _fw_s = int(getattr(fw, "seconds", 0) or 0)
+                _wait_s = min(max(_fw_s, 10), 120)
+                logger.error(f"mtproto: FLOOD_WAIT {_fw_s}с при поднятии "
+                             f"клиента (попытка {_try}/{len(ladder)}) — "
+                             f"жду {_wait_s}с и пробую дальше")
+                _MT_LAST_ERR = (f"Telegram просит паузу {_fw_s}с на "
+                                "авторизацию MTProto (слишком много новых "
+                                "сессий подряд) — повторите через пару минут")
                 if client is not None:
                     try:
                         await client.disconnect()
                     except Exception:
                         pass
                     client = None
-                if _sess_try < len(_session_candidates):
+                await asyncio.sleep(_wait_s + 2)
+            except Exception as e:
+                last_exc = e
+                logger.error(f"mtproto: клиент не поднялся "
+                             f"(попытка {_try}/{len(ladder)}, сессия {_tag}): "
+                             f"{e!r}")
+                _MT_LAST_ERR = (f"клиент MTProto не смог подключиться к "
+                                f"Telegram ({e!r})")
+                if client is not None:
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
+                    client = None
+                if _try < len(ladder):
                     await asyncio.sleep(2)  # сразу рвать соединение не стоит
-        _MT_LAST_ERR = (f"клиент MTProto не смог подключиться к Telegram "
-                        f"({last_exc!r}) — повторите попытку через минуту; "
-                        "если повторяется — проверьте сеть сервера")
+        if not _MT_LAST_ERR:
+            _MT_LAST_ERR = (f"клиент MTProto не смог подключиться "
+                            f"({last_exc!r})")
         return None
+
+
+_MT_KEEPALIVE_TASK = None
+
+
+def _mt_keepalive_kick():
+    """ВОЛНА 20: фоновый догрев MTProto из единого тикера (каждые 30 с).
+    Если клиент ещё не поднят — запускает поднятие В ФОНЕ (не блокируя
+    тикер: FloodWait-паузы внутри фоновой задачи, а не в тике). Благодаря
+    сохранённой на диске сессии догрев почти всегда мгновенный и без новых
+    авторизаций; когда клиент уже поднят — функция ничего не делает."""
+    global _MT_KEEPALIVE_TASK
+    if not _TELETHON_OK or not BOT_TOKEN:
+        return
+    if _MT_CLIENT is not None:
+        return
+    _t = _MT_KEEPALIVE_TASK
+    if _t is not None and not _t.done():
+        return  # предыдущий догрев ещё работает — не плодим задачи
+    _MT_KEEPALIVE_TASK = asyncio.ensure_future(_mt_keepalive_bg())
+
+
+async def _mt_keepalive_bg():
+    try:
+        await _mt_client()
+    except Exception as e:
+        logger.warning(f"mtproto: фоновый догрев не удался ({e})")
 
 
 async def _mt_warmup():
@@ -8302,7 +8408,7 @@ async def _mt_warmup():
     try:
         client = await _mt_client()
         if client is None:
-            logger.info("mtproto: прогрев пропущен (нет Telethon/BOT_TOKEN)")
+            logger.info(f"mtproto: прогрев пропущен ({_mt_unavailable_reason()})")
             return
         _dlg_ok = True
         try:
@@ -8903,9 +9009,13 @@ def _vault_fail_reason(e):
         s = ("Telegram не дал боту доступ к источнику файла — пришлите файл "
              "ещё раз (обычно помогает сразу)")
     elif "mtproto недоступен" in low:
-        s = ("потоковый режим больших файлов сейчас недоступен на сервере "
-             "(не поднялся MTProto-клиент) — повторите через минуту или "
-             "пересоберите деплой из нового zip")
+        # ВОЛНА 20: ветка оставлена только для старых формулировок; новый
+        # текст «потоковый режим… : <причина>» уже читаемый — пройдёт как есть.
+        s = ("потоковый режим больших файлов сейчас недоступен на сервере — "
+             "точная причина указана ботом рядом; повторите через минуту")
+    elif "потоковый режим больших файлов" in low:
+        # ВОЛНА 20: уже читаемый текст — НЕ маскируем, показываем как есть.
+        return s[:220]
     elif "файл исчез" in low or "message_id_invalid" in low:
         s = "файл исчез из чата (сообщение удалено?) — пришлите его ещё раз"
     elif "источник файла потерян" in low:
@@ -8919,7 +9029,7 @@ def _vault_fail_reason(e):
           or "контейнер" in low or "channel" in low and "invalid" in low):
         s = ("канал-хранилище не принял шифр — проверьте, что бот "
              "администратор канала, и попробуйте ещё раз")
-    return s[:160]
+    return s[:220]
 
 
 async def _vault_botapi_download(context, file_id):
@@ -9077,9 +9187,11 @@ async def _vault_seal_item_mtproto_once(msg, context, user, item, password,
                 logger.warning(f"vault put: Bot API-скачивание не удалось: {e}")
         if botapi_payload is None:
             if client is None:
-                # ВОЛНА 19: честная причина вместо безликой формулировки.
+                # ВОЛНА 19/20: читаемый текст с ЧЕСТНОЙ причиной — он идёт
+                # пользователю как есть (без маскировки в _vault_fail_reason).
                 raise RuntimeError(
-                    f"MTProto недоступен ({_mt_unavailable_reason()})"
+                    "потоковый режим больших файлов сейчас недоступен на "
+                    f"сервере: {_mt_unavailable_reason()}"
                     + ("" if small else
                        " — файл больше 20 МБ, без потока его не взять; "
                        "повторите позже или пришлите файл заново"))
@@ -25065,6 +25177,13 @@ async def _unified_notification_tick_locked(context):
         await _tick_send_timers(bot)
     except Exception as e:
         logger.error(f"unified_tick: timers crashed: {e}")
+
+    # 1-минус) ВОЛНА 20: фоновый догрев MTProto (не блокирует тик — задача
+    # в фоне; если клиент уже поднят или Telethon нет — мгновенный выход).
+    try:
+        _mt_keepalive_kick()
+    except Exception as e:
+        logger.warning(f"unified_tick: mt keepalive не запущен: {e}")
 
     # 1a) Авто-бэкап базы в приватный канал-хранилище (раз в день).
     try:
