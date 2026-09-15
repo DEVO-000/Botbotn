@@ -7162,6 +7162,400 @@ async def _storage_channel_post_handler(update: Update, context: ContextTypes.DE
 
 
 # ==================================
+# === БАЗА В ЛИЧКЕ (волна 15) ===
+# ==================================
+# Просьба пользователя: «бот ничего не помнит — лучше я загружу в него
+# файл, который он давал в прошлый раз, последний с базой данных».
+# До волны 15 снапшот базы принимался только ПОСТОМ В КАНАЛ (волна 13).
+# Теперь:
+#   1) кнопка «💾 Снапшот базы мне в личку» (панель разработчика) отдаёт
+#      пользователю САМ файл базы — его можно хранить где угодно;
+#   2) этот файл можно просто ОТПРАВИТЬ БОТУ В ЛИЧКУ из любого состояния —
+#      бот подтвердит, применит базу (latest-wins), скопирует файл в
+#      канал-хранилище, ЗАКРЕПИТ его и сотрёт старые снапшоты — после
+#      рестарта бот вспомнит всё именно из этого закрепа.
+# Фильтр-перехватчик зарегистрирован ПЕРЕД ConversationHandler (группа 0):
+# снапшот не попадает ни в Сейф, ни в облако, ни в старое восстановление
+# панели — двойной обработки нет; кнопки подтверждения живут вне FSM и
+# работают даже когда состояние разговора потеряно после рестарта.
+
+class _CdbSnapshotDocFilter(filters.MessageFilter):
+    """True только для ДОКУМЕНТА-снапшота базы (devorks_db_snapshot_…).
+
+    На остальные документы фильтр НЕ срабатывает — они идут дальше по
+    обычным маршрутам (Сейф, облако, панель). Группа чата проверяется
+    отдельно в регистрационной строке (filters.ChatType.PRIVATE)."""
+
+    def __init__(self):
+        super().__init__()
+        self.name = "CdbSnapshotDocFilter"
+
+    def filter(self, message):
+        doc = getattr(message, "document", None)
+        if doc is None:
+            return False
+        fname = str(getattr(doc, "file_name", "") or "")
+        return fname.startswith(CDB_SNAPSHOT_PREFIX)
+
+
+_CDB_SNAPSHOT_DOC_FILTER = _CdbSnapshotDocFilter()
+
+
+async def _cdb_private_doc_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 15: файл базы отправлен боту В ЛИЧКУ — предложение восстановления.
+
+    • Не разработчик → честный отказ: в снапшоте база ВСЕХ пользователей,
+      восстановление по нему меняет данные каждого — это право разработчика.
+    • Больше 20 МБ → честный отказ (Bot API не даёт ботам скачивать такие
+      файлы; снапшоты DEVORKS+ такими не бывают — файл чужой/битый).
+    • Иначе — сохраняем указатель файла в user_data и показываем кнопки
+      [✅ Восстановить][❌ Отмена]. Само восстановление — по нажатию «Да»
+      (_cdb_private_restore_cb): файл скачивается ТОГДА, поэтому между
+      «отправил файл» и «нажал Да» может пройти сколько угодно времени."""
+    msg = getattr(update, "effective_message", None)
+    if msg is None:
+        return
+    doc = getattr(msg, "document", None)
+    if doc is None:
+        return
+    fname = str(getattr(doc, "file_name", "") or "")
+    _from = getattr(msg, "from_user", None)
+    uid = str(getattr(_from, "id", "") or "")
+    if uid != str(DEVELOPER_ID):
+        try:
+            await msg.reply_text(
+                "🔒 Это системный архив базы данных DEVORKS+: внутри данные "
+                "ВСЕХ пользователей. Восстановление из него доступно только "
+                "разработчику бота.")
+        except Exception:
+            pass
+        return
+    fsize = int(getattr(doc, "file_size", 0) or 0)
+    if fsize > 20 * 1024 * 1024:
+        try:
+            await msg.reply_text(
+                f"❌ «{fname}» ({_fmt_bytes(fsize)}) больше 20 МБ — Telegram "
+                "не даёт ботам скачивать такие файлы. Снапшоты, сделанные "
+                "этим ботом, такими не бывают: проверьте, тот ли это файл.")
+        except Exception:
+            pass
+        return
+    context.user_data["cdb_rst_pending"] = {
+        "file_id": str(getattr(doc, "file_id", "") or ""),
+        "fname": fname,
+        "size": fsize,
+        "msg_id": int(getattr(msg, "message_id", 0) or 0),
+        "chat_id": int(getattr(msg, "chat_id", 0) or 0),
+    }
+    try:
+        await msg.reply_text(
+            "♻️ Это ФАЙЛ БАЗЫ ДАННЫХ DEVORKS+.\n\n"
+            f"«{fname}» • {_fmt_bytes(fsize)}\n\n"
+            "По «✅ Восстановить» бот:\n"
+            "• заменит текущую базу данными из файла — по правилу «последний "
+            "актуальный побеждает»: свежую базу старым файлом не откатить;\n"
+            "• скопирует файл в канал-хранилище, ЗАКРЕПИТ его и сотрёт "
+            "старые снапшоты — после рестарта бот вспомнит всё из закрепа.\n\n"
+            "Продолжить?",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Восстановить", callback_data="cdb_rst_yes"),
+                InlineKeyboardButton("❌ Отмена", callback_data="cdb_rst_no"),
+            ]]))
+    except Exception:
+        pass
+
+
+async def _cdb_private_restore_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 15: «✅ Восстановить» под файлом базы, присланным в личку.
+
+    Полностью повторяет правила волны 13 (_cdb_ingest_post), но источник —
+    личный чат, а закреп делается в НАСТРОЕННЫХ db-каналах (после применения
+    снапшота конфиг перечитывается: список каналов сам приезжает из файла):
+      1) скачать (≤20 МБ) и проверить _meta.json → штамп created_utc;
+      2) latest-wins: штамп НЕ новее cdb_last_flush → честный отказ (откат
+         свежей базы старым файлом невозможен);
+      3) применить базу (_storage_restore_apply) под flush-локом;
+      4) в КАЖДЫЙ db-канал: серверная копия файла (copy_message — без
+         повторной загрузки), unpin_all + pin, стирание старых снапшотов;
+      5) реестр cdb_registry/cdb_sent/cdb_last_flush → storage_config.json;
+      6) отчёт пользователю (и разработчику, если это разные люди)."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    if str(query.from_user.id) != str(DEVELOPER_ID):
+        try:
+            await query.edit_message_text("Доступ запрещён.")
+        except Exception:
+            pass
+        return
+    pend = dict((context.user_data or {}).get("cdb_rst_pending") or {})
+    if query.data == "cdb_rst_no":
+        context.user_data.pop("cdb_rst_pending", None)
+        try:
+            await query.edit_message_text(
+                "❌ Отменено: файл проигнорирован, ничего не менялось.")
+        except Exception:
+            pass
+        return
+    # === «Да» ===
+    if not pend or not pend.get("file_id"):
+        try:
+            await query.answer(
+                "Не нашёл файл в памяти (перезапуск?). Отправьте файл базы "
+                "ещё раз — и нажмите «Восстановить».", show_alert=True)
+        except Exception:
+            pass
+        return
+    _src_chat = int(pend.get("chat_id") or 0) or int(query.message.chat_id)
+    _src_msg = int(pend.get("msg_id") or 0)
+    fname = str(pend.get("fname") or CDB_SNAPSHOT_PREFIX)
+    payload = None
+    try:
+        tg_file = await context.bot.get_file(str(pend.get("file_id")))
+        buf = io.BytesIO()
+        await asyncio.wait_for(tg_file.download_to_memory(out=buf), timeout=300)
+        payload = buf.getvalue()
+    except Exception as e:
+        logger.error(f"cdb private restore: скачать «{fname}» не удалось: {e}")
+        context.user_data.pop("cdb_rst_pending", None)
+        try:
+            await query.edit_message_text(f"❌ Не удалось скачать файл: {e}")
+        except Exception:
+            pass
+        return
+    # Верификация: наш zip с _meta.json + штамп времени.
+    verified, stamp = False, ""
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(payload))
+        if "_meta.json" not in zf.namelist():
+            raise ValueError("нет _meta.json")
+        try:
+            stamp = str(json.loads(
+                zf.read("_meta.json").decode("utf-8")
+            ).get("created_utc") or "")
+        except Exception:
+            stamp = ""
+        zf.close()
+        verified = True
+    except Exception as e:
+        context.user_data.pop("cdb_rst_pending", None)
+        try:
+            await query.edit_message_text(
+                f"❌ Файл «{fname}» — это НЕ снапшот DEVORKS+ (битый или "
+                f"чужой zip: {e}). Ничего не применял и не закреплял.")
+        except Exception:
+            pass
+        return
+    if not verified:
+        return
+    _notes = []
+    try:
+        async with _get_cdb_flush_lock():
+            cfg = load_storage_config()
+            last = str(cfg.get("cdb_last_flush") or "")
+            if stamp and last and stamp <= last:
+                context.user_data.pop("cdb_rst_pending", None)
+                try:
+                    await query.edit_message_text(
+                        f"ℹ️ Файл «{fname}» (штамп {stamp}) НЕ применён: он НЕ "
+                        f"новее текущей базы ({last}). Правило «последний "
+                        "актуальный побеждает»: откатывать свежие данные "
+                        "старым файлом нельзя.")
+                except Exception:
+                    pass
+                return
+            restored, problems = _storage_restore_apply(payload)
+            if not restored:
+                try:
+                    await query.edit_message_text(
+                        "❌ Из файла «" + fname + "» ничего не восстановлено"
+                        + (": " + "; ".join(problems[:3]) if problems else "."))
+                except Exception:
+                    pass
+                return
+            _CDB_DIRTY.clear()  # данные только что из файла — заливать обратно нечего
+            cfg = load_storage_config()  # ПОСЛЕ apply: каналы могли приехать из снапшота
+            db_ids = get_db_channel_ids()
+            pinned_ch, fail_ch, pruned_n = [], [], 0
+            reg = dict(cfg.get("cdb_registry") or {})
+            sent = dict(cfg.get("cdb_sent") or {})
+            for ch in db_ids:
+                new_msg_id = 0
+                try:
+                    _copy = await context.bot.copy_message(
+                        chat_id=int(ch), from_chat_id=_src_chat,
+                        message_id=_src_msg,
+                    )
+                    new_msg_id = int(getattr(_copy, "message_id", 0) or 0)
+                except Exception as e:
+                    logger.error(f"cdb private restore: копия в {ch} не удалась: {e}")
+                    fail_ch.append(f"{ch}: копия не удалась")
+                    continue
+                try:
+                    await context.bot.unpin_all_chat_messages(chat_id=int(ch))
+                except Exception as e:
+                    logger.warning(f"cdb private restore: unpin_all {ch}: {e}")
+                try:
+                    await context.bot.pin_chat_message(
+                        chat_id=int(ch), message_id=new_msg_id,
+                        disable_notification=True,
+                    )
+                    pinned_ch.append(int(ch))
+                except Exception as e:
+                    logger.error(f"cdb private restore: pin в {ch} НЕ УДАЛСЯ: {e}")
+                    _notes.append(
+                        f"НЕ удалось ЗАКРЕПИТЬ в канале {ch} — при старте бот "
+                        "его не прочитает. Проверьте право бота на закрепление.")
+                # Чистка СТАРЫХ снапшотов канала (правило: один актуальный).
+                _old_ids = []
+                for _v in (sent.get(str(ch)) or []):
+                    try:
+                        _iv = int(_v)
+                    except (TypeError, ValueError):
+                        continue
+                    if _iv not in _old_ids:
+                        _old_ids.append(_iv)
+                _prev = (reg.get(str(ch)) or {}).get("msg_id")
+                try:
+                    _prev = int(_prev)
+                    if _prev and _prev not in _old_ids:
+                        _old_ids.append(_prev)
+                except (TypeError, ValueError):
+                    pass
+                for _old in _old_ids:
+                    if int(_old) == int(new_msg_id):
+                        continue
+                    try:
+                        await context.bot.delete_message(
+                            chat_id=int(ch), message_id=int(_old))
+                        pruned_n += 1
+                    except Exception:
+                        pass
+                reg[str(ch)] = {
+                    "msg_id": int(new_msg_id),
+                    "file_id": str(pend.get("file_id") or ""),
+                    "ts": stamp,
+                    "size": len(payload),
+                }
+                sent[str(ch)] = [int(new_msg_id)]
+            if stamp:
+                cfg["cdb_last_flush"] = stamp
+            cfg["cdb_registry"] = reg
+            cfg["cdb_sent"] = sent
+            save_storage_config(cfg)
+    except Exception as e:
+        logger.error(f"cdb private restore crashed: {e}")
+        try:
+            await query.edit_message_text(
+                f"❌ Восстановление не удалось (внутренняя ошибка): {e}")
+        except Exception:
+            pass
+        return
+    context.user_data.pop("cdb_rst_pending", None)
+    # Отчёт пользователю (он же разработчик) — подробный и честный.
+    _rep = (
+        f"✅ БАЗА ВОССТАНОВЛЕНА ИЗ ФАЙЛА: {fname}\n"
+        f"• штамп снапшота: {stamp or '?'}\n"
+        f"• файлов данных восстановлено: {len(restored)}\n"
+        f"• закреплено в каналах: {len(pinned_ch)}"
+        + (f" ({', '.join(str(c) for c in pinned_ch)})" if pinned_ch else "")
+        + (f"\n• 🧹 старых снапшотов стёрто: {pruned_n}" if pruned_n else "")
+    )
+    if problems:
+        _rep += f"\n⚠️ Проблемы: {'; '.join(problems[:3])}"
+    if fail_ch:
+        _rep += ("\n⚠️ Не удалось скопировать файл в: " + "; ".join(fail_ch[:3])
+                 + " — данные восстановлены, но в этих каналах остался старый закреп.")
+    if not db_ids and not fail_ch:
+        _rep += ("\nℹ️ Каналов-хранилищ нет: база восстановлена в память бота. "
+                 "Подключите канал (Панель разработчика → Хранилище), чтобы "
+                 "переживать рестарты, и пришлите файл базы ещё раз — "
+                 "закреплю его там.")
+    for _n in _notes:
+        _rep += f"\n⚠️ {_n}"
+    try:
+        await query.edit_message_text(_rep[:3500])
+    except Exception:
+        pass
+    try:
+        if DEVELOPER_ID and str(query.from_user.id) != str(DEVELOPER_ID):
+            await context.bot.send_message(
+                chat_id=int(str(DEVELOPER_ID).strip()), text=_rep[:3500])
+    except Exception:
+        pass
+
+
+async def dev_cdb_export_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 15: кнопка «💾 Снапшот базы мне в личку» — файл базы ПОЛЬЗОВАТЕЛЮ.
+
+    Тот же zip, что уходит в канал (_storage_pack_payload + _meta.json со
+    штампом), но он отправляется в личный чат разработчика: сохраните файл —
+    и даже если бот полностью забудет всё, вы просто отправите этот файл ему
+    в чат, и всё вернётся (см. _cdb_private_doc_handler)."""
+    query = update.callback_query
+    try:
+        await query.answer("Собираю снапшот…", show_alert=False)
+    except Exception:
+        pass
+    if str(query.from_user.id) != str(DEVELOPER_ID):
+        try:
+            await query.edit_message_text("Доступ запрещён.")
+        except Exception:
+            pass
+        return
+    payload, meta, files_n = _storage_pack_payload()
+    if not payload:
+        try:
+            await query.answer("Нет данных для снапшота.", show_alert=True)
+        except Exception:
+            pass
+        return
+    if len(payload) > STORAGE_MAX_FILE_BYTES:
+        try:
+            await query.answer(
+                "Снапшот больше 49 МБ — Telegram не даст отправить его "
+                "файлом. Берите актуальный из закрепа канала-хранилища.",
+                show_alert=True)
+        except Exception:
+            pass
+        return
+    stamp = _utcnow().strftime("%Y-%m-%d_%H-%M-%S")
+    fname = f"{CDB_SNAPSHOT_PREFIX}_{stamp}.zip"
+    caption = (
+        f"💾 DEVORKS+ база данных • штамп {stamp} • юзеров "
+        f"{meta.get('users', 0)}, классов {meta.get('classes', 0)}, "
+        f"файлов {files_n} • {_fmt_bytes(len(payload))}\n\n"
+        "СОХРАНИ ЭТОТ ФАЙЛ (он же уходит в канал-хранилище закрепом).\n"
+        "Если бот забудет всё — просто ОТПРАВЬ ЭТОТ ФАЙЛ ЕМУ В ЧАТ: бот "
+        "восстановит базу, закрепит её в канале и вспомнит всё."
+    )
+    try:
+        await context.bot.send_document(
+            chat_id=int(query.from_user.id),
+            document=InputFile(payload, filename=fname),
+            caption=caption[:1024],
+        )
+    except Exception as e:
+        logger.error(f"dev cdb export: не удалось отправить снапшот: {e}")
+        try:
+            await query.answer(f"❌ Не удалось отправить файл: {e}", show_alert=True)
+        except Exception:
+            pass
+        return
+    try:
+        cfg = load_storage_config()
+        await query.edit_message_text(
+            "✅ Снапшот базы отправил тебе в личку (выше). Сохрани его: "
+            "отправь этот файл боту в чат в любой момент — и всё "
+            "восстановится.\n\n" + _storage_dev_status_text(cfg),
+            reply_markup=get_storage_dev_keyboard(cfg))
+    except Exception:
+        pass
+
+
+# ==================================
 # === СЕЙФ (🔐 zero-knowledge) ===
 # ==================================
 # НОВОЕ (волна 7) по запросу пользователя: файлы (текст, фото, видео,
@@ -10499,6 +10893,9 @@ def get_storage_dev_keyboard(cfg=None):
         [InlineKeyboardButton("💾 Слить базу в канал сейчас", callback_data="dev_cdb_sync")],
         # ВОЛНА 10: «вспомнить всё» — вытянуть самую свежую базу из канала.
         [InlineKeyboardButton("📦 Вспомнить всё из канала", callback_data="dev_cdb_recall")],
+        # ВОЛНА 15: файл базы — в личку разработчика: хранить где угодно,
+        # потом просто отправить файл боту в чат — всё восстановится.
+        [InlineKeyboardButton("💾 Снапшот базы мне в личку", callback_data="dev_cdb_export")],
         [InlineKeyboardButton(auto, callback_data="dev_storage_toggle")],
         [InlineKeyboardButton("📦 Бэкап сейчас", callback_data="dev_storage_backup")],
         [InlineKeyboardButton("♻️ Восстановить из бэкапа", callback_data="dev_storage_restore")],
@@ -10548,6 +10945,10 @@ def _storage_dev_status_text(cfg):
         lines.append("   💡 Можно и просто перекинуть файл снапшота (devorks_db_snapshot_…)")
         lines.append("   ПРЯМО В КАНАЛ — бот возьмёт ПОСЛЕДНИЙ актуальный, применит базу,")
         lines.append("   сам его ЗАКРЕПИТ и сотрёт старые снапшоты (дубли не плодятся).")
+        # ВОЛНА 15: путь «файл базы у меня в телефоне — отправлю боту в чат».
+        lines.append("   💡 ВОЛНА 15: кнопка «💾 Снапшот базы мне в личку» отдаст файл ТЕБЕ:")
+        lines.append("   отправь его боту В ЧАТ в любой момент — применит базу, ЗАКРЕПИТ")
+        lines.append("   в канале и сотрёт старые (правило «последний актуальный побеждает»).")
     else:
         lines.append("")
         lines.append("🗄️ База в канале: ВЫКЛ (данные только на сервере/Supabase).")
@@ -11158,7 +11559,9 @@ async def dev_storage_restore_file_start(update: Update, context: ContextTypes.D
         "📤 Отправьте сюда ФАЙЛОМ бэкап:\n"
         "• zip-архив из канала-хранилища (devorks_backup_ГГГГ-ММ-ДД.zip), ИЛИ\n"
         "• одиночный json-файл данных (users.json и т. п.).\n\n"
-        "Файл лежит в приватном канале — скачайте его оттуда и пришлите сюда."
+        "Файл лежит в приватном канале — скачайте его оттуда и пришлите сюда.\n\n"
+        "ℹ️ Снапшоты devorks_db_snapshot_… сюда присылать не нужно: отправьте\n"
+        "их просто в чат — бот сам предложит восстановление и закрепит в канале."
     )
     return DEV_STORAGE_RESTORE
 
@@ -25434,6 +25837,19 @@ def main():
         logger.info(f"Глобальная отмена инжектирована в {_n} состояний.")
     except Exception as e:
         logger.error(f"Не удалось инжектировать глобальную отмену: {e}")
+
+    # ВОЛНА 15: файл базы (devorks_db_snapshot_…), отправленный боту В ЛИЧКУ, —
+    # перехват ДО ConversationHandler (та же группа 0, порядок решает): снапшот
+    # не попадает в Сейф/облако/старое восстановление панели. Кнопки
+    # подтверждения (cdb_rst_yes/no) и выдача снапшота (dev_cdb_export) тоже
+    # живут вне FSM — работают из любого состояния и после потери состояния.
+    application.add_handler(CallbackQueryHandler(
+        _cdb_private_restore_cb, pattern="^cdb_rst_(yes|no)$"))
+    application.add_handler(CallbackQueryHandler(
+        dev_cdb_export_cb, pattern="^dev_cdb_export$"))
+    application.add_handler(MessageHandler(
+        _CDB_SNAPSHOT_DOC_FILTER & filters.ChatType.PRIVATE,
+        _cdb_private_doc_handler))
 
     application.add_handler(conv_handler)
 
