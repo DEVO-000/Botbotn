@@ -8240,17 +8240,39 @@ async def _mt_warmup():
     """ВОЛНА 16: прогрев MTProto при старте — клиент поднимается ЗАРАНЕЕ
     (а не при первом файле >20 МБ) и строит кэш сущностей. После рестарта
     Render большие файлы (до 2 ГБ) работают сразу. Любая ошибка — не
-    критична: режим остаётся ленивым и повторит попытку при операции."""
+    критична: режим остаётся ленивым и повторит попытку при операции.
+    ВОЛНА 18: get_dialogs ботам Telegram НЕ разрешает (user-only API) —
+    это было пустышкой; вместо неё честно прогреваем кэш КАНАЛОВ-хранилищ
+    (get_messages с hash=0 ботам разрешён и кэширует access_hash)."""
     try:
         client = await _mt_client()
         if client is None:
             logger.info("mtproto: прогрев пропущен (нет Telethon/BOT_TOKEN)")
             return
+        _dlg_ok = True
         try:
             await client.get_dialogs(limit=100)
+        except Exception:
+            _dlg_ok = False  # для бота это норма, а не сбой
+        _ok_ch = _all_ch = 0
+        _cl = list(get_cloud_channel_ids() or [])
+        for _c in (get_db_channel_ids() or []):
+            if _c not in _cl:
+                _cl.append(_c)
+        for ch in _cl:
+            _all_ch += 1
+            try:
+                await client.get_messages(_mt_peer_channel(ch), limit=1)
+                _ok_ch += 1
+            except Exception:
+                pass
+        if _dlg_ok:
             logger.info("mtproto: прогрев готов — большие файлы до 2 ГБ доступны")
-        except Exception as e:
-            logger.warning(f"mtproto: прогрев кэша не удался (не критично): {e}")
+        elif _all_ch:
+            logger.info(f"mtproto: прогрев готов (каналы {_ok_ch}/{_all_ch}) — "
+                        "большие файлы до 2 ГБ доступны")
+        else:
+            logger.info("mtproto: клиент поднят — большие файлы до 2 ГБ доступны")
     except Exception as e:
         logger.warning(f"mtproto: прогрев не удался (не критично): {e}")
 
@@ -8263,10 +8285,11 @@ def _mt_peer_channel(ch_id):
     return _InputPeerChannel(raw, 0)
 
 
-def _mt_peer_user(user_id):
+def _mt_peer_user(user_id, access_hash=0):
     """InputPeerUser для личного чата. Для ботов Telegram принимает
-    access_hash=0 от пользователей, которые писали боту."""
-    return _InputPeerUser(int(user_id), 0)
+    access_hash=0 от пользователей, которые писали боту; ВОЛНА 18 — можно
+    передать и НАСТОЯЩИЙ access_hash (запомненный при приёме файла)."""
+    return _InputPeerUser(int(user_id), int(access_hash or 0))
 
 
 def _dvf2_tmp_dir():
@@ -8601,11 +8624,66 @@ async def _mt_resolve_peer(client, peer_id):
             "через минуту (кэш прогреется сам)")
 
 
-async def _mt_fetch_document(client, peer_id, msg_id):
+async def _mt_resolve_peer_ah(client, peer_id):
+    """ВОЛНА 18: (peer, access_hash) для ЛИЧНОГО чата — не бросает.
+    peer=None, если сущность не найдена; access_hash=0, если неизвестен.
+    Нужен прогреву при приёме большого файла: access_hash запоминается в
+    элементе пачки и используется при шифровании, даже если кэш сессии
+    к тому моменту потеряется."""
+    pid = int(peer_id)
+    for _attempt in (0, 1):
+        try:
+            peer = await client.get_input_entity(pid)
+            return peer, int(getattr(peer, "access_hash", 0) or 0)
+        except Exception:
+            pass
+        if _attempt == 0:
+            try:
+                await client.get_dialogs(limit=200)
+            except Exception:
+                pass
+    return None, 0
+
+
+async def _mt_fetch_document(client, peer_id, msg_id, ah=0):
     """Достаёт сообщение (канал ИЛИ личный чат — волна 17) и его документ
-    (MTProto). Возвращает (message, document) или (message_or_None, None)."""
-    peer = await _mt_resolve_peer(client, peer_id)
-    return await _mt_fetch_document_peer(client, peer, msg_id)
+    (MTProto). Возвращает (message, document) или (message_or_None, None).
+    ВОЛНА 18: для ЛИЧНОГО чата цепочка peer'ов — кэш Telethon →
+    сохранённый access_hash (запомнен прогревом при приёме файла) → hash=0:
+    раньше холодный кэш после рестарта Render ронял загрузку Сейфа целиком
+    (get_dialogs ботам Telegram не разрешает, догреть кэш было нечем).
+    Исключение бросаем, только если упали ВСЕ попытки (сеть/права)."""
+    pid, mid = int(peer_id), int(msg_id)
+    if pid < 0:
+        peer = await _mt_resolve_channel(client, pid)
+        return await _mt_fetch_document_peer(client, peer, mid)
+    attempts, seen = [], set()
+    try:
+        peer = await client.get_input_entity(pid)
+        seen.add((pid, int(getattr(peer, "access_hash", 0) or 0)))
+        attempts.append(peer)
+    except Exception:
+        pass
+    if int(ah or 0) and (pid, int(ah)) not in seen:
+        seen.add((pid, int(ah)))
+        attempts.append(_mt_peer_user(pid, int(ah)))
+    if (pid, 0) not in seen:
+        attempts.append(_mt_peer_user(pid, 0))
+    if not attempts:
+        attempts.append(_mt_peer_user(pid, 0))
+    last_err, last_res = None, None
+    for peer in attempts:
+        try:
+            res = await _mt_fetch_document_peer(client, peer, mid)
+        except Exception as e:
+            last_err = e
+            continue
+        last_res = res
+        if res[1] is not None:
+            return res
+    if last_res is not None:
+        return last_res
+    raise RuntimeError(f"источник недоступен для MTProto ({last_err})")
 
 
 async def _mt_download_stream(client, doc, doc_size, sink, progress=None, title=""):
@@ -8754,6 +8832,99 @@ async def _mt_send_file_to_user(client, chat_id, path, size, caption,
         tick_task.cancel()
 
 
+def _vault_fail_reason(e):
+    """ВОЛНА 18: честная ПРИЧИНА сбоя для сообщения пользователю — раньше
+    он видел только «попробуйте ещё раз позже», а причина жила в логах
+    Render, которые пользователь всё равно не читает."""
+    try:
+        s = str(e or "").strip()
+    except Exception:
+        s = ""
+    if not s:
+        s = "неизвестная ошибка"
+    low = s.lower()
+    if ("личный чат не найден" in low or ("peer" in low and "invalid" in low)
+            or "источник недоступен" in low):
+        s = ("Telegram не дал боту доступ к источнику файла — пришлите файл "
+             "ещё раз (обычно помогает сразу)")
+    elif "файл исчез" in low or "message_id_invalid" in low:
+        s = "файл исчез из чата (сообщение удалено?) — пришлите его ещё раз"
+    elif "источник файла потерян" in low:
+        s = "источник файла потерян — пришлите файл ещё раз"
+    elif "мало свободного места" in low:
+        s = "мало свободного места на диске сервера — место освобождается после перезапуска бота"
+    elif ("floodwait" in low or "паузу" in low
+          or "too many requests" in low or "flood" in low):
+        s = "Telegram просит паузу (слишком много запросов) — попробуйте через пару минут"
+    elif ("не принят" in low or "не удалось загрузить" in low
+          or "контейнер" in low or "channel" in low and "invalid" in low):
+        s = ("канал-хранилище не принял шифр — проверьте, что бот "
+             "администратор канала, и попробуйте ещё раз")
+    return s[:160]
+
+
+async def _vault_botapi_download(context, file_id):
+    """ВОЛНА 18: скачивание ОРИГИНАЛА через Bot API (≤20 МБ) — запасной путь,
+    когда MTProto не смог открыть источник (холодный кэш после рестарта и т.
+    п.). Возвращает bytes; при сбое бросает исключение."""
+    tg_file = await context.bot.get_file(file_id)
+    buf = io.BytesIO()
+    await asyncio.wait_for(tg_file.download_to_memory(out=buf), timeout=300)
+    return buf.getvalue()
+
+
+async def _vault_mt_precheck(context, item, ack_msg=None):
+    """ВОЛНА 18: ранний прогрев источника БОЛЬШОГО файла — фоном, ПОКА
+    пользователь называет файлы и вводит пароль. Проверяет, что MTProto уже
+    видит сообщение с файлом, и запоминает access_hash в элементе пачки.
+    Раньше всё это впервые происходило ПОСЛЕ «✅ Готово» — холодный кэш
+    сущностей после рестарта Render ронял шифрование, и пользователь узнавал
+    об этом только в конце. Если файл не виден — честно правим ack-сообщение
+    с предупреждением. Ошибки не критичны: при шифровании будут повторные
+    попытки и запасной путь через file_id."""
+    try:
+        client = await _mt_client()
+        if client is None:
+            return
+        mt = dict(item.get("mt_raw") or {})
+        pid = int(mt.get("peer_id") or mt.get("channel_id") or 0)
+        mid = int(mt.get("msg_id") or 0)
+        if not pid or not mid:
+            return
+        peer, ah = (None, 0)
+        if pid > 0:
+            peer, ah = await _mt_resolve_peer_ah(client, pid)
+            if peer is None:
+                peer = _mt_peer_user(pid)
+        else:
+            peer = await _mt_resolve_channel(client, pid)
+        m = await _mt_run_with_flood(lambda: client.get_messages(peer, ids=mid))
+        doc = None
+        if m is not None:
+            doc = getattr(m, "document", None) or getattr(m, "photo", None)
+        if doc is not None:
+            item["mt_ok"] = True
+            if ah:
+                mt["ah"] = int(ah)
+                item["mt_raw"] = mt
+        elif ack_msg is not None:
+            _txt = str(getattr(ack_msg, "text", "") or "")
+            if _txt:
+                try:
+                    await context.bot.edit_message_text(
+                        _txt + "\n\n⚠️ Большой файл: источник пока не виден "
+                        "режиму потока (кэш Telegram прогревается). Если после "
+                        "«✅ Готово» шифрование не удастся — просто пришлите "
+                        "файл ещё раз.",
+                        chat_id=ack_msg.chat_id,
+                        message_id=ack_msg.message_id,
+                    )
+                except Exception:
+                    pass
+    except Exception as e:
+        logger.info(f"vault precheck: источник пока не прогрет ({e})")
+
+
 async def _vault_seal_item_mtproto(msg, context, user, item, password,
                                    progress_msg, idx, total):
     """ВОЛНА 14/17: шифрует ОДИН большой файл. Источник — САМО сообщение
@@ -8763,7 +8934,27 @@ async def _vault_seal_item_mtproto(msg, context, user, item, password,
     контейнер в канал (≤49 МБ — Bot API, больше — MTProto) → при УСПЕХЕ
     оригинал стирается из личного чата и временные файлы удаляются.
     Возвращает запись user.vault_files; при сбое бросает исключение —
-    оригинал остаётся в чате, чтобы пользователь его не потерял."""
+    оригинал остаётся в чате, чтобы пользователь его не потерял.
+    ВОЛНА 18: ДВЕ попытки (сбои сети/кэша самоизлечиваются) + запасные пути:
+    file_id через Bot API (≤20 МБ) и заливка шифра MTProto, если Bot API
+    отказал. Причина сбоя — честная, для сообщения пользователю."""
+    last_err = None
+    for _attempt in (1, 2):
+        try:
+            return await _vault_seal_item_mtproto_once(
+                msg, context, user, item, password, progress_msg, idx, total)
+        except Exception as e:
+            last_err = e
+            logger.error(f"vault put: попытка {_attempt}/2 не удалась "
+                         f"({item.get('name')}): {e}")
+            if _attempt == 1:
+                await asyncio.sleep(5)  # холодный кэш/сеть часто отходят сами
+    raise last_err  # обе попытки упали — оригинал остаётся в чате
+
+
+async def _vault_seal_item_mtproto_once(msg, context, user, item, password,
+                                        progress_msg, idx, total):
+    """ВОЛНА 18: ОДНА попытка шифрования большого файла (обёртка повторяет)."""
     name = str(item.get("name") or "файл")
     kind = str(item.get("kind") or "document")
     mime = str(item.get("mime") or "")
@@ -8778,10 +8969,31 @@ async def _vault_seal_item_mtproto(msg, context, user, item, password,
     raw_mid = int(mt.get("msg_id") or 0)
     if not raw_ch or not raw_mid:
         raise RuntimeError("источник файла потерян — пришлите файл ещё раз")
-    _m, doc = await _mt_fetch_document(client, raw_ch, raw_mid)
+    # ВОЛНА 18: сначала MTProto (цепочка peer'ов: кэш → access_hash → hash=0),
+    # при полном провале и размере ≤20 МБ — запасное скачивание через Bot API
+    # по file_id (файл уже лежит в Telegram, Bot API умеет ≤20 МБ).
+    doc = None
+    mt_err = None
+    try:
+        _m, doc = await _mt_fetch_document(
+            client, raw_ch, raw_mid, int(mt.get("ah") or 0))
+    except Exception as e:
+        mt_err = e
+        logger.warning(f"vault put: MTProto-источник не открылся ({e}); "
+                       "пробую запасной путь Bot API/file_id")
+    botapi_payload = None
     if doc is None:
-        raise RuntimeError(
-            "файл исчез из чата (сообщение удалено?) — пришлите файл ещё раз")
+        fid = str(item.get("file_id") or "")
+        if fid and 0 < size <= VAULT_MAX_FILE_BYTES:
+            try:
+                botapi_payload = await _vault_botapi_download(context, fid)
+            except Exception as e:
+                logger.warning(f"vault put: Bot API-скачивание не удалось: {e}")
+        if botapi_payload is None:
+            if mt_err is not None:
+                raise mt_err
+            raise RuntimeError(
+                "файл исчез из чата (сообщение удалено?) — пришлите файл ещё раз")
     doc_size = int(getattr(doc, "size", 0) or size or 0)
     if not _dvf2_disk_ok(doc_size):
         raise RuntimeError("мало свободного места на диске сервера")
@@ -8798,34 +9010,44 @@ async def _vault_seal_item_mtproto(msg, context, user, item, password,
         prog = _ProgressEdit(
             context, progress_msg, f"📦 [{idx}/{total}] «{name}»: качаю и шифрую")
         try:
-            await _mt_download_stream(
-                client, doc, doc_size, enc.push, prog,
-                f"📦 [{idx}/{total}] «{name}»: качаю и шифрую")
-            enc_total = enc.finish()
+            if botapi_payload is not None:
+                # ВОЛНА 18: оригинал уже в памяти (Bot API) — шифруем сразу.
+                enc.push(botapi_payload)
+                enc_total = enc.finish()
+                botapi_payload = b""
+            else:
+                await _mt_download_stream(
+                    client, doc, doc_size, enc.push, prog,
+                    f"📦 [{idx}/{total}] «{name}»: качаю и шифрую")
+                enc_total = enc.finish()
         except Exception:
             enc.abort()
             raise
         await _ProgressEdit(context, progress_msg, "").edit(
             f"📦 [{idx}/{total}] «{name}»: заливаю шифр в канал…", force=True)
+        _vault_cap = "🔐 Сейф: зашифрованный файл (открыть без пароля невозможно)."
+        _vault_fn = f"vault_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{idx}.bin"
         if enc_total <= (49 * 1024 * 1024 - 1024 * 1024):
             with open(tmp_enc, "rb") as fh:
                 enc_bytes = fh.read()
             try:
                 up = await _storage_upload_document(
-                    context, enc_bytes,
-                    filename=f"vault_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{idx}.bin",
-                    caption="🔐 Сейф: зашифрованный файл (открыть без пароля невозможно).",
-                )
+                    context, enc_bytes, filename=_vault_fn, caption=_vault_cap)
             finally:
                 enc_bytes = b""
+            # ВОЛНА 18: Bot API отказал — шифр ≤48 МБ можно залить и MTProto.
+            if up is None and _TELETHON_OK and BOT_TOKEN:
+                up = await _mt_upload_container(
+                    client, tmp_enc, enc_total,
+                    caption=_vault_cap, filename=_vault_fn)
         else:
             up = await _mt_upload_container(
                 client, tmp_enc, enc_total,
-                caption="🔐 Сейф: зашифрованный файл (открыть без пароля невозможно).",
-                filename=f"vault_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{idx}.bin",
-            )
+                caption=_vault_cap, filename=_vault_fn)
         if up is None:
-            raise RuntimeError("контейнер не удалось загрузить в канал")
+            raise RuntimeError(
+                "шифр не принят каналом — проверьте, что бот администратор "
+                "канала-хранилища")
         rec = {
             "id": _vault_gen_id(user),
             "kind": kind, "mime": mime,
@@ -9709,6 +9931,9 @@ async def vault_put_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "mime": str(getattr(att, "mime_type", "") or ""),
             "size": fsize,
             "chat_msg_id": int(getattr(msg, "message_id", 0) or 0),  # ВОЛНА 11
+            # ВОЛНА 18: file_id — запасное скачивание ≤20 МБ через Bot API,
+            # если MTProto не откроет источник (холодный кэш после рестарта).
+            "file_id": str(getattr(att, "file_id", "") or ""),
             # ВОЛНА 17: источник — личный чат (peer_id > 0), НЕ канал.
             "mt_raw": {"peer_id": int(msg.chat_id),
                        "msg_id": int(getattr(msg, "message_id", 0) or 0)},
@@ -9724,6 +9949,18 @@ async def vault_put_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=_vault_put_kb(),
         )
         _vault_track_ack(context, _ack, user=user)
+        # ВОЛНА 18: ранний прогрев источника — фоном, ПОКА пользователь
+        # называет файлы и вводит пароль; access_hash запомнится заранее,
+        # и к моменту «✅ Готово» источник уже проверен.
+        try:
+            _ptask = asyncio.create_task(
+                _vault_mt_precheck(context, batch[-1], _ack))
+            _bd = getattr(getattr(context, "application", None),
+                          "bot_data", None)
+            if isinstance(_bd, dict):
+                _bd.setdefault("_bg_tasks", []).append(_ptask)
+        except Exception:
+            pass
         return VAULT_PUT_WAIT
 
     # Скачиваем В ПАМЯТЬ (≤20 МБ — разрешено Bot API).
@@ -10090,6 +10327,7 @@ async def _vault_encrypt_batch(msg, context, user, password):
         progress = None
     files = [f for f in (getattr(user, "vault_files", []) or []) if isinstance(f, dict)]
     ok_n, fail_n = 0, 0
+    fail_reasons = []  # ВОЛНА 18: честные причины сбоев — в сообщение юзеру
     for i, item in enumerate(batch, 1):
         if progress is not None:
             try:
@@ -10112,6 +10350,9 @@ async def _vault_encrypt_batch(msg, context, user, password):
                 logger.error(
                     f"vault put: большой файл ({item.get('name')}): {e}")
                 rec_mt = None
+                fail_reasons.append(
+                    f"«{(item.get('name') or 'файл')}»: "
+                    f"{_vault_fail_reason(e)}")
             if rec_mt is None:
                 fail_n += 1
                 continue
@@ -10131,6 +10372,8 @@ async def _vault_encrypt_batch(msg, context, user, password):
         except Exception as e:
             logger.error(f"vault put: шифрование не удалось ({item.get('name')}): {e}")
             fail_n += 1
+            fail_reasons.append(
+                f"«{(item.get('name') or 'файл')}»: {_vault_fail_reason(e)}")
             item["payload"] = b""
             continue
         item["payload"] = b""  # исходник больше не нужен — только шифр
@@ -10140,14 +10383,34 @@ async def _vault_encrypt_batch(msg, context, user, password):
         key = _vault_derive_key(password, bytes.fromhex(salt_hex), iters)
         verifier_hex = _vault_verifier(key).hex()
         # Грузим ШИФР в канал по кругу (cloud-каналы).
-        up = await _storage_upload_document(
-            context, container,
-            filename=f"vault_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{i}.bin",
-            caption="🔐 Сейф: зашифрованный файл (открыть без пароля невозможно).",
-        )
+        _vfn = f"vault_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{i}.bin"
+        _vcap = "🔐 Сейф: зашифрованный файл (открыть без пароля невозможно)."
+        up = await _storage_upload_document(context, container,
+                                            filename=_vfn, caption=_vcap)
+        if up is None:
+            # ВОЛНА 18: вторая попытка Bot API (одноразовые сбои бывают),
+            # затем заливка шифра через MTProto — ≤48 МБ ботам разрешено.
+            up = await _storage_upload_document(context, container,
+                                                filename=_vfn, caption=_vcap)
+            if up is None and _TELETHON_OK and BOT_TOKEN:
+                _mtc = await _mt_client()
+                if _mtc is not None:
+                    _updir = _tempfile.mkdtemp(prefix="dvf1_up_")
+                    try:
+                        _uppath = os.path.join(_updir, "c.bin")
+                        with open(_uppath, "wb") as _ufh:
+                            _ufh.write(container)
+                        up = await _mt_upload_container(
+                            _mtc, _uppath, len(container),
+                            caption=_vcap, filename=_vfn)
+                    finally:
+                        _shutil.rmtree(_updir, ignore_errors=True)
         container = b""
         if up is None:
             fail_n += 1
+            fail_reasons.append(
+                f"«{(item.get('name') or 'файл')}»: шифр не приняли каналы — "
+                "проверьте, что бот администратор канала")
             continue
         files.append({
             "id": _vault_gen_id(user),
@@ -10210,6 +10473,19 @@ async def _vault_encrypt_batch(msg, context, user, password):
         lines.append(f"🏷 Название загрузки: «{_batch_label}» — видно в «📦 Мои файлы».")
     if fail_n:
         lines.append(f"⚠️ Не удалось обработать: {fail_n} — попробуйте ещё раз позже.")
+        # ВОЛНА 18: честные причины прямо в сообщении — раньше причина жила
+        # только в логах Render, которые пользователь не читает.
+        if fail_reasons:
+            lines.append("")
+            lines.append("Причины:")
+            for _fr in fail_reasons[:3]:
+                lines.append(f"• {_fr}")
+            if len(fail_reasons) > 3:
+                lines.append(f"• …и ещё {len(fail_reasons) - 3}")
+            lines.append("")
+            lines.append("Файлы, которые не зашифровались, ОСТАЛИСЬ в чате — "
+                         "ничего не потеряно. Попробуйте ещё раз: 🔐 Сейф → "
+                         "📥 Положить (файлы пришлите заново).")
     if migrated:
         lines.append(f"🗂 Старые незашифрованные копии удалены: {migrated} — теперь файлы только в Сейфе.")
     lines.append("")
