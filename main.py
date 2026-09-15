@@ -6890,20 +6890,45 @@ async def cloud_bigself_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return MAIN_MENU
 
 
+async def _cdb_fetch_payload_mtproto(context, src_chat, src_msg):
+    """ВОЛНА 16: скачать файл базы 20–49 МБ через MTProto (Bot API умеет
+    только 20 МБ вниз, а снапшоты бывают и такими — потолок отправки
+    49 МБ). Качает ПРЯМО из чата-источника (личка или канал — бот там
+    участник) потоком, в ОЗУ: снапшоты ≤49 МБ, память не проблема."""
+    client = await _mt_client()
+    if client is None:
+        raise RuntimeError("MTProto недоступен (Telethon не установлен?)")
+    if int(src_chat) < 0:
+        peer = await _mt_resolve_channel(client, int(src_chat))
+    else:
+        peer = _mt_peer_user(int(src_chat))
+    _m, doc = await _mt_fetch_document_peer(client, peer, int(src_msg))
+    if doc is None:
+        raise RuntimeError("сообщение с файлом не найдено через MTProto")
+    buf = io.BytesIO()
+    await _mt_download_stream(
+        client, doc, int(getattr(doc, "size", 0) or 0), buf.write, None, "")
+    payload = buf.getvalue()
+    if not payload:
+        raise RuntimeError("скачался пустой файл")
+    return payload
+
+
 async def _cdb_ingest_post(context, post, doc, fname, chat_id):
     """ВОЛНА 13: пользователь САМ вставил снапшот базы в канал.
 
     Просьба пользователя: «бот опять ничего не помнит — лучше я буду в него
     вставлять файлы из канала, последние, но он также их должен закрепить».
     Бот видит пост с документом devorks_db_snapshot_…, скачивает его,
-    проверяет _meta.json и действует по правилу «ПОСЛЕДНИЙ АКТУАЛЬНЫЙ
-    ПОБЕЖДАЕТ» (без дублей и без откатов):
-    • штамп снапшота (created_utc из _meta.json) НОВЕЕ локального
-      cdb_last_flush → применяем базу, ЗАКРЕПЛЯЕМ пост (pin) и стираем
-      старые снапшоты этого канала — при старте бот прочитает именно
-      этот закреп;
-    • штамп НЕ новее → честно пропускаем: свежую базу старым файлом не
-      откатываем (та же защита, что у кнопки «📦 Вспомнить всё»).
+    проверяет _meta.json и применяет базу. ВОЛНА 16: файл в канал вставляет
+    ЧЕЛОВЕК (свои собственные снапшоты бот не видит — зацикливание
+    невозможно), значит ЭТОТ файл и есть актуальная база:
+    • применяем базу ВСЕГДА, ЗАКРЕПЛЯЕМ пост (pin) и стираем старые
+      снапшоты этого канала — при старте бот прочитает именно этот закреп;
+    • если штамп старше локального cdb_last_flush — всё равно применяем
+      (ручное восстановление БЕЗ отказов «не новее»), честно помечая это
+      в отчёте; защита latest-wins осталась только на автоматических
+      путях (старт бота, кнопка «📦 Вспомнить всё»).
     Отчёт уходит разработчику в ЛС (у channel-постов нет автора). Свои
     собственные снапшоты бот не видит: Telegram не присылает боту
     channel_post о его же сообщениях — зацикливание невозможно.
@@ -6912,17 +6937,17 @@ async def _cdb_ingest_post(context, post, doc, fname, chat_id):
     отправлен в канал, КОТОРОГО НЕТ в конфиге (конфиг потерян при переезде,
     а бот всё ещё админ в канале) — бот ПОДКЛЮЧАЕТ этот канал сам (режим
     «Оба») и применяет снапшот: пользователь не должен запирать
-    восстановление о потерянный конфиг. Правило «последний актуальный
-    побеждает» проверяется в ЛЮБОМ случае — свежую базу старым файлом не
-    откатить даже в новом канале."""
+    восстановление о потерянный конфиг. ВОЛНА 16: и в новом канале файл
+    применяется ВСЕГДА — он дан человеком вручную."""
     _reports = []
     try:
         fsize = int(getattr(doc, "file_size", 0) or 0)
-        if fsize > 20 * 1024 * 1024:
+        if fsize > 20 * 1024 * 1024 and not _TELETHON_OK:
             _reports.append(
-                f"❌ Снапшот «{fname}» ({_fmt_bytes(fsize)}) НЕ принят: бот не "
-                "может скачивать файлы больше 20 МБ (лимит Telegram для "
-                "ботов). Слейте базу кнопкой «💾 Слить базу в канал сейчас».")
+                f"❌ Снапшот «{fname}» ({_fmt_bytes(fsize)}) НЕ принят: Bot API "
+                "не скачивает файлы больше 20 МБ, а режим MTProto (файлы до "
+                "2 ГБ) на сервере ВЫКЛЮЧЕН — нужен telethon>=1.36 в "
+                "requirements.txt и строка «mtproto: клиент поднялся» в логе.")
         else:
             payload = None
             try:
@@ -6931,8 +6956,21 @@ async def _cdb_ingest_post(context, post, doc, fname, chat_id):
                 await asyncio.wait_for(tg_file.download_to_memory(out=buf), timeout=300)
                 payload = buf.getvalue()
             except Exception as e:
-                logger.error(f"cdb ingest: скачать «{fname}» не удалось: {e}")
-                _reports.append(f"❌ Снапшот «{fname}» не удалось скачать: {e}")
+                # ВОЛНА 16: файлы 20–49 МБ Bot API не скачает (лимит вниз —
+                # 20 МБ) — качаем MTProto-потоком ПРЯМО из этого же канала.
+                logger.warning(
+                    f"cdb ingest: Bot API скачать «{fname}» не смог ({e}); "
+                    "пробую MTProto")
+                try:
+                    payload = await _cdb_fetch_payload_mtproto(
+                        context, int(chat_id), int(post.message_id))
+                except Exception as e2:
+                    logger.error(
+                        f"cdb ingest: скачать «{fname}» не удалось: {e2}")
+                    _reports.append(
+                        f"❌ Снапшот «{fname}» ({_fmt_bytes(fsize)}) не скачался "
+                        f"через MTProto: {e2}. Проверьте, что бот админ канала, "
+                        "и лог старта «mtproto: клиент поднялся».")
             if payload is not None:
                 verified, stamp = False, ""
                 try:
@@ -6972,13 +7010,14 @@ async def _cdb_ingest_post(context, post, doc, fname, chat_id):
                                 _adopted = True
                                 cfg = load_storage_config()
                         last = str(cfg.get("cdb_last_flush") or "")
-                        if stamp and last and stamp <= last:
-                            _reports.append(
-                                f"ℹ️ Снапшот «{fname}» (штамп {stamp}) НЕ применён: "
-                                f"он НЕ новее текущей базы ({last}). Правило "
-                                "«последний актуальный побеждает»: откатывать "
-                                "свежие данные старым файлом нельзя.")
-                        else:
+                        # ВОЛНА 16: снапшот в канал вставляет ЧЕЛОВЕК —
+                        # ручной файл и есть актуальная база: применяем
+                        # ВСЕГДА и закрепляем, БЕЗ отказа «не новее»
+                        # (просьба пользователя: «загрузил базу — бот
+                        # говорит Готово и всё восстанавливается»). Если
+                        # штамп старше текущего — честная пометка в отчёте.
+                        _older = bool(stamp and last and stamp <= last)
+                        if True:
                             restored, problems = _storage_restore_apply(payload)
                             if not restored:
                                 _reports.append(
@@ -7053,6 +7092,11 @@ async def _cdb_ingest_post(context, post, doc, fname, chat_id):
                                 if _adopted:
                                     _rep += (f"\n➕ Канал {chat_id} не был настроен — "
                                              "подключён автоматически (режим «Оба»).")
+                                if _older:
+                                    _rep += (f"\nℹ️ Штамп снапшота ({stamp}) НЕ новее "
+                                             f"текущей базы ({last}) — применён "
+                                             "ПРИНУДИТЕЛЬНО: файл дан вручную, "
+                                             "он и есть актуальная база.")
                                 if pruned:
                                     _rep += (f" • 🧹 старых снапшотов стёрто: {pruned} "
                                              "(остался один актуальный)")
@@ -7252,8 +7296,9 @@ async def _cdb_private_doc_handler(update: Update, context: ContextTypes.DEFAULT
             "♻️ Это ФАЙЛ БАЗЫ ДАННЫХ DEVORKS+.\n\n"
             f"«{fname}» • {_fmt_bytes(fsize)}\n\n"
             "По «✅ Восстановить» бот:\n"
-            "• заменит текущую базу данными из файла — по правилу «последний "
-            "актуальный побеждает»: свежую базу старым файлом не откатить;\n"
+            "• применит ЭТОТ файл как актуальную базу — БЕЗ отказов «не "
+            "новее»: вы дали файл вручную, значит он и есть последний "
+            "(ответ — «Готово!»);\n"
             "• скопирует файл в канал-хранилище, ЗАКРЕПИТ его и сотрёт "
             "старые снапшоты — после рестарта бот вспомнит всё из закрепа.\n\n"
             "Продолжить?",
@@ -7271,9 +7316,11 @@ async def _cdb_private_restore_cb(update: Update, context: ContextTypes.DEFAULT_
     Полностью повторяет правила волны 13 (_cdb_ingest_post), но источник —
     личный чат, а закреп делается в НАСТРОЕННЫХ db-каналах (после применения
     снапшота конфиг перечитывается: список каналов сам приезжает из файла):
-      1) скачать (≤20 МБ) и проверить _meta.json → штамп created_utc;
-      2) latest-wins: штамп НЕ новее cdb_last_flush → честный отказ (откат
-         свежей базы старым файлом невозможен);
+      1) скачать (Bot API ≤20 МБ; больше — MTProto-поток, ВОЛНА 16) и
+         проверить _meta.json → штамп created_utc;
+      2) ВОЛНА 16: применяется ВСЕГДА — вы дали файл вручную и нажали
+         «✅ Восстановить», значит ЭТОТ файл и есть актуальная база,
+         ответ — «Готово!» (latest-wins остался только на автопутях);
       3) применить базу (_storage_restore_apply) под flush-локом;
       4) в КАЖДЫЙ db-канал: серверная копия файла (copy_message — без
          повторной загрузки), unpin_all + pin, стирание старых снапшотов;
@@ -7318,13 +7365,27 @@ async def _cdb_private_restore_cb(update: Update, context: ContextTypes.DEFAULT_
         await asyncio.wait_for(tg_file.download_to_memory(out=buf), timeout=300)
         payload = buf.getvalue()
     except Exception as e:
-        logger.error(f"cdb private restore: скачать «{fname}» не удалось: {e}")
-        context.user_data.pop("cdb_rst_pending", None)
+        # ВОЛНА 16: файлы 20–49 МБ Bot API не скачает (лимит вниз — 20 МБ),
+        # а снапшоты бывают и такими. Качаем MTProto-потоком ПРЯМО из
+        # этого чата (бот видит свои личные чаты и через MTProto).
+        logger.warning(
+            f"cdb private restore: Bot API скачать «{fname}» не смог ({e}); "
+            "пробую MTProto")
         try:
-            await query.edit_message_text(f"❌ Не удалось скачать файл: {e}")
-        except Exception:
-            pass
-        return
+            payload = await _cdb_fetch_payload_mtproto(
+                context, _src_chat, _src_msg)
+        except Exception as e2:
+            logger.error(
+                f"cdb private restore: скачать «{fname}» не удалось: {e2}")
+            context.user_data.pop("cdb_rst_pending", None)
+            try:
+                await query.edit_message_text(
+                    f"❌ Не удалось скачать файл: {e2}. Снапшоты больше 20 МБ "
+                    "качаются через MTProto — проверьте строку «mtproto: "
+                    "клиент поднялся» в логе старта.")
+            except Exception:
+                pass
+            return
     # Верификация: наш zip с _meta.json + штамп времени.
     verified, stamp = False, ""
     try:
@@ -7353,19 +7414,19 @@ async def _cdb_private_restore_cb(update: Update, context: ContextTypes.DEFAULT_
     _notes = []
     try:
         async with _get_cdb_flush_lock():
+            # ВОЛНА 16: ручное восстановление по файлу от разработчика —
+            # БЕЗ отказа «не новее»: вы дали файл и нажали «✅ Восстановить»,
+            # значит ЭТОТ файл и есть актуальная база. Отвечаем «Готово!».
+            # (Просьба пользователя: «загрузил базу — бот должен сказать
+            # готово и вся база должна восстановиться».) Защита latest-wins
+            # осталась только на АВТОМАТИЧЕСКИХ путях (старт/кнопка),
+            # чтобы свежую базу никто случайно не откатил.
             cfg = load_storage_config()
             last = str(cfg.get("cdb_last_flush") or "")
             if stamp and last and stamp <= last:
-                context.user_data.pop("cdb_rst_pending", None)
-                try:
-                    await query.edit_message_text(
-                        f"ℹ️ Файл «{fname}» (штамп {stamp}) НЕ применён: он НЕ "
-                        f"новее текущей базы ({last}). Правило «последний "
-                        "актуальный побеждает»: откатывать свежие данные "
-                        "старым файлом нельзя.")
-                except Exception:
-                    pass
-                return
+                _notes.append(
+                    f"ℹ️ Штамп файла ({stamp}) НЕ новее текущей базы ({last}) — "
+                    "применён ПРИНУДИТЕЛЬНО: файл дан вручную.")
             restored, problems = _storage_restore_apply(payload)
             if not restored:
                 try:
@@ -7456,7 +7517,7 @@ async def _cdb_private_restore_cb(update: Update, context: ContextTypes.DEFAULT_
     context.user_data.pop("cdb_rst_pending", None)
     # Отчёт пользователю (он же разработчик) — подробный и честный.
     _rep = (
-        f"✅ БАЗА ВОССТАНОВЛЕНА ИЗ ФАЙЛА: {fname}\n"
+        f"✅ Готово! База восстановлена из файла: {fname}\n"
         f"• штамп снапшота: {stamp or '?'}\n"
         f"• файлов данных восстановлено: {len(restored)}\n"
         f"• закреплено в каналах: {len(pinned_ch)}"
@@ -7958,6 +8019,25 @@ async def _mt_client():
             return None
 
 
+async def _mt_warmup():
+    """ВОЛНА 16: прогрев MTProto при старте — клиент поднимается ЗАРАНЕЕ
+    (а не при первом файле >20 МБ) и строит кэш сущностей. После рестарта
+    Render большие файлы (до 2 ГБ) работают сразу. Любая ошибка — не
+    критична: режим остаётся ленивым и повторит попытку при операции."""
+    try:
+        client = await _mt_client()
+        if client is None:
+            logger.info("mtproto: прогрев пропущен (нет Telethon/BOT_TOKEN)")
+            return
+        try:
+            await client.get_dialogs(limit=100)
+            logger.info("mtproto: прогрев готов — большие файлы до 2 ГБ доступны")
+        except Exception as e:
+            logger.warning(f"mtproto: прогрев кэша не удался (не критично): {e}")
+    except Exception as e:
+        logger.warning(f"mtproto: прогрев не удался (не критично): {e}")
+
+
 def _mt_peer_channel(ch_id):
     """Bot API id канала (-100…) → InputPeerChannel. Ботам Telegram разрешает
     access_hash=0 для каналов, где бот администратор — это наш случай."""
@@ -8242,16 +8322,47 @@ async def _mt_run_with_flood(coro_factory, tries=4):
     raise RuntimeError(f"Telegram просит паузу {getattr(last_err, 'seconds', '?')} с")
 
 
-async def _mt_fetch_document(client, channel_id, msg_id):
-    """Достаёт сообщение канала и его документ (MTProto). Возвращает
-    (message, document) или (message_or_None, None)."""
-    peer = _mt_peer_channel(channel_id)
+async def _mt_resolve_channel(client, ch_id):
+    """ВОЛНА 16: надёжный InputPeer канала для бота. Порядок попыток:
+    1) кэш Telethon (правильный access_hash — Telethon сидит под ТЕМ же
+       токеном и получает те же апдейты, что и Bot API, поэтому помнит
+       сущности всех чатов бота);
+    2) прогрев кэша через get_dialogs (бот видит чаты, где он участник)
+       и повторная попытка;
+    3) классический приём ботов — InputPeerChannel(id, 0): Telegram
+       разрешает access_hash=0 ботам-участникам канала.
+    После рестарта Render кэш пуст — раньше это могло дать CHANNEL_INVALID
+    на первом же большом файле; теперь лечится автоматически."""
+    try:
+        return await client.get_input_entity(int(ch_id))
+    except Exception:
+        pass
+    try:
+        await client.get_dialogs(limit=100)
+    except Exception:
+        pass
+    try:
+        return await client.get_input_entity(int(ch_id))
+    except Exception:
+        return _mt_peer_channel(ch_id)
+
+
+async def _mt_fetch_document_peer(client, peer, msg_id):
+    """Достаёт сообщение по ГОТОВОМУ peer'у и его документ (MTProto).
+    Возвращает (message, document) или (message_or_None, None)."""
     m = await _mt_run_with_flood(
         lambda: client.get_messages(peer, ids=int(msg_id)))
     if m is None:
         return None, None
     doc = getattr(m, "document", None) or getattr(m, "photo", None)
     return m, doc
+
+
+async def _mt_fetch_document(client, channel_id, msg_id):
+    """Достаёт сообщение канала и его документ (MTProto). Возвращает
+    (message, document) или (message_or_None, None)."""
+    peer = await _mt_resolve_channel(client, channel_id)
+    return await _mt_fetch_document_peer(client, peer, msg_id)
 
 
 async def _mt_download_stream(client, doc, doc_size, sink, progress=None, title=""):
@@ -8303,7 +8414,9 @@ async def _mt_upload_container(client, path, size, caption, filename=None):
     """Заливает ГОТОВЫЙ шифр-контейнер в cloud-канал через MTProto
     (Bot API не умеет больше 50 МБ). Каналы пробует по порядку.
     Возвращает {"message_id", "file_id", "size", "channel_id"} или None."""
-    targets = get_cloud_channel_ids()
+    # ВОЛНА 16: каналы «только для базы» тоже годятся для шифров Сейфа —
+    # раньше при пустом cloud-списке заливка отказывала, хотя канал был.
+    targets = get_cloud_channel_ids() or get_db_channel_ids()
     if not targets:
         return None
     upload_path = path
@@ -8317,7 +8430,7 @@ async def _mt_upload_container(client, path, size, caption, filename=None):
             upload_path = path
     for ch in targets:
         try:
-            peer = _mt_peer_channel(ch)
+            peer = await _mt_resolve_channel(client, ch)
             sent = await _mt_run_with_flood(lambda: client.send_file(
                 peer, upload_path, force_document=True,
                 caption=(caption or "")[:1024] or None,
@@ -9312,18 +9425,25 @@ async def vault_put_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text(
                 f"🚫 Файл больше {_fmt_bytes(VAULT_MAX_FILE_BYTES)}: обычный "
                 "режим бота такие файлы скачать не может, а режим больших "
-                "файлов (MTProto) ещё не включён на сервере.\n\nЧто делать:\n"
-                "• попросите разработчика включить большие файлы "
-                "(на сервере: pip install telethon);\n"
-                "• пока — сожмите файл в ZIP/7z или разбейте на части "
-                "по 15–19 МБ и пришлите каждую отдельно — сложу их в Сейф "
-                "одной пачкой."
+                "файлов (до 2 ГБ) сейчас ВЫКЛЮЧЕН на сервере — "
+                + ("нет токена бота (BOT_TOKEN)." if not BOT_TOKEN else
+                   "библиотека Telethon не установлена. Пересоберите деплой "
+                   "из нового zip (requirements.txt: telethon>=1.36) — в логе "
+                   "старта должна появиться строка «mtproto: клиент поднялся».")
+                + "\n\nПока можно: сжать файл в ZIP/7z или разбить на части "
+                "по 15–19 МБ и прислать каждую отдельно — сложу в Сейф пачкой."
             )
             return VAULT_PUT_WAIT
-        _cloud_ids = get_cloud_channel_ids()
+        # ВОЛНА 16: каналы «только для базы» тоже годятся для шифров Сейфа —
+        # раньше при пустом cloud-списке большие файлы отказывали, хотя
+        # канал у пользователя был.
+        _cloud_ids = get_cloud_channel_ids() or get_db_channel_ids()
         if not _cloud_ids:
             await msg.reply_text(
-                "❌ Хранилище отключено. Попросите разработчика настроить каналы.")
+                "❌ Хранилище не настроено: добавьте бота администратором в "
+                "свой канал и подключите его (Панель разработчика → "
+                "Хранилище) — туда уйдёт шифр. Без канала большим файлам "
+                "(до 2 ГБ) физически некуда лечь.")
             return VAULT_PUT_WAIT
         try:
             await context.bot.send_chat_action(
@@ -10928,6 +11048,13 @@ def _storage_dev_status_text(cfg):
                  f"(около {cfg.get('backup_hour_utc', 4)}:00 UTC)")
     lines.append(f"🕒 Последний бэкап: {cfg.get('last_backup_date') or 'не было'}")
     lines.append(f"🗃 Бэкапов в реестре: {len(cfg.get('backups') or [])}")
+    # ВОЛНА 16: статус режима больших файлов Сейфа (до 2 ГБ) — сразу видно,
+    # работает ли он и что именно чинить, если нет.
+    if _TELETHON_OK and BOT_TOKEN:
+        lines.append("🟢 Сейф до 2 ГБ (MTProto): ВКЛ — telethon установлен.")
+    else:
+        lines.append("🔴 Сейф до 2 ГБ (MTProto): ВЫКЛ — telethon не установлен "
+                     "(requirements.txt: telethon>=1.36; пересоберите деплой).")
     # ВОЛНА 8: статус режима «Канал = база данных».
     if cfg.get("channel_db_enabled"):
         dirty = len(_CDB_DIRTY)
@@ -10946,9 +11073,9 @@ def _storage_dev_status_text(cfg):
         lines.append("   ПРЯМО В КАНАЛ — бот возьмёт ПОСЛЕДНИЙ актуальный, применит базу,")
         lines.append("   сам его ЗАКРЕПИТ и сотрёт старые снапшоты (дубли не плодятся).")
         # ВОЛНА 15: путь «файл базы у меня в телефоне — отправлю боту в чат».
-        lines.append("   💡 ВОЛНА 15: кнопка «💾 Снапшот базы мне в личку» отдаст файл ТЕБЕ:")
-        lines.append("   отправь его боту В ЧАТ в любой момент — применит базу, ЗАКРЕПИТ")
-        lines.append("   в канале и сотрёт старые (правило «последний актуальный побеждает»).")
+        lines.append("   💡 ВОЛНА 15/16: кнопка «💾 Снапшот базы мне в личку» отдаст файл ТЕБЕ:")
+        lines.append("   отправь его боту В ЧАТ в любой момент — применит базу (БЕЗ отказов")
+        lines.append("   «не новее»), ответит «Готово!», ЗАКРЕПИТ в канале и сотрёт старые.")
     else:
         lines.append("")
         lines.append("🗄️ База в канале: ВЫКЛ (данные только на сервере/Supabase).")
@@ -24610,6 +24737,18 @@ async def _post_init(application):
         logger.info("Восстановление базы из канала (канал-БД) запущено в фоне.")
     except Exception as e:
         logger.error(f"Не удалось запустить восстановление из канала: {e}")
+
+    # === ВОЛНА 16: прогрев MTProto (Telethon) — большие файлы до 2 ГБ
+    # работают СРАЗУ после рестарта, статус режима виден в логе старта
+    # (строка «mtproto: прогрев готов…» или причина отказа). ===
+    try:
+        _mt_task = asyncio.create_task(_mt_warmup())
+        try:
+            application.bot_data.setdefault("_bg_tasks", []).append(_mt_task)
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error(f"mtproto: прогрев не запущен: {e}")
 
     # === ШАГ 3: миграция данных в облачное хранилище (Supabase / Mongo). ===
     # Один проход: читаем (Supabase → Mongo → файл) и сразу записываем
