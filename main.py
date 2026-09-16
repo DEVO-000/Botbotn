@@ -429,21 +429,8 @@ VAULT_REN_WAIT = 124
 # одно название на всю загрузку, видно в «📦 Мои файлы».
 VAULT_LABEL_WAIT = 125
 
-# === ВОЛНА 22: ПУЛЬТ (управление Telegram текстом/голосом) ===
-# Главное меню Пульта (inline-клавиатура: тумблеры, корпус стилей, контакты).
-PULT_MENU = 126
-# Ждём файл экспорта Telegram Desktop (result.json) для сбора стилей.
-PULT_WAIT_EXPORT = 127
-# Ждём ПЕРЕСЛАННОЕ сообщение: живой чат / канал пользователя (режим
-# выбирается флагом context.user_data['pult_mode']). Эстафета людям
-# удалена волной 22.3 по решению пользователя.
-PULT_WAIT_CONTACT = 128
-# Ждём канал для постов: пересланное сообщение из канала / @username / -100…
-PULT_WAIT_CHANNEL = 129
-# Ждём команду Пульта (текст или голос — middleware сама расшифрует).
-PULT_WAIT_CMD = 130
-# Пользователь вводит СВОЙ вариант текста для пункта плана отправки.
-PULT_EDIT_TEXT = 131
+# ВОЛНА 22.4: «🎙 Пульт» удалён ПОЛНОСТЬЮ по решению пользователя — кнопки,
+# состояний (бывшие 126–131), хендлеров и хранилищ стилей больше нет.
 
 # ВОЛНА 13: состояния, где текст = ПРОИЗВОЛЬНОЕ НАЗВАНИЕ (файла/загрузки).
 # Быстрые команды туда НЕ инжектируются: пользователь может назвать файл
@@ -2013,13 +2000,7 @@ class User:
         # не могла стереть файлы из чата (нечего было удалять). Хранятся
         # ТОЛЬКО номера сообщений — никакого содержимого.
         self.vault_trace = {"chat_id": 0, "msgs": []}
-        # === ВОЛНА 22: ПУЛЬТ (управление Telegram текстом/голосом) ===
-        # Структура — см. _pult_default(): главный выключатель, тумблеры
-        # (мат, пунктуация, подтверждение), канал для постов, стили по чатам
-        # (пары «реплика собеседника → ваш ответ» + ваши монологи),
-        # канал для постов. Никаких api_id/api_hash — только
-        # официальный экспорт Telegram Desktop и чаты, где стоит бот.
-        self.pult = _pult_default()
+        # ВОЛНА 22.4: поле user.pult (Пульт) удалено — функция снесена целиком.
 
     def to_dict(self):
         return {
@@ -2095,8 +2076,7 @@ class User:
             'vault_rec_until': getattr(self, 'vault_rec_until', ''),
             # ВОЛНА 12: персистентный след загрузки в чате (id сообщений).
             'vault_trace': getattr(self, 'vault_trace', {"chat_id": 0, "msgs": []}),
-            # ВОЛНА 22: Пульт (настройки, стили по чатам, контакты, стикеры).
-            'pult': getattr(self, 'pult', None),
+            # ВОЛНА 22.4: ключ 'pult' больше не сериализуется (Пульт удалён).
         }
 
     @classmethod
@@ -2191,8 +2171,8 @@ class User:
             _vt["chat_id"] = int(_vt.get("chat_id") or 0)
         except (TypeError, ValueError):
             _vt["chat_id"] = 0
-        # Бэк-совместимость, волна 22: Пульт — нормализуем структуру и капы.
-        user.pult = _pult_normalize(getattr(user, "pult", None))
+        # ВОЛНА 22.4: старые ключи 'pult' из БД молча выбрасываются
+        # (нормализатор _pult_normalize удалён вместе с Пультом).
         return user
 
 
@@ -2791,9 +2771,9 @@ def build_referral_link(bot_username, user_id):
 # Показывается в приветствии главного меню («🛠 Сборка …»): мгновенно видно,
 # какая сборка реально запущена на сервере (защита от ситуации «архив
 # собран, а деплой не подхватился»). Меняйте при каждой волне правок.
-BOT_BUILD = "22.3"
+BOT_BUILD = "22.4"
 
-INSTRUCTIONS_VERSION = "2.3"
+INSTRUCTIONS_VERSION = "2.4"
 
 
 def _default_instructions_text():
@@ -2802,17 +2782,17 @@ def _default_instructions_text():
         '**📋 ОСНОВНЫЕ ФУНКЦИИ:**\n'
         '1. **Регистрация** — укажите дату рождения и местное время (нужно для часового пояса и поздравлений).\n'
         '2. **Классы** — создайте класс или войдите по коду. В одном классе до 40 человек и до 2 доп. админов.\n'
-        '3. **Расписание** — смотрите расписание на сегодня и на завтра. Админ класса настраивает расписание и звонки.\n'
-        '4. **Домашнее задание** — быстрое добавление: выберите предмет из списка, дату одной кнопкой (Сегодня/Завтра/+2 дня/+7 дней), введите текст. Админы могут добавлять и удалять ДЗ прямо из меню.\n'
+        '3. **Расписание** — смотрите расписание на сегодня и на завтра, или всё на неделю сразу. Админ класса настраивает расписание и звонки, причём день расписания можно задать ТЕКСТОМ или КАРТИНКОЙ (фото).\n'
+        '4. **Домашнее задание** — быстрое добавление: выберите предмет из списка, дату одной кнопкой (Сегодня/Завтра/+2 дня/+7 дней), введите текст — или прикрепите ФОТО/ФАЙЛЫ к заданию (админ). Админы могут добавлять и удалять ДЗ прямо из меню.\n'
         '5. **Таймер** — быстрая установка: 5/10/15/30 мин, 1/2/3/6/12 ч, либо произвольная дата и время. '
         'Можно ставить сразу несколько таймеров подряд — после каждого бот предложит поставить ещё один. Напоминания приходят в заданное время и не теряются при перезапуске.\n'
         '6. **Утренние и вечерние уведомления** — настройте удобное время и свой текст для «доброе утро» и «спокойной ночи».\n'
         '7. **День рождения** — бот сам поздравит вас в этот день и (по желанию) напомнит классу.\n'
         '8. **Погода и праздники** — ежедневный прогноз по вашему городу и напоминания о праздниках.\n'
-        '9. **DEVORKS+ai** — умный помощник: задайте любой вопрос и получите ответ. Всегда отвечает честно. Три режима: Обычный, 😈 Хамло и 🥰 Тепло (переключаются кнопками при входе в чат). Присылайте фото с текстом (ДЗ, документы) — бот сам распознает текст (OCR).\n'
+        '9. **DEVORKS+ai** — умный помощник: задайте любой вопрос и получите ответ. Всегда отвечает честно. Три режима: Обычный, 😈 Хамло и 🥰 Тепло (переключаются кнопками при входе в чат). AI принимает только ТЕКСТ — фото он не читает.\n'
         '10. **Анонимные сообщения** — отправляйте одноклассникам анонимные сообщения и отвечайте на них.\n'
         '11. **Личные и классные кнопки** — создавайте свои кнопки (ссылки/текст) и делайте меню удобным.\n'
-        '12. **🪄 AI Agent** — напишите обычным языком («русский на пятницу страница 45», «погода на завтра», «скрой кнопку Погода», «включи режим хамло», «напиши анонимно Пете …») — бот сам выполнит. Управляет всем: ДЗ, учителя, звонки, таймеры, кнопки, анонимки, погода и режимы ИИ.\n\n'
+        '12. **🪄 AI Agent** — напишите обычным языком («русский на пятницу страница 45», «как зовут учителя по физре», «погода на завтра», «скрой кнопку Погода», «напиши анонимно Пете …») — бот сам выполнит. Про учителя КОНКРЕТНОГО предмета пришлёт только его, а не весь список. Управляет всем: ДЗ, учителя, звонки, таймеры, кнопки, анонимки, погода и режимы ИИ.\n\n'
         '**⚙️ НАСТРОЙКИ КНОПОК:**\n'
         '• Скрыть/показать любые кнопки\n'
         '• Переименовать кнопки\n'
@@ -3299,15 +3279,47 @@ def get_day_name(day_index):
     days_ru = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
     return days_ru[day_index]
 
+def _schedule_day_view(class_obj, day_name):
+    """ВОЛНА 22.4: возвращает представление расписания на день.
+
+    Расписание дня хранится в class_obj.schedule[day_name] и теперь бывает
+    двух видов (обратно совместимо):
+      • строка — обычный текст («1. Математика\n2. Русский…»);
+      • dict {"image": <file_id>, "caption": <текст или ''>} — КАРТИНКА
+        расписания, которую админ прислал при редактировании дня.
+
+    Возвращает кортеж:
+      ("text",  "<текст>")            — обычный день;
+      ("image", {"image": fid, "caption": str}) — день-картинка;
+      ("empty", "<пояснение>")        — расписание не установлено.
+    """
+    if not class_obj or not isinstance(getattr(class_obj, 'schedule', None), dict):
+        return ("empty", "Расписание не установлено")
+    raw = class_obj.schedule.get(day_name)
+    if not raw:
+        return ("empty", f"На {day_name} расписание не установлено")
+    if isinstance(raw, dict) and raw.get("image"):
+        return ("image", raw)
+    if isinstance(raw, dict):
+        # Мусорная структура без image — честно ведём себя как с пустым днём.
+        return ("empty", f"На {day_name} расписание не установлено")
+    return ("text", str(raw))
+
+
 def get_day_schedule(class_obj, day_name):
-    if not class_obj or not class_obj.schedule:
-        return "Расписание не установлено"
+    """Текстовое представление расписания дня.
 
-    schedule = class_obj.schedule.get(day_name)
-    if not schedule:
-        return f"На {day_name} расписание не установлено"
-
-    return schedule
+    ВОЛНА 22.4: если день хранится КАРТИНКОЙ — возвращаем подпись (если
+    админ её оставил) либо честную пометку «присылается картинкой». Места,
+    которые умеют отправлять сами файлы, используют _schedule_day_view()
+    и показывают настоящее изображение."""
+    kind, payload = _schedule_day_view(class_obj, day_name)
+    if kind == "image":
+        cap = (payload.get("caption") or "").strip()
+        return cap or "🖼 Расписание этого дня присылается картинкой — «📅 Расписание»."
+    if kind == "empty":
+        return payload
+    return payload
 
 def get_homework_for_date(class_obj, date_str):
     if not class_obj or not class_obj.homework:
@@ -3335,9 +3347,24 @@ def format_homework(homework_dict, date_str=None):
     ТОЛЬКО дату (без поля «Добавлено»), а под ней — список заданий по
     предметам. Дни отсортированы хронологически; задания без даты
     выводятся в самом конце под заголовком «Без даты».
+
+    ВОЛНА 22.4: у пунктов с вложениями (фото/файлы/видео — ключ 'media')
+    после текста печатается маркер «📎 вложения: …». Сами файлы
+    досылаются следом в кнопках-просмотрах (см. _send_homework_media).
     """
     if not homework_dict:
         return "📝 Домашнее задание не задано."
+
+    def _fmt_assignment(assignment):
+        # Один пункт: текст (может быть пустым, если ДЗ — только файлы)
+        # + маркер вложений.
+        t = (assignment.get('text') or '').strip()
+        media_line = _media_summary_line(assignment.get('media'))
+        if not t:
+            t = media_line or "(без текста)"
+        elif media_line:
+            t += f"\n  ↳ {media_line}"
+        return t
 
     # Режим «отфильтровано извне» — стандартный вывод одной шапки.
     if date_str:
@@ -3345,7 +3372,7 @@ def format_homework(homework_dict, date_str=None):
         for subject, assignments in homework_dict.items():
             text += f"**{subject}:**\n"
             for assignment in assignments:
-                text += f"• {assignment.get('text', '')}\n"
+                text += f"• {_fmt_assignment(assignment)}\n"
             text += "\n"
         return text
 
@@ -3355,7 +3382,7 @@ def format_homework(homework_dict, date_str=None):
         for assignment in assignments:
             due = (assignment.get('date') or '').strip()
             grouped.setdefault(due or '', {}).setdefault(subject, []).append(
-                assignment.get('text', '')
+                assignment
             )
 
     if not grouped:
@@ -3378,10 +3405,64 @@ def format_homework(homework_dict, date_str=None):
         for subject, items in grouped[due].items():
             text += f"**{subject}:**\n"
             for item in items:
-                text += f"• {item}\n"
+                text += f"• {_fmt_assignment(item)}\n"
         text += "\n"
 
     return text
+
+
+def _iter_assignment_media(homework_dict):
+    """ВОЛНА 22.4: собирает непустые списки 'media' из пунктов ДЗ —
+    чтобы кнопки-просмотры («📝 Домашнее задание», «📅 Сегодня»,
+    «📅 Завтра») дослали файлы текстом списка. Пункты без вложений
+    молча пропускаются; мусорные записи не роняют вывод."""
+    for subject, assignments in (homework_dict or {}).items():
+        for a in (assignments or []):
+            if not isinstance(a, dict):
+                continue
+            m = a.get('media')
+            if isinstance(m, list) and m:
+                yield m
+
+
+async def _send_day_schedule_screen(update, context, class_obj, day_name,
+                                    when_word, when_str, homework):
+    """ВОЛНА 22.4: единый экран «Расписание на сегодня/завтра» + ДЗ.
+
+    Поддерживает дни-КАРТИНКИ (schedule[day] = {"image": file_id, …}): фото
+    отправляется с шапкой, ДЗ и вложения идут следом отдельными сообщениями.
+    Текстовые дни работают ровно как раньше."""
+    kind, payload = _schedule_day_view(class_obj, day_name)
+    header = f"📅 Расписание на {when_word} ({day_name}, {when_str})"
+    hw_text = format_homework(homework, when_word).replace("**", "") if homework else ""
+
+    if kind == "image":
+        cap = header + " 🖼"
+        if payload.get("caption"):
+            cap += f"\n{payload['caption']}"
+        try:
+            # Лимит подписи Telegram — 1024 символа.
+            await update.message.reply_photo(payload["image"], caption=cap[:1024])
+        except Exception as e:
+            logger.warning(f"schedule image send не прошёл ({day_name}): {e}")
+            await update.message.reply_text(
+                header + ":\n\n🖼 Картинка расписания не открылась — админ может "
+                         "перезалить её через «📅 Редактировать расписание».")
+        if hw_text:
+            await update.message.reply_text(hw_text)
+        else:
+            await update.message.reply_text(
+                f"📝 Домашнее задание на {when_word} не задано.")
+    else:
+        message = f"{header}:\n\n{payload}"
+        message += f"\n\n{hw_text}" if homework else (
+            f"\n\n📝 Домашнее задание на {when_word} не задано.")
+        await update.message.reply_text(message)
+
+    # Вложения ДЗ — в обоих вариантах.
+    for _m_list in _iter_assignment_media(homework):
+        await _send_homework_media(context, update.effective_chat.id, _m_list)
+
 
 def check_class_limit(class_code):
     class_obj = get_class_by_code(class_code)
@@ -3743,7 +3824,6 @@ ALL_MAIN_MENU_BUTTONS = [
     "⭐ Звезды",
     "🤖 DEVORKS+ai",
     "🪄 AI Agent",
-    "🎙 Пульт",
     "🌦 Погода",
     "📚 Инструкция",
     "🔑 Код класса",
@@ -3761,7 +3841,7 @@ QUICK_COMMANDS = [
     "⏰ Таймер", "🕵️ Анонимное сообщение", "📨 Мои анонимные сообщения",
     "🎓 Управление классами", "⚙️ Настройки", "🌟 Мои кнопки",
     "☁️ Облако", "🔐 Сейф",
-    "⭐ Звезды", "🤖 DEVORKS+ai", "🪄 AI Agent", "🎙 Пульт",
+    "⭐ Звезды", "🤖 DEVORKS+ai", "🪄 AI Agent",
     "🌦 Погода", "📚 Инструкция", "🔑 Код класса",
     "💬 Чат поддержки", "👨‍💼 Админская панель", "⬅️ Назад в меню",
 ]
@@ -3892,7 +3972,6 @@ def get_main_menu_keyboard(user):
         # а в главном меню он теперь живёт внутри ☁️ Облако.
         "⭐ Звезды", "🤖 DEVORKS+ai",
         "🪄 AI Agent",
-        "🎙 Пульт",
         "🌦 Погода",
         # ПУНКТ 3: чат поддержки прямо из главного меню (всегда доступен).
         "💬 Чат поддержки",
@@ -13367,14 +13446,13 @@ AUTOMATION_SECTIONS = {
     "написать админу": "💬 Написать админу",
     "настройки": "⚙️ Настройки",
     "назад в меню": "⬅️ Назад в меню",
-    # ВОЛНА 22.1: Пульт и переименованный AI Agent тоже открываются
+    # ВОЛНА 22.1: переименованный AI Agent тоже открывается
     # действием open_section (старое имя «автоматизация» оставлено как алиас).
     "ai agent": AUTOMATION_BUTTON,
     "ai агент": AUTOMATION_BUTTON,
     "ай агент": AUTOMATION_BUTTON,
     "автоматизация": AUTOMATION_BUTTON,
-    "пульт": "🎙 Пульт",
-    "пульт управления": "🎙 Пульт",
+    # ВОЛНА 22.4: алиасы «пульт» удалены — Пульта больше нет.
 }
 
 
@@ -13558,12 +13636,12 @@ def _automation_system_prompt(context_text, is_admin):
         '10) {"action":"send_class_message","text":"<сообщение>"} — объявление всему классу (только админ).\n'
         '11) {"action":"show_homework","subject":"<предмет или null>","date":"ГГГГ-ММ-ДД или null"} — показать ДЗ.\n'
         '12) {"action":"show_schedule","day":"<день или null>"} — показать расписание.\n'
-        '13) {"action":"show_teachers"} — показать учителей.\n'
+        '13) {"action":"show_teachers","subject":"<предмет или null>","subjects":["<предмет>"]} — показать учителей. БЕЗ параметров — весь список. ЕСЛИ пользователь спрашивает про КОНКРЕТНЫЙ предмет/предметы («как зовут учителя по физре», «как зовут учителей по математике, русскому и физре») — передай ТОЛЬКО запрошенные предметы (один — в subject, несколько — массивом в subjects) и НЕ показывай остальных. Названия предметов сопоставляй с классом («физра» → «Физкультура», «русский» → «Русский язык»).\n'
         '14) {"action":"show_bells"} — показать звонки.\n'
         '15) {"action":"show_holidays"} — показать каникулы.\n'
         '16) {"action":"show_weather"} — показать погоду СЕЙЧАС в городе пользователя.\n'
         '17) {"action":"weather_forecast","days":<1..3>} — ПРОГНОЗ погоды: «погода на завтра» = days:1, «на 3 дня» = days:3.\n'
-        '18) {"action":"open_section","section":"<раздел или название кнопки>"} — ОТКРЫТЬ раздел интерфейса бота (автоматизация «нажимает» кнопку за пользователя). Стандартные разделы: меню, дз, добавить дз, удалить дз, учителя, расписание, звонки, каникулы, таймер, анонимное сообщение, мои анонимные сообщения, классы, мои кнопки, звезды, ии (чат с AI), ai agent (бывшая автоматизация), пульт, погода, инструкция, код класса, написать админу, настройки. ТАКЖЕ можно открыть любую ЛИЧНУЮ, ГЛОБАЛЬНУЮ или КЛАССНУЮ кнопку, передав её точное название в section. Используй, когда пользователь просит открыть/зайти/показать раздел или кнопку («открой дз», «включи чат с ии»). Не используй, если пользователь просит ДАННЫЕ (ДЗ/учителей) — для этого есть show_*.\n'
+        '18) {"action":"open_section","section":"<раздел или название кнопки>"} — ОТКРЫТЬ раздел интерфейса бота (автоматизация «нажимает» кнопку за пользователя). Стандартные разделы: меню, дз, добавить дз, удалить дз, учителя, расписание, звонки, каникулы, таймер, анонимное сообщение, мои анонимные сообщения, классы, мои кнопки, звезды, ии (чат с AI), ai agent (бывшая автоматизация), погода, инструкция, код класса, написать админу, настройки. ТАКЖЕ можно открыть любую ЛИЧНУЮ, ГЛОБАЛЬНУЮ или КЛАССНУЮ кнопку, передав её точное название в section. Используй, когда пользователь просит открыть/зайти/показать раздел или кнопку («открой дз», «включи чат с ии»). Не используй, если пользователь просит ДАННЫЕ (ДЗ/учителей) — для этого есть show_*.\n'
         '19) {"action":"show_vip"} — показать активные VIP-подписки пользователя и даты их окончания.\n'
         '20) {"action":"send_anon","name":"<имя или @username получателя>","text":"<сообщение>"} — ОТПРАВИТЬ анонимное сообщение однокласснику (доступно всем; имя получателя ищем в классе пользователя).\n'
         '21) {"action":"create_button","name":"<название>","content":"<текст или ссылка>","type":"text|url"} — СОЗДАТЬ личную кнопку пользователя (тип по умолчанию text). Учитывай лимит личных кнопок из контекста.\n'
@@ -13582,8 +13660,7 @@ def _automation_system_prompt(context_text, is_admin):
         '34) {"action":"show_storage"} — показать статус хранилища и список файлов ЛИЧНОГО ОБЛАКА пользователя (доступно всем). «облако», «мои файлы», «что у меня в облаке», «сколько у меня файлов» → это действие.\n'
         '35) {"action":"backup_now"} — сделать БЭКАП ВСЕЙ БАЗЫ в приватный канал-хранилище (ТОЛЬКО разработчик). «сделай бэкап», «сохрани базу», «забэкапься» → это действие.\n'
         '36) {"action":"vault_status"} — показать СТАТУС СЕЙФА: сколько файлов зашифровано и общий размер (доступно всем). Имена файлов скрыты даже тут — они зашифрованы. «сейф», «что в сейфе», «сколько зашифровано», «мой сейф» → это действие.\n'
-        '37) {"action":"cdb_sync"} — СЛИТЬ ВСЮ БАЗУ в приватный канал-БД СЕЙЧАС (закреплённый снапшот; ТОЛЬКО разработчик). «сохрани базу в канал», «соль базу в канал», «синхронизируй базу», «перенеси базу в канал» → это действие.\n'
-        '38) {"action":"pult_post","text":"<текст поста>"} — ПУЛЬТ: опубликовать пост в канале пользователя («сделай пост в моем канале рыбка сто я иду» — text:«рыбка сто я иду»).\n\n'
+        '37) {"action":"cdb_sync"} — СЛИТЬ ВСЮ БАЗУ в приватный канал-БД СЕЙЧАС (закреплённый снапшот; ТОЛЬКО разработчик). «сохрани базу в канал», «соль базу в канал», «синхронизируй базу», «перенеси базу в канал» → это действие.\n\n'
         "ПРАВИЛА:\n"
         "- Отвечай ТОЛЬКО JSON-объектом, без пояснений и markdown.\n"
         "- Не выдумывай даты: считай их строго от сегодняшней даты из контекста. «Пятница этой недели» — пятница текущей недели (даже если она уже прошла — берём ближайшую ПЯТНИЦУ ТЕКУЩЕЙ недели, а не следующую). Для «следующей недели» есть отдельная строка контекста с готовыми датами.\n"
@@ -13598,7 +13675,7 @@ def _automation_system_prompt(context_text, is_admin):
         "- КОД КЛАССА: «скажи код класса», «какой у нас код?», «покажи код» = show_class_code.\n"
         "- ХРАНИЛИЩЕ/ОБЛАКО: «облако», «мои файлы», «что в облаке» = show_storage; «сделай бэкап», «сохрани базу» = backup_now (только разработчик); «открой облако» = open_section section:\"облако\".\n"
         "- КАНАЛ-БАЗА: «соль базу в канал», «сохрани базу в канал», «перенеси базу в канал», «синхронизируй базу» = cdb_sync (только разработчик).\n"
-        "- ПУЛЬТ: «сделай пост в моем канале <текст>» = pult_post. Действий pult_dm/стикеров людям БОЛЬШЕ НЕТ (эстафета удалена) — на такие просьбы отвечайте none. НЕ используйте pult_* для анонимок (это send_anon) и объявлений классу (это send_class_message).\n"
+        "- УЧИТЕЛЯ ТОЧНО: на вопрос про учителя КОНКРЕТНОГО предмета отвечай show_teachers с subject/subjects ТОЛЬКО этих предметов — не вываливай весь список. «Пост в мой канал» больше НЕВОЗМОЖЕН — на такие просьбы отвечайте none.\n"
         "- СЕЙФ: «сейф», «что в сейфе», «сколько зашифровано» = vault_status; «открой сейф», «положи в сейф» = open_section section:\"сейф\" (дальше пользователь работает кнопками — пароль через автоматизацию НЕ вводится). НЕ проси пароль в чате AI Agent!\n"
         "- Даты только в формате ГГГГ-ММ-ДД, время — ЧЧ:ММ (24-часовое).\n"
         "- Для edit_bell: если end <= start — верни clarify с объяснением.\n"
@@ -13636,6 +13713,35 @@ def _match_subject_name(raw, candidates):
     return None
 
 
+# ВОЛНА 22.4: разговорные синонимы предметов — страховка на случай, если
+# DeepSeek передал сырую форму («физра») вместо канонической («Физкультура»).
+# Промпт требует нормализовать, но исполнитель не должен зависеть от модели.
+_TEACHER_SUBJECT_ALIASES = {
+    "физра": "физкультура",
+    "физ-ра": "физкультура",
+    "матеша": "математика",
+    "матан": "математика",
+    "литра": "литература",
+    "инфа": "информатика",
+    "англ": "английский",
+    "русский": "русский язык",
+}
+
+
+def _resolve_teacher_subject(raw, teacher_keys):
+    """Подбор предмета УЧИТЕЛЯ по смыслу: _match_subject_name + синонимы.
+
+    Возвращает каноническое имя предмета из teacher_keys или None."""
+    canon = sorted(k for k in (teacher_keys or []) if str(k or "").strip())
+    m = _match_subject_name(raw, canon)
+    if m:
+        return m
+    alias = _TEACHER_SUBJECT_ALIASES.get((raw or "").strip().lower())
+    if alias:
+        return _match_subject_name(alias, canon)
+    return None
+
+
 async def _automation_execute_action(update, context, user, class_obj, action):
     """Исполняет JSON-сценарий от DeepSeek. Возвращает текстовый отчёт.
 
@@ -13649,10 +13755,52 @@ async def _automation_execute_action(update, context, user, class_obj, action):
 
     # --- Читающие действия (доступны всем) ---
     if name == "show_teachers":
-        if class_obj and class_obj.teachers:
-            rows = [f"📚 {s}: {t}" for s, t in class_obj.teachers.items()]
-            return "👨‍🏫 Учителя класса:\n\n" + "\n".join(rows), True
-        return "👨‍🏫 Учителя не добавлены.", True
+        if not class_obj or not class_obj.teachers:
+            return "👨‍🏫 Учителя не добавлены.", True
+
+        # ВОЛНА 22.4: точечные вопросы про учителей — требование пользователя
+        # («могу спросить как зовут учителя по физре — пришлёт ТОЛЬКО его;
+        # спросить про математике, русскому и физре — пришлёт только их»).
+        # DeepSeek передаёт предмет(ы) в subject/subjects; здесь — честный
+        # подбор по смыслу (_resolve_teacher_subject: «физра» → «Физкультура»).
+        wanted = []
+        subj_raw = (action.get("subject") or "").strip()
+        if subj_raw:
+            wanted.append(subj_raw)
+        subjects_raw = action.get("subjects")
+        if isinstance(subjects_raw, list):
+            for s in subjects_raw:
+                s = str(s or "").strip()
+                if s:
+                    wanted.append(s)
+        wanted = list(dict.fromkeys(wanted))  # без повторов, порядок сохранён
+
+        if wanted:
+            rows = []
+            not_found = []
+            for w in wanted:
+                matched = _resolve_teacher_subject(w, class_obj.teachers.keys())
+                if matched:
+                    rows.append(f"📚 {matched}: {class_obj.teachers[matched]}")
+                else:
+                    not_found.append(w)
+            answer = ""
+            if rows:
+                header = ("👨‍🏫 Учителя по вашим предметам:"
+                          if len(rows) > 1 else "👨‍🏫 Учитель по вашему предмету:")
+                answer = header + "\n\n" + "\n".join(rows)
+            if not_found:
+                nf = "; ".join(f"«{w}»" for w in not_found)
+                answer += ("\n\n" if answer else "") + (
+                    f"🤔 По предметам {nf} учитель не назначен — админ может "
+                    "добавить через «👨‍🏫 Учителя».")
+            if answer:
+                return answer, True
+            # Сюда не доходим (rows или not_found всегда непустые при wanted).
+            return "👨‍🏫 Учителя не добавлены.", True
+
+        rows = [f"📚 {s}: {t}" for s, t in class_obj.teachers.items()]
+        return "👨‍🏫 Учителя класса:\n\n" + "\n".join(rows), True
 
     if name == "show_bells":
         return get_bells_info(class_obj, user), True
@@ -14622,39 +14770,7 @@ async def _automation_execute_action(update, context, user, class_obj, action):
                     failed += 1
             return f"📢 Объявление отправлено: {sent} получено, {failed} не доставлено.", True
 
-        if name in ("pult_post",):
-            # ВОЛНА 22: Пульт — пост в канал от лица пользователя
-            # (ВОЛНА 22.3: эстафета людям удалена).
-            if not bool((getattr(user, "pult", {}) or {}).get("enabled")):
-                return ("🎙 Пульт выключен. Откройте «🎙 Пульт» в меню, включите, "
-                        "задайте канал — после этого такие команды заработают.", True)
-            plan = _pult_plan_from_automation(action)
-            if not plan:
-                return "❓ Не понял, какой пост сделать. Напишите: «сделай пост в моем канале <текст>».", False
-            # Генерация текста поста в стиле канала (если стиль есть).
-            notes = []
-            for it in plan:
-                if it["kind"] == "post":
-                    pult_cfg = (getattr(user, "pult", {}) or {})
-                    ch = pult_cfg.get("channel") or {}
-                    _sk = _pult_norm_key(ch.get("title") or "") if ch else ""
-                    if _sk not in (pult_cfg.get("styles") or {}):
-                        _sk = ""
-                    text, note = await _pult_generate_text(user, _sk, it["text"])
-                    it["text"] = text
-                    if note:
-                        notes.append(f"• Канал: {note}")
-            context.user_data["pult_plan"] = plan
-            card, need = _pult_plan_card(user, plan)
-            if notes:
-                card += "\n\nℹ️ " + "\n".join(notes)
-            if need:
-                await update.message.reply_text(
-                    card, reply_markup=_pult_confirm_kb(plan))
-                return ("🎙 Проверьте план выше и нажмите «✅ Отправить».", True)
-            report = await _pult_execute_plan(context, user, plan)
-            context.user_data.pop("pult_plan", None)
-            return report, True
+        # ВОЛНА 22.4: действие pult_post удалено вместе с Пультом.
 
     return f"Неизвестное действие «{name}».", True
 
@@ -14924,9 +15040,7 @@ _MENU_TEXT_ALIASES = {
     "выйти из аккаунта": "🔓 Выйти из аккаунта",
     "добавить дз": "➕ Добавить ДЗ",
     "удалить дз": "🗑️ Удалить ДЗ",
-    "пульт": "🎙 Пульт",
-    "открой пульт": "🎙 Пульт",
-    "включи пульт": "🎙 Пульт",
+    # ВОЛНА 22.4: алиасы «пульт» удалены — Пульта больше нет.
 }
 
 
@@ -15034,1307 +15148,6 @@ async def _run_automation_oneshot(update, context, user, class_obj, raw):
             "🪄 Жду уточнения — напишите продолжение прямо сюда (голосом тоже можно)."
         )
     return MAIN_MENU
-
-
-# ==================================
-# === ВОЛНА 22: 🎙 ПУЛЬТ ===
-# ==================================
-# Управление Telegram текстом И голосом БЕЗ api_id/api_hash и БЕЗ Premium:
-#   • корпус стиля — официальный экспорт чатов из Telegram Desktop (result.json)
-#     + живые группы/каналы, куда пользователь добавил бота и разрешил анализ;
-#   • стили ПО ЧАТАМ: с Мишей — один стиль, с Дусей — другой (пары
-#     «реплика собеседника → ваш ответ» + ваши монологи);
-#   • команды («напиши Мише чтобы вернул 100₽», «сделай пост в моем канале …»,
-#     «отправь Дусе стикер сердца») LLM разбирает в план, пользователь
-#     подтверждает — и бот исполняет: посты в канал — прямо, сообщения людям —
-#     «эстафетой» от имени бота с подписью «от вас» (или черновиком, если
-#     контакт ещё не добавлен);
-#   • тумблеры: мат (ВЫКЛ по умолчанию), знаки препинания (ВКЛ),
-#     подтверждение отправки (ВКЛ).
-# Приватность: хранятся ТОЛЬКО обрезанные примеры текста для стиля (капы ниже),
-# ничего не уходит на сторону кроме промптов LLM.
-
-import re as _pult_re
-
-_PULT_TEXT_MAX = 250        # максимум символов в одном примере стиля
-_PULT_PAIRS_MAX = 60        # пар на один стиль
-_PULT_MONO_MAX = 100        # монологов на один стиль
-_PULT_STYLES_MAX = 24       # стилей на пользователя
-_PULT_CONTACTS_MAX = 30     # контактов-эстафета
-_PULT_STICKERS_MAX = 20     # запомненных стикеров
-_PULT_EXPORT_MAX_BYTES = 30 * 1024 * 1024
-_PULT_EXPORT_MSGS_MAX = 1500   # сообщений на чат из экспорта
-_PULT_EXPORT_CHATS_MAX = 40    # чатов из экспорта (по объёму)
-_PULT_PLAN_MAX = 6          # действий в одном плане
-_PULT_DM_TEXT_MAX = 500     # текст сообщения в плане
-_PULT_LIVE_TEXT_MAX = 250   # текст из живого чата в корпус
-
-# Выход из Пульта (все состояния) — как в Автоматизации.
-_PULT_EXIT_TRIGGERS = frozenset({
-    "отмена", "❌ отмена", "выход", "cancel", "назад", "⬅️ назад в меню",
-    "⬅️ назад", "выйти",
-})
-
-# Режим ожидания PULT_WAIT_CONTACT (context.user_data['pult_mode']):
-#   livechat — пересылка ЛЮБОГО сообщения из группы/канала (живой анализ)
-#   channel  — пересылка из канала пользователя / @username / -100…ID
-#   (ВОЛНА 22.3: режимы «contact»/«sticker» — эстафета людям — удалены)
-
-
-def _pult_default():
-    """Честная структура настроек Пульта по умолчанию (всё ВЫКЛ/скромно)."""
-    return {
-        "enabled": False,      # главный выключатель
-        "mat": False,          # мат в сгенерированных текстах
-        "punct": True,         # писать со знаками препинания
-        "confirm": True,       # показывать план перед отправкой
-        "me": "",              # имя пользователя в экспорте («от кого»)
-        "channel": None,       # {"chat_id": -100…, "title": "…"}
-        "styles": {},          # key → {"title","kind","pairs","mono","ts"}
-        "contacts": {},        # norm → {"uid": int, "name": str}
-        "stickers": {},        # norm → {"name": str, "file_id": str}
-        "live": {},            # str(chat_id) → {"title": str, "on": bool}
-    }
-
-
-def _pult_norm_key(name):
-    """Ключ словаря стилей/контактов/стикеров: lower, без лишних пробелов и
-    ТОЛЬКО пунктуации (эмодзи сохраняем — «❤️» это имя стикера, фикс по тесту
-    I3; буквы/цифры/эмодзи остаются, точки-запятые-кавычки уходят)."""
-    s = str(name or "").strip().lower()
-    s = _pult_re.sub(r"[.,!?;:()\[\]{}\"'`«»„“”\-—–…/\\|]", " ", s)
-    s = _pult_re.sub(r"\s+", " ", s).strip()
-    return s
-
-
-def _pult_clip(text, limit=_PULT_TEXT_MAX):
-    """Обрезает пример стиля до лимита (честно, без поломки слов)."""
-    t = str(text or "").strip()
-    if len(t) <= limit:
-        return t
-    return t[:limit - 1].rstrip() + "…"
-
-
-def _pult_style_norm(style):
-    """Приводит один стиль к канону (капы, типы) — для normalize и после сбора."""
-    style = style if isinstance(style, dict) else {}
-    pairs = style.get("pairs") if isinstance(style.get("pairs"), list) else []
-    mono = style.get("mono") if isinstance(style.get("mono"), list) else []
-    clean_pairs = []
-    for p in pairs[-_PULT_PAIRS_MAX:]:
-        if isinstance(p, (list, tuple)) and len(p) == 2:
-            a, b = _pult_clip(p[0]), _pult_clip(p[1])
-            if a and b:
-                clean_pairs.append([a, b])
-    clean_mono = [_pult_clip(m) for m in mono[-_PULT_MONO_MAX:] if str(m or "").strip()]
-    return {
-        "title": _pult_clip(style.get("title"), 80),
-        "kind": "group" if style.get("kind") == "group" else "chat",
-        "pairs": clean_pairs,
-        "mono": clean_mono,
-        "ts": str(style.get("ts") or "")[:19],
-    }
-
-
-def _pult_normalize(raw):
-    """Обратная совместимость/чистка user.pult при загрузке из БД (волна 22)."""
-    p = raw if isinstance(raw, dict) else {}
-    out = _pult_default()
-    out["enabled"] = bool(p.get("enabled"))
-    out["mat"] = bool(p.get("mat"))
-    out["punct"] = bool(p.get("punct", True))
-    out["confirm"] = bool(p.get("confirm", True))
-    out["me"] = _pult_clip(p.get("me"), 80)
-    ch = p.get("channel")
-    if isinstance(ch, dict):
-        try:
-            out["channel"] = {"chat_id": int(ch.get("chat_id") or 0),
-                              "title": _pult_clip(ch.get("title"), 80)}
-            if out["channel"]["chat_id"] == 0:
-                out["channel"] = None
-        except (TypeError, ValueError):
-            out["channel"] = None
-    styles = p.get("styles")
-    if isinstance(styles, dict):
-        merged = {}
-        for key, st in list(styles.items())[-_PULT_STYLES_MAX:]:
-            k = _pult_norm_key(key)
-            if not k:
-                continue
-            merged[k] = _pult_style_norm(st)
-        out["styles"] = merged
-    contacts = p.get("contacts")
-    if isinstance(contacts, dict):
-        clean = {}
-        for k, v in list(contacts.items())[-_PULT_CONTACTS_MAX:]:
-            nk = _pult_norm_key(k)
-            if not nk or not isinstance(v, dict):
-                continue
-            try:
-                uid = int(v.get("uid") or 0)
-            except (TypeError, ValueError):
-                continue
-            if uid > 0:
-                clean[nk] = {"uid": uid, "name": _pult_clip(v.get("name"), 80)}
-        out["contacts"] = clean
-    stickers = p.get("stickers")
-    if isinstance(stickers, dict):
-        clean = {}
-        for k, v in list(stickers.items())[-_PULT_STICKERS_MAX:]:
-            nk = _pult_norm_key(k)
-            if not nk or not isinstance(v, dict):
-                continue
-            fid = str(v.get("file_id") or "").strip()
-            if fid:
-                clean[nk] = {"name": _pult_clip(v.get("name"), 40), "file_id": fid}
-        out["stickers"] = clean
-    live = p.get("live")
-    if isinstance(live, dict):
-        clean = {}
-        for cid, info in list(live.items())[-30:]:
-            try:
-                cid_s = str(int(cid))
-            except (TypeError, ValueError):
-                continue
-            info = info if isinstance(info, dict) else {}
-            clean[cid_s] = {"title": _pult_clip(info.get("title"), 80),
-                            "on": bool(info.get("on"))}
-        out["live"] = clean
-    return out
-
-
-def _pult_style_add(pult, key, title, kind, pair=None, mono=None):
-    """Добавляет пример в стиль (с капами). Возвращает True, если добавлено."""
-    key = _pult_norm_key(key)
-    if not key:
-        return False
-    styles = pult.setdefault("styles", {})
-    if key not in styles and len(styles) >= _PULT_STYLES_MAX:
-        return False
-    st = styles.setdefault(key, _pult_style_norm({"title": title, "kind": kind}))
-    st["title"] = _pult_clip(title or st.get("title"), 80)
-    st["kind"] = "group" if kind == "group" else "chat"
-    added = False
-    if pair and isinstance(pair, (list, tuple)) and len(pair) == 2:
-        a, b = _pult_clip(pair[0]), _pult_clip(pair[1])
-        if a and b:
-            st.setdefault("pairs", []).append([a, b])
-            del st["pairs"][:-_PULT_PAIRS_MAX]
-            added = True
-    if mono and str(mono).strip():
-        st.setdefault("mono", []).append(_pult_clip(mono))
-        del st["mono"][:-_PULT_MONO_MAX]
-        added = True
-    if added:
-        st["ts"] = datetime.now().strftime("%Y-%m-%d %H:%M")
-    return added
-
-
-# --- корпус из экспорта Telegram Desktop (result.json) ---
-
-def _pult_export_text(t):
-    """Текст сообщения из экспорта: строка ИЛИ список частей (ссылки, эмодзи).
-    Части-строки склеиваем; dict-части используем только с текстом."""
-    if isinstance(t, str):
-        return t.strip()
-    if isinstance(t, list):
-        parts = []
-        for x in t:
-            if isinstance(x, str):
-                parts.append(x)
-            elif isinstance(x, dict) and isinstance(x.get("text"), str):
-                parts.append(x["text"])
-        return "".join(parts).strip()
-    return ""
-
-
-def _pult_ingest_export(data):
-    """Разбирает result.json Telegram Desktop в «сырые» чаты.
-
-    Возвращает (chats, candidates):
-      chats      — [{"name", "msgs": [(sender, text), …]}] с капами;
-      candidates — топ-5 имён-кандидатов «кто здесь я» (по частоте).
-    Ошибки → (None, []).
-    """
-    if not isinstance(data, dict):
-        return None, []
-    raw_chats = data.get("chats")
-    if not isinstance(raw_chats, list):
-        raw_chats = [data] if isinstance(data, dict) else []
-    counter = {}
-    chats = []
-    for chat in raw_chats:
-        if not isinstance(chat, dict):
-            continue
-        msgs_raw = chat.get("messages")
-        if not isinstance(msgs_raw, list) or not msgs_raw:
-            continue
-        name = _pult_clip(chat.get("name") or chat.get("title") or "чат", 80)
-        msgs = []
-        for msg in msgs_raw[-_PULT_EXPORT_MSGS_MAX:]:
-            if not isinstance(msg, dict) or msg.get("type") != "message":
-                continue
-            text = _pult_clip(_pult_export_text(msg.get("text")), _PULT_TEXT_MAX)
-            if not text:
-                continue
-            sender = _pult_clip(msg.get("from") or msg.get("actor") or "", 80)
-            msgs.append((sender, text))
-            if sender:
-                counter[sender] = counter.get(sender, 0) + 1
-        if msgs:
-            chats.append({"name": name, "msgs": msgs})
-    if not chats:
-        return None, []
-    # Оставляем самые «толстые» чаты (по числу сообщений).
-    chats.sort(key=lambda c: len(c["msgs"]), reverse=True)
-    chats = chats[:_PULT_EXPORT_CHATS_MAX]
-    candidates = [n for n, _ in sorted(counter.items(),
-                                       key=lambda kv: kv[1], reverse=True)[:5]]
-    return chats, candidates
-
-
-def _pult_apply_export_styles(user, chats, me_name):
-    """Строит стили из разобранного экспорта под именем «я» = me_name.
-
-    Личный чат (≤2 уникальных авторов) → стиль по ИМЕНИ СОБЕСЕДНИКА
-    («с Мишей я пишу так»), групповой — по названию чата. Возвращает
-    человекочитаемую сводку."""
-    me = _pult_clip(me_name, 80)
-    pult = user.pult
-    pult["me"] = me
-    lines = []
-    total_pairs = total_mono = 0
-    for chat in (chats or []):
-        name = chat["name"]
-        msgs = chat["msgs"]
-        senders = {s for s, _ in msgs if s}
-        if not senders or (len(senders) == 1 and me not in senders):
-            continue  # не про пользователя — не трогаем
-        if len(senders) <= 2:
-            partner = next((s for s in senders if s != me), "")
-            if not partner:
-                continue
-            key, title, kind = partner, f"Личный чат с {partner}", "chat"
-        else:
-            key, title, kind = name, name, "group"
-        if _pult_norm_key(key) not in pult["styles"] and len(pult["styles"]) >= _PULT_STYLES_MAX:
-            lines.append(f"• {title} — ПРОПУЩЕН (лимит {_PULT_STYLES_MAX} стилей)")
-            continue
-        np_ = nm = 0
-        prev = None
-        for sender, text in msgs:
-            if sender == me:
-                if prev is not None and prev[0] != me:
-                    if _pult_style_add(pult, key, title, kind, pair=[prev[1], text]):
-                        np_ += 1
-                if _pult_style_add(pult, key, title, kind, mono=text):
-                    nm += 1
-            prev = (sender, text)
-        if np_ or nm:
-            total_pairs += np_
-            total_mono += nm
-            lines.append(f"• {title} — пар: {np_}, примеров: {nm}")
-    if not lines:
-        lines.append("• Ничего не собрано: не нашлось сообщений от "
-                     f"«{me}». Попробуйте указать другое имя.")
-    header = (f"📥 Стиль собран (я = «{me}»):\n" if lines else "")
-    footer = (f"\nИтого: {total_pairs} пар и {total_mono} примеров. "
-              f"Ваше имя запомнено — следующий экспорт разберётся сразу.")
-    return header + "\n".join(lines) + footer
-
-
-# --- LLM: разбор команд и генерация текста в стиле ---
-
-async def _pult_llm_json(system, user_prompt, temperature=0.3):
-    """LLM с ЧЕСТНЫМ фолбэком: DeepSeek → Groq. Возвращает dict или None."""
-    messages = [{"role": "system", "content": system},
-                {"role": "user", "content": user_prompt}]
-    raw = await _deepseek_chat(messages, timeout=60,
-                               temperature=temperature, force_json=True)
-    if raw:
-        d = _extract_json_dict(raw)
-        if d:
-            return d
-    if GROQ_API_KEY:
-        try:
-            resp = await groq_client.chat.completions.create(
-                model=GROQ_MODEL, messages=messages,
-                temperature=temperature, max_tokens=1500,
-                response_format={"type": "json_object"},
-            )
-            content = resp.choices[0].message.content
-            d = _extract_json_dict(content)
-            if d:
-                return d
-        except Exception as e:
-            logger.warning(f"pult: Groq-фолбэк не ответил ({e})")
-    return None
-
-
-def _pult_style_samples(user, key):
-    """Примеры стиля для цели. Возвращает (pairs, mono, note). Если точного
-    стиля нет — честный общий корпус из всех стилей."""
-    pult = user.pult
-    st = (pult.get("styles") or {}).get(_pult_norm_key(key))
-    if st:
-        return list(st.get("pairs") or []), list(st.get("mono") or []), ""
-    pairs, mono = [], []
-    for k, s in (pult.get("styles") or {}).items():
-        pairs.extend(list((s or {}).get("pairs") or [])[-10:])
-        mono.extend(list((s or {}).get("mono") or [])[-15:])
-    note = ("точного стиля для этого адресата нет — пишу общим стилем "
-            "(соберите экспорт с этим чатом)")
-    return pairs, mono, note
-
-
-def _pult_style_block(pairs, mono):
-    """Примеры для промпта: пары «собеседник → вы» + монологи."""
-    lines = []
-    for a, b in (pairs or [])[-15:]:
-        lines.append(f"Собеседник: {a}\nВы: {b}")
-    for m in (mono or [])[-15:]:
-        lines.append(f"Вы: {m}")
-    return "\n---\n".join(lines) if lines else "(примеров пока нет)"
-
-
-async def _pult_generate_text(user, key, brief):
-    """Генерирует сообщение в стиле пользователя. Возвращает (text, note)."""
-    pairs, mono, note = _pult_style_samples(user, key)
-    pult = user.pult
-    mat_line = ("Мат РАЗРЕШЁН: пользователь общается с матом — используй его "
-                "уместно и в том же объёме, что в примерах."
-                if pult.get("mat")
-                else "Мат ЗАПРЕЩЁН: обходи мат эвфемизмами, даже если он в примерах.")
-    punct_line = ("Знаки препинания: НЕ используй вообще — пиши сплошным "
-                  "разговорным потоком без точек, запятых и вопросительных."
-                  if not pult.get("punct")
-                  else "Знаки препинания: используй как в примерах.")
-    system = (
-        "Ты — голос пользователя Telegram в его личной переписке. Твоя задача: "
-        "написать ГОТОВОЕ короткое сообщение ОТ ЕГО ЛИЦА по сути, которую передаст "
-        "координатор. Отвечай СТРОГО JSON: {\"text\": \"<готовое сообщение>\"} — "
-        "без кавычек внутри, без пояснений, без подписи «от кого».\n\n"
-        f"СТИЛЬ ПОЛЬЗОВАТЕЛЯ (примеры):\n{_pult_style_block(pairs, mono)}\n\n"
-        f"{mat_line}\n{punct_line}\n"
-        "Длина: как у типичных сообщений пользователя (1-2 предложения). "
-        "Язык: русский. Пиши как живой человек из примеров, не как ассистент."
-    )
-    d = await _pult_llm_json(system, f"Суть сообщения: {brief}",
-                             temperature=0.9)
-    text = ""
-    if isinstance(d, dict):
-        text = _pult_clip(d.get("text") or "", _PULT_DM_TEXT_MAX)
-    if not text:
-        return _pult_clip(brief, _PULT_DM_TEXT_MAX), (
-            note + "; LLM не ответила — оставил суть как есть" if note
-            else "LLM не ответила — оставил суть как есть")
-    text = _pult_apply_punct(text, pult.get("punct", True))
-    return text, note
-
-
-# --- пунктуация: честный пост-процессор (работает даже если LLM забыл) ---
-
-_PUNCT_STRIP_CHARS = ".,!?;:«»„“”\"()—–-…"
-_PUNCT_COLON_TAG = "\x00c\x00"
-
-
-def _pult_apply_punct(text, with_punct=True):
-    """Если знаки ВЫКЛ — убираем пунктуацию, но щадим время (17:30) и эмодзи."""
-    if with_punct or not text:
-        return text
-    t = _pult_re.sub(r"(\d):(\d)", rf"\1{_PUNCT_COLON_TAG}\2", text)
-    for ch in _PUNCT_STRIP_CHARS:
-        t = t.replace(ch, " ")
-    t = t.replace(_PUNCT_COLON_TAG, ":")
-    t = _pult_re.sub(r"[ \t]+", " ", t).strip()
-    return t
-
-
-def _pult_plan_from_parsed(user, parsed):
-    """JSON команды {"actions":[…]} → план исполнимых пунктов.
-    ВОЛНА 22.3: dm/sticker (эстафета людям) удалены — остался только post."""
-    plan = []
-    acts = parsed.get("actions") if isinstance(parsed.get("actions"), list) else []
-    for a in acts[:_PULT_PLAN_MAX + 2]:
-        if not isinstance(a, dict):
-            continue
-        act = str(a.get("act") or "").strip().lower()
-        if act == "post":
-            text = _pult_clip(a.get("text"), _PULT_DM_TEXT_MAX)
-            if text:
-                ch = user.pult.get("channel") or {}
-                plan.append({"kind": "post",
-                             "target": ch.get("title") or "канал",
-                             "text": text})
-            if len(plan) >= _PULT_PLAN_MAX:
-                break
-    return plan
-
-
-def _pult_plan_from_automation(action):
-    """Действие автоматизации pult_post → тот же формат плана.
-    ВОЛНА 22.3: pult_dm (эстафета людям) удалён по решению пользователя."""
-    plan = []
-    name = (action.get("action") or "").strip()
-    if name == "pult_post":
-        text = _pult_clip(action.get("text"), _PULT_DM_TEXT_MAX)
-        if text:
-            plan.append({"kind": "post", "target": "канал", "text": text})
-    return plan[:_PULT_PLAN_MAX]
-
-
-def _pult_plan_card(user, plan):
-    """Человекочитаемая карточка плана. Возвращает (text, need_confirm).
-    ВОЛНА 22.3: только посты в канал (dm/sticker удалены)."""
-    pult = user.pult
-    lines = ["🎙 Проверьте план отправки:"]
-    for i, it in enumerate(plan, 1):
-        lines.append(f"{i}) 📢 Канал «{it['target']}»: «{it['text']}»")
-    if pult.get("confirm", True):
-        lines.append("\nНажмите «✅ Отправить», чтобы исполнить.")
-        return "\n".join(lines), True
-    return "\n".join(lines), False
-
-
-def _pult_confirm_kb(plan):
-    """Кнопки подтверждения: отправить / отменить + ✏️ к каждому текстовому."""
-    rows = []
-    edit_row = []
-    for i, it in enumerate(plan):
-        if it["kind"] == "post" and i < 5:
-            edit_row.append(InlineKeyboardButton(f"✏️ {i + 1}",
-                                                 callback_data=f"pult_edi_{i}"))
-    if edit_row:
-        rows.append(edit_row)
-    rows.append([
-        InlineKeyboardButton("✅ Отправить", callback_data="pult_send"),
-        InlineKeyboardButton("❌ Отмена", callback_data="pult_ccancel"),
-    ])
-    return InlineKeyboardMarkup(rows)
-
-
-async def _pult_execute_plan(context, user, plan):
-    """Исполняет план (только посты в канал) и возвращает честный отчёт.
-    ВОЛНА 22.3: эстафета людям удалена по решению пользователя."""
-    pult = user.pult
-    lines = []
-    for i, it in enumerate(plan, 1):
-        try:
-            ch = pult.get("channel")
-            if not ch:
-                lines.append(
-                    f"⚠️ {i}. Канал не задан — ЧЕРНОВИК поста:\n\n«{it['text']}»\n"
-                    "💡 Задайте канал: 🎙 Пульт → 📢 Канал.")
-                continue
-            await context.bot.send_message(int(ch["chat_id"]), it["text"])
-            lines.append(f"✅ {i}. Пост опубликован в «{ch.get('title')}».")
-        except (TGBadRequest, TGForbidden) as e:
-            lines.append(f"⚠️ {i}. Telegram отказал ({e}): {it['target']}. "
-                         "Проверьте, что бот администратор канала.")
-        except Exception as e:
-            lines.append(f"⚠️ {i}. Сбой: {e!r}")
-    return "📣 Итог Пульта:\n\n" + "\n".join(lines)
-
-
-# --- живые группы: наблюдатель (group=1, не мешает FSM) ---
-
-_pult_live_index = {"ts": 0.0, "map": {}}
-_pult_last_other = {}      # chat_id → (sender_name, text) — последняя «чужая» реплика
-_pult_dirty = {"users": set(), "ts": 0.0}   # кому нужен save_user (дебаунс)
-
-
-def _pult_get_live_index():
-    """Индекс {chat_id: [(uid, style_key), …]} по всем пользователям с Пультом
-    (кэш 60 с). Ошибки — честный пустой индекс."""
-    now = time.time()
-    if now - _pult_live_index["ts"] < 60:
-        return _pult_live_index
-    m = {}
-    try:
-        for uid, user in load_users().items():
-            pult = getattr(user, "pult", None) or {}
-            if not pult.get("enabled"):
-                continue
-            for cid, info in (pult.get("live") or {}).items():
-                if not isinstance(info, dict) or not info.get("on"):
-                    continue
-                try:
-                    cid_i = int(cid)
-                except (TypeError, ValueError):
-                    continue
-                key = _pult_norm_key(info.get("title") or cid)
-                if key:
-                    m.setdefault(cid_i, []).append((str(uid), key))
-    except Exception as e:
-        logger.error(f"pult: индекс живых чатов не построен ({e})")
-        m = {}
-    _pult_live_index["map"] = m
-    _pult_live_index["ts"] = now
-    return _pult_live_index
-
-
-def _pult_mark_dirty(uid):
-    _pult_dirty["users"].add(str(uid))
-    now = time.time()
-    if now - _pult_dirty["ts"] < 45:
-        return
-    _pult_dirty["ts"] = now
-    batch, _pult_dirty["users"] = _pult_dirty["users"], set()
-    for u in batch:
-        try:
-            su = get_user(u)
-            if su:
-                save_user(su)
-        except Exception as e:
-            logger.warning(f"pult: дебаунс-сохранение {u} не прошло ({e})")
-
-
-async def _pult_group_observer(update, context):
-    """ВОЛНА 22: копит стиль пользователя из групп/каналов, которые он
-    разрешил (pult.live.on). Никаких ответов — тихий сборник с капами."""
-    try:
-        msg = getattr(update, "effective_message", None)
-        chat = getattr(update, "effective_chat", None)
-        if msg is None or chat is None:
-            return
-        if chat.type not in ("group", "supergroup"):
-            return
-        text = str(getattr(msg, "text", "") or "").strip()
-        if not text:
-            return
-        frm = getattr(msg, "from_user", None)
-        if frm is None or getattr(frm, "is_bot", False):
-            return
-        owners = _pult_get_live_index()["map"].get(int(chat.id))
-        if not owners:
-            return
-        for uid, key in owners:
-            user = get_user(uid)
-            pult = getattr(user, "pult", None) if user else None
-            if not user or not pult or not pult.get("enabled"):
-                continue
-            info = (pult.get("live") or {}).get(str(int(chat.id))) or {}
-            title = info.get("title") or (chat.title or "чат")
-            clipped = text[:_PULT_LIVE_TEXT_MAX]
-            if frm.id == int(uid):
-                prev = _pult_last_other.get(int(chat.id))
-                if prev:
-                    _pult_style_add(pult, key, title, "group", pair=[prev[1], clipped])
-                _pult_style_add(pult, key, title, "group", mono=clipped)
-            else:
-                _pult_style_add(pult, key, title, "group", mono=None)
-                _pult_last_other[int(chat.id)] = (str(frm.first_name or "?"),
-                                                  clipped)
-                if len(_pult_last_other) > 500:
-                    _pult_last_other.pop(next(iter(_pult_last_other)))
-            _pult_mark_dirty(uid)
-    except Exception as e:
-        logger.warning(f"pult: наблюдатель групп сбой ({e})")
-
-
-# --- промпт разбора команд ---
-
-_PULT_CMD_SYSTEM = (
-    "Ты — парсер команд «Пульта» школьного бота. Преврати запрос пользователя "
-    "на русском в JSON: {\"actions\": [ … ]} — список действий В ПОРЯДКЕ "
-    "УПОМИНАНИЯ. Доступные действия:\n"
-    '{"act":"post","text":"<готовый текст поста в канал>"}\n'
-    '{"act":"clarify","question":"<один уточняющий вопрос>"}\n'
-    '{"act":"none","answer":"<ответ, если это вообще не команда Пульта>"}\n\n'
-    "ПРАВИЛА:\n"
-    "- «сделай пост в моем канале <текст>» → post с ГОТОВЫМ текстом поста.\n"
-    "- Действий «напиши кому-то лично» и «отправь стикер» БОЛЬШЕ НЕТ (эстафета "
-    "удалена) — на такие просьбы отвечай none с честным объяснением, что бот "
-    "теперь постит только в канал пользователя.\n"
-    "- Если текст поста пуст или канал не указан — clarify. Не команды бота — "
-    "none с коротким ответом.\n"
-    "- Отвечай ТОЛЬКО JSON."
-)
-
-
-def _pult_menu_text(user):
-    pult = user.pult
-    on = "🟢 ВКЛ" if pult.get("enabled") else "🔴 ВЫКЛ"
-    styles = pult.get("styles") or {}
-    n_pairs = sum(len((s or {}).get("pairs") or []) for s in styles.values())
-    n_mono = sum(len((s or {}).get("mono") or []) for s in styles.values())
-    ch = pult.get("channel")
-    lines = [
-        f"🎙 ПУЛЬТ — {on}",
-        "",
-        "Команды текстом или ГОЛОСОМ: «сделай пост в моем канале рыбка сто "
-        "я иду».",
-        "",
-        f"✍️ Стиль: {len(styles)} чатов • {n_pairs} пар • {n_mono} примеров",
-        f"📢 Канал: «{ch['title']}»" if ch else "📢 Канал: не задан",
-        f"🗣 Мат: {'разрешён' if pult.get('mat') else 'запрещён'} • "
-        f"Знаки препинания: {'с знаками' if pult.get('punct') else 'без знаков'} • "
-        f"Подтверждение: {'да' if pult.get('confirm') else 'нет'}",
-        "",
-        "Посты уходят НАПРЯМУЮ в ваш канал (бот-админ). Писать людям от "
-        "вашего имени Bot API не умеет — эстафета удалена по вашему решению.",
-    ]
-    return "\n".join(lines)
-
-
-def _pult_menu_kb(user):
-    pult = user.pult
-    def _b(t, d):
-        return InlineKeyboardButton(t, callback_data=d)
-    rows = [
-        [_b("🟢 Пульт ВКЛ" if pult.get("enabled") else "🔴 Пульт ВЫКЛ", "pult_t_en"),
-         _b("✍️ Команда", "pult_cmd")],
-        [_b("📥 Стиль из экспорта", "pult_export"),
-         _b(f"🎨 Стили: {len(pult.get('styles') or {})}", "pult_styles")],
-        [_b("💬 Живые чаты", "pult_livelist"),
-         _b("📢 Канал", "pult_channel")],
-        [_b(f"🗣 Мат: {'вкл' if pult.get('mat') else 'выкл'}", "pult_t_mat"),
-         _b(f"✒️ Знаки: {'да' if pult.get('punct') else 'нет'}", "pult_t_punct"),
-         _b(f"✔️ Подтверждение: {'да' if pult.get('confirm') else 'нет'}", "pult_t_conf")],
-        [_b("⬅️ В главное меню", "pult_exit")],
-    ]
-    return InlineKeyboardMarkup(rows)
-
-
-async def pult_menu_start(update, context):
-    """Вход в Пульт — из кнопки меню ИЛИ из колбэка «⬅️». Возвращает PULT_MENU."""
-    uid = str(update.effective_user.id)
-    user = get_user(uid)
-    if not user:
-        user = User(uid, update.effective_user.username or "",
-                    update.effective_user.first_name or "")
-    kb = _pult_menu_kb(user)
-    text = _pult_menu_text(user)
-    q = getattr(update, "callback_query", None)
-    if q is not None and q.message:
-        try:
-            await q.edit_message_text(text, reply_markup=kb)
-        except TGBadRequest:
-            pass
-        await q.answer()
-    else:
-        if update.message:
-            await update.message.reply_text(
-                "🎙 Пульт открыт. Настройте внизу — и пишите/говорите команды.",
-                reply_markup=ReplyKeyboardMarkup([["❌ Отмена"]], resize_keyboard=True))
-            await update.message.reply_text(text, reply_markup=kb)
-    return PULT_MENU
-
-
-async def _pult_rerender(update, context, user, extra=""):
-    """Перерисовывает меню Пульта (inline) в ответ на колбэк."""
-    q = getattr(update, "callback_query", None)
-    text = _pult_menu_text(user) + (f"\n\n{extra}" if extra else "")
-    if q is not None:
-        try:
-            await q.edit_message_text(text, reply_markup=_pult_menu_kb(user))
-        except TGBadRequest:
-            try:
-                await q.answer("Уже обновлено", show_alert=False)
-            except Exception:
-                pass
-            return
-        try:
-            await q.answer()
-        except Exception:
-            pass
-
-
-async def pult_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Маршрутизатор inline-кнопок Пульта (pattern ^pult_). Возвращает состояние."""
-    query = update.callback_query
-    data = (query.data or "")
-    uid = str(update.effective_user.id)
-    user = get_user(uid)
-    if not user:
-        user = User(uid, update.effective_user.username or "",
-                    update.effective_user.first_name or "")
-    pult = user.pult
-    try:
-        if data == "pult_exit":
-            try:
-                await query.answer()
-            except Exception:
-                pass
-            await context.bot.send_message(
-                update.effective_chat.id,
-                "🎙 Пульт закрыт.",
-                reply_markup=get_main_menu_keyboard(user))
-            return MAIN_MENU
-
-        if data == "pult_menu":
-            await _pult_rerender(update, context, user)
-            return PULT_MENU
-
-        if data in ("pult_t_en", "pult_t_mat", "pult_t_punct", "pult_t_conf"):
-            field = {"pult_t_en": "enabled", "pult_t_mat": "mat",
-                     "pult_t_punct": "punct", "pult_t_conf": "confirm"}[data]
-            pult[field] = not bool(pult.get(field))
-            save_user(user)
-            extra = ""
-            if field == "enabled" and not pult["enabled"]:
-                extra = "⚠️ Пульт выключен — команды приниматься не будут."
-            if field == "enabled" and pult["enabled"]:
-                extra = ("✅ Пульт включён! Живые чаты заработали, команды "
-                         "принимаются.")
-            await _pult_rerender(update, context, user, extra)
-            return PULT_MENU
-
-        if data == "pult_export":
-            await query.edit_message_text(
-                "📥 СТИЛЬ ИЗ ЭКСПОРТА\n\n"
-                "1) Откройте Telegram Desktop → Настройки → Экспорт данных → "
-                "выберите чаты (личные и группы) → экспорт в JSON.\n"
-                "2) Пришлите мне файл result.json документом прямо сюда.\n\n"
-                "Я соберу стили ПО КАЖДОМУ чату: с Мишей — один, с Дусей — "
-                "другой. Ничего не нужно кроме файла — ни api_id, ни Premium.",
-                reply_markup=InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("⬅️ Назад", callback_data="pult_menu")]]))
-            await query.answer()
-            return PULT_WAIT_EXPORT
-
-        if data == "pult_cmd":
-            await query.edit_message_text(
-                "✍️ Напишите команду (или пришлите голосом):\n\n"
-                "«сделай пост в моем канале рыбка сто я иду»",
-                reply_markup=InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("⬅️ Назад", callback_data="pult_menu")]]))
-            await query.answer()
-            return PULT_WAIT_CMD
-
-        if data == "pult_styles":
-            keys = list((pult.get("styles") or {}).keys())
-            context.user_data["pult_view_styles"] = keys
-            rows = []
-            for i, k in enumerate(keys):
-                st = pult["styles"].get(k) or {}
-                rows.append([InlineKeyboardButton(
-                    f"🗑 {st.get('title') or k} "
-                    f"({len(st.get('pairs') or [])}п/{len(st.get('mono') or [])}пр)",
-                    callback_data=f"pult_sdel_{i}")])
-            rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="pult_menu")])
-            await query.edit_message_text(
-                "🎨 СТИЛИ ПО ЧАТАМ — нажмите на стиль, чтобы УДАЛИТЬ его:",
-                reply_markup=InlineKeyboardMarkup(rows))
-            await query.answer()
-            return PULT_MENU
-
-        if data.startswith("pult_sdel_"):
-            keys = context.user_data.get("pult_view_styles") or []
-            try:
-                i = int(data.split("_")[-1])
-                k = keys[i]
-            except (ValueError, IndexError):
-                k = None
-            if k and k in (pult.get("styles") or {}):
-                pult["styles"].pop(k, None)
-                save_user(user)
-                await query.answer("Удалено")
-            else:
-                try:
-                    await query.answer()
-                except Exception:
-                    pass
-            await _pult_rerender(update, context, user)
-            return PULT_MENU
-
-        if data == "pult_livelist":
-            live = pult.get("live") or {}
-            items = list(live.items())
-            context.user_data["pult_view_live"] = [cid for cid, _ in items]
-            rows = []
-            for i, (cid, info) in enumerate(items):
-                mark = "🟢" if info.get("on") else "⚪️"
-                rows.append([InlineKeyboardButton(
-                    f"{mark} {info.get('title') or cid}",
-                    callback_data=f"pult_lon_{i}"),
-                    InlineKeyboardButton("🗑", callback_data=f"pult_ldel_{i}")])
-            rows.append([InlineKeyboardButton("➕ Добавить чат", callback_data="pult_ladd")])
-            rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="pult_menu")])
-            await query.edit_message_text(
-                "💬 ЖИВЫЕ ЧАТЫ\n\nБот копит стиль из групп, куда он добавлен и "
-                "где зелёный индикатор. ➕ — перешлите ЛЮБОЕ сообщение из "
-                "нужной группы.",
-                reply_markup=InlineKeyboardMarkup(rows))
-            await query.answer()
-            return PULT_MENU
-
-        if data.startswith("pult_lon_") or data.startswith("pult_ldel_"):
-            ids = context.user_data.get("pult_view_live") or []
-            try:
-                i = int(data.split("_")[-1])
-                cid = ids[i]
-            except (ValueError, IndexError):
-                cid = None
-            if cid and cid in (pult.get("live") or {}):
-                if data.startswith("pult_lon_"):
-                    pult["live"][cid]["on"] = not pult["live"][cid].get("on")
-                else:
-                    pult["live"].pop(cid, None)
-                save_user(user)
-                try:
-                    await query.answer("Готово")
-                except Exception:
-                    pass
-            else:
-                try:
-                    await query.answer()
-                except Exception:
-                    pass
-            # перерисовываем список живых чатов заново
-            cb = query
-            cb.data = "pult_livelist"
-            update.callback_query = cb
-            return await pult_callback(update, context)
-
-        if data == "pult_ladd":
-            context.user_data["pult_mode"] = "livechat"
-            await query.edit_message_text(
-                "💬 ДОБАВЛЕНИЕ ЖИВОГО ЧАТА\n\nПерешлите сюда ЛЮБОЕ сообщение "
-                "из группы/канала (у которых бот — участник).",
-                reply_markup=InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("⬅️ Назад", callback_data="pult_menu")]]))
-            await query.answer()
-            return PULT_WAIT_CONTACT
-
-        if data == "pult_channel":
-            context.user_data["pult_mode"] = "channel"
-            ch = pult.get("channel")
-            cur = f"Текущий канал: «{ch['title']}»." if ch else "Канал пока не задан."
-            await query.edit_message_text(
-                f"📢 КАНАЛ ДЛЯ ПОСТОВ\n\n{cur}\n\nПерешлите сюда ЛЮБОЕ сообщение "
-                "из ВАШЕГО канала (бот должен быть АДМИНОМ канала) — или "
-                "пришлите @username / -100…ID. Посты «сделай пост …» уйдут туда.",
-                reply_markup=InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("⬅️ Назад", callback_data="pult_menu")]]))
-            await query.answer()
-            return PULT_WAIT_CONTACT
-
-        if data == "pult_send":
-            plan = context.user_data.get("pult_plan") or []
-            context.user_data.pop("pult_plan", None)
-            try:
-                await query.answer()
-            except Exception:
-                pass
-            if not plan:
-                try:
-                    await query.edit_message_text("План пуст — команда уже исполнена или отменена.")
-                except TGBadRequest:
-                    pass
-                return PULT_MENU
-            report = await _pult_execute_plan(context, user, plan)
-            try:
-                await query.edit_message_text(
-                    report,
-                    reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("🎙 Пульт", callback_data="pult_menu"),
-                        InlineKeyboardButton("⬅️ В меню", callback_data="pult_exit"),
-                    ]]))
-            except TGBadRequest:
-                pass
-            return PULT_MENU
-
-        if data == "pult_ccancel":
-            context.user_data.pop("pult_plan", None)
-            try:
-                await query.answer("Отменено")
-            except Exception:
-                pass
-            await _pult_rerender(update, context, user, "План отменён — ничего не отправлено.")
-            return PULT_MENU
-
-        if data.startswith("pult_edi_"):
-            try:
-                i = int(data.split("_")[-1])
-            except ValueError:
-                i = -1
-            plan = context.user_data.get("pult_plan") or []
-            if 0 <= i < len(plan) and plan[i]["kind"] == "post":
-                context.user_data["pult_edit_idx"] = i
-                await query.edit_message_text(
-                    f"✏️ Введите СВОЙ текст для пункта {i + 1} (канал):\n\n"
-                    f"Текущий: «{plan[i]['text']}»",
-                    reply_markup=InlineKeyboardMarkup(
-                        [[InlineKeyboardButton("⬅️ Назад", callback_data="pult_menu")]]))
-                await query.answer()
-                return PULT_EDIT_TEXT
-            try:
-                await query.answer("Нельзя редактировать этот пункт")
-            except Exception:
-                pass
-            return PULT_MENU
-
-        if data.startswith("pult_me_"):
-            try:
-                idx = int(data.split("_")[-1])
-            except ValueError:
-                idx = -1
-            return await _pult_export_me_choice(update, context, user, idx)
-
-        # неизвестный колбэк — просто перерисуем меню
-        await _pult_rerender(update, context, user)
-        return PULT_MENU
-    except Exception as e:
-        logger.error(f"pult_callback сбой ({data}): {e}")
-        try:
-            await query.answer("Сбой — попробуйте ещё раз", show_alert=True)
-        except Exception:
-            pass
-        return PULT_MENU
-
-
-# --- текстовые хендлеры Пульта ---
-
-def _pult_is_exit(raw):
-    return raw.strip().lower() in _PULT_EXIT_TRIGGERS
-
-
-async def pult_menu_text_handler(update, context):
-    """Текст в меню Пульта: выход / команда (если Пульт включён)."""
-    uid = str(update.effective_user.id)
-    user = get_user(uid)
-    if not user:
-        user = User(uid)
-    raw = (update.message.text or "").strip()
-    if _pult_is_exit(raw):
-        await update.message.reply_text(
-            "🎙 Пульт закрыт.", reply_markup=get_main_menu_keyboard(user))
-        return MAIN_MENU
-    if not user.pult.get("enabled"):
-        await update.message.reply_text(
-            "⚠️ Пульт выключен. Нажмите «🟢 Пульт ВКЛ» в меню ниже — и команды "
-            "заработают.",
-            reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("🎙 Открыть меню Пульта",
-                                       callback_data="pult_menu")]]))
-        return PULT_MENU
-    return await pult_command_process(update, context, user, raw)
-
-
-async def pult_state_text_handler(update, context):
-    """Текст в состоянии ожидания экспорта — только подсказка/выход."""
-    raw = (update.message.text or "").strip()
-    if _pult_is_exit(raw):
-        user = get_user(str(update.effective_user.id)) or User(str(update.effective_user.id))
-        await update.message.reply_text(
-            "🎙 Пульт закрыт.", reply_markup=get_main_menu_keyboard(user))
-        return MAIN_MENU
-    await update.message.reply_text(
-        "Пришлите ФАЙЛ result.json документом (Telegram Desktop → Настройки → "
-        "Экспорт данных).",
-        reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("⬅️ Назад", callback_data="pult_menu")]]))
-    return PULT_WAIT_EXPORT
-
-
-async def pult_export_document_handler(update, context):
-    """Приём result.json (в меню Пульта И в состоянии ожидания экспорта)."""
-    uid = str(update.effective_user.id)
-    user = get_user(uid)
-    if not user:
-        user = User(uid)
-    doc = getattr(update.message, "document", None)
-    if doc is None:
-        await update.message.reply_text("Пришлите result.json ДОКУМЕНТОМ (файлом).")
-        return PULT_WAIT_EXPORT
-    if int(getattr(doc, "file_size", 0) or 0) > _PULT_EXPORT_MAX_BYTES:
-        await update.message.reply_text(
-            f"⚠️ Файл слишком большой (>{_PULT_EXPORT_MAX_BYTES // (1024 * 1024)} МБ). "
-            "Экспортируйте меньше чатов.")
-        return PULT_WAIT_EXPORT
-    name = str(getattr(doc, "file_name", "") or "").lower()
-    if name and not name.endswith((".json",)):
-        await update.message.reply_text(
-            "⚠️ Это не JSON-файл. Нужен result.json из экспорта Telegram Desktop.")
-        return PULT_WAIT_EXPORT
-    try:
-        tg_file = await context.bot.get_file(doc.file_id)
-        buf = io.BytesIO()
-        await asyncio.wait_for(tg_file.download_to_memory(out=buf), timeout=90)
-        data = json.loads(buf.getvalue().decode("utf-8", errors="replace"))
-    except Exception as e:
-        await update.message.reply_text(
-            f"⚠️ Не смог прочитать JSON: {e}. Убедитесь, что это файл "
-            "result.json из экспорта Telegram Desktop.")
-        return PULT_WAIT_EXPORT
-    chats, candidates = _pult_ingest_export(data)
-    if not chats:
-        await update.message.reply_text(
-            "⚠️ В файле не нашлось чатов с сообщениями. Экспортируйте в "
-            "формате «Машинно-читаемый JSON» (machine-readable JSON).")
-        return PULT_WAIT_EXPORT
-    me_saved = (user.pult.get("me") or "").strip()
-    if me_saved and me_saved in {s for c in chats for s, _ in c["msgs"]}:
-        report = _pult_apply_export_styles(user, chats, me_saved)
-        save_user(user)
-        context.user_data.pop("pult_export_raw", None)
-        await update.message.reply_text(
-            report + "\n\nГотово! Команды уже можно давать голосом или текстом.",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🎙 Меню Пульта", callback_data="pult_menu")]]))
-        return PULT_MENU
-    # Имя «я» неизвестно — предложим кандидатов (кнопками).
-    context.user_data["pult_export_raw"] = chats
-    rows = []
-    for i, cand in enumerate(candidates[:5]):
-        rows.append([InlineKeyboardButton(f"Я — «{cand}»",
-                                          callback_data=f"pult_me_{i}")])
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="pult_menu")])
-    context.user_data["pult_export_cands"] = candidates[:5]
-    await update.message.reply_text(
-        "Файл прочитан! Кто из этих участников — ВЫ? (по нему соберу стиль)",
-        reply_markup=InlineKeyboardMarkup(rows))
-    return PULT_WAIT_EXPORT
-
-
-async def _pult_export_me_choice(update, context, user, idx):
-    """Пользователь выбрал «кто я» в экспорте — строим стили."""
-    chats = context.user_data.get("pult_export_raw") or []
-    cands = context.user_data.get("pult_export_cands") or []
-    if not chats or not (0 <= idx < len(cands)):
-        await _pult_rerender(update, context, user)
-        return PULT_MENU
-    report = _pult_apply_export_styles(user, chats, cands[idx])
-    save_user(user)
-    context.user_data.pop("pult_export_raw", None)
-    context.user_data.pop("pult_export_cands", None)
-    q = update.callback_query
-    try:
-        await q.edit_message_text(
-            report + "\n\nГотово! Команды уже можно давать голосом или текстом.",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🎙 Меню Пульта", callback_data="pult_menu")]]))
-        await q.answer()
-    except TGBadRequest:
-        pass
-    return PULT_MENU
-
-
-async def pult_contact_input_handler(update, context):
-    """Ввод в PULT_WAIT_CONTACT: канал / живой чат — по флагу pult_mode.
-    ВОЛНА 22.3: режимы «contact» и «sticker» (эстафета людям) удалены по
-    решению пользователя — Bot API не умеет писать людям от чужого имени."""
-    uid = str(update.effective_user.id)
-    user = get_user(uid)
-    if not user:
-        user = User(uid)
-    pult = user.pult
-    mode = context.user_data.get("pult_mode") or "livechat"
-    msg = update.message
-    raw = (msg.text or "").strip()
-    if _pult_is_exit(raw):
-        context.user_data.pop("pult_mode", None)
-        await msg.reply_text("🎙 Пульт закрыт.",
-                             reply_markup=get_main_menu_keyboard(user))
-        return MAIN_MENU
-    origin = getattr(msg, "forward_origin", None)
-
-    if mode == "channel":
-        ch_obj = None
-        if origin is not None:
-            ch_obj = (getattr(origin, "chat", None)
-                      or getattr(origin, "sender_chat", None))
-        if ch_obj is None and raw:
-            ident = raw.lstrip("@").strip()
-            try:
-                ch_obj = await context.bot.get_chat(
-                    int(ident) if ident.lstrip("-").isdigit() else f"@{ident}")
-            except Exception as e:
-                await msg.reply_text(f"⚠️ Канал не найден: {e}")
-                return PULT_WAIT_CONTACT
-        if ch_obj is None:
-            await msg.reply_text("Перешлите сообщение ИЗ канала или пришлите "
-                                 "@username / -100…ID.")
-            return PULT_WAIT_CONTACT
-        cid = int(ch_obj.id)
-        title = str(getattr(ch_obj, "title", "") or getattr(ch_obj, "username", "") or "канал")
-        try:
-            me_bot = await context.bot.get_me()
-            member = await context.bot.get_chat_member(cid, me_bot.id)
-            status = str(getattr(member, "status", "") or "")
-            if status not in ("administrator", "creator"):
-                raise TGBadRequest("бот не админ")
-        except Exception as e:
-            await msg.reply_text(
-                f"⚠️ Нужен бот-АДМИН канала «{title}»: добавьте его администратором "
-                f"с правом публикации. ({e})")
-            return PULT_WAIT_CONTACT
-        pult["channel"] = {"chat_id": cid, "title": _pult_clip(title, 80)}
-        save_user(user)
-        context.user_data.pop("pult_mode", None)
-        await msg.reply_text(
-            f"✅ Канал «{title}» подключён. «Сделай пост в моем канале …» — заработало.",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🎙 Меню Пульта", callback_data="pult_menu")]]))
-        return PULT_MENU
-
-    # mode == livechat — нужен ПЕРЕСЛАННЫЙ апдейт
-    if mode == "livechat":
-        src = (getattr(origin, "chat", None)
-               or getattr(origin, "sender_chat", None))
-        if src is None:
-            await msg.reply_text(
-                "Перешлите ЛЮБОЕ сообщение ИЗ нужной группы/канала "
-                "(пересылка из чата, а не текст сюда).")
-            return PULT_WAIT_CONTACT
-        cid = str(int(src.id))
-        title = _pult_clip(getattr(src, "title", None) or getattr(src, "username", None) or "чат", 80)
-        live = pult.setdefault("live", {})
-        if cid not in live and len(live) >= 30:
-            await msg.reply_text("⚠️ Лимит живых чатов (30) — удалите лишний.")
-            return PULT_WAIT_CONTACT
-        live[cid] = {"title": title, "on": True}
-        save_user(user)
-        _pult_live_index["ts"] = 0.0  # пересобрать индекс
-        context.user_data.pop("pult_mode", None)
-        await msg.reply_text(
-            f"✅ Живой чат «{title}» добавлен (🟢 включён). Стиль будет "
-            "накапливаться сам.",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🎙 Меню Пульта", callback_data="pult_menu")]]))
-        return PULT_MENU
-
-    # ВОЛНА 22.3: легаси-режимы («contact»/«sticker») и мусор в
-    # pult_mode — честно объясняем, что эстафеты больше нет.
-    context.user_data.pop("pult_mode", None)
-    await msg.reply_text(
-        "⚠️ Эта функция Пульта удалена: бот постит только в ВАШ канал и "
-        "копит стиль из живых чатов. Писать людям от вашего имени Bot API "
-        "не умеет — нужен бизнес-аккаунт, а он отключён по вашему решению.")
-    return PULT_MENU
-
-
-async def pult_command_handler(update, context):
-    """Команда в состоянии PULT_WAIT_CMD (текст/голос)."""
-    uid = str(update.effective_user.id)
-    user = get_user(uid)
-    if not user:
-        user = User(uid)
-    raw = (update.message.text or "").strip()
-    if _pult_is_exit(raw):
-        await update.message.reply_text(
-            "🎙 Пульт закрыт.", reply_markup=get_main_menu_keyboard(user))
-        return MAIN_MENU
-    return await pult_command_process(update, context, user, raw)
-
-
-async def pult_edit_text_handler(update, context):
-    """Свой текст для пункта плана."""
-    uid = str(update.effective_user.id)
-    user = get_user(uid) or User(uid)
-    raw = (update.message.text or "").strip()
-    if _pult_is_exit(raw):
-        context.user_data.pop("pult_edit_idx", None)
-        context.user_data.pop("pult_plan", None)
-        await update.message.reply_text(
-            "🎙 Пульт закрыт.", reply_markup=get_main_menu_keyboard(user))
-        return MAIN_MENU
-    i = context.user_data.get("pult_edit_idx")
-    plan = context.user_data.get("pult_plan") or []
-    if not isinstance(i, int) or not (0 <= i < len(plan)):
-        await update.message.reply_text("План уже изменился — начните заново.")
-        return PULT_MENU
-    plan[i]["text"] = _pult_clip(raw, _PULT_DM_TEXT_MAX)
-    context.user_data.pop("pult_edit_idx", None)
-    card, need = _pult_plan_card(user, plan)
-    await update.message.reply_text(
-        f"✅ Текст заменён.\n\n{card}",
-        reply_markup=_pult_confirm_kb(plan) if need else None)
-    if need:
-        return PULT_MENU
-    report = await _pult_execute_plan(context, user, plan)
-    context.user_data.pop("pult_plan", None)
-    await update.message.reply_text(report)
-    return PULT_MENU
-
-
-async def pult_command_process(update, context, user, raw):
-    """Полный цикл команды: LLM → план → генерация в стиле → карточка → исполнение."""
-    uid = user.user_id
-    if is_user_spamming(uid, key="pult_cmd", min_interval=3.0, burst=5,
-                        burst_window=30.0):
-        await update.message.reply_text("🎙 Слишком быстро — подождите пару секунд.")
-        return PULT_MENU
-    pult = user.pult
-    if not pult.get("enabled"):
-        await update.message.reply_text(
-            "⚠️ Пульт выключен — включите его в меню Пульта.",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🎙 Открыть Пульт",
-                                     callback_data="pult_menu")]]))
-        return PULT_MENU
-    system = _PULT_CMD_SYSTEM
-    thinking = None
-    try:
-        thinking = await update.message.reply_text("🎙 Пульт думает…   ⏳")
-    except Exception:
-        thinking = None
-    parsed = await _pult_llm_json(system, raw, temperature=0.2)
-    if thinking:
-        try:
-            await context.bot.delete_message(update.effective_chat.id,
-                                             thinking.message_id)
-        except Exception:
-            pass
-    if not parsed:
-        await update.message.reply_text(
-            "⚠️ Не смог разобрать команду (LLM недоступна или не ответила). "
-            "Проверьте DEEPSEEK_API_KEY/GROQ_API_KEY на сервере и повторите.")
-        return PULT_MENU
-    acts = parsed.get("actions") if isinstance(parsed.get("actions"), list) else []
-    if not acts:
-        ans = str(parsed.get("answer") or parsed.get("question") or "").strip()
-        await update.message.reply_text(
-            ans or "🤔 Не понял команду. Сформулируйте: «сделай пост в моем "
-                   "канале <текст>».")
-        return PULT_MENU
-    plan = _pult_plan_from_parsed(user, parsed)
-    if not plan:
-        # ВОЛНА 22.3: если LLM вернула dm/sticker (эстафета удалена) — честно
-        # объясняем, а не «не хватило данных».
-        if any(str(a.get("act") or "").strip().lower() in ("dm", "sticker")
-               for a in acts if isinstance(a, dict)):
-            await update.message.reply_text(
-                "⚠️ Бот больше не пишет людям — эстафета удалена: Bot API не "
-                "умеет писать от вашего имени. Осталось: посты в ВАШ канал "
-                "(«сделай пост в моем канале …») и стили по чатам.")
-            return PULT_MENU
-        # Нет исполнимых действий: честно показываем clarify-вопрос ИЛИ
-        # ответ none (ответ LLM не теряется — волна 22, фикс по тесту E10).
-        first_msg = ""
-        for a in acts:
-            if isinstance(a, dict):
-                first_msg = str(a.get("question") or a.get("answer") or "").strip()
-                if first_msg:
-                    break
-        await update.message.reply_text(
-            first_msg or "❓ Не хватило данных: скажите, КАКОЙ пост сделать "
-                         "в ваш канал.")
-        return PULT_MENU
-    # Генерация текста поста в стиле (стиль канала, если он есть в стилях).
-    notes = []
-    for it in plan:
-        if it["kind"] == "post":
-            ch = pult.get("channel") or {}
-            _sk = _pult_norm_key(ch.get("title") or "") if ch else ""
-            if _sk not in (pult.get("styles") or {}):
-                _sk = ""
-            text, note = await _pult_generate_text(user, _sk, it["text"])
-            it["text"] = text
-            if note:
-                notes.append(f"• Канал: {note}")
-    context.user_data["pult_plan"] = plan
-    card, need = _pult_plan_card(user, plan)
-    if notes:
-        card += "\n\nℹ️ " + "\n".join(notes)
-    if need:
-        await update.message.reply_text(card, reply_markup=_pult_confirm_kb(plan))
-        return PULT_MENU
-    report = await _pult_execute_plan(context, user, plan)
-    context.user_data.pop("pult_plan", None)
-    await update.message.reply_text(report)
-    return PULT_MENU
 
 
 # ==================================
@@ -17097,7 +15910,7 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, use
     # ВОЛНА 22.1: маркер сборки — сразу видно, какая версия реально крутится
     # на сервере (защита от «архив собран, а деплой не подхватился»).
     greeting_text = (f"👋 Добро пожаловать в DEVORKS+, {user.first_name}!\n"
-                     f"🛠 Сборка {BOT_BUILD} • 🎙 Пульт — в меню ниже")
+                     f"🛠 Сборка {BOT_BUILD}")
     keyboard = get_main_menu_keyboard(user)
 
     if hasattr(update, 'message') and update.message:
@@ -17370,32 +16183,36 @@ def _inject_global_cancel(states_dict):
     return injected
 
 @timeout(CONVERSATION_TIMEOUT)
-async def handle_main_menu_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка фото в главном меню.
+async def ai_photo_reject_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.4: AI больше НЕ принимает фото — требование пользователя
+    («ai не должен принимать фото»). Раньше фото из главного меню (в режиме
+    AI) и из чата «🤖 DEVORKS+ai» уходили в OCR/Groq Vision; теперь оба входа
+    закрыты одним честным отказом.
 
-    В режиме AI (`ai_mode == True`) фото уходит в Groq Vision через
-    `handle_ai_message`. В обычном режиме отвечаем подсказкой, чтобы
-    пользователь сначала зашёл в AI-режим.
-    """
+    Фото/файлы остались легальными ровно в двух местах:
+      • вложения к ДЗ — админ, «➕ Добавить ДЗ» (после выбора даты);
+      • картинка расписания — «📅 Редактировать расписание» → выбрать день.
+
+    Возвращаем None — в PTB это означает «остаться в текущем состоянии», то
+    есть пользователь не вылетает из AI-чата и не теряет историю диалога."""
     user_id = str(update.effective_user.id)
     if not await ensure_subscribed(update, context):
-        return MAIN_MENU
+        return None
     if is_user_blocked(user_id):
         await send_blocked_message(update, context, user_id)
         return ConversationHandler.END
 
-    user = get_user(user_id) or User(user_id)
-
-    if context.user_data.get('ai_mode'):
-        await handle_ai_message(update, context)
-        return MAIN_MENU
-
     await update.message.reply_text(
-        "🖼 Чтобы я мог посмотреть фото — сначала зайдите в режим AI "
-        "(кнопка «🤖 AI» в меню), а потом отправьте фото.",
-        reply_markup=get_main_menu_keyboard(user),
+        "🖼 AI не принимает фото.\n\n"
+        "Фото и файлы у нас живут в двух местах:\n"
+        "• 📝 ДЗ — админ может прикрепить фото/файлы к заданию "
+        "(«➕ Добавить ДЗ» → выберите предмет и дату → присылайте);\n"
+        "• 📅 Расписание — картинку расписания можно прислать при "
+        "редактировании дня («📅 Редактировать расписание»).\n\n"
+        "А если хотели что-то спросить — напишите текстом, я отвечу."
     )
-    return MAIN_MENU
+    # None = остаться в текущем состоянии (не выкидываем из AI-чата).
+    return None
 
 
 @timeout(CONVERSATION_TIMEOUT)
@@ -17671,9 +16488,7 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # AUTOMATION_BUTTON); состояние и логика прежние (AI_AUTOMATION).
         return await automation_start(update, context)
 
-    elif message_text == "🎙 Пульт":
-        # ВОЛНА 22: пульт управления — стили по чатам, команды текстом/голосом.
-        return await pult_menu_start(update, context)
+    # ВОЛНА 22.4: ветка «🎙 Пульт» удалена — кнопки больше не существует.
 
     elif message_text == "👨‍💼 Админская панель":
         if class_obj and is_user_class_blocked(user_id, class_obj.class_code):
@@ -17704,20 +16519,14 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         local_now = get_local_time(user)
         today_index = local_now.weekday()
         day_name = get_day_name(today_index)
-        schedule = get_day_schedule(class_obj, day_name)
 
         today_str = local_now.strftime("%Y-%m-%d")
         homework = get_homework_for_date(class_obj, today_str)
 
-        message = f"📅 Расписание на сегодня ({day_name}, {today_str}):\n\n{schedule}"
-
-        if homework:
-            hw_text = format_homework(homework, "сегодня").replace("**", "")
-            message += "\n\n" + hw_text
-        else:
-            message += "\n\n📝 Домашнее задание на сегодня не задано."
-
-        await update.message.reply_text(message)
+        # ВОЛНА 22.4: единый экран дня (поддерживает дни-картинки + ДЗ + вложения).
+        await _send_day_schedule_screen(
+            update, context, class_obj, day_name,
+            "сегодня", today_str, homework)
         return MAIN_MENU
 
     elif message_text == "📅 Завтра":
@@ -17729,20 +16538,14 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tomorrow = get_local_time(user) + timedelta(days=1)
         tomorrow_index = tomorrow.weekday()
         day_name = get_day_name(tomorrow_index)
-        schedule = get_day_schedule(class_obj, day_name)
 
         tomorrow_str = tomorrow.strftime("%Y-%m-%d")
         homework = get_homework_for_date(class_obj, tomorrow_str)
 
-        message = f"📅 Расписание на завтра ({day_name}, {tomorrow_str}):\n\n{schedule}"
-
-        if homework:
-            hw_text = format_homework(homework, "завтра").replace("**", "")
-            message += "\n\n" + hw_text
-        else:
-            message += "\n\n📝 Домашнее задание на завтра не задано."
-
-        await update.message.reply_text(message)
+        # ВОЛНА 22.4: единый экран дня (поддерживает дни-картинки + ДЗ + вложения).
+        await _send_day_schedule_screen(
+            update, context, class_obj, day_name,
+            "завтра", tomorrow_str, homework)
         return MAIN_MENU
 
     elif message_text == "📅 Расписание":
@@ -17768,9 +16571,15 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Пятница", "Суббота", "Воскресенье",
         ]
         parts = [f"📅 Расписание на неделю — {class_obj.class_name}\n"]
+        # ВОЛНА 22.4: дни-картинки в тексте помечаются, файлы досылаются следом.
+        image_days = []
         for day in week_days:
-            day_schedule = get_day_schedule(class_obj, day)
-            parts.append(f"\n📌 {day}:\n{day_schedule}")
+            kind, payload = _schedule_day_view(class_obj, day)
+            if kind == "image":
+                parts.append(f"\n📌 {day}: 🖼 (картинкой ниже)")
+                image_days.append((day, payload))
+            else:
+                parts.append(f"\n📌 {day}:\n{payload}")
         full_text = "\n".join(parts)
 
         # У Telegram есть лимит ~4096 символов на сообщение. Если расписание
@@ -17789,6 +16598,19 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     chunk += "\n" + piece if chunk else piece
             if chunk.strip():
                 await update.message.reply_text(chunk)
+
+        # ВОЛНА 22.4: досылаем картинки дней-расписаний (в порядке недели).
+        for _day, _img in image_days:
+            _cap = f"📌 Расписание — {_day}"
+            if _img.get("caption"):
+                _cap += f"\n{_img['caption']}"
+            try:
+                await update.message.reply_photo(_img["image"], caption=_cap[:1024])
+            except Exception as e:
+                logger.warning(f"week schedule image send не прошёл ({_day}): {e}")
+                await update.message.reply_text(
+                    f"🖼 Картинка расписания на {_day} не открылась — админ может "
+                    "перезалить её через «📅 Редактировать расписание».")
         return MAIN_MENU
 
     elif message_text == "📝 Домашнее задание":
@@ -17818,6 +16640,9 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         buf += addition
                 if buf.strip():
                     await update.message.reply_text(buf, parse_mode="Markdown")
+            # ВОЛНА 22.4: досылаем вложения ВСЕХ пунктов ДЗ после текста.
+            for _m_list in _iter_assignment_media(class_obj.homework):
+                await _send_homework_media(context, update.effective_chat.id, _m_list)
         else:
             await update.message.reply_text("Вы не состоите в классе.")
         return MAIN_MENU
@@ -20364,6 +19189,7 @@ async def handle_week_schedule(update: Update, context: ContextTypes.DEFAULT_TYP
 
         day_name = get_day_name(day_index)
         class_obj = get_class_by_user(user_id)
+        kind = None  # ВОЛНА 22.4: "image" только если день реально — картинка
 
         if not class_obj:
             text = (
@@ -20373,14 +19199,32 @@ async def handle_week_schedule(update: Update, context: ContextTypes.DEFAULT_TYP
         elif is_user_class_blocked(user_id, class_obj.class_code):
             text = "Вы заблокированы в этом классе."
         else:
-            schedule = get_day_schedule(class_obj, day_name)
-            text = f"📅 Расписание на {day_name}:\n\n{schedule}"
+            kind, payload = _schedule_day_view(class_obj, day_name)
+            # ВОЛНА 22.4: день-картинка — текстом помечаем, фото досылаем следом.
+            if kind == "image":
+                text = (f"📅 Расписание на {day_name}:\n\n"
+                        "🖼 Картинка отправлена следом.")
+                if payload.get("caption"):
+                    text += f"\n📝 {payload['caption']}"
+            else:
+                text = f"📅 Расписание на {day_name}:\n\n{payload}"
 
         await _send_or_edit(
             query, context, user_id,
             text,
             _build_week_schedule_keyboard(active_day_index=day_index),
         )
+        # ВОЛНА 22.4: отправляем картинку дня после текстового сообщения.
+        # kind остаётся None, если класса нет/пользователь заблокирован —
+        # в этих ветках картинки не будет.
+        if kind == "image":
+            try:
+                await query.message.reply_photo(payload["image"])
+            except Exception as e:
+                logger.warning(f"week_schedule day image ({day_name}): {e}")
+                await query.message.reply_text(
+                    "🖼 Картинка не открылась — админ может перезалить её "
+                    "через «📅 Редактировать расписание».")
         return WEEK_SCHEDULE
 
     # Неизвестный callback — остаёмся в состоянии WEEK_SCHEDULE.
@@ -20538,14 +19382,21 @@ async def edit_schedule_day_handler(update: Update, context: ContextTypes.DEFAUL
             pass
         return ADMIN_PANEL
 
-    current_schedule = class_obj.schedule.get(day_name, "") or "(пусто)"
+    raw_current = class_obj.schedule.get(day_name, "") or ""
+    # ВОЛНА 22.4: день может храниться картинкой — честно показываем это.
+    if isinstance(raw_current, dict) and raw_current.get("image"):
+        cap = (raw_current.get("caption") or "").strip()
+        current_schedule = "🖼 КАРТИНКА расписания" + (f" (подпись: {cap})" if cap else "")
+    else:
+        current_schedule = raw_current or "(пусто)"
 
     context.user_data['editing_schedule_day'] = day_name
 
     text = (
         f"📅 Редактирование расписания на {day_name}\n\n"
         f"Текущее расписание:\n{current_schedule}\n\n"
-        f"Введите новое расписание (одним сообщением):"
+        f"Введите новое расписание текстом (одним сообщением) — "
+        f"или пришлите КАРТИНКУ расписания (можно с подписью)."
     )
 
     # Кнопка «Отмена» возвращает к выбору дня, а не в главное меню — удобнее редактировать.
@@ -20611,6 +19462,73 @@ async def edit_schedule_content_handler(update: Update, context: ContextTypes.DE
     context.user_data.pop('editing_schedule_day', None)
     # Остаёмся в EDIT_SCHEDULE_CONTENT, чтобы CallbackQueryHandler в этом стейте мог
     # обработать клики по «Редактировать другой день» / «В админ-панель».
+    return EDIT_SCHEDULE_CONTENT
+
+
+@timeout(CONVERSATION_TIMEOUT)
+async def edit_schedule_image_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.4: расписание дня можно задать КАРТИНКОЙ — требование
+    пользователя («для расписания можно изображение»).
+
+    Админ в «📅 Редактировать расписание» → выбрал день → присылает фото
+    (подпись на фото становится текстом-сопроводлением, необязательно).
+    Хранение: class_obj.schedule[day] = {"image": <file_id>, "caption": str}.
+    Обратно совместимо: текстовые дни остаются строками. Повторное фото
+    заменяет картинку; новый текст (edit_schedule_content_handler) снова
+    делает день текстовым."""
+    user_id = str(update.effective_user.id)
+    day_name = context.user_data.get('editing_schedule_day')
+    class_code = context.user_data.get('current_admin_class')
+
+    if not class_code or not day_name:
+        await update.message.reply_text(
+            "Ошибка: не понятно, какой день редактировать. Откройте "
+            "«📅 Редактировать расписание» заново.")
+        return await admin_panel(update, context)
+
+    class_obj = get_class_by_code(class_code)
+    if not class_obj:
+        await update.message.reply_text("Класс не найден.")
+        return await admin_panel(update, context)
+
+    if not getattr(update.message, "photo", None):
+        await update.message.reply_text(
+            "Пришлите ИЗОБРАЖЕНИЕ расписания (фото) — либо введите текст "
+            "расписания сообщением.")
+        return EDIT_SCHEDULE_CONTENT
+
+    caption = (update.message.caption or "").strip()
+    if caption:
+        rejected = await reject_if_forbidden_chars(update, caption, EDIT_SCHEDULE_CONTENT)
+        if rejected is not None:
+            return rejected
+
+    if not isinstance(getattr(class_obj, 'schedule', None), dict):
+        class_obj.schedule = {}
+    class_obj.schedule[day_name] = {
+        "image": update.message.photo[-1].file_id,   # самый большой размер
+        "caption": caption[:800],
+    }
+
+    classes = load_classes()
+    classes[class_code] = class_obj
+    ok = save_classes(classes)
+
+    if ok:
+        success_text = (
+            f"✅ Расписание на {day_name} сохранено КАРТИНКОЙ!"
+            + (f"\n📝 Подпись: {caption}" if caption else "")
+            + "\n\nВсе ученики класса увидят это изображение в "
+              "«📅 Расписание» и «📅 Сегодня/Завтра».")
+    else:
+        success_text = "❌ Не удалось сохранить расписание (ошибка записи файла). Попробуйте ещё раз."
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📅 Редактировать другой день", callback_data="edit_schedule")],
+        [InlineKeyboardButton("⬅️ В админ-панель", callback_data="back_to_admin")],
+    ])
+    await update.message.reply_text(success_text, reply_markup=keyboard)
+    context.user_data.pop('editing_schedule_day', None)
     return EDIT_SCHEDULE_CONTENT
 
 
@@ -23528,6 +22446,22 @@ async def save_homework_handler(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text("Данные не найдены.")
         return await admin_panel(update, context)
 
+    # ВОЛНА 22.4: если уже есть накопленные вложения — присланный ТЕКСТ
+    # становится ОПИСАНИЕМ к готовящемуся ДЗ с файлами (а не отдельным
+    # заданием). Дальше администратор либо добавит ещё файлы, либо нажмёт
+    # «✅ Готово» — сохранит всё одним пунктом ДЗ.
+    if context.user_data.get('hw_media_buffer'):
+        rejected = await reject_if_forbidden_chars(update, homework_text, ADD_HOMEWORK)
+        if rejected is not None:
+            return rejected
+        context.user_data['hw_media_desc'] = homework_text
+        await update.message.reply_text(
+            f"📝 Описание сохранено: «{homework_text}»\n\n"
+            "Пришлите ещё вложения или нажмите «✅ Готово».",
+            reply_markup=_hw_media_confirm_kb()
+        )
+        return None
+
     rejected = await reject_if_forbidden_chars(update, homework_text, ADD_HOMEWORK)
     if rejected is not None:
         return rejected
@@ -23564,7 +22498,241 @@ async def save_homework_handler(update: Update, context: ContextTypes.DEFAULT_TY
     context.user_data.pop('homework_subject', None)
     context.user_data.pop('awaiting_hw_text', None)
     context.user_data.pop('awaiting_hw_custom_date', None)
+    # ВОЛНА 22.4: defensive — буфер вложений не должен переживать сохранение.
+    context.user_data.pop('hw_media_buffer', None)
+    context.user_data.pop('hw_media_desc', None)
 
+    return MANAGE_HOMEWORK
+
+
+# ==================================
+# === ВОЛНА 22.4: ВЛОЖЕНИЯ В ДЗ (фото, файлы, видео, аудио) ===
+# ==================================
+# Требование пользователя: «для добавления дз админ может прикреплять фото
+# файлы и тд». Дизайн ЧЕСТНОГО потока:
+#   1) админ выбирает предмет и дату (как раньше);
+#   2) на шаге текста может прислать ЛЮБОЕ вложение — бот копит его в буфер
+#      user_data ('hw_media_buffer', до _HW_MEDIA_MAX_FILES штук) и отвечает
+#      кнопкой «✅ Готово»;
+#   3) текст, присланный ВО ВРЕМЯ набора вложений, становится описанием
+#      (см. save_homework_handler);
+#   4) «✅ Готово» сохраняет ОДИН пункт ДЗ с описанием и всеми вложениями;
+#   5) старый поток «текст → сразу сохранить» не изменился ни на бит.
+# Хранение (обратно совместимо): пункт ДЗ получает ключ 'media' — список
+# {"type": "photo|document|video|audio|voice", "file_id": ..., "name": ...}.
+# file_id Telegram переиспользуется на нашем боте — пересылка работает без
+# скачивания файла на сервер.
+
+_HW_MEDIA_MAX_FILES = 10   # максимум вложений на один пункт ДЗ
+
+# Читаемые подписи типов вложений (для сводки и маркеров в списке ДЗ).
+_HW_MEDIA_LABELS = {
+    "photo": "📷 фото",
+    "document": "📎 файл",
+    "video": "🎬 видео",
+    "audio": "🎵 аудио",
+    "voice": "🎤 голосовое",
+}
+
+
+def _extract_media_ref(message):
+    """Достаёт из сообщения ссылку на вложение (file_id). None — медиа нет."""
+    if getattr(message, "photo", None):
+        # photo — список размеров; берём самый большой (последний).
+        return {"type": "photo", "file_id": message.photo[-1].file_id}
+    if getattr(message, "document", None):
+        return {"type": "document", "file_id": message.document.file_id,
+                "name": (message.document.file_name or "файл")[:80]}
+    if getattr(message, "video", None):
+        return {"type": "video", "file_id": message.video.file_id,
+                "name": (message.video.file_name or "видео")[:80]}
+    if getattr(message, "audio", None):
+        return {"type": "audio", "file_id": message.audio.file_id,
+                "name": (message.audio.file_name or "аудио")[:80]}
+    if getattr(message, "voice", None):
+        return {"type": "voice", "file_id": message.voice.file_id}
+    return None
+
+
+def _media_summary_line(media_list):
+    """Сводка вложений одной строкой: «📷 фото ×2, 📎 файл ×1». Пусто — ''."""
+    counts = {}
+    for m in (media_list or []):
+        t = str((m or {}).get("type") or "?")
+        counts[t] = counts.get(t, 0) + 1
+    parts = []
+    for t, label in _HW_MEDIA_LABELS.items():
+        if counts.get(t):
+            parts.append(f"{label} ×{counts[t]}" if counts[t] > 1 else label)
+    # Неизвестные типы (на будущее) — честно показываем как «вложение».
+    unknown = sum(v for k, v in counts.items() if k not in _HW_MEDIA_LABELS)
+    if unknown:
+        parts.append(f"📎 вложение ×{unknown}" if unknown > 1 else "📎 вложение")
+    return ", ".join(parts)
+
+
+def _hw_media_confirm_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Готово", callback_data="hw_media_done")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="cancel_action")],
+    ])
+
+
+async def _send_homework_media(context, chat_id, media_list, max_send=10):
+    """Пересылает вложения пункта ДЗ в чат (не более max_send за раз).
+
+    Возвращает (отправлено, сорвалось). Ошибки по одному файлу не роняют
+    остальные: Telegram иногда забывает file_id очень старых сообщений —
+    тогда файл пропускается, но список ДЗ остаётся честным."""
+    sent = failed = 0
+    for m in (media_list or [])[:max_send]:
+        mtype = (m or {}).get("type")
+        fid = (m or {}).get("file_id")
+        if not fid:
+            continue
+        try:
+            if mtype == "photo":
+                await context.bot.send_photo(chat_id=chat_id, photo=fid)
+            elif mtype == "video":
+                await context.bot.send_video(chat_id=chat_id, video=fid)
+            elif mtype == "audio":
+                await context.bot.send_audio(chat_id=chat_id, audio=fid)
+            elif mtype == "voice":
+                await context.bot.send_voice(chat_id=chat_id, voice=fid)
+            else:  # document — дефолт (в т.ч. неизвестные будущие типы)
+                await context.bot.send_document(chat_id=chat_id, document=fid)
+            sent += 1
+        except Exception as e:
+            failed += 1
+            logger.warning(f"hw media send ({mtype}) не прошёл: {e}")
+    return sent, failed
+
+
+def _clear_hw_media_context(context):
+    """Стирает буфер вложений ДЗ из user_data (после сохранения/отмены)."""
+    context.user_data.pop('hw_media_buffer', None)
+    context.user_data.pop('hw_media_desc', None)
+
+
+@timeout(CONVERSATION_TIMEOUT)
+async def homework_media_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.4: приём вложений на шаге ввода ДЗ (состояния ADD_HOMEWORK и
+    QUICK_ADD_HOMEWORK). Копит файлы в буфер и ждёт «✅ Готово»."""
+    user_id = str(update.effective_user.id)
+    date_str = context.user_data.get('homework_date')
+    subject = context.user_data.get('homework_subject')
+    class_code = context.user_data.get('current_admin_class')
+
+    if not date_str or not subject or not class_code:
+        await update.message.reply_text(
+            "Данные не найдены — начните добавление ДЗ заново "
+            "(«➕ Добавить ДЗ»).")
+        return await admin_panel(update, context)
+
+    media = _extract_media_ref(update.message)
+    if media is None:
+        await update.message.reply_text(
+            "Пришлите фото или файл — либо напишите задание текстом.")
+        return None
+
+    buffer = context.user_data.setdefault('hw_media_buffer', [])
+    if len(buffer) >= _HW_MEDIA_MAX_FILES:
+        await update.message.reply_text(
+            f"⚠️ Лимит вложений на одно ДЗ — {_HW_MEDIA_MAX_FILES}. "
+            "Нажмите «✅ Готово», чтобы сохранить.",
+            reply_markup=_hw_media_confirm_kb())
+        return None
+
+    # Подпись к первому вложению (если админ не задал описание текстом) —
+    # становится описанием ДЗ.
+    if not context.user_data.get('hw_media_desc') and update.message.caption:
+        caption = update.message.caption.strip()
+        if caption:
+            rejected = await reject_if_forbidden_chars(update, caption, ADD_HOMEWORK)
+            if rejected is not None:
+                return rejected
+            context.user_data['hw_media_desc'] = caption[:500]
+
+    buffer.append(media)
+    desc = context.user_data.get('hw_media_desc')
+    summary = _media_summary_line(buffer)
+    text = (f"📎 Вложение принято ({len(buffer)} из {_HW_MEDIA_MAX_FILES}).\n"
+            f"Всего: {summary}\n\n"
+            "Пришлите ещё — или нажмите «✅ Готово».")
+    if desc:
+        text += f"\n📝 Описание: {desc}"
+    await update.message.reply_text(text, reply_markup=_hw_media_confirm_kb())
+    # None = остаться в текущем состоянии и ждать ещё вложения / «Готово».
+    return None
+
+
+@timeout(CONVERSATION_TIMEOUT)
+async def hw_media_done_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.4: кнопка «✅ Готово» — сохраняет пункт ДЗ с вложениями."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+    user_id = str(update.effective_user.id)
+    date_str = context.user_data.get('homework_date')
+    subject = context.user_data.get('homework_subject')
+    class_code = context.user_data.get('current_admin_class')
+    buffer = context.user_data.get('hw_media_buffer') or []
+
+    if not date_str or not subject or not class_code or not buffer:
+        _clear_hw_media_context(context)
+        await query.edit_message_text(
+            "Данные не найдены — начните добавление ДЗ заново "
+            "(«➕ Добавить ДЗ»).")
+        return await admin_panel(update, context)
+
+    class_obj = get_class_by_code(class_code)
+    if not class_obj:
+        _clear_hw_media_context(context)
+        await query.edit_message_text("Не удалось сохранить. Попробуйте снова.")
+        return MANAGE_HOMEWORK
+
+    if subject not in class_obj.homework:
+        class_obj.homework[subject] = []
+    class_obj.homework[subject].append({
+        'text': context.user_data.get('hw_media_desc', '') or '',
+        'date': date_str,
+        'added_by': user_id,
+        'added_at': datetime.now().strftime("%Y-%m-%d %H:%M"),
+        'media': list(buffer),
+    })
+    classes = load_classes()
+    classes[class_code] = class_obj
+    save_classes(classes)
+
+    media_snapshot = list(buffer)
+    desc = context.user_data.get('hw_media_desc', '') or ''
+    _clear_hw_media_context(context)
+    context.user_data.pop('homework_date', None)
+    context.user_data.pop('homework_subject', None)
+    context.user_data.pop('awaiting_hw_text', None)
+    context.user_data.pop('awaiting_hw_custom_date', None)
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Ещё ДЗ", callback_data="add_homework")],
+        [InlineKeyboardButton("⬅️ В админ-панель", callback_data="back_to_admin")],
+        [InlineKeyboardButton("⬅️ В главное меню", callback_data="back_to_main")],
+    ])
+    text = (f"✅ Домашнее задание с вложениями добавлено!\n\n"
+            f"📅 Дата: {date_str}\n📚 Предмет: {subject}\n"
+            f"📎 Вложения: {_media_summary_line(media_snapshot)}")
+    if desc:
+        text += f"\n📝 Описание: {desc}"
+    try:
+        await query.edit_message_text(text, reply_markup=keyboard)
+    except Exception:
+        # «message is not modified» и прочие мелочи — не роняем подтверждение.
+        await update.effective_chat.send_message(text, reply_markup=keyboard)
+
+    # Показываем вложения сразу — админ видит ровно то, что получит класс.
+    await _send_homework_media(context, update.effective_chat.id, media_snapshot)
     return MANAGE_HOMEWORK
 
 async def delete_homework_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -23712,6 +22880,9 @@ async def view_homework_handler(update: Update, context: ContextTypes.DEFAULT_TY
     homework_text = format_homework(class_obj.homework)
 
     await query.edit_message_text(homework_text, parse_mode="Markdown", reply_markup=get_back_button_keyboard())
+    # ВОЛНА 22.4: досылаем вложения пунктов ДЗ (админ видит то же, что и класс).
+    for _m_list in _iter_assignment_media(class_obj.homework):
+        await _send_homework_media(context, update.effective_chat.id, _m_list)
     return MANAGE_HOMEWORK
 
 async def quick_homework_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -24212,10 +23383,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await check_subscription_handler(update, context)
         return MAIN_MENU
 
-    # ВОЛНА 22: все кнопки Пульта (в ЛЮБОМ состоянии — план может быть построен
-    # из главного меню и из автоматизации) — единый маршрутизатор.
-    if data.startswith("pult_"):
-        return await pult_callback(update, context)
+    # ВОЛНА 22.4: маршрутизатор pult_* удалён вместе с Пультом.
 
     if data.startswith("view_anon_msg_"):
         return await view_anon_message_detail(update, context)
@@ -24754,6 +23922,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await hw_delete_subject_handler(update, context)
     elif data.startswith("hw_date_"):
         return await hw_date_handler(update, context)
+    elif data == "hw_media_done":
+        # ВОЛНА 22.4: «✅ Готово» — сохранить ДЗ с накопленными вложениями.
+        return await hw_media_done_handler(update, context)
     elif data.startswith("hw_subject_"):
         return await homework_subject_handler(update, context)
     elif data.startswith("quick_hw_"):
@@ -24894,6 +24065,8 @@ async def cancel_action_handler(update: Update, context: ContextTypes.DEFAULT_TY
         'timer_date', 'timer_time', 'homework_date', 'homework_subject',
         'awaiting_hw_text', 'awaiting_hw_custom_date', 'renaming_button',
         'anon_target', 'quick_admin_class', 'broadcast_text',
+        # ВОЛНА 22.4: буфер вложений ДЗ тоже стирается при отмене.
+        'hw_media_buffer', 'hw_media_desc',
     ]
     for key in temp_keys:
         context.user_data.pop(key, None)
@@ -27983,10 +27156,9 @@ def main():
             ],
             MAIN_MENU: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_main_menu),
-                # Фото в режиме AI: добавлено для поддержки Groq Vision —
-                # пользователь может прислать фото в чат с AI и получить ответ.
-                # НОВОЕ: картинки-документы (скриншоты «файлом») тоже поддержаны.
-                MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_main_menu_photo),
+                # ВОЛНА 22.4: AI больше не принимает фото — честный отказ вместо
+                # прежнего роутинга в Groq Vision (handle_main_menu_photo удалён).
+                MessageHandler(filters.PHOTO | filters.Document.IMAGE, ai_photo_reject_handler),
                 CallbackQueryHandler(handle_callback),
             ],
             CLASS_MANAGEMENT: [
@@ -28012,6 +27184,8 @@ def main():
             ],
             EDIT_SCHEDULE_CONTENT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, edit_schedule_content_handler),
+                # ВОЛНА 22.4: расписание дня можно задать картинкой.
+                MessageHandler(filters.PHOTO, edit_schedule_image_handler),
                 CallbackQueryHandler(handle_callback),
             ],
             EDIT_TEACHERS: [
@@ -28074,6 +27248,11 @@ def main():
                 # ПУНКТ 9: универсальный текстовый обработчик распределяет ввод
                 # между добавлением нового предмета, кастомной даты и текстом ДЗ.
                 MessageHandler(filters.TEXT & ~filters.COMMAND, add_homework_date_handler),
+                # ВОЛНА 22.4: вложения ДЗ — фото/файлы/видео/аудио/голос.
+                MessageHandler(
+                    filters.PHOTO | filters.Document.ALL | filters.VIDEO
+                    | filters.AUDIO | filters.VOICE,
+                    homework_media_receive),
                 CallbackQueryHandler(handle_callback),
             ],
             DELETE_HOMEWORK_SELECT: [
@@ -28091,6 +27270,11 @@ def main():
             ],
             QUICK_ADD_HOMEWORK: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, save_homework_handler),
+                # ВОЛНА 22.4: вложения ДЗ работают и в быстром потоке.
+                MessageHandler(
+                    filters.PHOTO | filters.Document.ALL | filters.VIDEO
+                    | filters.AUDIO | filters.VOICE,
+                    homework_media_receive),
                 CallbackQueryHandler(handle_callback),
             ],
             ENTER_HOMEWORK_DATE: [
@@ -28287,12 +27471,10 @@ def main():
             ],
             AI_CHAT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_ai_message),
-                # ИСПРАВЛЕНО («ии не видит изображение»): в состоянии AI_CHAT не
-                # было фото-хендлера — картинка молча падала в fallback и бот
-                # не отвечал, а вижн-запросы из главного меню без OCR падали с
-                # «AI временно недоступен». Теперь фото И картинки-документы
-                # принимаются прямо в чате: OCR → DeepSeek, иначе — вижн Groq.
-                MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_ai_message),
+                # ВОЛНА 22.4: фото/картинки-документы в чате с AI больше НЕ
+                # обрабатываются (требование пользователя) — честный отказ и
+                # остаёмся в чате (None = состояние не меняется).
+                MessageHandler(filters.PHOTO | filters.Document.IMAGE, ai_photo_reject_handler),
                 CallbackQueryHandler(handle_callback),
             ],
             # === НОВОЕ: 🪄 AI Agent (DeepSeek → действия бота) ===
@@ -28300,37 +27482,7 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, automation_text_handler),
                 CallbackQueryHandler(handle_callback),
             ],
-            # === ВОЛНА 22: 🎙 Пульт (стили по чатам + команды текстом/голосом) ===
-            PULT_MENU: [
-                CallbackQueryHandler(pult_callback, pattern="^pult_"),
-                MessageHandler(filters.Document.ALL, pult_export_document_handler),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, pult_menu_text_handler),
-            ],
-            PULT_WAIT_EXPORT: [
-                MessageHandler(filters.Document.ALL, pult_export_document_handler),
-                CallbackQueryHandler(pult_callback, pattern="^pult_"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, pult_state_text_handler),
-            ],
-            PULT_WAIT_CONTACT: [
-                MessageHandler(
-                    # ВОЛНА 22.1 HOTFIX: голые имена Sticker и Photo из модуля
-                    # filters — это КЛАССЫ PTB 21.6 (не экземпляры), их нельзя
-                    # соединять «|» — из-за этого бот падал на старте
-                    # (AttributeError: 'Sticker' has no attribute
-                    # 'data_filter'). Правильно: Sticker.ALL и PHOTO
-                    # (проверено интроспекцией PTB 21.6).
-                    (filters.TEXT | filters.Document.ALL | filters.Sticker.ALL | filters.PHOTO)
-                    & ~filters.COMMAND, pult_contact_input_handler),
-                CallbackQueryHandler(pult_callback, pattern="^pult_"),
-            ],
-            PULT_WAIT_CMD: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, pult_command_handler),
-                CallbackQueryHandler(pult_callback, pattern="^pult_"),
-            ],
-            PULT_EDIT_TEXT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, pult_edit_text_handler),
-                CallbackQueryHandler(pult_callback, pattern="^pult_"),
-            ],
+            # === ВОЛНА 22.4: состояния Пульта (PULT_MENU..PULT_EDIT_TEXT) удалены. ===
             # === НОВЫЕ состояния для функционала «Погода» и «Праздники» ===
             ENTER_CITY: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, enter_city_handler),
@@ -28538,13 +27690,7 @@ def main():
     application.add_handler(
         TypeHandler(Update, _voice_transcription_middleware), group=-1
     )
-    # ВОЛНА 22: наблюдатель групп Пульта — тихо копит стиль в группах/каналах,
-    # которые пользователь разрешил (pult.live.on). Группа 1 — не мешает FSM
-    # (группа 0) и не ломает другие хендлеры: только читает текст.
-    application.add_handler(
-        MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND,
-                       _pult_group_observer),
-        group=1)
+    # ВОЛНА 22.4: наблюдатель групп Пульта удалён вместе с Пультом.
 
     # 📤 ВОЛНА 8: посты в каналах-хранилищах = большие файлы от пользователей
     # (кнопка «📤 Отправить в канал самому»). Channel-посты не проходят через
