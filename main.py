@@ -2790,7 +2790,7 @@ def build_referral_link(bot_username, user_id):
 # Показывается в приветствии главного меню («🛠 Сборка …»): мгновенно видно,
 # какая сборка реально запущена на сервере (защита от ситуации «архив
 # собран, а деплой не подхватился»). Меняйте при каждой волне правок.
-BOT_BUILD = "22.1"
+BOT_BUILD = "22.2"
 
 INSTRUCTIONS_VERSION = "2.3"
 
@@ -28340,7 +28340,13 @@ def main():
             ],
             PULT_WAIT_CONTACT: [
                 MessageHandler(
-                    (filters.TEXT | filters.Document.ALL | filters.Sticker | filters.Photo)
+                    # ВОЛНА 22.1 HOTFIX: голые имена Sticker и Photo из модуля
+                    # filters — это КЛАССЫ PTB 21.6 (не экземпляры), их нельзя
+                    # соединять «|» — из-за этого бот падал на старте
+                    # (AttributeError: 'Sticker' has no attribute
+                    # 'data_filter'). Правильно: Sticker.ALL и PHOTO
+                    # (проверено интроспекцией PTB 21.6).
+                    (filters.TEXT | filters.Document.ALL | filters.Sticker.ALL | filters.PHOTO)
                     & ~filters.COMMAND, pult_contact_input_handler),
                 CallbackQueryHandler(pult_callback, pattern="^pult_"),
             ],
