@@ -434,8 +434,9 @@ VAULT_LABEL_WAIT = 125
 PULT_MENU = 126
 # Ждём файл экспорта Telegram Desktop (result.json) для сбора стилей.
 PULT_WAIT_EXPORT = 127
-# Ждём ПЕРЕСЛАННОЕ сообщение: контакт-эстафета / живой чат / стикер (режим
-# выбирается флагом context.user_data['pult_mode']).
+# Ждём ПЕРЕСЛАННОЕ сообщение: живой чат / канал пользователя (режим
+# выбирается флагом context.user_data['pult_mode']). Эстафета людям
+# удалена волной 22.3 по решению пользователя.
 PULT_WAIT_CONTACT = 128
 # Ждём канал для постов: пересланное сообщение из канала / @username / -100…
 PULT_WAIT_CHANNEL = 129
@@ -2016,7 +2017,7 @@ class User:
         # Структура — см. _pult_default(): главный выключатель, тумблеры
         # (мат, пунктуация, подтверждение), канал для постов, стили по чатам
         # (пары «реплика собеседника → ваш ответ» + ваши монологи),
-        # контакты-эстафета и стикеры. Никаких api_id/api_hash — только
+        # канал для постов. Никаких api_id/api_hash — только
         # официальный экспорт Telegram Desktop и чаты, где стоит бот.
         self.pult = _pult_default()
 
@@ -2790,7 +2791,7 @@ def build_referral_link(bot_username, user_id):
 # Показывается в приветствии главного меню («🛠 Сборка …»): мгновенно видно,
 # какая сборка реально запущена на сервере (защита от ситуации «архив
 # собран, а деплой не подхватился»). Меняйте при каждой волне правок.
-BOT_BUILD = "22.2"
+BOT_BUILD = "22.3"
 
 INSTRUCTIONS_VERSION = "2.3"
 
@@ -9249,6 +9250,8 @@ async def _vault_seal_item_mtproto(msg, context, user, item, password,
         try:
             return await _vault_seal_item_mtproto_once(
                 msg, context, user, item, password, progress_msg, idx, total)
+        except _VaultCancelled:
+            raise  # ВОЛНА 22.3: отмену пользователя НЕ ретраим — это не сбой
         except Exception as e:
             last_err = e
             logger.error(f"vault put: попытка {_attempt}/2 не удалась "
@@ -9322,6 +9325,10 @@ async def _vault_seal_item_mtproto_once(msg, context, user, item, password,
     if not _dvf2_disk_ok(doc_size):
         raise RuntimeError("мало свободного места на диске сервера")
     job = _dvf2_make_job_dir()
+    # ВОЛНА 22.3: регистрируем временник в операции — при отмене сотрём.
+    _op_here = _VAULT_OPS.get(str(getattr(user, "user_id", "") or ""))
+    if _op_here is not None:
+        _op_here["temp"].append(job)
     tmp_enc = os.path.join(job, "container.bin")
     enc = _Dvf2Encryptor(password, {
         "n": name, "k": kind, "m": mime,
@@ -9331,24 +9338,39 @@ async def _vault_seal_item_mtproto_once(msg, context, user, item, password,
     up = None
     enc_total = 0
     try:
-        prog = _ProgressEdit(
-            context, progress_msg, f"📦 [{idx}/{total}] «{name}»: качаю и шифрую")
+        # ВОЛНА 22.3: прогресс качания/шифрования пишется в op['sub'] — его
+        # показывает аниматор (никаких параллельных правок того же сообщения).
+        _op_here = _VAULT_OPS.get(str(getattr(user, "user_id", "") or ""))
+        prog = _VaultSubProg(_op_here, f"📦 [{idx}/{total}] «{name}»")
+        if _op_here is not None:
+            _op_here["phase"] = f"Файл {idx}/{total}: «{name}»"
+
+        def _push_checked(chunk):
+            # ВОЛНА 22.3: кусок-за-куском — кооперативная отмена «❌ Отмена».
+            if _op_here is not None and _op_here["event"].is_set():
+                raise _VaultCancelled()
+            enc.push(chunk)
+
         try:
             if botapi_payload is not None:
                 # ВОЛНА 18: оригинал уже в памяти (Bot API) — шифруем сразу.
+                if _op_here is not None and _op_here["event"].is_set():
+                    raise _VaultCancelled()
                 enc.push(botapi_payload)
                 enc_total = enc.finish()
                 botapi_payload = b""
             else:
                 await _mt_download_stream(
-                    client, doc, doc_size, enc.push, prog,
+                    client, doc, doc_size, _push_checked, prog,
                     f"📦 [{idx}/{total}] «{name}»: качаю и шифрую")
                 enc_total = enc.finish()
         except Exception:
             enc.abort()
             raise
-        await _ProgressEdit(context, progress_msg, "").edit(
-            f"📦 [{idx}/{total}] «{name}»: заливаю шифр в канал…", force=True)
+        if _op_here is not None and _op_here["event"].is_set():
+            raise _VaultCancelled()
+        if _op_here is not None:
+            _op_here["sub"] = f"📦 [{idx}/{total}] «{name}»: заливаю шифр в канал…"
         _vault_cap = "🔐 Сейф: зашифрованный файл (открыть без пароля невозможно)."
         _vault_fn = f"vault_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{idx}.bin"
         if enc_total <= (49 * 1024 * 1024 - 1024 * 1024):
@@ -9361,6 +9383,8 @@ async def _vault_seal_item_mtproto_once(msg, context, user, item, password,
                 enc_bytes = b""
             # ВОЛНА 18: Bot API отказал — шифр ≤48 МБ можно залить и MTProto.
             if up is None and _TELETHON_OK and BOT_TOKEN:
+                if _op_here is not None and _op_here["event"].is_set():
+                    raise _VaultCancelled()
                 up = await _mt_upload_container(
                     client, tmp_enc, enc_total,
                     caption=_vault_cap, filename=_vault_fn)
@@ -9372,6 +9396,14 @@ async def _vault_seal_item_mtproto_once(msg, context, user, item, password,
             raise RuntimeError(
                 "шифр не принят каналом — проверьте, что бот администратор "
                 "канала-хранилища")
+        # ВОЛНА 22.3: залитый шифр ЭТОЙ пачки — в реестр отмены.
+        if _op_here is not None:
+            try:
+                _op_here["sent"].append(
+                    (int(up.get("channel_id") or get_storage_channel_id() or 0),
+                     int(up.get("message_id") or 0)))
+            except (TypeError, ValueError):
+                pass
         rec = {
             "id": _vault_gen_id(user),
             "kind": kind, "mime": mime,
@@ -10547,6 +10579,15 @@ async def vault_put_password(update: Update, context: ContextTypes.DEFAULT_TYPE)
     msg = update.message
     user_id = str(update.effective_user.id)
     user = get_user(user_id)
+    # ВОЛНА 22.3: прямо сейчас идёт шифрование/загрузка Сейфа? Тогда «Отмена»
+    # ТОЛЬКО ставит флаг отмены и не трогает user_data — им владеет работающий
+    # процесс; зачистку и честный отчёт сделает сам цикл шифрования.
+    if _vault_op_running(user_id):
+        _VAULT_OPS[user_id]["event"].set()
+        await msg.reply_text(
+            "⛔ Останавливаю шифрование/загрузку — секунду, подчищу всё "
+            "недогруженное…")
+        return VAULT_PUT_PASSWORD
     batch = context.user_data.get('vault_batch')
     if not user or not isinstance(batch, list) or not batch:
         context.user_data.pop('vault_put_mode', None)
@@ -10636,6 +10677,117 @@ async def vault_put_password(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return VAULT_QS_WAIT
 
 
+# === ВОЛНА 22.3: живая анимация заливки Сейфа + честная ОТМЕНА ===
+# Пользователь просил: (1) при заливании шифра в канал — анимация, чтобы было
+# видно, что всё грузится; (2) «❌ Отмена» во время шифрования/загрузки должна
+# ОСТАНОВИТЬ процесс и удалить то, что успело зашифроваться/загрузиться.
+
+class _VaultCancelled(Exception):
+    """Кооперативная отмена операции Сейфа по команде пользователя."""
+
+
+# Реестр активных операций Сейфа: uid → состояние (одно на пользователя).
+_VAULT_OPS = {}
+_VAULT_OP_FRAMES = "🌑🌒🌓🌔🌕🌖🌗🌘"
+
+
+def _vault_op_begin(user_id, total):
+    """Открывает операцию шифрования/загрузки Сейфа для пользователя."""
+    op = {
+        "event": asyncio.Event(),          # установка = «пользователь нажал Отмена»
+        "sent": [],                        # (channel_id, msg_id) залитых шифров ЭТОЙ пачки
+        "temp": [],                        # временные каталоги/файлы на диске
+        "phase": "Шифрую и заливаю",       # человекочитаемая фаза
+        "done": 0, "total": int(total or 0),
+        "sub": "",                         # подстрока прогресса («качаю и шифрую 43%»)
+        "active": True,
+    }
+    _VAULT_OPS[str(user_id)] = op
+    return op
+
+
+def _vault_op_end(user_id):
+    """Закрывает операцию (флаг снят, реестр почищен)."""
+    op = _VAULT_OPS.pop(str(user_id), None)
+    if op is not None:
+        op["active"] = False
+    return op
+
+
+def _vault_op_running(user_id):
+    """True, пока идёт шифрование/загрузка пачки Сейфа."""
+    op = _VAULT_OPS.get(str(user_id))
+    return bool(op and op.get("active") and not op["event"].is_set())
+
+
+async def _vault_animate_progress(context, progress_msg, op):
+    """ВОЛНА 22.3: анимация на сообщении-прогрессе. Правит текст РАЗ В 2.5 с
+    (лимиты editMessageText соблюдаются), кадры-луны крутятся, фаза/счётчик/
+    подстрока берутся из op — их обновляет рабочий цикл и потоковое шифро­вание."""
+    j = 0
+    while True:
+        await asyncio.sleep(2.5)
+        j += 1
+        frame = _VAULT_OP_FRAMES[j % len(_VAULT_OP_FRAMES)]
+        txt = f"🔐 {op.get('phase') or 'Шифрую и заливаю'}: " \
+              f"{op.get('done', 0)}/{op.get('total', 0)} {frame}"
+        if op.get("sub"):
+            txt += f"\n{op['sub']}"
+        try:
+            await context.bot.edit_message_text(
+                txt, chat_id=progress_msg.chat_id,
+                message_id=progress_msg.message_id)
+        except Exception:
+            pass  # один сбой правки не должен убивать анимацию
+
+
+class _VaultSubProg:
+    """Интерфейс как у _ProgressEdit, но текст пишется в op['sub'] — его
+    показывает аниматор. Так потоковое шифрование и спиннер не дерутся за
+    одно сообщение (правки не дублируются, лимиты не нарушаются)."""
+
+    def __init__(self, op, prefix=""):
+        self.op = op
+        self.prefix = prefix or ""
+        self._last = 0.0
+
+    async def edit(self, text=None, force=False):
+        if self.op is None:
+            return None
+        now = time.monotonic()
+        if not force and (now - self._last) < 3.5:
+            return None
+        self._last = now
+        t = (text or "").strip()
+        self.op["sub"] = f"{self.prefix} {t}".strip() if t else self.prefix
+        return None
+
+
+async def _vault_cancel_cleanup(context, op):
+    """Отмена: стираем из каналов шифры ЭТОЙ пачки и временные файлы с диска.
+    Возвращает число удалённых шифр-сообщений (для честного отчёта)."""
+    deleted = 0
+    for cid, mid in (op.get("sent") or []):
+        if not cid or not mid:
+            continue
+        try:
+            await context.bot.delete_message(chat_id=int(cid), message_id=int(mid))
+            deleted += 1
+        except Exception:
+            pass
+    op["sent"] = []
+    for p in (op.get("temp") or []):
+        try:
+            if os.path.isdir(p):
+                _shutil.rmtree(p, ignore_errors=True)
+            elif os.path.isfile(p):
+                os.remove(p)
+        except Exception:
+            pass
+    op["temp"] = []
+    return deleted
+
+
 async def _vault_encrypt_batch(msg, context, user, password):
     """ВОЛНА 9: шифрует пачку паролем Сейфа, грузит шифры в канал по кругу,
     удаляет миграционные оригиналы. Возвращает состояние для ConversationHandler.
@@ -10644,119 +10796,184 @@ async def _vault_encrypt_batch(msg, context, user, password):
     batch = context.user_data.get('vault_batch') or []
     # ВОЛНА 13: читаем название ДО чистки user_data ниже.
     _batch_label = str(context.user_data.get('vault_batch_label') or "").strip()[:80]
+    # ВОЛНА 22.3: операция (для честной отмены) + ЖИВАЯ анимация прогресса
+    # вместо статичного текста — пользователь видит, что всё грузится.
+    op = _vault_op_begin(getattr(user, "user_id", "") or "", len(batch))
     progress = None
+    anim = None
     try:
-        progress = await msg.reply_text(f"🔐 Шифрую и загружаю {len(batch)} файл(ов)…")
+        progress = await msg.reply_text(
+            f"🔐 Шифрую и заливаю 0/{len(batch)} {_VAULT_OP_FRAMES[0]}")
     except Exception:
         progress = None
+    if progress is not None:
+        anim = asyncio.create_task(_vault_animate_progress(context, progress, op))
     files = [f for f in (getattr(user, "vault_files", []) or []) if isinstance(f, dict)]
     ok_n, fail_n = 0, 0
     fail_reasons = []  # ВОЛНА 18: честные причины сбоев — в сообщение юзеру
-    for i, item in enumerate(batch, 1):
-        if progress is not None:
-            try:
-                await context.bot.edit_message_text(
-                    f"🔐 Шифрую и загружаю {i}/{len(batch)}…",
-                    chat_id=progress.chat_id, message_id=progress.message_id,
-                )
-            except Exception:
-                pass
+    cancelled = False  # ВОЛНА 22.3: пачка прервана пользователем
+    try:
+        for i, item in enumerate(batch, 1):
+            # ВОЛНА 22.3: «❌ Отмена» — прекращаем ВЕСЬ цикл немедленно.
+            if op["event"].is_set():
+                raise _VaultCancelled()
+            op["done"] = i - 1
+            op["sub"] = f"«{(item.get('name') or 'файл')}»: шифрую…"
         # ВОЛНА 14: большой файл (>20 МБ) — потоковый путь DVF2 через
         # MTProto. ВОЛНА 17: источник — сообщение пользователя в ЛИЧНОМ чате
         # (никаких сырых копий в каналах); здесь бот качает
         # его потоком, шифрует кусками по 1 МБ и заливает контейнер.
-        if item.get("source") == "mtproto":
-            try:
-                rec_mt = await _vault_seal_item_mtproto(
-                    msg, context, user, item, password,
-                    progress, i, len(batch))
-            except Exception as e:
-                logger.error(
-                    f"vault put: большой файл ({item.get('name')}): {e}")
-                rec_mt = None
-                fail_reasons.append(
-                    f"«{(item.get('name') or 'файл')}»: "
-                    f"{_vault_fail_reason(e)}")
-            if rec_mt is None:
-                fail_n += 1
+            if item.get("source") == "mtproto":
+                try:
+                    rec_mt = await _vault_seal_item_mtproto(
+                        msg, context, user, item, password,
+                        progress, i, len(batch))
+                except _VaultCancelled:
+                    raise  # ВОЛНА 22.3: отмену НЕ глотаем как сбой файла
+                except Exception as e:
+                    logger.error(
+                        f"vault put: большой файл ({item.get('name')}): {e}")
+                    rec_mt = None
+                    fail_reasons.append(
+                        f"«{(item.get('name') or 'файл')}»: "
+                        f"{_vault_fail_reason(e)}")
+                if rec_mt is None:
+                    fail_n += 1
+                    continue
+                # ВОЛНА 13: без своей reply-подписи — название всей загрузки.
+                rec_mt["label"] = _vault_item_label(item, _batch_label)
+                files.append(rec_mt)
+                ok_n += 1
+                op["done"] = i
+                op["sub"] = ""
+                item["done"] = True  # ВОЛНА 11: шифр в канале — оригинал из чата сотрём
                 continue
-            # ВОЛНА 13: без своей reply-подписи — название всей загрузки.
-            rec_mt["label"] = _vault_item_label(item, _batch_label)
-            files.append(rec_mt)
-            ok_n += 1
-            item["done"] = True  # ВОЛНА 11: шифр в канале — оригинал из чата сотрём
-            continue
-        try:
-            container = await asyncio.to_thread(
-                _vault_pack, password, item.get("payload") or b"", {
-                    "n": item.get("name", "файл"), "k": item.get("kind", "document"),
-                    "m": item.get("mime", ""), "t": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                },
-            )
-        except Exception as e:
-            logger.error(f"vault put: шифрование не удалось ({item.get('name')}): {e}")
-            fail_n += 1
-            fail_reasons.append(
-                f"«{(item.get('name') or 'файл')}»: {_vault_fail_reason(e)}")
-            item["payload"] = b""
-            continue
-        item["payload"] = b""  # исходник больше не нужен — только шифр
-        salt_hex = container[9:25].hex()
-        nonce_hex = container[25:37].hex()
-        iters = int.from_bytes(container[5:9], "big")
-        key = _vault_derive_key(password, bytes.fromhex(salt_hex), iters)
-        verifier_hex = _vault_verifier(key).hex()
-        # Грузим ШИФР в канал по кругу (cloud-каналы).
-        _vfn = f"vault_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{i}.bin"
-        _vcap = "🔐 Сейф: зашифрованный файл (открыть без пароля невозможно)."
-        up = await _storage_upload_document(context, container,
-                                            filename=_vfn, caption=_vcap)
-        if up is None:
-            # ВОЛНА 18: вторая попытка Bot API (одноразовые сбои бывают),
-            # затем заливка шифра через MTProto — ≤48 МБ ботам разрешено.
+            try:
+                container = await asyncio.to_thread(
+                    _vault_pack, password, item.get("payload") or b"", {
+                        "n": item.get("name", "файл"), "k": item.get("kind", "document"),
+                        "m": item.get("mime", ""), "t": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    },
+                )
+            except Exception as e:
+                logger.error(f"vault put: шифрование не удалось ({item.get('name')}): {e}")
+                fail_n += 1
+                fail_reasons.append(
+                    f"«{(item.get('name') or 'файл')}»: {_vault_fail_reason(e)}")
+                item["payload"] = b""
+                continue
+            item["payload"] = b""  # исходник больше не нужен — только шифр
+            salt_hex = container[9:25].hex()
+            nonce_hex = container[25:37].hex()
+            iters = int.from_bytes(container[5:9], "big")
+            key = _vault_derive_key(password, bytes.fromhex(salt_hex), iters)
+            verifier_hex = _vault_verifier(key).hex()
+            # Грузим ШИФР в канал по кругу (cloud-каналы).
+            _vfn = f"vault_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{i}.bin"
+            _vcap = "🔐 Сейф: зашифрованный файл (открыть без пароля невозможно)."
+            # ВОЛНА 22.3: отмена между шагами загрузки.
+            if op["event"].is_set():
+                raise _VaultCancelled()
+            op["sub"] = f"«{(item.get('name') or 'файл')}»: заливаю шифр…"
             up = await _storage_upload_document(context, container,
                                                 filename=_vfn, caption=_vcap)
-            if up is None and _TELETHON_OK and BOT_TOKEN:
-                _mtc = await _mt_client()
-                if _mtc is not None:
-                    _updir = _tempfile.mkdtemp(prefix="dvf1_up_")
-                    try:
-                        _uppath = os.path.join(_updir, "c.bin")
-                        with open(_uppath, "wb") as _ufh:
-                            _ufh.write(container)
-                        up = await _mt_upload_container(
-                            _mtc, _uppath, len(container),
-                            caption=_vcap, filename=_vfn)
-                    finally:
-                        _shutil.rmtree(_updir, ignore_errors=True)
-        container = b""
-        if up is None:
-            fail_n += 1
-            fail_reasons.append(
-                f"«{(item.get('name') or 'файл')}»: шифр не приняли каналы — "
-                "проверьте, что бот администратор канала")
-            continue
-        files.append({
-            "id": _vault_gen_id(user),
-            "kind": item.get("kind", "document"),
-            "mime": item.get("mime", ""),
-            "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
-            "size_orig": int(item.get("size", 0) or 0),
-            "size_enc": int(up.get("size", 0) or 0),
-            "salt": salt_hex,
-            "verifier": verifier_hex,
-            "iters": iters,
-            "nonce": nonce_hex,
-            "msg_id": int(up.get("message_id", 0)),
-            "file_id": up.get("file_id"),
-            "channel_id": up.get("channel_id"),
-            # ВОЛНА 12: видная подпись («чтобы не запутаться, где что»).
-            # ВОЛНА 13: без своей подписи — название всей загрузки.
-            # Содержимое и настоящее имя — по-прежнему под шифром.
-            "label": _vault_item_label(item, _batch_label),
-        })
-        ok_n += 1
-        item["done"] = True  # ВОЛНА 11: шифр в канале — оригинал из чата сотрём
+            if up is None:
+                # ВОЛНА 18: вторая попытка Bot API (одноразовые сбои бывают),
+                # затем заливка шифра через MTProto — ≤48 МБ ботам разрешено.
+                if op["event"].is_set():
+                    raise _VaultCancelled()
+                up = await _storage_upload_document(context, container,
+                                                    filename=_vfn, caption=_vcap)
+                if up is None and _TELETHON_OK and BOT_TOKEN:
+                    if op["event"].is_set():
+                        raise _VaultCancelled()
+                    _mtc = await _mt_client()
+                    if _mtc is not None:
+                        _updir = _tempfile.mkdtemp(prefix="dvf1_up_")
+                        op["temp"].append(_updir)  # ВОЛНА 22.3: для отмены
+                        try:
+                            _uppath = os.path.join(_updir, "c.bin")
+                            with open(_uppath, "wb") as _ufh:
+                                _ufh.write(container)
+                            up = await _mt_upload_container(
+                                _mtc, _uppath, len(container),
+                                caption=_vcap, filename=_vfn)
+                        finally:
+                            _shutil.rmtree(_updir, ignore_errors=True)
+            container = b""
+            if up is None:
+                fail_n += 1
+                fail_reasons.append(
+                    f"«{(item.get('name') or 'файл')}»: шифр не приняли каналы — "
+                    "проверьте, что бот администратор канала")
+                continue
+            # ВОЛНА 22.3: запоминаем залитый шифр ЭТОЙ пачки — при отмене
+            # пользователь попросил «удалить что шифровал и загружал».
+            try:
+                op["sent"].append((int(up.get("channel_id")
+                                       or get_storage_channel_id() or 0),
+                                   int(up.get("message_id") or 0)))
+            except (TypeError, ValueError):
+                pass
+            files.append({
+                "id": _vault_gen_id(user),
+                "kind": item.get("kind", "document"),
+                "mime": item.get("mime", ""),
+                "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "size_orig": int(item.get("size", 0) or 0),
+                "size_enc": int(up.get("size", 0) or 0),
+                "salt": salt_hex,
+                "verifier": verifier_hex,
+                "iters": iters,
+                "nonce": nonce_hex,
+                "msg_id": int(up.get("message_id", 0)),
+                "file_id": up.get("file_id"),
+                "channel_id": up.get("channel_id"),
+                # ВОЛНА 12: видная подпись («чтобы не запутаться, где что»).
+                # ВОЛНА 13: без своей подписи — название всей загрузки.
+                # Содержимое и настоящее имя — по-прежнему под шифром.
+                "label": _vault_item_label(item, _batch_label),
+            })
+            ok_n += 1
+            op["done"] = i
+            op["sub"] = ""
+            item["done"] = True  # ВОЛНА 11: шифр в канале — оригинал из чата сотрём
+    except _VaultCancelled:
+        cancelled = True
+    finally:
+        # ВОЛНА 22.3: анимацию останавливаем в любом исходе, операцию закрываем.
+        if anim is not None:
+            anim.cancel()
+            try:
+                await anim
+            except (asyncio.CancelledError, Exception):
+                pass
+        _vault_op_end(getattr(user, "user_id", "") or "")
+    if cancelled:
+        # ВОЛНА 22.3: пользователь нажал «❌ Отмена» — честная зачистка:
+        # шифры ЭТОЙ пачки стираются из канала, временные файлы — с диска.
+        deleted = await _vault_cancel_cleanup(context, op)
+        if progress is not None:
+            try:
+                await context.bot.edit_message_text(
+                    "⛔ Остановлено",
+                    chat_id=progress.chat_id, message_id=progress.message_id)
+            except Exception:
+                pass
+        for key in ('vault_put_mode', 'vault_batch', 'vault_migrate_ids',
+                    'vault_attempts', 'vault_setup_pw', 'vault_qs_data',
+                    'vault_batch_label'):
+            context.user_data.pop(key, None)
+        await msg.reply_text(
+            "⛔ Остановлено по вашему «❌ Отмена».\n\n"
+            f"• Загрузка прервана: обработано {op.get('done', 0)}/{op.get('total', 0)}.\n"
+            f"• Из канала стёрто шифров этой загрузки: {deleted}.\n"
+            "• Временные файлы стёрты с сервера.\n"
+            "• Исходные файлы ОСТАЛИСЬ в чате — ничего не потеряно.\n"
+            "• В Сейфе — только то, что лежало до этой загрузки.\n\n"
+            "Положить заново: 🔐 Сейф → 📥 Положить.",
+            reply_markup=get_main_menu_keyboard(user))
+        return MAIN_MENU
     user.vault_files = files
     # Миграция: незашифрованные оригиналы («старые файлы») больше не нужны —
     # правило «файлы всегда в сейфе облака».
@@ -11527,6 +11744,15 @@ async def vault_qs_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     первого пароля) и для смены вопросов (после проверки пароля)."""
     msg = update.message
     user = get_user(str(update.effective_user.id))
+    # ВОЛНА 22.3: идёт шифрование/загрузка (первая настройка)? «Отмена»
+    # только ставит флаг — зачистку делает рабочий цикл, чтобы не порвать
+    # наполовину зашифрованную пачку.
+    if _vault_op_running(str(update.effective_user.id)):
+        _VAULT_OPS[str(update.effective_user.id)]["event"].set()
+        await msg.reply_text(
+            "⛔ Останавливаю шифрование/загрузку — секунду, подчищу всё "
+            "недогруженное…")
+        return VAULT_QS_WAIT
     qs = context.user_data.get('vault_qs_data')
     if not user or not isinstance(qs, dict):
         context.user_data.pop('vault_qs_data', None)
@@ -13357,8 +13583,7 @@ def _automation_system_prompt(context_text, is_admin):
         '35) {"action":"backup_now"} — сделать БЭКАП ВСЕЙ БАЗЫ в приватный канал-хранилище (ТОЛЬКО разработчик). «сделай бэкап», «сохрани базу», «забэкапься» → это действие.\n'
         '36) {"action":"vault_status"} — показать СТАТУС СЕЙФА: сколько файлов зашифровано и общий размер (доступно всем). Имена файлов скрыты даже тут — они зашифрованы. «сейф», «что в сейфе», «сколько зашифровано», «мой сейф» → это действие.\n'
         '37) {"action":"cdb_sync"} — СЛИТЬ ВСЮ БАЗУ в приватный канал-БД СЕЙЧАС (закреплённый снапшот; ТОЛЬКО разработчик). «сохрани базу в канал», «соль базу в канал», «синхронизируй базу», «перенеси базу в канал» → это действие.\n'
-        '38) {"action":"pult_dm","items":[{"to":"<имя получателя>","text":"<суть сообщения от лица пользователя>"}],"stickers":[{"to":"<имя>","sticker":"<название стикера>"}]} — ПУЛЬТ: передать сообщения/стикеры людям («напиши Мише чтобы вернул 100₽», «скажи Дусе что я подхожу и отправь ей стикер сердца»). text — КРАТКАЯ СУТЬ от первого лица. Если в запросе несколько получателей — все идут в items. Стикеры необязательны (поле stickers можно опустить).\n'
-        '39) {"action":"pult_post","text":"<текст поста>"} — ПУЛЬТ: опубликовать пост в канале пользователя («сделай пост в моем канале рыбка сто я иду» — text:«рыбка сто я иду»).\n\n'
+        '38) {"action":"pult_post","text":"<текст поста>"} — ПУЛЬТ: опубликовать пост в канале пользователя («сделай пост в моем канале рыбка сто я иду» — text:«рыбка сто я иду»).\n\n'
         "ПРАВИЛА:\n"
         "- Отвечай ТОЛЬКО JSON-объектом, без пояснений и markdown.\n"
         "- Не выдумывай даты: считай их строго от сегодняшней даты из контекста. «Пятница этой недели» — пятница текущей недели (даже если она уже прошла — берём ближайшую ПЯТНИЦУ ТЕКУЩЕЙ недели, а не следующую). Для «следующей недели» есть отдельная строка контекста с готовыми датами.\n"
@@ -13373,7 +13598,7 @@ def _automation_system_prompt(context_text, is_admin):
         "- КОД КЛАССА: «скажи код класса», «какой у нас код?», «покажи код» = show_class_code.\n"
         "- ХРАНИЛИЩЕ/ОБЛАКО: «облако», «мои файлы», «что в облаке» = show_storage; «сделай бэкап», «сохрани базу» = backup_now (только разработчик); «открой облако» = open_section section:\"облако\".\n"
         "- КАНАЛ-БАЗА: «соль базу в канал», «сохрани базу в канал», «перенеси базу в канал», «синхронизируй базу» = cdb_sync (только разработчик).\n"
-        "- ПУЛЬТ: «напиши/скажи/передай <кому> <что>» = pult_dm (text — краткая суть от первого лица, БЕЗ обращения в начале); «отправь <кому> стикер <название>» = pult_dm со stickers; «сделай пост в моем канале <текст>» = pult_post. НЕ используйте pult_* для анонимок (это send_anon) и объявлений классу (это send_class_message).\n"
+        "- ПУЛЬТ: «сделай пост в моем канале <текст>» = pult_post. Действий pult_dm/стикеров людям БОЛЬШЕ НЕТ (эстафета удалена) — на такие просьбы отвечайте none. НЕ используйте pult_* для анонимок (это send_anon) и объявлений классу (это send_class_message).\n"
         "- СЕЙФ: «сейф», «что в сейфе», «сколько зашифровано» = vault_status; «открой сейф», «положи в сейф» = open_section section:\"сейф\" (дальше пользователь работает кнопками — пароль через автоматизацию НЕ вводится). НЕ проси пароль в чате AI Agent!\n"
         "- Даты только в формате ГГГГ-ММ-ДД, время — ЧЧ:ММ (24-часовое).\n"
         "- Для edit_bell: если end <= start — верни clarify с объяснением.\n"
@@ -14397,27 +14622,28 @@ async def _automation_execute_action(update, context, user, class_obj, action):
                     failed += 1
             return f"📢 Объявление отправлено: {sent} получено, {failed} не доставлено.", True
 
-        if name in ("pult_dm", "pult_post"):
-            # ВОЛНА 22: Пульт — сообщения людям/пост в канал от лица пользователя.
+        if name in ("pult_post",):
+            # ВОЛНА 22: Пульт — пост в канал от лица пользователя
+            # (ВОЛНА 22.3: эстафета людям удалена).
             if not bool((getattr(user, "pult", {}) or {}).get("enabled")):
                 return ("🎙 Пульт выключен. Откройте «🎙 Пульт» в меню, включите, "
-                        "добавьте контакты/канал — после этого такие команды "
-                        "заработают.", True)
+                        "задайте канал — после этого такие команды заработают.", True)
             plan = _pult_plan_from_automation(action)
             if not plan:
-                return "❓ Не понял, кому и что передать. Назовите получателя и текст.", False
-            # Генерация текстов в стиле (для dm).
+                return "❓ Не понял, какой пост сделать. Напишите: «сделай пост в моем канале <текст>».", False
+            # Генерация текста поста в стиле канала (если стиль есть).
             notes = []
             for it in plan:
-                if it["kind"] == "dm":
-                    text, note = await _pult_generate_text(
-                        user, it.get("style_key") or it["target"], it["text"])
+                if it["kind"] == "post":
+                    pult_cfg = (getattr(user, "pult", {}) or {})
+                    ch = pult_cfg.get("channel") or {}
+                    _sk = _pult_norm_key(ch.get("title") or "") if ch else ""
+                    if _sk not in (pult_cfg.get("styles") or {}):
+                        _sk = ""
+                    text, note = await _pult_generate_text(user, _sk, it["text"])
                     it["text"] = text
                     if note:
-                        notes.append(f"• {it['target']}: {note}")
-                    # резолв контакта теперь, когда есть план
-                    uid, disp = _pult_resolve_target(user, it["target"])
-                    it["uid"], it["target"] = uid, disp
+                        notes.append(f"• Канал: {note}")
             context.user_data["pult_plan"] = plan
             card, need = _pult_plan_card(user, plan)
             if notes:
@@ -14850,9 +15076,9 @@ _PULT_EXIT_TRIGGERS = frozenset({
 })
 
 # Режим ожидания PULT_WAIT_CONTACT (context.user_data['pult_mode']):
-#   contact  — пересылка сообщения ОТ человека (контакт-эстафета)
 #   livechat — пересылка ЛЮБОГО сообщения из группы/канала (живой анализ)
-#   sticker  — отправка/пересылка стикера (запоминаем file_id)
+#   channel  — пересылка из канала пользователя / @username / -100…ID
+#   (ВОЛНА 22.3: режимы «contact»/«sticker» — эстафета людям — удалены)
 
 
 def _pult_default():
@@ -15224,51 +15450,16 @@ def _pult_apply_punct(text, with_punct=True):
     return t
 
 
-# --- план отправки: разбор LLM → единый формат ---
-
-def _pult_resolve_target(user, name):
-    """Ищет контакт по имени (нормализованно и по подстроке).
-    Возвращает (uid|None, display_name)."""
-    contacts = user.pult.get("contacts") or {}
-    nk = _pult_norm_key(name)
-    if nk and nk in contacts:
-        c = contacts[nk]
-        return int(c["uid"]), c["name"]
-    for k, c in contacts.items():
-        if nk and (nk in k or k in nk):
-            return int(c["uid"]), c["name"]
-    return None, str(name or "").strip() or "Адресат"
-
-
 def _pult_plan_from_parsed(user, parsed):
-    """JSON команды {"actions":[…]} → план исполнимых пунктов."""
+    """JSON команды {"actions":[…]} → план исполнимых пунктов.
+    ВОЛНА 22.3: dm/sticker (эстафета людям) удалены — остался только post."""
     plan = []
     acts = parsed.get("actions") if isinstance(parsed.get("actions"), list) else []
     for a in acts[:_PULT_PLAN_MAX + 2]:
         if not isinstance(a, dict):
             continue
         act = str(a.get("act") or "").strip().lower()
-        if act == "dm":
-            to = str(a.get("to") or "").strip()
-            text = _pult_clip(a.get("text"), _PULT_DM_TEXT_MAX)
-            if not to or not text:
-                continue
-            uid, disp = _pult_resolve_target(user, to)
-            plan.append({"kind": "dm", "target": disp, "uid": uid,
-                         "text": text, "style_key": to})
-            if len(plan) >= _PULT_PLAN_MAX:
-                break
-        elif act == "sticker":
-            to = str(a.get("to") or "").strip()
-            st = str(a.get("sticker") or "").strip()
-            if not to or not st:
-                continue
-            uid, disp = _pult_resolve_target(user, to)
-            plan.append({"kind": "sticker", "target": disp, "uid": uid,
-                         "sticker": _pult_clip(st, 40)})
-            if len(plan) >= _PULT_PLAN_MAX:
-                break
-        elif act == "post":
+        if act == "post":
             text = _pult_clip(a.get("text"), _PULT_DM_TEXT_MAX)
             if text:
                 ch = user.pult.get("channel") or {}
@@ -15281,30 +15472,11 @@ def _pult_plan_from_parsed(user, parsed):
 
 
 def _pult_plan_from_automation(action):
-    """Действие автоматизации pult_dm/pult_post → тот же формат плана
-    (без резолва контактов — резолв произойдёт в _pult_plan_card/execute)."""
+    """Действие автоматизации pult_post → тот же формат плана.
+    ВОЛНА 22.3: pult_dm (эстафета людям) удалён по решению пользователя."""
     plan = []
     name = (action.get("action") or "").strip()
-    if name == "pult_dm":
-        items = action.get("items") if isinstance(action.get("items"), list) else []
-        for it in items[:_PULT_PLAN_MAX]:
-            if not isinstance(it, dict):
-                continue
-            to = str(it.get("to") or "").strip()
-            text = _pult_clip(it.get("text"), _PULT_DM_TEXT_MAX)
-            if to and text:
-                plan.append({"kind": "dm", "target": to, "uid": None,
-                             "text": text, "style_key": to})
-        sticks = action.get("stickers") if isinstance(action.get("stickers"), list) else []
-        for it in sticks[:_PULT_PLAN_MAX - len(plan) or 1]:
-            if not isinstance(it, dict):
-                continue
-            to = str(it.get("to") or "").strip()
-            st = str(it.get("sticker") or "").strip()
-            if to and st:
-                plan.append({"kind": "sticker", "target": to, "uid": None,
-                             "sticker": _pult_clip(st, 40)})
-    elif name == "pult_post":
+    if name == "pult_post":
         text = _pult_clip(action.get("text"), _PULT_DM_TEXT_MAX)
         if text:
             plan.append({"kind": "post", "target": "канал", "text": text})
@@ -15312,19 +15484,12 @@ def _pult_plan_from_automation(action):
 
 
 def _pult_plan_card(user, plan):
-    """Человекочитаемая карточка плана. Возвращает (text, need_confirm)."""
+    """Человекочитаемая карточка плана. Возвращает (text, need_confirm).
+    ВОЛНА 22.3: только посты в канал (dm/sticker удалены)."""
     pult = user.pult
     lines = ["🎙 Проверьте план отправки:"]
     for i, it in enumerate(plan, 1):
-        if it["kind"] == "dm":
-            mode = "эстафета" if it.get("uid") else "ЧЕРНОВИК (контакт не найден)"
-            lines.append(f"{i}) 💬 {it['target']} [{mode}]: «{it['text']}»")
-        elif it["kind"] == "sticker":
-            known = _pult_norm_key(it.get("sticker")) in (pult.get("stickers") or {})
-            mark = "" if known else " (стикер не найден — будет ⚠️)"
-            lines.append(f"{i}) 🎨 {it['target']} — стикер «{it['sticker']}»{mark}")
-        else:
-            lines.append(f"{i}) 📢 Канал «{it['target']}»: «{it['text']}»")
+        lines.append(f"{i}) 📢 Канал «{it['target']}»: «{it['text']}»")
     if pult.get("confirm", True):
         lines.append("\nНажмите «✅ Отправить», чтобы исполнить.")
         return "\n".join(lines), True
@@ -15336,7 +15501,7 @@ def _pult_confirm_kb(plan):
     rows = []
     edit_row = []
     for i, it in enumerate(plan):
-        if it["kind"] == "dm" and i < 5:
+        if it["kind"] == "post" and i < 5:
             edit_row.append(InlineKeyboardButton(f"✏️ {i + 1}",
                                                  callback_data=f"pult_edi_{i}"))
     if edit_row:
@@ -15349,50 +15514,23 @@ def _pult_confirm_kb(plan):
 
 
 async def _pult_execute_plan(context, user, plan):
-    """Исполняет план и возвращает честный отчёт по каждому пункту."""
+    """Исполняет план (только посты в канал) и возвращает честный отчёт.
+    ВОЛНА 22.3: эстафета людям удалена по решению пользователя."""
     pult = user.pult
     lines = []
     for i, it in enumerate(plan, 1):
         try:
-            if it["kind"] == "dm":
-                uid = it.get("uid")
-                if not uid:
-                    lines.append(
-                        f"⚠️ {i}. «{it['target']}» — контакта нет, ЧЕРНОВИК:\n\n"
-                        f"«{it['text']}»\n"
-                        "💡 Добавьте контакт: 🎙 Пульт → 📇 Контакты → ➕ — тогда "
-                        "сообщения будут уходить сами.")
-                    continue
-                await context.bot.send_message(
-                    int(uid),
-                    f"💬 От {user.first_name}:\n\n{it['text']}")
-                lines.append(f"✅ {i}. {it['target']} — доставлено (эстафета).")
-            elif it["kind"] == "sticker":
-                uid = it.get("uid")
-                st = (pult.get("stickers") or {}).get(_pult_norm_key(it.get("sticker")))
-                if not uid:
-                    lines.append(f"⚠️ {i}. Стикер «{it['sticker']}» — контакт "
-                                 f"«{it['target']}» не найден, некуда отправлять.")
-                    continue
-                if not st:
-                    lines.append(f"⚠️ {i}. Стикер «{it['sticker']}» не запомнен. "
-                                 "Добавьте: 🎙 Пульт → 🎨 Стикеры → ➕ (пришлите его).")
-                    continue
-                await context.bot.send_sticker(int(uid), st["file_id"])
-                lines.append(f"✅ {i}. Стикер «{st.get('name') or it['sticker']}» → "
-                             f"{it['target']} — доставлен.")
-            else:  # post
-                ch = pult.get("channel")
-                if not ch:
-                    lines.append(
-                        f"⚠️ {i}. Канал не задан — ЧЕРНОВИК поста:\n\n«{it['text']}»\n"
-                        "💡 Задайте канал: 🎙 Пульт → 📢 Канал.")
-                    continue
-                await context.bot.send_message(int(ch["chat_id"]), it["text"])
-                lines.append(f"✅ {i}. Пост опубликован в «{ch.get('title')}».")
+            ch = pult.get("channel")
+            if not ch:
+                lines.append(
+                    f"⚠️ {i}. Канал не задан — ЧЕРНОВИК поста:\n\n«{it['text']}»\n"
+                    "💡 Задайте канал: 🎙 Пульт → 📢 Канал.")
+                continue
+            await context.bot.send_message(int(ch["chat_id"]), it["text"])
+            lines.append(f"✅ {i}. Пост опубликован в «{ch.get('title')}».")
         except (TGBadRequest, TGForbidden) as e:
             lines.append(f"⚠️ {i}. Telegram отказал ({e}): {it['target']}. "
-                         "Проверьте, что бот может писать этому получателю/каналу.")
+                         "Проверьте, что бот администратор канала.")
         except Exception as e:
             lines.append(f"⚠️ {i}. Сбой: {e!r}")
     return "📣 Итог Пульта:\n\n" + "\n".join(lines)
@@ -15500,37 +15638,18 @@ _PULT_CMD_SYSTEM = (
     "Ты — парсер команд «Пульта» школьного бота. Преврати запрос пользователя "
     "на русском в JSON: {\"actions\": [ … ]} — список действий В ПОРЯДКЕ "
     "УПОМИНАНИЯ. Доступные действия:\n"
-    '{"act":"dm","to":"<кому>","text":"<суть сообщения от первого лица пользователя>"}\n'
-    '{"act":"sticker","to":"<кому>","sticker":"<название стикера>"}\n'
     '{"act":"post","text":"<готовый текст поста в канал>"}\n'
     '{"act":"clarify","question":"<один уточняющий вопрос>"}\n'
     '{"act":"none","answer":"<ответ, если это вообще не команда Пульта>"}\n\n'
     "ПРАВИЛА:\n"
-    "- «напиши Мише чтобы вернул 100₽» → dm to:«Миша» text:«верни 100₽» — text "
-    "КРАТКИЙ, от первого лица, БЕЗ обращения в начале.\n"
-    "- «напиши Дусе что я подхожу и отправь ей стикер сердца и Ване тоже» → "
-    "ТРИ действия: dm Дусе «я подхожу», sticker Дуся «сердце», dm Ване «я подхожу».\n"
     "- «сделай пост в моем канале <текст>» → post с ГОТОВЫМ текстом поста.\n"
-    "- Имена получателей используй из списка ЦЕЛИ, если там есть подходящий.\n"
-    "- Если кому писать непонятно или текст пуст — clarify. "
-    "Не команды бота — none с коротким ответом.\n"
+    "- Действий «напиши кому-то лично» и «отправь стикер» БОЛЬШЕ НЕТ (эстафета "
+    "удалена) — на такие просьбы отвечай none с честным объяснением, что бот "
+    "теперь постит только в канал пользователя.\n"
+    "- Если текст поста пуст или канал не указан — clarify. Не команды бота — "
+    "none с коротким ответом.\n"
     "- Отвечай ТОЛЬКО JSON."
 )
-
-
-def _pult_targets_list(user):
-    """Список известных целей для промпта (контакты + стили + канал)."""
-    pult = user.pult
-    names = [c.get("name") for c in (pult.get("contacts") or {}).values() if c.get("name")]
-    names += [s.get("title") for s in (pult.get("styles") or {}).values() if s.get("title")]
-    if pult.get("channel"):
-        names.append(pult["channel"].get("title") or "канал")
-    uniq = []
-    for n in names:
-        n = str(n).strip()
-        if n and n not in uniq:
-            uniq.append(n)
-    return uniq[:40]
 
 
 def _pult_menu_text(user):
@@ -15543,20 +15662,17 @@ def _pult_menu_text(user):
     lines = [
         f"🎙 ПУЛЬТ — {on}",
         "",
-        "Команды текстом или ГОЛОСОМ: «напиши Мише чтобы вернул 100₽», "
-        "«напиши Дусе что я подхожу и отправь стикер сердца и Ване тоже», "
-        "«сделай пост в моем канале рыбка сто я иду».",
+        "Команды текстом или ГОЛОСОМ: «сделай пост в моем канале рыбка сто "
+        "я иду».",
         "",
         f"✍️ Стиль: {len(styles)} чатов • {n_pairs} пар • {n_mono} примеров",
-        f"📇 Контакты-эстафета: {len(pult.get('contacts') or {})}",
-        f"🎨 Стикеры: {len(pult.get('stickers') or {})}",
         f"📢 Канал: «{ch['title']}»" if ch else "📢 Канал: не задан",
         f"🗣 Мат: {'разрешён' if pult.get('mat') else 'запрещён'} • "
         f"Знаки препинания: {'с знаками' if pult.get('punct') else 'без знаков'} • "
         f"Подтверждение: {'да' if pult.get('confirm') else 'нет'}",
         "",
-        "Без Premium: сообщения уходят от бота с подписью «от вас» (эстафета) "
-        "или черновиком; посты в канал — напрямую.",
+        "Посты уходят НАПРЯМУЮ в ваш канал (бот-админ). Писать людям от "
+        "вашего имени Bot API не умеет — эстафета удалена по вашему решению.",
     ]
     return "\n".join(lines)
 
@@ -15571,8 +15687,6 @@ def _pult_menu_kb(user):
         [_b("📥 Стиль из экспорта", "pult_export"),
          _b(f"🎨 Стили: {len(pult.get('styles') or {})}", "pult_styles")],
         [_b("💬 Живые чаты", "pult_livelist"),
-         _b(f"📇 Контакты: {len(pult.get('contacts') or {})}", "pult_contacts")],
-        [_b(f"🎨 Стикеры: {len(pult.get('stickers') or {})}", "pult_stickers"),
          _b("📢 Канал", "pult_channel")],
         [_b(f"🗣 Мат: {'вкл' if pult.get('mat') else 'выкл'}", "pult_t_mat"),
          _b(f"✒️ Знаки: {'да' if pult.get('punct') else 'нет'}", "pult_t_punct"),
@@ -15682,9 +15796,7 @@ async def pult_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data == "pult_cmd":
             await query.edit_message_text(
                 "✍️ Напишите команду (или пришлите голосом):\n\n"
-                "«напиши Мише чтобы вернул 100₽»\n"
-                "«сделай пост в моем канале рыбка сто я иду»\n"
-                "«напиши Дусе что я подхожу и отправь ей стикер сердца»",
+                "«сделай пост в моем канале рыбка сто я иду»",
                 reply_markup=InlineKeyboardMarkup(
                     [[InlineKeyboardButton("⬅️ Назад", callback_data="pult_menu")]]))
             await query.answer()
@@ -15785,114 +15897,6 @@ async def pult_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer()
             return PULT_WAIT_CONTACT
 
-        if data == "pult_contacts":
-            contacts = pult.get("contacts") or {}
-            keys = list(contacts.keys())
-            context.user_data["pult_view_contacts"] = keys
-            rows = []
-            for i, k in enumerate(keys):
-                rows.append([InlineKeyboardButton(
-                    f"🗑 {contacts[k].get('name') or k}",
-                    callback_data=f"pult_cdel_{i}")])
-            rows.append([InlineKeyboardButton("➕ Добавить контакт",
-                                              callback_data="pult_cadd")])
-            rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="pult_menu")])
-            await query.edit_message_text(
-                "📇 КОНТАКТЫ-ЭСТАФЕТА\n\nПерешлите сообщение ОТ человека — и по "
-                "команде «напиши ему …» бот доставит лично ему с подписью "
-                f"«от вас». Сейчас: {len(keys)} из {_PULT_CONTACTS_MAX}.",
-                reply_markup=InlineKeyboardMarkup(rows))
-            await query.answer()
-            return PULT_MENU
-
-        if data.startswith("pult_cdel_"):
-            keys = context.user_data.get("pult_view_contacts") or []
-            try:
-                i = int(data.split("_")[-1])
-                k = keys[i]
-            except (ValueError, IndexError):
-                k = None
-            if k and k in (pult.get("contacts") or {}):
-                pult["contacts"].pop(k, None)
-                save_user(user)
-                try:
-                    await query.answer("Удалено")
-                except Exception:
-                    pass
-            else:
-                try:
-                    await query.answer()
-                except Exception:
-                    pass
-            cb = query
-            cb.data = "pult_contacts"
-            update.callback_query = cb
-            return await pult_callback(update, context)
-
-        if data == "pult_cadd":
-            context.user_data["pult_mode"] = "contact"
-            await query.edit_message_text(
-                "📇 ДОБАВЛЕНИЕ КОНТАКТА\n\nПерешлите сюда ЛЮБОЕ "
-                "сообщение ОТ этого человека (от Миши, Дуси, Вани — кого "
-                "пожелаете). Бот запомнит его личку.",
-                reply_markup=InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("⬅️ Назад", callback_data="pult_menu")]]))
-            await query.answer()
-            return PULT_WAIT_CONTACT
-
-        if data == "pult_stickers":
-            stickers = pult.get("stickers") or {}
-            keys = list(stickers.keys())
-            context.user_data["pult_view_stickers"] = keys
-            rows = []
-            for i, k in enumerate(keys):
-                rows.append([InlineKeyboardButton(
-                    f"🗑 {stickers[k].get('name') or k}",
-                    callback_data=f"pult_zdel_{i}")])
-            rows.append([InlineKeyboardButton("➕ Добавить стикер",
-                                              callback_data="pult_sadd")])
-            rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="pult_menu")])
-            await query.edit_message_text(
-                "🎨 СТИКЕРЫ\n\nПришлите (или перешлите) стикер — запомню его. "
-                "Затем скажите «отправь Дусе стикер сердце» и он полетит.",
-                reply_markup=InlineKeyboardMarkup(rows))
-            await query.answer()
-            return PULT_MENU
-
-        if data.startswith("pult_zdel_"):
-            keys = context.user_data.get("pult_view_stickers") or []
-            try:
-                i = int(data.split("_")[-1])
-                k = keys[i]
-            except (ValueError, IndexError):
-                k = None
-            if k and k in (pult.get("stickers") or {}):
-                pult["stickers"].pop(k, None)
-                save_user(user)
-                try:
-                    await query.answer("Удалено")
-                except Exception:
-                    pass
-            else:
-                try:
-                    await query.answer()
-                except Exception:
-                    pass
-            cb = query
-            cb.data = "pult_stickers"
-            update.callback_query = cb
-            return await pult_callback(update, context)
-
-        if data == "pult_sadd":
-            context.user_data["pult_mode"] = "sticker"
-            await query.edit_message_text(
-                "🎨 ДОБАВЛЕНИЕ СТИКЕРА\n\nПришлите стикер (можно перешлённый). "
-                "Имя возьму из эмодзи стикера (например ❤️).",
-                reply_markup=InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("⬅️ Назад", callback_data="pult_menu")]]))
-            await query.answer()
-            return PULT_WAIT_CONTACT
-
         if data == "pult_channel":
             context.user_data["pult_mode"] = "channel"
             ch = pult.get("channel")
@@ -15946,10 +15950,10 @@ async def pult_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except ValueError:
                 i = -1
             plan = context.user_data.get("pult_plan") or []
-            if 0 <= i < len(plan) and plan[i]["kind"] == "dm":
+            if 0 <= i < len(plan) and plan[i]["kind"] == "post":
                 context.user_data["pult_edit_idx"] = i
                 await query.edit_message_text(
-                    f"✏️ Введите СВОЙ текст для пункта {i + 1} ({plan[i]['target']}):\n\n"
+                    f"✏️ Введите СВОЙ текст для пункта {i + 1} (канал):\n\n"
                     f"Текущий: «{plan[i]['text']}»",
                     reply_markup=InlineKeyboardMarkup(
                         [[InlineKeyboardButton("⬅️ Назад", callback_data="pult_menu")]]))
@@ -16108,14 +16112,15 @@ async def _pult_export_me_choice(update, context, user, idx):
 
 
 async def pult_contact_input_handler(update, context):
-    """Ввод в PULT_WAIT_CONTACT/PULT_WAIT_CHANNEL: контакт / живой чат /
-    стикер / канал — по флагу pult_mode."""
+    """Ввод в PULT_WAIT_CONTACT: канал / живой чат — по флагу pult_mode.
+    ВОЛНА 22.3: режимы «contact» и «sticker» (эстафета людям) удалены по
+    решению пользователя — Bot API не умеет писать людям от чужого имени."""
     uid = str(update.effective_user.id)
     user = get_user(uid)
     if not user:
         user = User(uid)
     pult = user.pult
-    mode = context.user_data.get("pult_mode") or "contact"
+    mode = context.user_data.get("pult_mode") or "livechat"
     msg = update.message
     raw = (msg.text or "").strip()
     if _pult_is_exit(raw):
@@ -16124,29 +16129,6 @@ async def pult_contact_input_handler(update, context):
                              reply_markup=get_main_menu_keyboard(user))
         return MAIN_MENU
     origin = getattr(msg, "forward_origin", None)
-    fwd_from = getattr(msg, "forward_from", None)
-    sticker = getattr(msg, "sticker", None)
-
-    if mode == "sticker":
-        if not sticker:
-            await msg.reply_text("Пришлите именно СТИКЕР.")
-            return PULT_WAIT_CONTACT
-        if len(pult.get("stickers") or {}) >= _PULT_STICKERS_MAX:
-            await msg.reply_text(f"⚠️ Лимит стикеров ({_PULT_STICKERS_MAX}) — "
-                                 "удалите лишний в 🎨 Стикеры.")
-            return PULT_WAIT_CONTACT
-        name = str(getattr(sticker, "emoji", "") or "").strip() or "стикер"
-        fid = str(getattr(sticker, "file_id", "") or "")
-        pult.setdefault("stickers", {})[_pult_norm_key(name)] = {
-            "name": name, "file_id": fid}
-        save_user(user)
-        context.user_data.pop("pult_mode", None)
-        await msg.reply_text(f"✅ Стикер «{name}» запомнен. Теперь: «отправь "
-                             "Дусе стикер " + name + "».",
-                             reply_markup=InlineKeyboardMarkup([[
-                                 InlineKeyboardButton("🎙 Меню Пульта",
-                                                      callback_data="pult_menu")]]))
-        return PULT_MENU
 
     if mode == "channel":
         ch_obj = None
@@ -16187,7 +16169,7 @@ async def pult_contact_input_handler(update, context):
                 InlineKeyboardButton("🎙 Меню Пульта", callback_data="pult_menu")]]))
         return PULT_MENU
 
-    # mode == contact / livechat — нужен ПЕРЕСЛАННЫЙ апдейт
+    # mode == livechat — нужен ПЕРЕСЛАННЫЙ апдейт
     if mode == "livechat":
         src = (getattr(origin, "chat", None)
                or getattr(origin, "sender_chat", None))
@@ -16213,35 +16195,13 @@ async def pult_contact_input_handler(update, context):
                 InlineKeyboardButton("🎙 Меню Пульта", callback_data="pult_menu")]]))
         return PULT_MENU
 
-    # mode == contact
-    sender = None
-    if origin is not None and type(origin).__name__ == "MessageOriginUser":
-        sender = getattr(origin, "sender_user", None)
-    elif fwd_from is not None:
-        sender = fwd_from
-    if sender is None or int(getattr(sender, "id", 0) or 0) == 0:
-        await msg.reply_text(
-            "Перешлите сообщение ОТ этого человека (от Миши, Дуси — напрямую "
-            "из вашей с ним переписки), тогда бот увидит его личку.")
-        return PULT_WAIT_CONTACT
-    if int(sender.id) == int(uid):
-        await msg.reply_text("Это ваше же сообщение 🙂 Перешлите сообщение ОТ "
-                             "того, кому бот должен писать.")
-        return PULT_WAIT_CONTACT
-    if len(pult.get("contacts") or {}) >= _PULT_CONTACTS_MAX:
-        await msg.reply_text(f"⚠️ Лимит контактов ({_PULT_CONTACTS_MAX}).")
-        return PULT_WAIT_CONTACT
-    nm = " ".join(x for x in [getattr(sender, "first_name", ""),
-                              getattr(sender, "last_name", "")] if x).strip() or "Друг"
-    pult.setdefault("contacts", {})[_pult_norm_key(nm)] = {
-        "uid": int(sender.id), "name": _pult_clip(nm, 80)}
-    save_user(user)
+    # ВОЛНА 22.3: легаси-режимы («contact»/«sticker») и мусор в
+    # pult_mode — честно объясняем, что эстафеты больше нет.
     context.user_data.pop("pult_mode", None)
     await msg.reply_text(
-        f"✅ Контакт «{nm}» добавлен! Теперь: «напиши {nm.split()[0]} …» — бот "
-        "доставит ему лично с подписью «от вас».",
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("🎙 Меню Пульта", callback_data="pult_menu")]]))
+        "⚠️ Эта функция Пульта удалена: бот постит только в ВАШ канал и "
+        "копит стиль из живых чатов. Писать людям от вашего имени Bot API "
+        "не умеет — нужен бизнес-аккаунт, а он отключён по вашему решению.")
     return PULT_MENU
 
 
@@ -16304,9 +16264,7 @@ async def pult_command_process(update, context, user, raw):
                 InlineKeyboardButton("🎙 Открыть Пульт",
                                      callback_data="pult_menu")]]))
         return PULT_MENU
-    targets = _pult_targets_list(user)
-    system = _PULT_CMD_SYSTEM + ("\nЦЕЛИ (известные имена): "
-                                 + "; ".join(targets) if targets else "")
+    system = _PULT_CMD_SYSTEM
     thinking = None
     try:
         thinking = await update.message.reply_text("🎙 Пульт думает…   ⏳")
@@ -16328,10 +16286,20 @@ async def pult_command_process(update, context, user, raw):
     if not acts:
         ans = str(parsed.get("answer") or parsed.get("question") or "").strip()
         await update.message.reply_text(
-            ans or "🤔 Не понял команду. Сформулируйте: «напиши <кому> <что>».")
+            ans or "🤔 Не понял команду. Сформулируйте: «сделай пост в моем "
+                   "канале <текст>».")
         return PULT_MENU
     plan = _pult_plan_from_parsed(user, parsed)
     if not plan:
+        # ВОЛНА 22.3: если LLM вернула dm/sticker (эстафета удалена) — честно
+        # объясняем, а не «не хватило данных».
+        if any(str(a.get("act") or "").strip().lower() in ("dm", "sticker")
+               for a in acts if isinstance(a, dict)):
+            await update.message.reply_text(
+                "⚠️ Бот больше не пишет людям — эстафета удалена: Bot API не "
+                "умеет писать от вашего имени. Осталось: посты в ВАШ канал "
+                "(«сделай пост в моем канале …») и стили по чатам.")
+            return PULT_MENU
         # Нет исполнимых действий: честно показываем clarify-вопрос ИЛИ
         # ответ none (ответ LLM не теряется — волна 22, фикс по тесту E10).
         first_msg = ""
@@ -16341,16 +16309,21 @@ async def pult_command_process(update, context, user, raw):
                 if first_msg:
                     break
         await update.message.reply_text(
-            first_msg or "❓ Не хватило данных: назовите, КОМУ и ЧТО передать.")
+            first_msg or "❓ Не хватило данных: скажите, КАКОЙ пост сделать "
+                         "в ваш канал.")
         return PULT_MENU
-    # Генерация текстов в стиле (для dm — краткая суть → живое сообщение).
+    # Генерация текста поста в стиле (стиль канала, если он есть в стилях).
     notes = []
     for it in plan:
-        if it["kind"] == "dm":
-            text, note = await _pult_generate_text(user, it.get("style_key") or it["target"], it["text"])
+        if it["kind"] == "post":
+            ch = pult.get("channel") or {}
+            _sk = _pult_norm_key(ch.get("title") or "") if ch else ""
+            if _sk not in (pult.get("styles") or {}):
+                _sk = ""
+            text, note = await _pult_generate_text(user, _sk, it["text"])
             it["text"] = text
             if note:
-                notes.append(f"• {it['target']}: {note}")
+                notes.append(f"• Канал: {note}")
     context.user_data["pult_plan"] = plan
     card, need = _pult_plan_card(user, plan)
     if notes:
