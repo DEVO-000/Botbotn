@@ -8174,6 +8174,14 @@ try:
         InputPeerChannel as _InputPeerChannel,
     )
     from telethon.errors import FloodWaitError as _FloodWaitError
+    try:  # ВОЛНА 21: перебор api_id-пар требует ловить ApiIdInvalid
+        from telethon.errors import (
+            ApiIdInvalidError as _ApiIdInvalidError,
+            ApiIdPublishedFloodError as _ApiIdPubFloodError,
+        )
+    except Exception:
+        _ApiIdInvalidError = None
+        _ApiIdPubFloodError = None
     _TELETHON_OK = True
 except Exception as _telethon_import_err:  # честная деградация без Telethon
     _TGClient = None
@@ -8181,6 +8189,8 @@ except Exception as _telethon_import_err:  # честная деградация
     _InputPeerUser = None
     _InputPeerChannel = None
     _FloodWaitError = None
+    _ApiIdInvalidError = None
+    _ApiIdPubFloodError = None
     # ВОЛНА 19: молчаливый импорт маскировал причину — на Render было видно
     # только «MTProto недоступен», а ПОЧЕМУ — только в логах сборки.
     try:
@@ -8190,12 +8200,49 @@ except Exception as _telethon_import_err:  # честная деградация
     except Exception:
         pass
 
-# api_id/api_hash: сначала переменные окружения, затем публичные данные
-# официального Telegram Desktop (открыты в его исходниках и используются
-# библиотеками как значения по умолчанию). Можно переопределить своими.
-_TELEGRAM_API_ID = int((_env("TELEGRAM_API_ID", "") or "2048"))
-_TELEGRAM_API_HASH = (_env("TELEGRAM_API_HASH", "")
-                      or "b18441a1ff607e10a989891a5462e627").strip()
+# api_id/api_hash: строго БЕЗ личных ключей пользователя (он их не даёт —
+# и не нужно). Официальные клиенты Telegram открыты в исходниках и ходят
+# в API со СВОИМИ публичными парами — используем их. ВОЛНА 21: пара
+# 2048/b18441… отвергнута Telegram (ApiIdInvalidError, подтверждено в
+# проде), поэтому вместо одной константы — СПИСОК публичных пар с
+# автоворотом: если Telegram отклонил пару, клиент молча пробует
+# следующую, а рабочая пара запоминается до рестарта. Свою пару можно
+# задать в env (TELEGRAM_API_ID + TELEGRAM_API_HASH) — она получит
+# наивысший приоритет.
+_MT_API_PAIRS = []
+_e_api_id = (_env("TELEGRAM_API_ID", "") or "").strip()
+_e_api_hash = (_env("TELEGRAM_API_HASH", "") or "").strip()
+if _e_api_id.isdigit() and int(_e_api_id) > 0 and _e_api_hash:
+    _MT_API_PAIRS.append((int(_e_api_id), _e_api_hash, "env"))
+# Публичная пара Telegram Android из официального репозитория
+# (BuildVars.java) — ПЕРВАЯ: проверено вживую (2026-09, реальный замер
+# с фейковым токеном) — Telegram ПРИНИМАЕТ её для ботов
+# (AccessTokenInvalidError на фейковый токен, НЕ ApiIdInvalidError).
+_MT_API_PAIRS.append((6, "eb06d4abfb49dc3eeb1aeb98ae0f581e",
+                      "Telegram Android"))
+# Публичная пара Telegram Desktop из официального репозитория tdesktop
+# (config.h) — запасная: тот же замер показал, что с 2026-09 Telegram
+# отвергает её для ImportBotAuthorizationRequest — ротация пропустит
+# её мгновенно, если Android-пара когда-нибудь перестанет работать.
+_MT_API_PAIRS.append((611835, "d524b414d21f4d37f08684c1df41ac9c",
+                      "Telegram Desktop"))
+_MT_PAIR_IDX = 0  # индекс пары, которая последней сработала
+
+
+def _is_api_id_error(e: Exception) -> bool:
+    """ВОЛНА 21: это ошибка «пара api_id/api_hash отклонена Telegram»?
+    Ловим и по классу, и по тексту (на случай старой версии Telethon,
+    где класс импортируется иначе)."""
+    try:
+        if _ApiIdInvalidError is not None and isinstance(e, _ApiIdInvalidError):
+            return True
+        if _ApiIdPubFloodError is not None and isinstance(e, _ApiIdPubFloodError):
+            return True
+    except Exception:
+        pass
+    _s = repr(e)
+    return ("ApiIdInvalidError" in _s
+            or "api_id/api_hash combination" in _s)
 
 _MT_CLIENT = None
 _MT_LOCK = None
@@ -8263,8 +8310,12 @@ async def _mt_client():
     FloodWaitError (ждём ровно столько, сколько велел Telegram), проверка
     get_me() после входа и СОХРАНЕНИЕ рабочей сессии на диск — чтобы бот
     перестал создавать новую авторизацию на каждую попытку и не загонял
-    себя в FLOOD_WAIT."""
-    global _MT_CLIENT, _MT_LOCK, _MT_LAST_ERR
+    себя в FLOOD_WAIT.
+    ВОЛНА 21: АВТОВОРОТ публичных api_id-пар (env → Telegram Desktop →
+    Telegram Android): отклонённая пара (ApiIdInvalidError) больше НЕ
+    ломает подключение и НЕ съедает попытку сессии — клиент молча пробует
+    следующую пару, а сработавшая запоминается до рестарта."""
+    global _MT_CLIENT, _MT_LOCK, _MT_LAST_ERR, _MT_PAIR_IDX
     if not _TELETHON_OK:
         _MT_LAST_ERR = ("библиотека Telethon не установлена — пересоберите "
                         "деплой из нового zip (requirements.txt: telethon>=1.36)")
@@ -8298,72 +8349,106 @@ async def _mt_client():
                 _tag = "сохранённая"
             else:
                 _tag = "чистая"
-            try:
-                client = _TGClient(
-                    _StringSession(_sess_val), _TELEGRAM_API_ID, _TELEGRAM_API_HASH,
-                    device_model="DEVORKS+ Bot", system_version="Linux",
-                    app_version="14.0", flood_sleep_threshold=120,
-                )
+            # ВОЛНА 21: перебор публичных api_id-пар. Отклонённая пара
+            # (ApiIdInvalidError) НЕ съедает попытку сессии — внутри одной
+            # ступени лестницы молча пробуем следующую пару. Порядок:
+            # сначала та, что последней сработала, затем остальные.
+            _pair_order = ([_MT_PAIR_IDX]
+                           + [i for i in range(len(_MT_API_PAIRS))
+                              if i != _MT_PAIR_IDX])
+            _pair_rejects = 0
+            _pair_last_rej = None
+            for _pi in _pair_order:
+                _pid, _phash, _plabel = _MT_API_PAIRS[_pi]
                 try:
-                    await asyncio.wait_for(client.connect(), timeout=45)
-                except asyncio.TimeoutError:
-                    raise RuntimeError(
-                        "подключение к Telegram не за 45 с (сеть сервера?)")
-                if not await client.is_user_authorized():
+                    client = _TGClient(
+                        _StringSession(_sess_val), _pid, _phash,
+                        device_model="DEVORKS+ Bot", system_version="Linux",
+                        app_version="14.0", flood_sleep_threshold=120,
+                    )
                     try:
-                        await asyncio.wait_for(
-                            client.sign_in(bot_token=BOT_TOKEN), timeout=60)
+                        await asyncio.wait_for(client.connect(), timeout=45)
                     except asyncio.TimeoutError:
                         raise RuntimeError(
-                            "авторизация бота не прошла за 60 с")
-                try:
-                    _me = await asyncio.wait_for(client.get_me(), timeout=30)
-                    logger.info("mtproto: бот авторизован как "
-                                f"@{getattr(_me, 'username', '?')}")
-                except Exception as _me_err:
-                    logger.warning(f"mtproto: get_me не ответила ({_me_err}) "
-                                   "— не критично")
-                _MT_CLIENT = client
-                try:
-                    _mt_save_session(str(client.session.save() or ""))
-                except Exception as _se:
-                    logger.warning(f"mtproto: сессию не запомнил ({_se})")
-                _dvf2_tmp_sweep()
-                _MT_LAST_ERR = ""
-                logger.info(f"mtproto: клиент поднялся (попытка {_try}, "
-                            f"сессия {_tag}) — файлы до 2 ГБ доступны")
-                return _MT_CLIENT
-            except _FloodWaitError as fw:
-                _fw_s = int(getattr(fw, "seconds", 0) or 0)
-                _wait_s = min(max(_fw_s, 10), 120)
-                logger.error(f"mtproto: FLOOD_WAIT {_fw_s}с при поднятии "
-                             f"клиента (попытка {_try}/{len(ladder)}) — "
-                             f"жду {_wait_s}с и пробую дальше")
-                _MT_LAST_ERR = (f"Telegram просит паузу {_fw_s}с на "
-                                "авторизацию MTProto (слишком много новых "
-                                "сессий подряд) — повторите через пару минут")
-                if client is not None:
+                            "подключение к Telegram не за 45 с (сеть сервера?)")
+                    if not await client.is_user_authorized():
+                        try:
+                            await asyncio.wait_for(
+                                client.sign_in(bot_token=BOT_TOKEN), timeout=60)
+                        except asyncio.TimeoutError:
+                            raise RuntimeError(
+                                "авторизация бота не прошла за 60 с")
                     try:
-                        await client.disconnect()
-                    except Exception:
-                        pass
-                    client = None
-                await asyncio.sleep(_wait_s + 2)
-            except Exception as e:
-                last_exc = e
-                logger.error(f"mtproto: клиент не поднялся "
-                             f"(попытка {_try}/{len(ladder)}, сессия {_tag}): "
-                             f"{e!r}")
-                _MT_LAST_ERR = (f"клиент MTProto не смог подключиться к "
-                                f"Telegram ({e!r})")
-                if client is not None:
+                        _me = await asyncio.wait_for(client.get_me(), timeout=30)
+                        logger.info("mtproto: бот авторизован как "
+                                    f"@{getattr(_me, 'username', '?')}")
+                    except Exception as _me_err:
+                        logger.warning(f"mtproto: get_me не ответила ({_me_err}) "
+                                       "— не критично")
+                    _MT_CLIENT = client
+                    _MT_PAIR_IDX = _pi
                     try:
-                        await client.disconnect()
-                    except Exception:
-                        pass
-                    client = None
-                if _try < len(ladder):
-                    await asyncio.sleep(2)  # сразу рвать соединение не стоит
+                        _mt_save_session(str(client.session.save() or ""))
+                    except Exception as _se:
+                        logger.warning(f"mtproto: сессию не запомнил ({_se})")
+                    _dvf2_tmp_sweep()
+                    _MT_LAST_ERR = ""
+                    logger.info(f"mtproto: клиент поднялся (попытка {_try}, "
+                                f"сессия {_tag}, пара {_plabel}) — файлы до "
+                                "2 ГБ доступны")
+                    return _MT_CLIENT
+                except _FloodWaitError as fw:
+                    _fw_s = int(getattr(fw, "seconds", 0) or 0)
+                    _wait_s = min(max(_fw_s, 10), 120)
+                    logger.error(f"mtproto: FLOOD_WAIT {_fw_s}с при поднятии "
+                                 f"клиента (попытка {_try}/{len(ladder)}, "
+                                 f"пара {_plabel}) — жду {_wait_s}с")
+                    _MT_LAST_ERR = (f"Telegram просит паузу {_fw_s}с на "
+                                    "авторизацию MTProto (слишком много новых "
+                                    "сессий подряд) — повторите через пару минут")
+                    if client is not None:
+                        try:
+                            await client.disconnect()
+                        except Exception:
+                            pass
+                        client = None
+                    await asyncio.sleep(_wait_s + 2)
+                    break  # FloodWait сменой пары не лечится — следующая ступень
+                except Exception as e:
+                    if _is_api_id_error(e):
+                        _pair_rejects += 1
+                        _pair_last_rej = e
+                        logger.warning(f"mtproto: пара api_id отклонена "
+                                       f"({_plabel}): {e!r} — молча пробую "
+                                       "следующую пару")
+                        if client is not None:
+                            try:
+                                await client.disconnect()
+                            except Exception:
+                                pass
+                            client = None
+                        continue
+                    last_exc = e
+                    logger.error(f"mtproto: клиент не поднялся "
+                                 f"(попытка {_try}/{len(ladder)}, сессия "
+                                 f"{_tag}, пара {_plabel}): {e!r}")
+                    _MT_LAST_ERR = (f"клиент MTProto не смог подключиться к "
+                                    f"Telegram ({e!r})")
+                    if client is not None:
+                        try:
+                            await client.disconnect()
+                        except Exception:
+                            pass
+                        client = None
+                    if _try < len(ladder):
+                        await asyncio.sleep(2)  # сразу рвать связь не стоит
+                    break  # серьёзная ошибка сменой пары не лечится
+            if _pair_rejects >= len(_pair_order):
+                # ВОЛНА 21: все пары в этой ступени отклонены — честная
+                # причина вместо безликого «не поднялся».
+                _MT_LAST_ERR = ("Telegram отклонил все публичные пары "
+                                f"api_id ({_pair_rejects} шт., последняя: "
+                                f"{_pair_last_rej!r})")
         if not _MT_LAST_ERR:
             _MT_LAST_ERR = (f"клиент MTProto не смог подключиться "
                             f"({last_exc!r})")
