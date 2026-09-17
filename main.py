@@ -24,7 +24,7 @@ from telegram import (
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters, ContextTypes,
     CallbackQueryHandler, ConversationHandler, PreCheckoutQueryHandler,
-    TypeHandler, ApplicationHandlerStop,
+    TypeHandler, ApplicationHandlerStop, PollAnswerHandler,
 )
 from telegram.constants import ParseMode
 from telegram.error import BadRequest as TGBadRequest, Forbidden as TGForbidden
@@ -432,6 +432,14 @@ VAULT_LABEL_WAIT = 125
 # ВОЛНА 22.4: «🎙 Пульт» удалён ПОЛНОСТЬЮ по решению пользователя — кнопки,
 # состояний (бывшие 126–131), хендлеров и хранилищ стилей больше нет.
 
+# ВОЛНА 22.10: ОПРОСЫ — админ класса («📊 Опрос классу») и разработчик
+# («📊 Опрос всем») создают настоящий Telegram-опрос: вопрос → варианты
+# (2–10 строк) → превью → рассылка всем адресатам. Итоги собираются
+# через PollAnswerHandler, пока бот запущен.
+POLL_WAIT_Q = 126        # ждём ВОПРОС опроса
+POLL_WAIT_OPTS = 127     # ждём ВАРИАНТЫ (по одному в строке, 2–10)
+POLL_WAIT_CONFIRM = 128  # превью + кнопки «✅ Отправить» / «❌ Отмена»
+
 # ВОЛНА 13: состояния, где текст = ПРОИЗВОЛЬНОЕ НАЗВАНИЕ (файла/загрузки).
 # Быстрые команды туда НЕ инжектируются: пользователь может назвать файл
 # «⏰ Таймер» — это имя файла, а не команда (глобальная отмена остаётся).
@@ -467,6 +475,7 @@ _VAULT_SESSION_KEYS = (
     'vault_rec_answers', 'vault_rec_oldpw', 'vault_ren_id', 'vault_chat_acks',
     'cloud_file_mode', 'cloud_batch', 'cloud_note', 'cloud_ren_id',
     'vault_pending', 'vault_batch_label',
+    'poll_flow',  # 22.10: недоделанный опрос тоже стираем при отмене
 )
 
 # Глобальное хранилище для временных данных оплаты
@@ -2007,7 +2016,7 @@ class User:
         # при нажатии «❌ Отменить» после распаковки. True (по умолчанию) —
         # файл исчезает из чата; False — файл ОСТАЁТСЯ в чате (подсказка об
         # удалении не предлагается). Тоггл: ⚙️ Настройки →
-        # «🗑 Удалять файл при «Отменить»».
+        # «🗑 Удалять файл при «Отмене»».
         self.vault_wipe_on_cancel = True
         # === ВОЛНА 22.8: ЦЕЛЬ кнопки «❌ Отменить» ИЗ КЛАВИАТУРЫ ===
         # {"chat_id": int, "msg_id": int} — последнее ВЫДАННОЕ (распакованное)
@@ -2807,7 +2816,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.9"
+BOT_BUILD = "22.10"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -3513,6 +3522,9 @@ def check_class_limit(class_code):
 def get_admin_panel_keyboard():
     keyboard = [
         [InlineKeyboardButton("📢 Отправить сообщение классу", callback_data="send_class_message")],
+        # ВОЛНА 22.10: настоящий Telegram-опрос классу + общие итоги.
+        [InlineKeyboardButton("📊 Опрос классу", callback_data="admin_poll"),
+         InlineKeyboardButton("📈 Итоги опросов", callback_data="poll_results")],
         [InlineKeyboardButton("📅 Редактировать расписание", callback_data="edit_schedule")],
         [InlineKeyboardButton("👨‍🏫 Редактировать учителей", callback_data="edit_teachers")],
         [InlineKeyboardButton("🔔 Редактировать звонки", callback_data="edit_bells")],
@@ -4087,12 +4099,11 @@ def get_main_menu_keyboard(user):
         if "🚪 Выйти из класса" not in hidden_buttons:
             keyboard.append([rename_map.get("🚪 Выйти из класса", "🚪 Выйти из класса")])
 
-    # ВОЛНА 22.8: «❌ Отменить» живёт В КЛАВИАТУРЕ (на сообщениях кнопок
-    # больше нет — просьба пользователя). Одна кнопка на все случаи Сейфа:
-    # идёт загрузка/выдача файла — остановит её; файл недавно выдан — сотрёт
-    # его из чата; нечего отменять — честно скажет.
-    if "❌ Отменить" not in hidden_buttons:
-        keyboard.append([rename_map.get("❌ Отменить", "❌ Отменить")])
+    # ВОЛНА 22.10: кнопки отмены В ГЛАВНОМ МЕНЮ БОЛЬШЕ НЕТ (просьба
+    # пользователя: «зачем нужна кнопка отмены в самой клавиатуре, где все
+    # кнопки — убери эту кнопку»). «❌ Отмена» появляется только НА ВРЕМЯ
+    # процесса Сейфа (диалог/заливка/выдача — _vault_dialog_kb) и после
+    # выдачи файла (_vault_offer_wipe) — одна на весь процесс.
 
     if "🔓 Выйти из аккаунта" not in hidden_buttons:
         keyboard.append([rename_map.get("🔓 Выйти из аккаунта", "🔓 Выйти из аккаунта")])
@@ -4351,7 +4362,7 @@ def get_settings_keyboard(user=None):
         [InlineKeyboardButton("🎉 Настройки праздников", callback_data="holiday_settings")],
         # ВОЛНА 22.7: удалять ли расшифрованный файл из чата при «Отменить».
         [InlineKeyboardButton(
-            f"🗑 Удалять файл при «Отменить»: {'да' if _wipe_on else 'нет'}",
+            f"🗑 Удалять файл при «Отмене»: {'да' if _wipe_on else 'нет'}",
             callback_data="toggle_vault_wipe")],
         [InlineKeyboardButton("🌟 Мои кнопки", callback_data="personal_buttons")],
         [InlineKeyboardButton("💡 Предложить функцию", callback_data="suggest_function")],
@@ -4453,6 +4464,9 @@ def get_developer_keyboard():
     keyboard = [
         [InlineKeyboardButton("📊 Статистика", callback_data="dev_stats")],
         [InlineKeyboardButton("🌐 Рассылка всем", callback_data="dev_broadcast")],
+        # ВОЛНА 22.10: настоящий Telegram-опрос ВСЕМ пользователям + итоги.
+        [InlineKeyboardButton("📊 Опрос всем", callback_data="dev_poll"),
+         InlineKeyboardButton("📈 Итоги опросов", callback_data="poll_results")],
         # === НОВОЕ: рассылка всем БЕЗ подписи "от разработчика" ===
         [InlineKeyboardButton("📩 Сообщение всем (без подписи)", callback_data="dev_instant_broadcast")],
         [InlineKeyboardButton("📨 Сообщение классу", callback_data="dev_class_message")],
@@ -9668,6 +9682,7 @@ async def _vault_get_dvf2(msg, context, user, rec, password):
     final_path = None
     real_name = ""
     cancelled = False
+    _cancel_after = False  # 22.10: «Отмена» нажали ВО ВРЕМЯ выдачи
     sent_mid = 0
     try:
         out_path = os.path.join(job, "data.bin")
@@ -9730,6 +9745,12 @@ async def _vault_get_dvf2(msg, context, user, rec, password):
         logger.error(f"vault get dvf2: выдача не удалась: {e}")
         err_text = "сбой при перекачке файла"
     finally:
+        # ВОЛНА 22.10: читаем пометку «Отмена была во время выдачи» ДО
+        # закрытия операции — после выдачи её исполним в _vault_offer_wipe.
+        try:
+            _cancel_after = bool(op.get("cancel_after"))
+        except Exception:
+            _cancel_after = False
         try:
             _shutil.rmtree(job, ignore_errors=True)
         except Exception:
@@ -9768,13 +9789,13 @@ async def _vault_get_dvf2(msg, context, user, rec, password):
                 message_id=progress_msg.message_id)
         except Exception:
             pass
-    # ВОЛНА 22.6: под выданным файлом — кнопка «❌ Отменить» (плюс
-    # подсказка в самом сообщении — просьба пользователя «прописать в боте»).
+    # ВОЛНА 22.6→22.10: подсказка после выдачи; cancel_after=True — «Отмена»
+    # нажали ещё во время загрузки: САМИ стираем файл и возвращаем меню.
     if sent_mid:
         await _vault_offer_wipe(
             context, msg.chat_id, sent_mid,
             wipe_enabled=bool(getattr(user, "vault_wipe_on_cancel", True)),
-            user=user)
+            user=user, cancel_after=_cancel_after)
     else:
         await msg.reply_text("✅ Готово. Файл расшифрован только что и только для вас.")
     return MAIN_MENU
@@ -9978,7 +9999,7 @@ def _vault_help_text():
         "(это и есть «отмена» после распаковки). Шифр в канале остаётся целым — "
         "файл можно расшифровать заново в любой момент. Нужен файл — сохраните "
         "или перешлите его ДО нажатия. Не хотите автоудаления — выключите его "
-        "в ⚙️ Настройках (пункт «Удалять файл при „Отменить“»).\n\n"
+        "в ⚙️ Настройках (пункт «Удалять файл при „Отмене“»).\n\n"
         "🔑 ВОССТАНОВЛЕНИЕ (если пароль забылся):\n"
         "• при создании пароля бот просит придумать 3 секретных вопроса и "
         "ответы (вопрос — ваш, ответ знаете только вы);\n"
@@ -10756,68 +10777,95 @@ async def vault_getstop_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def _vault_dialog_kb():
-    """ВОЛНА 22.9: клавиатура диалогов Сейфа. Раньше каждый диалог подменял
-    всю клавиатуру одиночной «❌ Отмена» — из-за этого кнопка «❌ Отменить»
-    ИСЧЕЗАЛА из клавиатуры ровно в моменты, когда она нужна (пользователь:
-    «не появилась отмена в клавиатуре»). Теперь оба ряда отмен всегда под
-    рукой: «❌ Отмена» — выйти из диалога, «❌ Отменить» — отмена файлов
-    Сейфа (остановит заливку / даст выдаче дойти до конца / сотрёт выданный
-    файл). Нажатия обеих ловятся инжектом глобальной отмены из ЛЮБОГО
-    состояния (см. _GLOBAL_CANCEL_RE), пароль/имя файла они не сломают."""
-    return ReplyKeyboardMarkup([['❌ Отмена'], ['❌ Отменить']], resize_keyboard=True)
+    """ВОЛНА 22.10: клавиатура процесса Сейфа — РОВНО ОДНА кнопка «❌ Отмена»
+    (просьба пользователя: «нужна одна кнопка отмены, которая за весь этот
+    процесс будет отвечать, а не две»; «после распаковки и загрузки должна
+    оставаться только одна кнопка отмены, и при загрузке тоже одна»).
+    Эта единственная кнопка обслуживает ВЕСЬ процесс: закрывает диалоги
+    (ввод пароля/подписи — глобальный перехват отмены), останавливает
+    заливку В Сейф, даёт выдаче дойти до конца (потом сама сотрёт файл и
+    вернёт главное меню) и стирает уже выданный файл. Нажатия ловятся
+    инжектом глобальной отмены из ЛЮБОГО состояния (_GLOBAL_CANCEL_RE)."""
+    return ReplyKeyboardMarkup([['❌ Отмена']], resize_keyboard=True)
+
+
+def _vault_wipe_target(user_id, context):
+    """ВОЛНА 22.10: цель отмены — {chat_id, msg_id} выданного файла Сейфа,
+    который ещё висит в чате. Ищем в user_data (быстро) и в профиле
+    (vault_kb_wipe — переживает рестарт бота). None — цели нет."""
+    _t = None
+    try:
+        _t = context.user_data.get("vault_kb_wipe")
+    except Exception:
+        _t = None
+    if not (isinstance(_t, dict) and _t.get("msg_id")):
+        _u = get_user(str(user_id)) if user_id else None
+        _t = getattr(_u, "vault_kb_wipe", None) if _u is not None else None
+    if isinstance(_t, dict) and _t.get("msg_id"):
+        return _t
+    return None
 
 
 async def vault_kb_cancel_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """ВОЛНА 22.8/22.9: «❌ Отменить» из КЛАВИАТУРЫ главного меню (на сообщениях
-    кнопок больше нет — просьба пользователя). Одна кнопка обслуживает
-    все отмены Сейфа:
+    """ВОЛНА 22.10: ЕДИНСТВЕННАЯ кнопка «❌ Отмена» — отвечает за ВЕСЬ процесс
+    Сейфа (просьба пользователя: «одна кнопка отмены, которая за весь этот
+    процесс будет отвечать, а не две»). Что она делает:
     1) ПРЯМО СЕЙЧАС идёт ЗАЛИВКА В СЕЙФ (kind="put") — ставим флаг отмены:
        процесс сам остановится на ближайшем куске и честно подчистит
        временные файлы (22.3);
-    1а) ПРЯМО СЕЙЧАС идёт ВЫДАЧА файла (kind="get") — НЕ прерываем её:
-       по требованию пользователя «если еще загружается то загрузка
-       должна закончиться»; после выдачи можно нажать ещё раз — и файл
-       будет стёрт из чата;
+    1а) ПРЯМО СЕЙЧАС идёт ВЫДАЧА файла (kind="get") — НЕ прерываем её
+       («если еще загружается то загрузка должна закончиться»), но помечаем
+       op["cancel_after"]: когда загрузка дойдёт до конца, бот САМ удалит
+       файл из чата (по настройке 22.7) и вернёт главное меню — нажимать
+       второй раз не нужно;
     2) файл недавно выдан из Сейфа и ещё висит в чате — удаляем сообщение
        с ним (если в ⚙️ Настройках включено удаление; цель хранится в
-       профиле — vault_kb_wipe — и переживает рестарт бота);
-    3) нечего отменять — честно говорим, для чего кнопка (клавиатуру
-       НЕ перетираем — 22.9: кнопка работает и внутри диалогов)."""
+       профиле — vault_kb_wipe — и переживает рестарт бота) и ВЫВОДИМ
+       ПОЛЬЗОВАТЕЛЯ НА ГЛАВНЫЙ ЭКРАН (главное меню в клавиатуре);
+    3) нечего отменять — честно говорим и возвращаем главное меню."""
     chat = update.effective_chat
     if chat is None or chat.type != "private":
         return MAIN_MENU  # в группах кнопка Сейфа не работает
     user_id = str(update.effective_user.id)
     user = get_user(user_id)
-    # 1) Активная операция Сейфа: род решает семантику (22.9).
+    _kb_menu = get_main_menu_keyboard(user) if user is not None else None
+    # 1) Активная операция Сейфа: род решает семантику (22.9/22.10).
     if _vault_op_running(user_id):
         _op = _VAULT_OPS.get(user_id) or {}
         if str(_op.get("kind") or "put") == "get":
             # 1а) ВЫДАЧА файла — НЕ прерываем (требование пользователя:
-            # «если еще загружается то загрузка должна закончиться»). Файл
-            # будет выдан; после этого «Отменить» сотрёт его из чата.
+            # «если еще загружается то загрузка должна закончиться»),
+            # но отмену запоминаем: после выдачи файл будет удалён
+            # автоматически (по настройке) и юзер вернётся в меню.
+            try:
+                _op["cancel_after"] = True
+            except Exception:
+                pass
             await update.message.reply_text(
-                "⏳ Выдача файла уже идёт — не буду её прерывать: загрузка "
-                "спокойно дойдёт до конца. Когда файл будет выдан, нажмите "
-                "«❌ Отменить» ещё раз — и я сотру его из чата.")
+                "⏳ Отмена принята — выдачу не прерываю: загрузка спокойно "
+                "дойдёт до конца. Как только файл будет выдан, я сам удалю "
+                "его из чата (или оставлю — смотря что у вас в ⚙️ Настройках) "
+                "и верну вас в главное меню.")
             return MAIN_MENU
         # 1) ЗАЛИВКА В СЕЙФ — останавливаем (22.3, как просил пользователь).
         _VAULT_OPS[user_id]["event"].set()
         await update.message.reply_text(
             "⛔ Останавливаю — процесс заметит отмену на ближайшем куске и "
-            "честно подчистит временные файлы. Шифр в Сейфе цел.")
+            "честно подчистит временные файлы. Шифр в Сейфе цел.",
+            reply_markup=_kb_menu)
         return MAIN_MENU
-    # 2) Выданный файл — стереть из чата (настройка 22.7 уважается).
-    target = context.user_data.get("vault_kb_wipe")
-    if not isinstance(target, dict) and user is not None:
-        target = getattr(user, "vault_kb_wipe", None)
-    if isinstance(target, dict) and target.get("msg_id"):
+    # 2) Выданный файл — стереть из чата (настройка 22.7 уважается) и
+    #    вывести пользователя на главный экран (22.10).
+    target = _vault_wipe_target(user_id, context)
+    if target is not None:
         _wipe_on = True if user is None else bool(
             getattr(user, "vault_wipe_on_cancel", True))
         if not _wipe_on:
             await update.message.reply_text(
                 "ℹ️ Файл ОСТАВЛЕН в чате: в ⚙️ Настройках выключено удаление "
-                "расшифрованного файла при «Отменить». Включить обратно "
-                "можно там же.")
+                "расшифрованного файла при «Отмене». Включить обратно можно "
+                "там же.",
+                reply_markup=_kb_menu)
             return MAIN_MENU
         _gone = False
         try:
@@ -10840,28 +10888,34 @@ async def vault_kb_cancel_msg(update: Update, context: ContextTypes.DEFAULT_TYPE
             "Шифр в Сейфе цел: расшифровать снова можно в любой момент."
             if _gone else
             "Файл уже исчез из чата (или не найден). Шифр в Сейфе цел — "
-            "расшифруйте заново, когда понадобится.")
+            "расшифруйте заново, когда понадобится.",
+            reply_markup=_kb_menu)
         return MAIN_MENU
-    # 3) Нечего отменять — честно (22.9: клавиатуру НЕ перетираем — кнопка
-    #    работает и внутри диалогов Сейфа, там своя клавиатура отмен).
+    # 3) Нечего отменять — честно и сразу в главное меню (22.10).
     await update.message.reply_text(
-        "Сейчас нечего отменять: «❌ Отменить» остановит заливку файла В "
-        "Сейф, даст спокойно дойти до конца выдаче и сотрёт из чата уже "
-        "выданный файл.")
+        "Сейчас нечего отменять: «❌ Отмена» остановит заливку файла В Сейф, "
+        "даст спокойно дойти до конца выдаче (потом сама сотрёт файл) и "
+        "сотрёт из чата уже выданный файл.",
+        reply_markup=_kb_menu)
     return MAIN_MENU
 
 
 async def _vault_offer_wipe(context, chat_id, file_msg_id, wipe_enabled=True,
-                            user=None):
-    """ВОЛНА 22.6→22.8: честная подсказка после выдачи (распаковки) файла.
-    ВОЛНА 22.8: КНОПКИ НА СООБЩЕНИИ БОЛЬШЕ НЕТ — «❌ Отменить» переехала в
-    КЛАВИАТУРУ главного меню (просьба пользователя). Здесь:
+                            user=None, cancel_after=False):
+    """ВОЛНА 22.6→22.10: честная подсказка после выдачи (распаковки) файла.
+    ВОЛНА 22.10: на сообщении кнопки НЕТ и в главном меню её тоже НЕТ —
+    после выдачи в клавиатуре остаётся РОВНО ОДНА кнопка «❌ Отмена»
+    (просьба пользователя: «после распаковки и загрузки должна оставаться
+    только одна кнопка отмены»). Здесь:
     • регистрируем цель отмены — user.vault_kb_wipe (переживает рестарт,
-      дубль в user_data): её сотрёт кнопка «❌ Отменить» из клавиатуры;
-    • шлём подсказку ВМЕСТЕ с главным меню (заодно чинит «залипшую»
-      клавиатуру диалога после выдачи файла);
+      дубль в user_data): её сотрёт кнопка «❌ Отмена» из клавиатуры;
+    • шлём подсказку ВМЕСТЕ с однокнопочной клавиатурой «❌ Отмена»;
     • 22.7: если автоудаление выключено (wipe_enabled=False) — честно
       сообщаем, что файл останется в чате.
+    cancel_after=True (22.10): «Отмена» была нажата ЕЩЁ ВО ВРЕМЯ выдачи —
+    загрузке дали дойти до конца (требование пользователя), теперь
+    выполняем обещание: сами стираем файл (по настройке 22.7) и возвращаем
+    пользователю главное меню — второй раз нажимать не нужно.
     Работает и для Bot API-выдачи, и для MTProto: сообщение отправлено
     самим ботом, значит бот может его удалить."""
     try:
@@ -10870,6 +10924,32 @@ async def _vault_offer_wipe(context, chat_id, file_msg_id, wipe_enabled=True,
                 user = get_user(str(int(chat_id)))
             except (TypeError, ValueError):
                 user = None
+        _kb_menu = get_main_menu_keyboard(user) if user is not None else None
+        if cancel_after:
+            # 22.10: отмена была ВО ВРЕМЯ загрузки — загрузка закончилась,
+            # теперь стираем файл (по настройке) и возвращаем главное меню.
+            _deleted = False
+            if wipe_enabled:
+                try:
+                    await context.bot.delete_message(
+                        chat_id=int(chat_id), message_id=int(file_msg_id))
+                    _deleted = True
+                except Exception:
+                    pass
+            if not wipe_enabled:
+                _text = ("✅ Загрузка закончилась — файл выдан.\n"
+                         "ℹ️ Файл ОСТАВЛЕН в чате: в ⚙️ Настройках выключено "
+                         "удаление при «Отмене».")
+            elif _deleted:
+                _text = ("✅ Загрузка закончилась — и отмена сработала: файл "
+                         "исчез из чата. Шифр в Сейфе цел: файл можно "
+                         "получить снова.")
+            else:
+                _text = ("✅ Загрузка закончилась — файл выдан (стереть его "
+                         "из чата не удалось: возможно, он уже удалён).")
+            await context.bot.send_message(
+                chat_id=chat_id, text=_text, reply_markup=_kb_menu)
+            return
         _target = {"chat_id": int(chat_id), "msg_id": int(file_msg_id)}
         try:
             context.user_data["vault_kb_wipe"] = _target
@@ -10881,24 +10961,26 @@ async def _vault_offer_wipe(context, chat_id, file_msg_id, wipe_enabled=True,
                 save_user(user)
             except Exception:
                 pass
-        _kb = get_main_menu_keyboard(user) if user is not None else None
+        _kb_cancel = _vault_dialog_kb()
         if not wipe_enabled:
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=("✅ Готово — файл распакован и выдан только вам.\n"
-                      "ℹ️ Автоудаление при «Отменить» выключено в ⚙️ Настройках "
+                      "ℹ️ Автоудаление при «Отмене» выключено в ⚙️ Настройках "
                       "— файл остаётся в чате. Шифр в Сейфе цел: файл можно "
-                      "получить снова."),
-                reply_markup=_kb)
+                      "получить снова. «❌ Отмена» в клавиатуре вернёт вас "
+                      "в главное меню."),
+                reply_markup=_kb_cancel)
             return
         await context.bot.send_message(
             chat_id=chat_id,
             text=("✅ Готово — файл распакован и выдан только вам.\n"
-                  "❌ «Отменить» — кнопка в КЛАВИАТУРЕ снизу: нажмите, и файл "
-                  "исчезнет из чата. Нужен ещё — сохраните/перешлите его "
+                  "❌ «Отмена» — единственная кнопка в КЛАВИАТУРЕ снизу: "
+                  "нажмите, и файл исчезнет из чата, а вы вернётесь в "
+                  "главное меню. Нужен ещё — сохраните/перешлите его "
                   "заранее; шифр в Сейфе останется целым, файл можно "
                   "получить снова."),
-            reply_markup=_kb)
+            reply_markup=_kb_cancel)
     except Exception as e:
         logger.warning(f"vault wipe: не удалось показать подсказку отмены: {e}")
 
@@ -10920,7 +11002,7 @@ async def vault_wipe_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _mid = int(query.data.replace("vault_wipe_", "", 1))
     except (TypeError, ValueError):
         return None
-    # ВОЛНА 22.7: настройка «🗑 Удалять файл при «Отменить»» (⚙️ Настройки).
+    # ВОЛНА 22.7: настройка «🗑 Удалять файл при «Отмене»» (⚙️ Настройки).
     _user = get_user(str(query.from_user.id))
     _wipe_on = True if _user is None else bool(
         getattr(_user, "vault_wipe_on_cancel", True))
@@ -10968,7 +11050,7 @@ async def vault_wipe_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def vault_wipe_toggle_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """ВОЛНА 22.7: тоггл в ⚙️ Настройках — «🗑 Удалять файл при «Отменить»».
+    """ВОЛНА 22.7: тоггл в ⚙️ Настройках — «🗑 Удалять файл при «Отмене»».
     ДА (по умолчанию) — «❌ Отменить» после распаковки удаляет файл из чата;
     НЕТ — файл остаётся в чате, подсказка об удалении не предлагается."""
     query = update.callback_query
@@ -11635,9 +11717,14 @@ async def vault_get_password(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 "недогруженное…")
             return VAULT_GET_PASSWORD
         await msg.reply_text(
-            "⏳ Выдача файла уже идёт — не прерываю её: загрузка спокойно "
-            "дойдёт до конца. После выдачи «❌ Отменить» в клавиатуре сотрёт "
-            "файл из чата.")
+            "⏳ Отмена принята — выдачу не прерываю: загрузка спокойно "
+            "дойдёт до конца. Как только файл будет выдан, я сам удалю "
+            "его из чата (или оставлю — смотря что у вас в ⚙️ Настройках) "
+            "и верну вас в главное меню.")
+        try:
+            _VAULT_OPS[_uid_now]["cancel_after"] = True  # 22.10
+        except Exception:
+            pass
         return VAULT_GET_PASSWORD
     user = get_user(str(update.effective_user.id))
     if not user:
@@ -16567,37 +16654,18 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # === ВОЛНА 12: ГЛОБАЛЬНАЯ КНОПКА ОТМЕНЫ ===
 # ==================================
 
-async def global_cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """ВОЛНА 12: «❌ Отмена» работает ИЗ ЛЮБОГО СОСТОЯНИЯ — даже когда FSM
-    потерян после рестарта/деплоя (раньше текст отмены улетал в чат с ИИ:
-    «нажимаю кнопку отмены в сейфе — отвечает ИИ и не выйти с сейфа, и файл
-    не пропадает»).
-
-    Что делает:
+async def _global_cancel_cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 12 (выделено в 22.10): общая чистка при выходе из диалога:
     • стирает из чата ВСЕ следы загрузки в Сейф: файлы, заметки, подсказки
       бота, набранные вопросы/ответы на секретные вопросы (персистентный
       след user.vault_trace — работает даже после перезапуска бота);
     • стирает НЕСОХРАНЁННЫЕ секретные вопросы/ответы и любые недоделанные
-      сессии Сейфа/облака (vault_*/cloud_* ключи user_data);
+      сессии Сейфа/облака (vault_*/cloud_*/poll_flow ключи user_data);
     • выключает режим AI-чата, если он был включён («отмена» = «стоп, в меню»);
-    • возвращает в главное меню.
-
-    Регистрируется дважды: инжектом ПЕРВЫМ хендлером в каждое текстовое
-    состояние ConversationHandler и отдельным хендлером ПОСЛЕ него — на
-    случай потерянного состояния (state=None)."""
+    • возвращает в главное меню."""
     msg = getattr(update, "message", None)
     if msg is None:
         return MAIN_MENU
-    # ВОЛНА 22.9: «❌ Отменить» — кнопка отмены СЕЙФА со своей семантикой
-    # (остановит заливку В Сейф, даст выдаче спокойно дойти до конца, сотрёт
-    # выданный файл). Она теперь видна в клавиатуре ВСЕГДА — и в диалогах
-    # тоже, — поэтому здесь делегируем её ровному обработчику Сейфа, а НЕ
-    # выполняем общую чистку диалога.
-    try:
-        if (getattr(msg, "text", None) or "").strip() == "❌ Отменить":
-            return await vault_kb_cancel_msg(update, context)
-    except Exception:
-        pass
     user_id = str(update.effective_user.id) if update.effective_user else None
     user = get_user(user_id) if user_id else None
     # 1) Чистка следов в чате: пачка + персистентный след (пережил рестарт).
@@ -16638,17 +16706,71 @@ async def global_cancel_handler(update: Update, context: ContextTypes.DEFAULT_TY
     return MAIN_MENU
 
 
+async def _global_cancel_dialog(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.10: версия перехватчика отмены для ДИАЛОГОВ (инжектится в
+    состояния ConversationHandler). Нажатие «❌ Отмена» в диалоге = ВЫХОД
+    из диалога (общая чистка). НО если прямо сейчас идёт операция Сейфа
+    (заливка/выдача) — работает семантика Сейфа (vault_kb_cancel_msg):
+    заливку остановим, выдаче дадим дойти до конца. Цель «стереть выданный
+    файл» здесь НАМЕРЕННО не трогается: пользователь отменяет ДИАЛОГ,
+    а не удаляет файл — файл не должен исчезнуть от отмены ввода пароля."""
+    msg = getattr(update, "message", None)
+    if msg is None:
+        return MAIN_MENU
+    _uid = str(update.effective_user.id) if update.effective_user else ""
+    try:
+        if _uid and (msg.text or "").strip() in ("❌ Отмена", "❌ Отменить") \
+                and _vault_op_running(_uid):
+            return await vault_kb_cancel_msg(update, context)
+    except Exception:
+        pass
+    return await _global_cancel_cleanup(update, context)
+
+
+async def global_cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 12/22.10: «❌ Отмена» работает ИЗ ЛЮБОГО СОСТОЯНИЯ — даже когда
+    FSM потерян после рестарта/деплоя (раньше текст отмены улетал в чат с ИИ:
+    «нажимаю кнопку отмены в сейфе — отвечает ИИ и не выйти с сейфа, и файл
+    не пропадает»).
+
+    Умная (standalone) версия — регистрируется ПОСЛЕ ConversationHandler
+    (state=None) и вызывается из главного меню (22.10: MAIN_MENU исключён
+    из инжекта). Семантика:
+    • идёт операция Сейфа (заливка/выдача) ИЛИ файл недавно выдан и ещё
+      висит в чате → семантика Сейфа (vault_kb_cancel_msg): остановим
+      заливку / пометим выдачу / сотрём файл и вернём главное меню;
+    • иначе — общая чистка и выход в главное меню."""
+    msg = getattr(update, "message", None)
+    if msg is None:
+        return MAIN_MENU
+    _uid = str(update.effective_user.id) if update.effective_user else ""
+    try:
+        if (msg.text or "").strip() in ("❌ Отмена", "❌ Отменить"):
+            if _uid and (_vault_op_running(_uid)
+                         or _vault_wipe_target(_uid, context) is not None):
+                return await vault_kb_cancel_msg(update, context)
+    except Exception:
+        pass
+    return await _global_cancel_cleanup(update, context)
+
+
 def _inject_global_cancel(states_dict):
-    """ВОЛНА 12: инжектит перехватчик слов отмены ПЕРВЫМ хендлером в каждое
-    состояние с текстовым вводом (по образцу _inject_quick_commands).
+    """ВОЛНА 12/22.10: инжектит перехватчик отмены (_global_cancel_dialog)
+    ПЕРВЫМ хендлером в каждое состояние с текстовым вводом.
+    ГЛАВНОЕ МЕНЮ (MAIN_MENU) с 22.10 НЕ инжектится: оно обрабатывает
+    «❌ Отмена»/«❌ Отменить» само (handle_main_menu) — с семантикой Сейфа
+    (стереть выданный файл), которую диалоговая чистка знать не должна.
     Возвращает число инжектированных состояний."""
     cancel_filter = filters.Regex(_GLOBAL_CANCEL_RE)
     injected = 0
     for _state, _handlers in states_dict.items():
+        if _state == MAIN_MENU:
+            # 22.10: главное меню обрабатывает отмену сам (handle_main_menu).
+            continue
         has_text_input = any(isinstance(h, MessageHandler) for h in _handlers)
         if has_text_input:
             _handlers.insert(0, MessageHandler(
-                cancel_filter, global_cancel_handler))
+                cancel_filter, _global_cancel_dialog))
             injected += 1
     return injected
 
@@ -16710,12 +16832,21 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if message_text in reverse_map:
         message_text = reverse_map[message_text]
 
-    # ВОЛНА 22.8: «❌ Отменить» из КЛАВИАТУРЫ (на сообщениях кнопок больше
-    # нет). Идёт загрузка/выдача Сейфа — остановим; файл выдан — сотрём из
-    # чата; нечего отменять — честно ответим. Ловим ДО ai_mode и остальных
-    # режимов, чтобы кнопка работала отовсюду и не утекала в AI.
-    if message_text == "❌ Отменить":
-        return await vault_kb_cancel_msg(update, context)
+    # ВОЛНА 22.10: единая кнопка «❌ Отмена» (и легаси «❌ Отменить»):
+    # в ГЛАВНОМ МЕНЮ её больше нет, но если она нажата (хвост процесса Сейфа:
+    # идёт операция или файл недавно выдан) — семантика Сейфа: остановить
+    # заливку / пометить выдачу / стереть выданный файл и вернуться в меню.
+    # Нечего отменять — общая чистка (выход в меню). Ловим ДО ai_mode и
+    # остальных режимов, чтобы кнопка не утекала в AI.
+    if message_text in ("❌ Отмена", "❌ Отменить"):
+        if _vault_op_running(user_id) or _vault_wipe_target(user_id, context):
+            return await vault_kb_cancel_msg(update, context)
+        return await global_cancel_handler(update, context)
+    # Легаси-фразы отмены («отмена», «cancel», «назад в меню»): раньше их
+    # ловил инжектированный хендлер — теперь главное меню обрабатывает их
+    # сам (22.10: состояние MAIN_MENU исключено из инжекта отмены).
+    if _GLOBAL_CANCEL_RE.match((message_text or "").strip()):
+        return await global_cancel_handler(update, context)
 
     if context.user_data.get('replying_to_anon'):
         return await send_anonymous_reply(update, context)
@@ -24091,6 +24222,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await dev_delete_holiday_handler(update, context)
     elif data == "dev_instant_broadcast":
         return await dev_instant_broadcast_start(update, context)
+    # === ВОЛНА 22.10: опросы (разработчик — всем, админ — классу) ===
+    elif data == "dev_poll":
+        if str(update.callback_query.from_user.id) != DEVELOPER_ID:
+            await update.callback_query.answer("Доступ запрещён.", show_alert=True)
+            return MAIN_MENU
+        return await poll_start(update, context, "all")
+    elif data == "admin_poll":
+        return await poll_admin_start(update, context)
+    elif data == "poll_go":
+        return await poll_go_cb(update, context)
+    elif data == "poll_results":
+        return await poll_results_cb(update, context)
     elif data == "personal_buttons":
         return await personal_buttons_menu(update, context)
     elif data == "suggest_function":
@@ -26083,6 +26226,278 @@ async def dev_instant_broadcast_handler(update: Update, context: ContextTypes.DE
         f"✅ Сообщение отправлено {sent} пользователям (без подписи разработчика)."
     )
     return await developer_panel(update, context)
+
+
+# ==================================
+# === ВОЛНА 22.10: ОПРОСЫ ===
+# ==================================
+# Просьба пользователя: «добавь ещё чтобы админ и разработчик мог делать
+# опросы в боте». Админ класса — «📊 Опрос классу» (админ-панель), разработчик
+# — «📊 Опрос всем» (панель разработчика). Поток: вопрос → варианты (2–10,
+# по одному в строке) → превью → «✅ Отправить» → бот рассылает НАСТОЯЩИЙ
+# Telegram-опрос (send_poll, НЕ анонимный — иначе Telegram не присылает
+# ответы, и итоги не собрать). Голос каждого пользователя виден только боту
+# (опрос живёт в личке), в итогах — ОБЩИЕ числа без имён.
+# Хранение итогов: память процесса (_POLL_LOG/_POLL_INDEX) — честно
+# предупреждаем в панели, что после рестарта бота итоги начинаются с нуля.
+
+_POLL_LOG = []      # список опросов (последний — в конце), максимум _POLL_KEEP
+_POLL_INDEX = {}    # poll_id Telegram -> запись опроса (у каждого получателя свой poll_id)
+_POLL_KEEP = 20     # сколько последних опросов помним
+
+
+def _poll_register(question, options, scope, creator_id):
+    """Регистрирует новый опрос (запись общая для всех его копий)."""
+    entry = {
+        "q": str(question),
+        "opts": [str(o) for o in options],
+        "tally": [0] * len(options),
+        "votes": 0,
+        "scope": str(scope or "all"),
+        "by": str(creator_id or ""),
+        "when": datetime.now().strftime("%d.%m.%Y %H:%M"),
+    }
+    _POLL_LOG.append(entry)
+    while len(_POLL_LOG) > _POLL_KEEP:
+        _old = _POLL_LOG.pop(0)
+        for _pid, _e in list(_POLL_INDEX.items()):
+            if _e is _old:
+                _POLL_INDEX.pop(_pid, None)
+    return entry
+
+
+def _poll_panel_kb(scope):
+    """Клавиатура панели, в которую вернётся создатель после отправки."""
+    return (get_developer_keyboard() if scope == "all"
+            else get_admin_panel_keyboard())
+
+
+async def poll_start(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                     scope, class_code=None):
+    """ВОЛНА 22.10: начало создания опроса — запоминаем адресата (all/class)
+    и спрашиваем ВОПРОС."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    context.user_data["poll_flow"] = {"scope": scope, "class_code": class_code}
+    where = ("ВСЕМ пользователям бота" if scope == "all"
+             else "всем участникам вашего класса")
+    await query.edit_message_text(
+        f"📊 СОЗДАНИЕ ОПРОСА — шаг 1 из 3\n\n"
+        f"1️⃣ Пришлите ВОПРОС опроса одним сообщением (до 300 символов).\n\n"
+        f"Опрос будет отправлен {where}.")
+    return POLL_WAIT_Q
+
+
+async def poll_admin_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.10: «📊 Опрос классу» — только админ класса; класс берём из
+    current_admin_class (ставится при входе в админ-панель)."""
+    query = update.callback_query
+    _uid = str(query.from_user.id)
+    if not is_user_class_admin(_uid):
+        await query.answer("Опросы может создавать только админ класса.",
+                           show_alert=True)
+        return MAIN_MENU
+    code = context.user_data.get('current_admin_class')
+    if not code:
+        classes = load_classes()
+        for class_obj in classes.values():
+            if class_obj.is_active and _uid in class_obj.admins:
+                code = class_obj.class_code
+                break
+        if not code:
+            await query.answer("Нет активного класса, где вы админ.",
+                               show_alert=True)
+            return MAIN_MENU
+        context.user_data['current_admin_class'] = code
+    return await poll_start(update, context, "class", class_code=code)
+
+
+@timeout(CONVERSATION_TIMEOUT)
+async def poll_question_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.10: шаг 2 — принимаем ВОПРОС опроса."""
+    msg = update.message
+    flow = context.user_data.get("poll_flow") or {}
+    if not flow.get("scope"):
+        await msg.reply_text("Сессия создания опроса потеряна. Начните заново.")
+        return MAIN_MENU
+    text = (msg.text or "").strip()
+    if len(text) > 300:
+        await msg.reply_text(
+            "❌ Вопрос длиннее 300 символов — Telegram не примет. Сократите "
+            "и пришлите заново.")
+        return POLL_WAIT_Q
+    rejected = await reject_if_forbidden_chars(update, text, POLL_WAIT_Q)
+    if rejected is not None:
+        return rejected
+    flow["q"] = text
+    context.user_data["poll_flow"] = flow
+    await msg.reply_text(
+        "📊 СОЗДАНИЕ ОПРОСА — шаг 2 из 3\n\n"
+        "2️⃣ Теперь пришлите ВАРИАНТЫ ОТВЕТА — по одному в строке, "
+        "от 2 до 10 вариантов (каждый до 100 символов).\n\n"
+        "Например:\nДа\nНет\nНе знаю")
+    return POLL_WAIT_OPTS
+
+
+@timeout(CONVERSATION_TIMEOUT)
+async def poll_options_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.10: шаг 3 — принимаем варианты, показываем превью."""
+    msg = update.message
+    flow = context.user_data.get("poll_flow") or {}
+    if not flow.get("q"):
+        await msg.reply_text("Сессия создания опроса потеряна. Начните заново.")
+        return MAIN_MENU
+    raw = [ln.strip() for ln in (msg.text or "").splitlines()]
+    opts = [o for o in raw if o]
+    # Дубликаты убираем, сохраняя порядок.
+    _seen = set()
+    opts = [o for o in opts if not (o in _seen or _seen.add(o))]
+    if len(opts) < 2 or len(opts) > 10:
+        await msg.reply_text(
+            "❌ Нужно от 2 до 10 вариантов — по одному в строке. "
+            "Пришлите заново.")
+        return POLL_WAIT_OPTS
+    if any(len(o) > 100 for o in opts):
+        await msg.reply_text(
+            "❌ Каждый вариант — до 100 символов. Сократите и пришлите заново.")
+        return POLL_WAIT_OPTS
+    rejected = await reject_if_forbidden_chars(update, "\n".join(opts),
+                                               POLL_WAIT_OPTS)
+    if rejected is not None:
+        return rejected
+    flow["opts"] = opts
+    context.user_data["poll_flow"] = flow
+    where = ("ВСЕМ пользователям бота" if flow.get("scope") == "all"
+             else "всем участникам вашего класса")
+    preview = ("📋 ПРЕВЬЮ ОПРОСА\n\n"
+               "❓ " + flow["q"] + "\n"
+               + "\n".join(f"  • {o}" for o in opts)
+               + f"\n\nОтправить опрос {where}?")
+    await msg.reply_text(
+        preview,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Отправить", callback_data="poll_go"),
+            InlineKeyboardButton("❌ Отмена", callback_data="cancel_action"),
+        ]]))
+    return POLL_WAIT_CONFIRM
+
+
+async def poll_go_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.10: «✅ Отправить» — рассылаем настоящий Telegram-опрос
+    (send_poll, не анонимный) всем адресатам и регистрируем сбор итогов."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    flow = context.user_data.get("poll_flow") or {}
+    q, opts, scope = flow.get("q"), flow.get("opts"), flow.get("scope")
+    if not q or not opts or scope not in ("all", "class"):
+        await query.edit_message_text(
+            "Сессия создания опроса потеряна — опрос не отправлен.")
+        return MAIN_MENU
+    if scope == "all":
+        users = load_users()
+        targets = [uid for uid, u in users.items()
+                   if not getattr(u, "is_blocked", False)]
+        _class_name = ""
+    else:
+        code = flow.get("class_code") or context.user_data.get(
+            'current_admin_class')
+        class_obj = get_class_by_code(code) if code else None
+        if class_obj is None:
+            await query.edit_message_text(
+                "Класс не найден — опрос не отправлен.")
+            return MAIN_MENU
+        members = [m for m in (class_obj.students + class_obj.admins)
+                   if m not in (class_obj.blocked_users or [])]
+        targets = [str(m) for m in members]
+        _class_name = class_obj.class_name
+    entry = _poll_register(q, opts, scope, query.from_user.id)
+    sent = 0
+    for uid in targets:
+        try:
+            _m = await context.bot.send_poll(
+                chat_id=int(uid), question=q, options=opts,
+                is_anonymous=False, allows_multiple_answers=False)
+            sent += 1
+            try:
+                _pid = str(_m.poll.id)
+                _POLL_INDEX[_pid] = entry
+            except Exception:
+                pass  # без poll_id итоги этой копии не соберутся — не критично
+        except Exception as e:
+            logger.error(f"poll: не доставлено {uid}: {e}")
+    context.user_data.pop("poll_flow", None)
+    who = (f"участникам класса «{_class_name}»" if scope == "class"
+           else "пользователям бота")
+    await query.edit_message_text(
+        f"✅ Опрос отправлен {sent} {who}.\n"
+        "📈 Итоги соберутся автоматически: панель → «📈 Итоги опросов» "
+        "(итоги хранятся, пока бот запущен).",
+        reply_markup=_poll_panel_kb(scope),
+    )
+    return DEV_PANEL if scope == "all" else ADMIN_PANEL
+
+
+async def poll_results_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.10: «📈 Итоги опросов» — общие числа голосов (без имён).
+    Показываем и разработчику, и админу; возврат — в панель нажавшего."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    _uid = str(query.from_user.id)
+    _is_dev = _uid == DEVELOPER_ID
+    if not _is_dev and not is_user_class_admin(_uid):
+        await query.answer("Итоги доступны админам и разработчику.",
+                           show_alert=True)
+        return MAIN_MENU
+    if not _POLL_LOG:
+        await query.edit_message_text(
+            "📊 Опросов пока не было.\n\n"
+            "Создайте: админ — «📊 Опрос классу», разработчик — "
+            "«📊 Опрос всем». Итоги хранятся, пока бот запущен.",
+            reply_markup=_poll_panel_kb("all" if _is_dev else "class"),
+        )
+        return DEV_PANEL if _is_dev else ADMIN_PANEL
+    lines = ["📈 ИТОГИ ОПРОСОВ (последние 5)\n"]
+    for entry in reversed(_POLL_LOG[-5:]):
+        total = entry["votes"]
+        _scope_tag = "класс" if entry["scope"] == "class" else "все"
+        lines.append(f"❓ {entry['q']}  ·  {entry['when']}  ·  {_scope_tag}")
+        for opt, cnt in zip(entry["opts"], entry["tally"]):
+            _pct = f"{(cnt * 100 // total)}%" if total else "—"
+            lines.append(f"  • {opt} — {cnt} ({_pct})")
+        lines.append(f"  👥 Всего голосов: {total}\n")
+    lines.append("Итоги анонимные (только числа, без имён) и хранятся, "
+                 "пока бот запущен.")
+    await query.edit_message_text(
+        "\n".join(lines),
+        reply_markup=_poll_panel_kb("all" if _is_dev else "class"),
+    )
+    return DEV_PANEL if _is_dev else ADMIN_PANEL
+
+
+async def poll_answer_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.10: сбор голосов. Telegram присылает PollAnswer по каждому
+    голосу в НЕанонимном опросе — складываем в общую копилку опроса."""
+    try:
+        pa = update.poll_answer
+        entry = _POLL_INDEX.get(str(getattr(pa, "poll_id", "")))
+        if entry is None:
+            return
+        for oi in (getattr(pa, "option_ids", None) or []):
+            _oi = int(oi)
+            if 0 <= _oi < len(entry["tally"]):
+                entry["tally"][_oi] += 1
+                entry["votes"] += 1
+    except Exception as e:
+        logger.warning(f"poll_answer: {e}")
 
 
 # ==================================
@@ -28086,6 +28501,18 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, vault_label_receive),
                 CallbackQueryHandler(handle_callback),
             ],
+            # === ВОЛНА 22.10: опросы (админ — классу, разработчик — всем) ===
+            POLL_WAIT_Q: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, poll_question_handler),
+                CallbackQueryHandler(handle_callback),
+            ],
+            POLL_WAIT_OPTS: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, poll_options_handler),
+                CallbackQueryHandler(handle_callback),
+            ],
+            POLL_WAIT_CONFIRM: [
+                CallbackQueryHandler(handle_callback),
+            ],
         },
         fallbacks=[
             CommandHandler("start", start),
@@ -28192,6 +28619,10 @@ def main():
     # ПУНКТ 8: глобальный обработчик кнопки «Разблокироваться» — работает даже
     # когда пользователь вне ConversationHandler (после блокировки conv завершён).
     application.add_handler(CallbackQueryHandler(unblock_self_handler, pattern="^unblock_self$"))
+
+    # ВОЛНА 22.10: сбор голосов опросов (PollAnswer приходит вне FSM —
+    # глобальный хендлер складывает голос в общую копилку опроса).
+    application.add_handler(PollAnswerHandler(poll_answer_handler))
 
     # Глобальный обработчик кнопки «✅ Я подписался(ась)» — работает даже когда
     # пользователь не внутри ConversationHandler (например, сразу после блокировки
