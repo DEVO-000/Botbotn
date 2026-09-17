@@ -450,7 +450,10 @@ _QUICK_SKIP_STATES = frozenset({VAULT_REN_WAIT, VAULT_LABEL_WAIT})
 #   команды) + отдельный хендлер для потерянного состояния (state=None).
 import re as _re_cancel
 _GLOBAL_CANCEL_RE = _re_cancel.compile(
-    r"^(?:❌\s*отмена|отмена|cancel|/cancel|назад в меню|⬅️\s*назад в меню"
+    # ВОЛНА 22.9: добавлено «❌ отменить» — кнопка отмены Сейфа теперь живёт
+    # в клавиатуре ВСЕГДА (в т. ч. в диалогах Сейфа), и её нажатие обязано
+    # ловиться из любого состояния, а не уходить в поле «пароль/имя файла».
+    r"^(?:❌\s*отмена|❌\s*отменить|отмена|cancel|/cancel|назад в меню|⬅️\s*назад в меню"
     r"|выйти из сейфа|выйти из облака)[\s!.,]*$",
     _re_cancel.IGNORECASE,
 )
@@ -2804,7 +2807,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.8"
+BOT_BUILD = "22.9"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -9590,11 +9593,12 @@ async def _vault_get_dvf2(msg, context, user, rec, password):
     Поток: MTProto качает шифр из канала → расшифровка на лету (в ОЗУ только
     куски) → временный файл → отправка пользователю с прогрессом → временный
     файл стёрт. САМ ШИФР на диск не пишется вовсе.
-    ВОЛНА 22.5: на прогрессе кнопка «❌ Отмена» — нажатие в ЛЮБОЙ фазе
-    (скачивание, расшифровка, отправка) останавливает процесс и стирает
-    ВСЕ временные файлы; после выдачи бот подсказывает: «❌ Отменить» —
-    В КЛАВИАТУРЕ (22.8: кнопок на сообщениях больше нет) — файл исчезает
-    из чата (отмена после распаковки)."""
+    ВОЛНА 22.5→22.9: во время выдачи отмены НЕТ — по прямому требованию
+    пользователя («если еще загружается то загрузка должна закончиться»)
+    выдача НЕ прерывается ни на какой фазе (скачивание, расшифровка,
+    отправка) — она спокойно дойдёт до конца. После выдачи бот подсказывает:
+    «❌ Отменить» — В КЛАВИАТУРЕ (22.8: кнопок на сообщениях больше нет) —
+    файл исчезает из чата (отмена после распаковки)."""
     if AESGCM is None:
         await msg.reply_text("❌ На сервере нет библиотеки шифрования (cryptography).")
         return MAIN_MENU
@@ -9637,11 +9641,11 @@ async def _vault_get_dvf2(msg, context, user, rec, password):
             reply_markup=get_main_menu_keyboard(user),
         )
         return MAIN_MENU
-    # ВОЛНА 22.5/22.8: операция с флагом отмены. 22.8: кнопки НА СООБЩЕНИИ
-    # больше нет — «❌ Отмена» ждёт В КЛАВИАТУРЕ (диалоговая «❌ Отмена» и
-    # «❌ Отменить» главного меню), плюс перехват текста «отмена» в
-    # vault_get_password; старые inline-кнопки (vault_getstop) тоже работают.
-    op = _vault_op_begin(getattr(user, "user_id", "") or "", 1)
+    # ВОЛНА 22.5/22.8/22.9: операция с родом "get" — выдача НЕ прерывается
+    # (требование пользователя: «загрузка должна закончиться»). Кнопки НА
+    # СООБЩЕНИИ больше нет — «❌ Отмена»/«❌ Отменить» ждут В КЛАВИАТУРЕ;
+    # старые inline-кнопки (vault_getstop) работают как легаси.
+    op = _vault_op_begin(getattr(user, "user_id", "") or "", 1, kind="get")
     op["phase"] = "Качаю и расшифровываю"
 
     def _cancelled():
@@ -9651,7 +9655,8 @@ async def _vault_get_dvf2(msg, context, user, rec, password):
     try:
         progress_msg = await msg.reply_text(
             "🔓 Качаю шифр и расшифровываю потоком… 0%\n"
-            "❌ Отмена — кнопка на клавиатуре снизу.")
+            "⏳ Не прерываю — загрузка спокойно дойдёт до конца; после выдачи "
+            "«❌ Отменить» в клавиатуре сотрёт файл из чата.")
     except Exception:
         progress_msg = None
     prog = _ProgressEdit(context, progress_msg,
@@ -10750,24 +10755,52 @@ async def vault_getstop_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return None  # состояние не меняем — работающий процесс сам всё завершит
 
 
+def _vault_dialog_kb():
+    """ВОЛНА 22.9: клавиатура диалогов Сейфа. Раньше каждый диалог подменял
+    всю клавиатуру одиночной «❌ Отмена» — из-за этого кнопка «❌ Отменить»
+    ИСЧЕЗАЛА из клавиатуры ровно в моменты, когда она нужна (пользователь:
+    «не появилась отмена в клавиатуре»). Теперь оба ряда отмен всегда под
+    рукой: «❌ Отмена» — выйти из диалога, «❌ Отменить» — отмена файлов
+    Сейфа (остановит заливку / даст выдаче дойти до конца / сотрёт выданный
+    файл). Нажатия обеих ловятся инжектом глобальной отмены из ЛЮБОГО
+    состояния (см. _GLOBAL_CANCEL_RE), пароль/имя файла они не сломают."""
+    return ReplyKeyboardMarkup([['❌ Отмена'], ['❌ Отменить']], resize_keyboard=True)
+
+
 async def vault_kb_cancel_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """ВОЛНА 22.8: «❌ Отменить» из КЛАВИАТУРЫ главного меню (на сообщениях
+    """ВОЛНА 22.8/22.9: «❌ Отменить» из КЛАВИАТУРЫ главного меню (на сообщениях
     кнопок больше нет — просьба пользователя). Одна кнопка обслуживает
     все отмены Сейфа:
-    1) ПРЯМО СЕЙЧАС идёт загрузка/шифрование пачки или выдача файла —
-       ставим флаг отмены: процесс сам остановится на ближайшем куске и
-       честно подчистит временные файлы (как vault_getstop_cb);
+    1) ПРЯМО СЕЙЧАС идёт ЗАЛИВКА В СЕЙФ (kind="put") — ставим флаг отмены:
+       процесс сам остановится на ближайшем куске и честно подчистит
+       временные файлы (22.3);
+    1а) ПРЯМО СЕЙЧАС идёт ВЫДАЧА файла (kind="get") — НЕ прерываем её:
+       по требованию пользователя «если еще загружается то загрузка
+       должна закончиться»; после выдачи можно нажать ещё раз — и файл
+       будет стёрт из чата;
     2) файл недавно выдан из Сейфа и ещё висит в чате — удаляем сообщение
        с ним (если в ⚙️ Настройках включено удаление; цель хранится в
        профиле — vault_kb_wipe — и переживает рестарт бота);
-    3) нечего отменять — честно говорим, для чего кнопка."""
+    3) нечего отменять — честно говорим, для чего кнопка (клавиатуру
+       НЕ перетираем — 22.9: кнопка работает и внутри диалогов)."""
     chat = update.effective_chat
     if chat is None or chat.type != "private":
         return MAIN_MENU  # в группах кнопка Сейфа не работает
     user_id = str(update.effective_user.id)
     user = get_user(user_id)
-    # 1) Активная операция Сейфа (шифрование пачки / выдача файла) — стоп.
+    # 1) Активная операция Сейфа: род решает семантику (22.9).
     if _vault_op_running(user_id):
+        _op = _VAULT_OPS.get(user_id) or {}
+        if str(_op.get("kind") or "put") == "get":
+            # 1а) ВЫДАЧА файла — НЕ прерываем (требование пользователя:
+            # «если еще загружается то загрузка должна закончиться»). Файл
+            # будет выдан; после этого «Отменить» сотрёт его из чата.
+            await update.message.reply_text(
+                "⏳ Выдача файла уже идёт — не буду её прерывать: загрузка "
+                "спокойно дойдёт до конца. Когда файл будет выдан, нажмите "
+                "«❌ Отменить» ещё раз — и я сотру его из чата.")
+            return MAIN_MENU
+        # 1) ЗАЛИВКА В СЕЙФ — останавливаем (22.3, как просил пользователь).
         _VAULT_OPS[user_id]["event"].set()
         await update.message.reply_text(
             "⛔ Останавливаю — процесс заметит отмену на ближайшем куске и "
@@ -10809,12 +10842,12 @@ async def vault_kb_cancel_msg(update: Update, context: ContextTypes.DEFAULT_TYPE
             "Файл уже исчез из чата (или не найден). Шифр в Сейфе цел — "
             "расшифруйте заново, когда понадобится.")
         return MAIN_MENU
-    # 3) Нечего отменять — честно.
+    # 3) Нечего отменять — честно (22.9: клавиатуру НЕ перетираем — кнопка
+    #    работает и внутри диалогов Сейфа, там своя клавиатура отмен).
     await update.message.reply_text(
-        "Сейчас нечего отменять: «❌ Отменить» останавливает загрузку или "
-        "выдачу файла Сейфа, пока она идёт, и стирает из чата уже выданный "
-        "файл.",
-        reply_markup=get_main_menu_keyboard(user) if user is not None else None)
+        "Сейчас нечего отменять: «❌ Отменить» остановит заливку файла В "
+        "Сейф, даст спокойно дойти до конца выдаче и сотрёт из чата уже "
+        "выданный файл.")
     return MAIN_MENU
 
 
@@ -11011,7 +11044,7 @@ async def _vault_prompt_password(msg, user, note: str = "", context=None):
             "он один для всех файлов Сейфа. Сообщение с паролем сразу сотрётся.\n\n"
             "Забыли? Отправьте слово «восстановить» или нажмите «🔑 Забыл "
             "пароль» в меню Сейфа.",
-            reply_markup=ReplyKeyboardMarkup([["❌ Отмена"]], resize_keyboard=True),
+            reply_markup=_vault_dialog_kb(),
         )
     else:
         _sent = await msg.reply_text(
@@ -11022,7 +11055,7 @@ async def _vault_prompt_password(msg, user, note: str = "", context=None):
             "Сразу после этого бот задаст 3 СЕКРЕТНЫХ ВОПРОСА — они вернут "
             "доступ, если пароль забудется.\n\n"
             "Отправьте пароль одним сообщением.",
-            reply_markup=ReplyKeyboardMarkup([["❌ Отмена"]], resize_keyboard=True),
+            reply_markup=_vault_dialog_kb(),
         )
     if context is not None:
         _vault_track_ack(context, _sent, user=user)
@@ -11151,13 +11184,19 @@ _VAULT_OPS = {}
 _VAULT_OP_FRAMES = "🌑🌒🌓🌔🌕🌖🌗🌘"
 
 
-def _vault_op_begin(user_id, total):
-    """Открывает операцию шифрования/загрузки Сейфа для пользователя."""
+def _vault_op_begin(user_id, total, kind="put"):
+    """Открывает операцию Сейфа для пользователя.
+    ВОЛНА 22.9: у операции есть РОД — kind="put" (заливка В Сейф) или
+    kind="get" (выдача файла ИЗ Сейфа в чат). Род определяет семантику
+    отмены: заливку можно остановить (22.3), а выдача по прямому требованию
+    пользователя («если еще загружается то загрузка должна закончиться»)
+    НЕ прерывается — она спокойно дойдёт до конца."""
     op = {
         "event": asyncio.Event(),          # установка = «пользователь нажал Отмена»
         "sent": [],                        # (channel_id, msg_id) залитых шифров ЭТОЙ пачки
         "temp": [],                        # временные каталоги/файлы на диске
         "phase": "Шифрую и заливаю",       # человекочитаемая фаза
+        "kind": str(kind or "put"),        # 22.9: "put" (заливка) / "get" (выдача)
         "done": 0, "total": int(total or 0),
         "sub": "",                         # подстрока прогресса («качаю и шифрую 43%»)
         "active": True,
@@ -11568,7 +11607,7 @@ async def vault_get_password_start(update: Update, context: ContextTypes.DEFAULT
     await query.message.reply_text(
         "🔑 Введите пароль этого файла. Попыток: "
         f"{VAULT_ATTEMPTS_MAX} (пароль сотрётся из чата).",
-        reply_markup=ReplyKeyboardMarkup([["❌ Отмена"]], resize_keyboard=True),
+        reply_markup=_vault_dialog_kb(),
     )
     return VAULT_GET_PASSWORD
 
@@ -11583,14 +11622,22 @@ async def vault_get_password(update: Update, context: ContextTypes.DEFAULT_TYPE)
     • ШАГ 1 смены секретных вопросов (vault_qs_stage == "auth", волна 9);
     • команду «восстановить» — переход к восстановлению по вопросам (волна 9)."""
     msg = update.message
-    # ВОЛНА 22.5: прямо сейчас идёт выдача файла Сейфа (скачивание/расшифровка/
-    # отправка)? Тогда «Отмена» ТОЛЬКО ставит флаг отмены — user_data принадлежит
-    # работающему процессу, зачистку сделает он сам (как в vault_put_password).
+    # ВОЛНА 22.5/22.9: прямо сейчас идёт операция Сейфа. ЗАЛИВКА (kind="put")
+    # останавливается флагом — как в 22.3. ВЫДАЧА (kind="get") НЕ прерывается
+    # никогда — требование пользователя: «если еще загружается то загрузка
+    # должна закончиться»; зачистку сделает сам процесс по завершении.
     _uid_now = str(update.effective_user.id)
     if _vault_op_running(_uid_now):
-        _VAULT_OPS[_uid_now]["event"].set()
+        if str((_VAULT_OPS.get(_uid_now) or {}).get("kind") or "put") == "put":
+            _VAULT_OPS[_uid_now]["event"].set()
+            await msg.reply_text(
+                "⛔ Останавливаю шифрование/загрузку — секунду, подчищу всё "
+                "недогруженное…")
+            return VAULT_GET_PASSWORD
         await msg.reply_text(
-            "⛔ Останавливаю выдачу файла — секунду, подчищу временные файлы…")
+            "⏳ Выдача файла уже идёт — не прерываю её: загрузка спокойно "
+            "дойдёт до конца. После выдачи «❌ Отменить» в клавиатуре сотрёт "
+            "файл из чата.")
         return VAULT_GET_PASSWORD
     user = get_user(str(update.effective_user.id))
     if not user:
@@ -11776,7 +11823,7 @@ async def vault_ren_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Сейфа (например «Фото контрольной», «Документы на кружок»). "
         "Сам файл и его настоящее имя останутся под шифром.\n\n"
         "Выйти — «❌ Отмена».",
-        reply_markup=ReplyKeyboardMarkup([["❌ Отмена"]], resize_keyboard=True),
+        reply_markup=_vault_dialog_kb(),
     )
     return VAULT_REN_WAIT
 
@@ -11894,7 +11941,7 @@ async def _vault_rec_begin(msg, context, user):
         "🔑 ВОССТАНОВЛЕНИЕ ДОСТУПА К СЕЙФУ\n\n"
         f"Вопрос 1 из {VAULT_QUESTIONS_N}:\n{questions[0]}\n\n"
         f"(попыток: {tries_left} из {VAULT_REC_MAX_ATTEMPTS}; отмена — «отмена»)",
-        reply_markup=ReplyKeyboardMarkup([["❌ Отмена"]], resize_keyboard=True),
+        reply_markup=_vault_dialog_kb(),
     )
     _vault_track_ack(context, _ack, user=user)  # ВОЛНА 12
     return VAULT_REC_ANSWER
@@ -11959,7 +12006,7 @@ async def vault_rec_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "перешифрованы, и вы сразу сможете посмотреть или забрать свои данные.\n\n"
             + _vault_strength_table_text() + "\n\n"
             "(Сам забытый пароль я вам не покажу — он сразу заменяется новым.)",
-            reply_markup=ReplyKeyboardMarkup([["❌ Отмена"]], resize_keyboard=True),
+            reply_markup=_vault_dialog_kb(),
         )
         return VAULT_REC_NEWPASS
     # Неверные ответы — попытка потрачена; начинаем новый цикл с вопроса 1.
@@ -12166,7 +12213,7 @@ async def vault_qs_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _ack = await query.message.reply_text(
         "❓ СМЕНА СЕКРЕТНЫХ ВОПРОСОВ — шаг 1: введите текущий ПАРОЛЬ СЕЙФА "
         "(попыток: 3).",
-        reply_markup=ReplyKeyboardMarkup([["❌ Отмена"]], resize_keyboard=True),
+        reply_markup=_vault_dialog_kb(),
     )
     _vault_track_ack(context, _ack, user=user)  # ВОЛНА 12
     return VAULT_GET_PASSWORD
@@ -12371,7 +12418,7 @@ async def vault_chpass_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
     context.user_data['vault_attempts'] = 0
     await query.message.reply_text(
         "🔑 СМЕНА ПАРОЛЯ — шаг 1: введите ТЕКУЩИЙ пароль файла.",
-        reply_markup=ReplyKeyboardMarkup([["❌ Отмена"]], resize_keyboard=True),
+        reply_markup=_vault_dialog_kb(),
     )
     return VAULT_GET_PASSWORD
 
@@ -16541,6 +16588,16 @@ async def global_cancel_handler(update: Update, context: ContextTypes.DEFAULT_TY
     msg = getattr(update, "message", None)
     if msg is None:
         return MAIN_MENU
+    # ВОЛНА 22.9: «❌ Отменить» — кнопка отмены СЕЙФА со своей семантикой
+    # (остановит заливку В Сейф, даст выдаче спокойно дойти до конца, сотрёт
+    # выданный файл). Она теперь видна в клавиатуре ВСЕГДА — и в диалогах
+    # тоже, — поэтому здесь делегируем её ровному обработчику Сейфа, а НЕ
+    # выполняем общую чистку диалога.
+    try:
+        if (getattr(msg, "text", None) or "").strip() == "❌ Отменить":
+            return await vault_kb_cancel_msg(update, context)
+    except Exception:
+        pass
     user_id = str(update.effective_user.id) if update.effective_user else None
     user = get_user(user_id) if user_id else None
     # 1) Чистка следов в чате: пачка + персистентный след (пережил рестарт).
