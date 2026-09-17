@@ -2002,10 +2002,17 @@ class User:
         self.vault_trace = {"chat_id": 0, "msgs": []}
         # === ВОЛНА 22.7: удалять ли СООБЩЕНИЕ с расшифрованным файлом ===
         # при нажатии «❌ Отменить» после распаковки. True (по умолчанию) —
-        # файл исчезает из чата; False — файл ОСТАЁТСЯ в чате (кнопка «❌
-        # Отменить» под файлом не предлагается). Тоггл: ⚙️ Настройки →
+        # файл исчезает из чата; False — файл ОСТАЁТСЯ в чате (подсказка об
+        # удалении не предлагается). Тоггл: ⚙️ Настройки →
         # «🗑 Удалять файл при «Отменить»».
         self.vault_wipe_on_cancel = True
+        # === ВОЛНА 22.8: ЦЕЛЬ кнопки «❌ Отменить» ИЗ КЛАВИАТУРЫ ===
+        # {"chat_id": int, "msg_id": int} — последнее ВЫДАННОЕ (распакованное)
+        # сообщение с файлом Сейфа: кнопка «❌ Отменить» в главном меню стирает
+        # его из чата. Лежит В БАЗЕ (переживает рестарт/деплой): раньше цель
+        # жили только в inline-кнопке на сообщении — по просьбе пользователя
+        # кнопки на сообщениях больше нет. Хранятся ТОЛЬКО номера сообщений.
+        self.vault_kb_wipe = None
         # ВОЛНА 22.4: поле user.pult (Пульт) удалено — функция снесена целиком.
 
     def to_dict(self):
@@ -2084,6 +2091,8 @@ class User:
             'vault_trace': getattr(self, 'vault_trace', {"chat_id": 0, "msgs": []}),
             # ВОЛНА 22.7: удалять ли файл при «Отменить» после распаковки.
             'vault_wipe_on_cancel': getattr(self, 'vault_wipe_on_cancel', True),
+            # ВОЛНА 22.8: цель кнопки «❌ Отменить» из клавиатуры (id сообщений).
+            'vault_kb_wipe': getattr(self, 'vault_kb_wipe', None),
             # ВОЛНА 22.4: ключ 'pult' больше не сериализуется (Пульт удалён).
         }
 
@@ -2182,6 +2191,18 @@ class User:
         # Бэк-совместимость, волна 22.7: удалять ли файл при «Отменить».
         if not isinstance(getattr(user, 'vault_wipe_on_cancel', None), bool):
             user.vault_wipe_on_cancel = True
+        # Бэк-совместимость, волна 22.8: цель кнопки «❌ Отменить» из клавиатуры.
+        _vkw = getattr(user, 'vault_kb_wipe', None)
+        if not isinstance(_vkw, dict) or not _vkw.get("msg_id"):
+            user.vault_kb_wipe = None
+        else:
+            try:
+                user.vault_kb_wipe = {
+                    "chat_id": int(_vkw.get("chat_id") or 0),
+                    "msg_id": int(_vkw.get("msg_id") or 0),
+                }
+            except (TypeError, ValueError):
+                user.vault_kb_wipe = None
         # ВОЛНА 22.4: старые ключи 'pult' из БД молча выбрасываются
         # (нормализатор _pult_normalize удалён вместе с Пультом).
         return user
@@ -2783,7 +2804,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.7"
+BOT_BUILD = "22.8"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -4062,6 +4083,13 @@ def get_main_menu_keyboard(user):
     if class_obj and not is_blocked_in_class:
         if "🚪 Выйти из класса" not in hidden_buttons:
             keyboard.append([rename_map.get("🚪 Выйти из класса", "🚪 Выйти из класса")])
+
+    # ВОЛНА 22.8: «❌ Отменить» живёт В КЛАВИАТУРЕ (на сообщениях кнопок
+    # больше нет — просьба пользователя). Одна кнопка на все случаи Сейфа:
+    # идёт загрузка/выдача файла — остановит её; файл недавно выдан — сотрёт
+    # его из чата; нечего отменять — честно скажет.
+    if "❌ Отменить" not in hidden_buttons:
+        keyboard.append([rename_map.get("❌ Отменить", "❌ Отменить")])
 
     if "🔓 Выйти из аккаунта" not in hidden_buttons:
         keyboard.append([rename_map.get("🔓 Выйти из аккаунта", "🔓 Выйти из аккаунта")])
@@ -8271,8 +8299,8 @@ def _vault_menu_text(user):
         "ответите верно — зададите новый пароль и вернёте данные. "
         "Попыток: 3, после — пауза 30 минут. Сами ответы нигде не хранятся — "
         "только пароль, запечатанный ими: без верных ответов он не читается.\n\n"
-        "❌ После распаковки под файлом есть кнопка «Отменить» — "
-        "файл исчезает из чата одной кнопкой (отключить — в ⚙️ Настройках).\n\n"
+        "❌ После распаковки файл исчезает из чата кнопкой «Отменить» "
+        "В КЛАВИАТУРЕ снизу (отключить — в ⚙️ Настройках).\n\n"
         "Выберите действие:"
     )
 
@@ -8734,8 +8762,9 @@ def _dvf2_safe_name(name):
 class _ProgressEdit:
     """Редкие правки сообщения-прогресса (не чаще раза в 3.5 с — лимиты
     editMessageText), чтобы потоковые операции 2 ГБ не упирались во флуд.
-    ВОЛНА 22.5: если у сообщения-прогресса есть inline-клавиатура (кнопка
-    «❌ Отмена» выдачи Сейфа) — она СОХРАНЯЕТСЯ при каждой правке."""
+    ВОЛНА 22.5: если у сообщения-прогресса есть inline-клавиатура — она
+    СОХРАНЯЕТСЯ при каждой правке (22.8: кнопок на прогрессе больше нет,
+    reply_markup остаётся None)."""
 
     def __init__(self, context, progress_msg, title="", reply_markup=None):
         self.context = context
@@ -9170,7 +9199,8 @@ async def _mt_send_file_to_user(client, chat_id, path, size, caption,
     Telethon не нашёл peer в кэше — подтягиваем hash из этого же чата.
     ВОЛНА 22.5: cancel_check — отмена ЗАГРУЗКИ пользователю (бросок из
     progress_callback обрывает выгрузку — недосланное сообщение Telegram
-    не создаёт); progress_markup — кнопка «❌ Отмена» сохраняется на прогрессе."""
+    не создаёт); progress_markup — 22.8: НЕ используется (кнопок на
+    сообщениях больше нет), параметр оставлен для совместимости."""
     state = {"cur": 0, "total": int(size or 0)}
 
     def _pcb(cur, total):
@@ -9562,8 +9592,9 @@ async def _vault_get_dvf2(msg, context, user, rec, password):
     файл стёрт. САМ ШИФР на диск не пишется вовсе.
     ВОЛНА 22.5: на прогрессе кнопка «❌ Отмена» — нажатие в ЛЮБОЙ фазе
     (скачивание, расшифровка, отправка) останавливает процесс и стирает
-    ВСЕ временные файлы; после выдачи под файлом появляется кнопка
-    «❌ Отменить» — файл исчезает из чата (отмена после распаковки)."""
+    ВСЕ временные файлы; после выдачи бот подсказывает: «❌ Отменить» —
+    В КЛАВИАТУРЕ (22.8: кнопок на сообщениях больше нет) — файл исчезает
+    из чата (отмена после распаковки)."""
     if AESGCM is None:
         await msg.reply_text("❌ На сервере нет библиотеки шифрования (cryptography).")
         return MAIN_MENU
@@ -9606,28 +9637,25 @@ async def _vault_get_dvf2(msg, context, user, rec, password):
             reply_markup=get_main_menu_keyboard(user),
         )
         return MAIN_MENU
-    # ВОЛНА 22.5: операция с флагом отмены (ставится кнопкой «❌ Отмена»,
-    # текстом «отмена» или кнопкой клавиатуры — см. vault_getstop_cb и
-    # перехват в vault_get_password).
+    # ВОЛНА 22.5/22.8: операция с флагом отмены. 22.8: кнопки НА СООБЩЕНИИ
+    # больше нет — «❌ Отмена» ждёт В КЛАВИАТУРЕ (диалоговая «❌ Отмена» и
+    # «❌ Отменить» главного меню), плюс перехват текста «отмена» в
+    # vault_get_password; старые inline-кнопки (vault_getstop) тоже работают.
     op = _vault_op_begin(getattr(user, "user_id", "") or "", 1)
     op["phase"] = "Качаю и расшифровываю"
 
     def _cancelled():
         return op["event"].is_set()
 
-    # Кнопка отмены ЖИВЁТ на сообщении-прогрессе все фазы выдачи.
-    _get_kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("❌ Отмена", callback_data="vault_getstop")]])
     progress_msg = None
     try:
         progress_msg = await msg.reply_text(
-            "🔓 Качаю шифр и расшифровываю потоком… 0%",
-            reply_markup=_get_kb)
+            "🔓 Качаю шифр и расшифровываю потоком… 0%\n"
+            "❌ Отмена — кнопка на клавиатуре снизу.")
     except Exception:
         progress_msg = None
     prog = _ProgressEdit(context, progress_msg,
-                         "🔓 Качаю шифр и расшифровываю потоком",
-                         reply_markup=_get_kb)
+                         "🔓 Качаю шифр и расшифровываю потоком")
     job = _dvf2_make_job_dir()
     op["temp"].append(job)  # ВОЛНА 22.5: для отмены (страховка к finally)
     dec = None
@@ -9683,7 +9711,7 @@ async def _vault_get_dvf2(msg, context, user, rec, password):
         _sent = await _mt_send_file_to_user(
             client, msg.chat_id, final_path, real_size, cap,
             context, progress_msg or msg,
-            cancel_check=_cancelled, progress_markup=_get_kb)
+            cancel_check=_cancelled)
         # ВОЛНА 22.6: id выданного файла — для кнопки «❌ Отменить» (стереть из чата).
         try:
             sent_mid = int(getattr(_sent, "id", 0) or 0)
@@ -9740,7 +9768,8 @@ async def _vault_get_dvf2(msg, context, user, rec, password):
     if sent_mid:
         await _vault_offer_wipe(
             context, msg.chat_id, sent_mid,
-            wipe_enabled=bool(getattr(user, "vault_wipe_on_cancel", True)))
+            wipe_enabled=bool(getattr(user, "vault_wipe_on_cancel", True)),
+            user=user)
     else:
         await msg.reply_text("✅ Готово. Файл расшифрован только что и только для вас.")
     return MAIN_MENU
@@ -9939,7 +9968,7 @@ def _vault_help_text():
         "уходит ТОЛЬКО шифр — неразличимый от случайного шума.\n"
         "3. Чтобы достать файл, вводите пароль Сейфа: бот скачивает шифр, "
         "расшифровывает в памяти и присылает файл. На диск ничего не пишется.\n"
-        "   ❌ ПОСЛЕ РАСПАКОВКИ: под выданным файлом появляется кнопка "
+        "   ❌ ПОСЛЕ РАСПАКОВКИ: в КЛАВИАТУРЕ снизу появляется кнопка "
         "«❌ Отменить» — нажмите, и расшифрованная копия ИСЧЕЗНЕТ из чата "
         "(это и есть «отмена» после распаковки). Шифр в канале остаётся целым — "
         "файл можно расшифровать заново в любой момент. Нужен файл — сохраните "
@@ -9963,11 +9992,11 @@ def _vault_help_text():
         "Выйти из Сейфа можно кнопкой «❌ Отмена» в ЛЮБОЙ момент — следы "
         "загруженных файлов и недописанные вопросы/ответы стираются из чата "
         "(это работает даже после перезапуска бота).\n"
-        "   ⛔ ОТМЕНА ВО ВРЕМЯ ВЫДАЧИ БОЛЬШОГО ФАЙЛА: на прогрессе («качаю и "
-        "расшифровываю», «отправляю») есть кнопка «❌ Отмена» — остановит "
-        "процесс и сотрёт все временные файлы; в чат ничего не попадёт.\n"
-        "   ❌ ОТМЕНА ПОСЛЕ РАСПАКОВКИ: кнопка «❌ Отменить» под выданным "
-        "файлом — расшифрованная копия исчезает из чата (настраивается "
+        "   ⛔ ОТМЕНА ВО ВРЕМЯ ВЫДАЧИ БОЛЬШОГО ФАЙЛА: на клавиатуре снизу "
+        "жмёте «❌ Отмена»/«❌ Отменить» — остановится "
+        "процесс и сотрутся все временные файлы; в чат ничего не попадёт.\n"
+        "   ❌ ОТМЕНА ПОСЛЕ РАСПАКОВКИ: кнопка «❌ Отменить» в клавиатуре — "
+        "расшифрованная копия исчезает из чата (настраивается "
         "в ⚙️ Настройках).\n\n"
         "Честные ограничения:\n"
         f"• файл до {_fmt_bytes(VAULT_MAX_FILE_BYTES)} — быстрый путь: "
@@ -10326,7 +10355,7 @@ async def vault_put_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # «⬅️ Назад в меню» НЕ распознавалась — текст уходил в заметки пачки и бот
     # «не выходил» из Сейфа. Теперь «назад в меню» тоже значит выход, а следы
     # загруженных в чат файлов стираются (файл не должен оставаться в чате).
-    if (low_raw in ("отмена", "cancel", "/cancel", "❌ отмена")
+    if (low_raw in ("отмена", "cancel", "/cancel", "❌ отмена", "❌ отменить")
             or "отмена" in low_raw or "cancel" in low_raw
             or "назад в меню" in low_raw):
         _batch_clean = batch if isinstance(batch, list) else None
@@ -10705,8 +10734,9 @@ async def vault_cancel_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def vault_getstop_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """ВОЛНА 22.5: кнопка «❌ Отмена» на прогрессе выдачи большого файла
-    (скачивание шифра → расшифровка → отправка пользователю). Только ставит
+    """ВОЛНА 22.5/22.8-легаси: кнопка «❌ Отмена» НА прогрессе выдачи
+    большого файла (осталась только на сообщениях, отправленных ДО
+    обновления — в 22.8 отмена живёт в клавиатуре). Только ставит
     флаг отмены — сам процесс заметит его на ближайшем куске и ЧЕСТНО
     подчищает временные файлы; шифр в канале не трогается."""
     query = update.callback_query
@@ -10720,41 +10750,131 @@ async def vault_getstop_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return None  # состояние не меняем — работающий процесс сам всё завершит
 
 
-async def _vault_offer_wipe(context, chat_id, file_msg_id, wipe_enabled=True):
-    """ВОЛНА 22.6/22.7: под только что выданным (распакованным) файлом —
-    кнопка «❌ Отменить» и честная подсказка: отмена ПОСЛЕ распаковки = файл
-    исчезает из чата. ВОЛНА 22.7: если в ⚙️ Настройках выключено удаление
-    (vault_wipe_on_cancel=False) — кнопка НЕ предлагается, файл остаётся
-    в чате (честно сообщаем, где это меняется). Работает и для Bot API-выдачи,
-    и для MTProto: сообщение отправлено самим ботом, значит бот может его
-    удалить."""
+async def vault_kb_cancel_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.8: «❌ Отменить» из КЛАВИАТУРЫ главного меню (на сообщениях
+    кнопок больше нет — просьба пользователя). Одна кнопка обслуживает
+    все отмены Сейфа:
+    1) ПРЯМО СЕЙЧАС идёт загрузка/шифрование пачки или выдача файла —
+       ставим флаг отмены: процесс сам остановится на ближайшем куске и
+       честно подчистит временные файлы (как vault_getstop_cb);
+    2) файл недавно выдан из Сейфа и ещё висит в чате — удаляем сообщение
+       с ним (если в ⚙️ Настройках включено удаление; цель хранится в
+       профиле — vault_kb_wipe — и переживает рестарт бота);
+    3) нечего отменять — честно говорим, для чего кнопка."""
+    chat = update.effective_chat
+    if chat is None or chat.type != "private":
+        return MAIN_MENU  # в группах кнопка Сейфа не работает
+    user_id = str(update.effective_user.id)
+    user = get_user(user_id)
+    # 1) Активная операция Сейфа (шифрование пачки / выдача файла) — стоп.
+    if _vault_op_running(user_id):
+        _VAULT_OPS[user_id]["event"].set()
+        await update.message.reply_text(
+            "⛔ Останавливаю — процесс заметит отмену на ближайшем куске и "
+            "честно подчистит временные файлы. Шифр в Сейфе цел.")
+        return MAIN_MENU
+    # 2) Выданный файл — стереть из чата (настройка 22.7 уважается).
+    target = context.user_data.get("vault_kb_wipe")
+    if not isinstance(target, dict) and user is not None:
+        target = getattr(user, "vault_kb_wipe", None)
+    if isinstance(target, dict) and target.get("msg_id"):
+        _wipe_on = True if user is None else bool(
+            getattr(user, "vault_wipe_on_cancel", True))
+        if not _wipe_on:
+            await update.message.reply_text(
+                "ℹ️ Файл ОСТАВЛЕН в чате: в ⚙️ Настройках выключено удаление "
+                "расшифрованного файла при «Отменить». Включить обратно "
+                "можно там же.")
+            return MAIN_MENU
+        _gone = False
+        try:
+            await context.bot.delete_message(
+                chat_id=int(target.get("chat_id") or chat.id),
+                message_id=int(target.get("msg_id")))
+            _gone = True
+        except Exception:
+            pass
+        # Цель отработана — гасим, чтобы повторное нажатие не удаляло заново.
+        context.user_data.pop("vault_kb_wipe", None)
+        if user is not None:
+            try:
+                user.vault_kb_wipe = None
+                save_user(user)
+            except Exception:
+                pass
+        await update.message.reply_text(
+            "❌ Готово — файл исчез из чата (отмена после распаковки). "
+            "Шифр в Сейфе цел: расшифровать снова можно в любой момент."
+            if _gone else
+            "Файл уже исчез из чата (или не найден). Шифр в Сейфе цел — "
+            "расшифруйте заново, когда понадобится.")
+        return MAIN_MENU
+    # 3) Нечего отменять — честно.
+    await update.message.reply_text(
+        "Сейчас нечего отменять: «❌ Отменить» останавливает загрузку или "
+        "выдачу файла Сейфа, пока она идёт, и стирает из чата уже выданный "
+        "файл.",
+        reply_markup=get_main_menu_keyboard(user) if user is not None else None)
+    return MAIN_MENU
+
+
+async def _vault_offer_wipe(context, chat_id, file_msg_id, wipe_enabled=True,
+                            user=None):
+    """ВОЛНА 22.6→22.8: честная подсказка после выдачи (распаковки) файла.
+    ВОЛНА 22.8: КНОПКИ НА СООБЩЕНИИ БОЛЬШЕ НЕТ — «❌ Отменить» переехала в
+    КЛАВИАТУРУ главного меню (просьба пользователя). Здесь:
+    • регистрируем цель отмены — user.vault_kb_wipe (переживает рестарт,
+      дубль в user_data): её сотрёт кнопка «❌ Отменить» из клавиатуры;
+    • шлём подсказку ВМЕСТЕ с главным меню (заодно чинит «залипшую»
+      клавиатуру диалога после выдачи файла);
+    • 22.7: если автоудаление выключено (wipe_enabled=False) — честно
+      сообщаем, что файл останется в чате.
+    Работает и для Bot API-выдачи, и для MTProto: сообщение отправлено
+    самим ботом, значит бот может его удалить."""
     try:
+        if user is None:
+            try:
+                user = get_user(str(int(chat_id)))
+            except (TypeError, ValueError):
+                user = None
+        _target = {"chat_id": int(chat_id), "msg_id": int(file_msg_id)}
+        try:
+            context.user_data["vault_kb_wipe"] = _target
+        except Exception:
+            pass
+        if user is not None:
+            try:
+                user.vault_kb_wipe = _target
+                save_user(user)
+            except Exception:
+                pass
+        _kb = get_main_menu_keyboard(user) if user is not None else None
         if not wipe_enabled:
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=("✅ Готово — файл распакован и выдан только вам.\n"
                       "ℹ️ Автоудаление при «Отменить» выключено в ⚙️ Настройках "
                       "— файл остаётся в чате. Шифр в Сейфе цел: файл можно "
-                      "получить снова."))
+                      "получить снова."),
+                reply_markup=_kb)
             return
         await context.bot.send_message(
             chat_id=chat_id,
             text=("✅ Готово — файл распакован и выдан только вам.\n"
-                  "❌ Кнопка ниже — «Отменить»: нажмите, и файл исчезнет из "
-                  "чата. Нужен ещё — сохраните/перешлите его заранее; "
-                  "шифр в Сейфе останется целым, файл можно получить снова."),
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton(
-                    "❌ Отменить",
-                    callback_data=f"vault_wipe_{int(file_msg_id)}")]]),
-        )
+                  "❌ «Отменить» — кнопка в КЛАВИАТУРЕ снизу: нажмите, и файл "
+                  "исчезнет из чата. Нужен ещё — сохраните/перешлите его "
+                  "заранее; шифр в Сейфе останется целым, файл можно "
+                  "получить снова."),
+            reply_markup=_kb)
     except Exception as e:
-        logger.warning(f"vault wipe: не удалось показать кнопку отмены: {e}")
+        logger.warning(f"vault wipe: не удалось показать подсказку отмены: {e}")
 
 
 async def vault_wipe_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """ВОЛНА 22.6: кнопка «❌ Отменить» ПОД выданным (распакованным) файлом —
-    файл (расшифрованная копия) ИСЧЕЗАЕТ из чата. Сам шифр в
+    """ВОЛНА 22.6/22.8-легаси: inline-кнопка «❌ Отменить» ПОД выданным
+    файлом (осталась только на сообщениях до обновления — в 22.8 отмена
+    живёт В КЛАВИАТУРЕ через vault_kb_cancel_msg). Файл (расшифрованная
+    копия) ИСЧЕЗАЕТ из чата. Сам шифр в
     канале остаётся: файл всегда можно расшифровать заново."""
     query = update.callback_query
     await query.answer()
@@ -10817,7 +10937,7 @@ async def vault_wipe_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def vault_wipe_toggle_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """ВОЛНА 22.7: тоггл в ⚙️ Настройках — «🗑 Удалять файл при «Отменить»».
     ДА (по умолчанию) — «❌ Отменить» после распаковки удаляет файл из чата;
-    НЕТ — файл остаётся в чате, кнопка под файлом не предлагается."""
+    НЕТ — файл остаётся в чате, подсказка об удалении не предлагается."""
     query = update.callback_query
     await query.answer()
     user_id = str(query.from_user.id)
@@ -10948,7 +11068,7 @@ async def vault_put_password(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # ВОЛНА 11: «назад в меню» тоже выход; при отмене стираем и следы файлов
     # из чата (пользователь просил: файл не должен оставаться в чате).
     _pw_low = password.lower().strip()
-    if (_pw_low in ("отмена", "cancel", "/cancel", "❌ отмена")
+    if (_pw_low in ("отмена", "cancel", "/cancel", "❌ отмена", "❌ отменить")
             or "отмена" in _pw_low or "cancel" in _pw_low
             or "назад в меню" in _pw_low):
         await _vault_cleanup_chat(context, msg.chat_id, batch, user=user)
@@ -11509,7 +11629,7 @@ async def vault_get_password(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except Exception:
         pass
     _pw_low = password.lower().strip()
-    if _pw_low in ("отмена", "cancel", "/cancel", "❌ отмена") or "отмена" in _pw_low or "cancel" in _pw_low:
+    if _pw_low in ("отмена", "cancel", "/cancel", "❌ отмена", "❌ отменить") or "отмена" in _pw_low or "cancel" in _pw_low:
         for key in ('vault_get_id', 'vault_attempts', 'vault_chp_id', 'vault_chp_stage', 'vault_chp_old'):
             context.user_data.pop(key, None)
         # ВОЛНА 12: заодно гасим персистентный след (если был).
@@ -11625,7 +11745,8 @@ async def vault_get_password(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if _sent_msg is not None and getattr(_sent_msg, "message_id", None):
         await _vault_offer_wipe(
             context, msg.chat_id, _sent_msg.message_id,
-            wipe_enabled=bool(getattr(user, "vault_wipe_on_cancel", True)))
+            wipe_enabled=bool(getattr(user, "vault_wipe_on_cancel", True)),
+            user=user)
     else:
         await msg.reply_text("✅ Готово. Файл расшифрован только что и только для вас.")
     return MAIN_MENU
@@ -11672,7 +11793,7 @@ async def vault_ren_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rec = _vault_find_record(user, vid)
     text = (msg.text or "").strip()
     low = text.lower()
-    if low in ("отмена", "cancel", "/cancel", "❌ отмена") or "отмена" in low or "cancel" in low:
+    if low in ("отмена", "cancel", "/cancel", "❌ отмена", "❌ отменить") or "отмена" in low or "cancel" in low:
         context.user_data.pop('vault_ren_id', None)
         await msg.reply_text("Отменено — подпись не менялась.",
                              reply_markup=get_main_menu_keyboard(user))
@@ -11795,7 +11916,7 @@ async def vault_rec_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return MAIN_MENU
     text = (msg.text or "").strip()
     low = text.lower()
-    if low in ("отмена", "cancel", "/cancel", "❌ отмена") or "отмена" in low or "cancel" in low:
+    if low in ("отмена", "cancel", "/cancel", "❌ отмена", "❌ отменить") or "отмена" in low or "cancel" in low:
         context.user_data.pop('vault_rec_answers', None)
         # ВОЛНА 12: набранные ответы на секретные вопросы стиряем из чата.
         await _vault_cleanup_chat(context, msg.chat_id, None, user=user)
@@ -11888,7 +12009,7 @@ async def vault_rec_newpass(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
     low = password.lower()
-    if low in ("отмена", "cancel", "/cancel", "❌ отмена") or "отмена" in low or "cancel" in low:
+    if low in ("отмена", "cancel", "/cancel", "❌ отмена", "❌ отменить") or "отмена" in low or "cancel" in low:
         context.user_data.pop('vault_rec_oldpw', None)
         context.user_data.pop('vault_rec_answers', None)
         # ВОЛНА 12: ответы на вопросы стеряем из чата и здесь.
@@ -12060,7 +12181,7 @@ async def _vault_qs_auth_password(update, context, user):
     except Exception:
         pass
     low = password.lower()
-    if low in ("отмена", "cancel", "/cancel", "❌ отмена") or "отмена" in low or "cancel" in low:
+    if low in ("отмена", "cancel", "/cancel", "❌ отмена", "❌ отменить") or "отмена" in low or "cancel" in low:
         context.user_data.pop('vault_qs_stage', None)
         context.user_data.pop('vault_attempts', None)
         # ВОЛНА 12: гасим персистентный след (если был).
@@ -12119,7 +12240,7 @@ async def vault_qs_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return MAIN_MENU
     text = (msg.text or "").strip()
     low = text.lower()
-    if low in ("отмена", "cancel", "/cancel", "❌ отмена") or "отмена" in low or "cancel" in low:
+    if low in ("отмена", "cancel", "/cancel", "❌ отмена", "❌ отменить") or "отмена" in low or "cancel" in low:
         was_setup = qs.get("mode") == "setup"
         context.user_data.pop('vault_qs_data', None)
         context.user_data.pop('vault_setup_pw', None)
@@ -12270,7 +12391,7 @@ async def vault_chpass_new_password(update: Update, context: ContextTypes.DEFAUL
     except Exception:
         pass
     _pw_low = password.lower().strip()
-    if _pw_low in ("отмена", "cancel", "/cancel", "❌ отмена") or "отмена" in _pw_low or "cancel" in _pw_low:
+    if _pw_low in ("отмена", "cancel", "/cancel", "❌ отмена", "❌ отменить") or "отмена" in _pw_low or "cancel" in _pw_low:
         for key in ('vault_chp_id', 'vault_chp_stage', 'vault_chp_old', 'vault_get_id'):
             context.user_data.pop(key, None)
         # ВОЛНА 12: гасим персистентный след (если был).
@@ -16531,6 +16652,13 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reverse_map = get_user_button_reverse_map(user)
     if message_text in reverse_map:
         message_text = reverse_map[message_text]
+
+    # ВОЛНА 22.8: «❌ Отменить» из КЛАВИАТУРЫ (на сообщениях кнопок больше
+    # нет). Идёт загрузка/выдача Сейфа — остановим; файл выдан — сотрём из
+    # чата; нечего отменять — честно ответим. Ловим ДО ai_mode и остальных
+    # режимов, чтобы кнопка работала отовсюду и не утекала в AI.
+    if message_text == "❌ Отменить":
+        return await vault_kb_cancel_msg(update, context)
 
     if context.user_data.get('replying_to_anon'):
         return await send_anonymous_reply(update, context)
@@ -24150,7 +24278,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # останавливает скачивание/расшифровку/отправку, стирает временные файлы.
         return await vault_getstop_cb(update, context)
     elif data.startswith("vault_wipe_"):
-        # ВОЛНА 22.6: «❌ Отменить» под выданным (распакованным) файлом —
+        # ВОЛНА 22.6/22.8: «❌ Отменить» (легаси — inline-кнопка старых
+        # сообщений; в 22.8 отмена живёт в клавиатуре) —
         # файл исчезает из чата (шифр в канале остаётся целым).
         return await vault_wipe_cb(update, context)
     # === Хранилище: мультиканальность (волна 7) ===
