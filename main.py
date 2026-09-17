@@ -2816,7 +2816,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.10"
+BOT_BUILD = "22.11"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -16848,6 +16848,20 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _GLOBAL_CANCEL_RE.match((message_text or "").strip()):
         return await global_cancel_handler(update, context)
 
+    # ВОЛНА 22.11: анти-гонка опросов. concurrent_updates(True): текст вопроса,
+    # отправленный сразу после нажатия «📊 Опрос», может обогнать колбэк и
+    # прийти, пока состояние ещё MAIN_MENU — тогда он молча уходил в AI/
+    # автоматизацию (бот «молчал»), а следующее сообщение падало уже в шаг
+    # вариантов. Если недоделанный опрос ждёт вопрос — этот текст и есть
+    # вопрос: принимаем и СРАЗУ просим варианты.
+    _pflow = context.user_data.get("poll_flow") or {}
+    if (_pflow.get("scope") in ("all", "class")
+            and not _pflow.get("q")
+            and message_text and not message_text.startswith("/")
+            and message_text not in QUICK_COMMANDS
+            and (message_text or "").strip().lower() not in _MENU_TEXT_ALIASES):
+        return await _poll_accept_question(update, context, _pflow, message_text)
+
     if context.user_data.get('replying_to_anon'):
         return await send_anonymous_reply(update, context)
 
@@ -26284,10 +26298,23 @@ async def poll_start(update: Update, context: ContextTypes.DEFAULT_TYPE,
     context.user_data["poll_flow"] = {"scope": scope, "class_code": class_code}
     where = ("ВСЕМ пользователям бота" if scope == "all"
              else "всем участникам вашего класса")
-    await query.edit_message_text(
-        f"📊 СОЗДАНИЕ ОПРОСА — шаг 1 из 3\n\n"
-        f"1️⃣ Пришлите ВОПРОС опроса одним сообщением (до 300 символов).\n\n"
-        f"Опрос будет отправлен {where}.")
+    # ВОЛНА 22.11: шаг 1 не может уронить диалог молча. Двойное нажатие
+    # («Message is not modified»), медиа-сообщение панели и прочие сбои edit
+    # раньше убивали poll_start ДО return — состояние не переключалось, и
+    # вопрос пользователя уходил «в никуда» (бот молчал). Теперь при сбое
+    # edit текст шага 1 уходит НОВЫМ сообщением, POLL_WAIT_Q ставится всегда.
+    _step1 = (f"📊 СОЗДАНИЕ ОПРОСА — шаг 1 из 3\n\n"
+              f"1️⃣ Пришлите ВОПРОС опроса одним сообщением (до 300 символов).\n\n"
+              f"Опрос будет отправлен {where}.")
+    try:
+        await query.edit_message_text(_step1)
+    except Exception as e:
+        logger.error(f"poll_start: edit шага 1 не удался ({e}) — шлю новым сообщением")
+        try:
+            await context.bot.send_message(chat_id=query.message.chat_id,
+                                           text=_step1)
+        except Exception as e2:
+            logger.error(f"poll_start: шаг 1 не доставлен вовсе: {e2}")
     return POLL_WAIT_Q
 
 
@@ -26315,42 +26342,98 @@ async def poll_admin_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await poll_start(update, context, "class", class_code=code)
 
 
-@timeout(CONVERSATION_TIMEOUT)
-async def poll_question_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """ВОЛНА 22.10: шаг 2 — принимаем ВОПРОС опроса."""
+async def _poll_accept_question(update, context, flow, text, is_update=False):
+    """ВОЛНА 22.11: ЕДИНАЯ точка приёма ВОПРОСА опроса. Сразу после приёма
+    бот ОБЯЗАН попросить варианты — молчание на этом шаге запрещено:
+    подсказка «шаг 2 из 3» отправляется с двойной доставкой (reply → при
+    сбое send_message), и пользователь всегда видит, что вопрос принят.
+
+    Используется:
+    • обычный шаг 1→2 (poll_question_handler);
+    • самолечение: одна строка в шаге вариантов = пользователь прислал
+      (пере)вопрос — принимаем и снова просим варианты;
+    • анти-гонка: текст вопроса прилетел в главное меню раньше, чем
+      завершилось нажатие «📊 Опрос» (concurrent_updates) — там его тоже
+      принимает этот хелпер.
+    """
     msg = update.message
-    flow = context.user_data.get("poll_flow") or {}
-    if not flow.get("scope"):
-        await msg.reply_text("Сессия создания опроса потеряна. Начните заново.")
-        return MAIN_MENU
-    text = (msg.text or "").strip()
+    text = (text or "").strip()
+    if not text:
+        try:
+            await msg.reply_text(
+                "📊 СОЗДАНИЕ ОПРОСА — шаг 1 из 3\n\n"
+                "1️⃣ Пришлите ВОПРОС опроса одним сообщением (до 300 символов).")
+        except Exception:
+            pass
+        return POLL_WAIT_Q
     if len(text) > 300:
-        await msg.reply_text(
-            "❌ Вопрос длиннее 300 символов — Telegram не примет. Сократите "
-            "и пришлите заново.")
+        try:
+            await msg.reply_text(
+                "❌ Вопрос длиннее 300 символов — Telegram не примет. Сократите "
+                "и пришлите заново.")
+        except Exception:
+            pass
         return POLL_WAIT_Q
     rejected = await reject_if_forbidden_chars(update, text, POLL_WAIT_Q)
     if rejected is not None:
         return rejected
     flow["q"] = text
     context.user_data["poll_flow"] = flow
-    await msg.reply_text(
-        "📊 СОЗДАНИЕ ОПРОСА — шаг 2 из 3\n\n"
-        "2️⃣ Теперь пришлите ВАРИАНТЫ ОТВЕТА — по одному в строке, "
-        "от 2 до 10 вариантов (каждый до 100 символов).\n\n"
-        "Например:\nДа\nНет\nНе знаю")
+    head = (("♻️ Вопрос обновлён: «" + text + "»") if is_update
+            else ("✅ Вопрос принят: «" + text + "»"))
+    _prompt = (head + "\n\n"
+               "📊 СОЗДАНИЕ ОПРОСА — шаг 2 из 3\n\n"
+               "2️⃣ Теперь пришлите ВАРИАНТЫ ОТВЕТА — по одному в строке, "
+               "от 2 до 10 вариантов (каждый до 100 символов).\n\n"
+               "Например:\nДа\nНет\nНе знаю")
+    try:
+        await msg.reply_text(_prompt)
+    except Exception as e:
+        logger.error(f"poll: подсказка вариантов не доставлена reply-ем: {e}")
+        try:
+            await context.bot.send_message(chat_id=msg.chat_id, text=_prompt)
+        except Exception as e2:
+            logger.error(f"poll: подсказка вариантов не доставлена совсем: {e2}")
     return POLL_WAIT_OPTS
 
 
 @timeout(CONVERSATION_TIMEOUT)
-async def poll_options_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """ВОЛНА 22.10: шаг 3 — принимаем варианты, показываем превью."""
+async def poll_question_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.10/22.11: шаг 2 — принимаем ВОПРОС опроса и СРАЗУ просим
+    варианты (единый хелпер _poll_accept_question)."""
     msg = update.message
     flow = context.user_data.get("poll_flow") or {}
-    if not flow.get("q"):
+    if not flow.get("scope"):
         await msg.reply_text("Сессия создания опроса потеряна. Начните заново.")
         return MAIN_MENU
-    raw = [ln.strip() for ln in (msg.text or "").splitlines()]
+    return await _poll_accept_question(update, context, flow, msg.text)
+
+
+@timeout(CONVERSATION_TIMEOUT)
+async def poll_options_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.10: шаг 3 — принимаем варианты, показываем превью.
+    ВОЛНА 22.11: тупиков и молчания больше нет —
+    • пришёл шаг вариантов БЕЗ вопроса (гонка/рестарт) → текст становится
+      вопросом, бот сразу просит варианты;
+    • ОДНА строка в шаге вариантов вариантами быть не может (опросу нужно
+      ≥2) → считаем её (новым) вопросом и сразу просим варианты — раньше
+      именно здесь пользователь получал бессмысленное «Нужно от 2 до 10
+      вариантов», пересылая вопрос второй раз."""
+    msg = update.message
+    flow = context.user_data.get("poll_flow") or {}
+    if not flow.get("scope"):
+        await msg.reply_text("Сессия создания опроса потеряна. Начните заново.")
+        return MAIN_MENU
+    text = (msg.text or "").strip()
+    if not flow.get("q"):
+        # Состояние перескочило к вариантам без вопроса — принимаем текст
+        # как ВОПРОС и сразу просим варианты (самолечение, без тупика).
+        return await _poll_accept_question(update, context, flow, text)
+    if len([ln for ln in text.splitlines() if ln.strip()]) <= 1:
+        # Одна строка ≠ варианты — это (новый) вопрос. Принимаем, не молчим.
+        return await _poll_accept_question(update, context, flow, text,
+                                           is_update=True)
+    raw = [ln.strip() for ln in text.splitlines()]
     opts = [o for o in raw if o]
     # Дубликаты убираем, сохраняя порядок.
     _seen = set()
@@ -26358,7 +26441,7 @@ async def poll_options_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     if len(opts) < 2 or len(opts) > 10:
         await msg.reply_text(
             "❌ Нужно от 2 до 10 вариантов — по одному в строке. "
-            "Пришлите заново.")
+            "Пришлите заново (или пришлите новый вопрос одним сообщением).")
         return POLL_WAIT_OPTS
     if any(len(o) > 100 for o in opts):
         await msg.reply_text(
