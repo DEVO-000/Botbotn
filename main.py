@@ -2000,6 +2000,12 @@ class User:
         # не могла стереть файлы из чата (нечего было удалять). Хранятся
         # ТОЛЬКО номера сообщений — никакого содержимого.
         self.vault_trace = {"chat_id": 0, "msgs": []}
+        # === ВОЛНА 22.7: удалять ли СООБЩЕНИЕ с расшифрованным файлом ===
+        # при нажатии «❌ Отменить» после распаковки. True (по умолчанию) —
+        # файл исчезает из чата; False — файл ОСТАЁТСЯ в чате (кнопка «❌
+        # Отменить» под файлом не предлагается). Тоггл: ⚙️ Настройки →
+        # «🗑 Удалять файл при «Отменить»».
+        self.vault_wipe_on_cancel = True
         # ВОЛНА 22.4: поле user.pult (Пульт) удалено — функция снесена целиком.
 
     def to_dict(self):
@@ -2076,6 +2082,8 @@ class User:
             'vault_rec_until': getattr(self, 'vault_rec_until', ''),
             # ВОЛНА 12: персистентный след загрузки в чате (id сообщений).
             'vault_trace': getattr(self, 'vault_trace', {"chat_id": 0, "msgs": []}),
+            # ВОЛНА 22.7: удалять ли файл при «Отменить» после распаковки.
+            'vault_wipe_on_cancel': getattr(self, 'vault_wipe_on_cancel', True),
             # ВОЛНА 22.4: ключ 'pult' больше не сериализуется (Пульт удалён).
         }
 
@@ -2171,6 +2179,9 @@ class User:
             _vt["chat_id"] = int(_vt.get("chat_id") or 0)
         except (TypeError, ValueError):
             _vt["chat_id"] = 0
+        # Бэк-совместимость, волна 22.7: удалять ли файл при «Отменить».
+        if not isinstance(getattr(user, 'vault_wipe_on_cancel', None), bool):
+            user.vault_wipe_on_cancel = True
         # ВОЛНА 22.4: старые ключи 'pult' из БД молча выбрасываются
         # (нормализатор _pult_normalize удалён вместе с Пультом).
         return user
@@ -2767,13 +2778,14 @@ def build_referral_link(bot_username, user_id):
     return f"https://t.me/{bot_username}?start=ref_{user_id}"
 
 
-# === ВЕРСИЯ СБОРКИ ===
-# Показывается в приветствии главного меню («🛠 Сборка …»): мгновенно видно,
-# какая сборка реально запущена на сервере (защита от ситуации «архив
-# собран, а деплой не подхватился»). Меняйте при каждой волне правок.
-BOT_BUILD = "22.4"
+# === ВЕРСИЯ СБОРКИ (ВНУТРЕННЯЯ) ===
+# ВОЛНА 22.5: по решению пользователя В приветствии и ЛЮБЫХ юзерских текстах
+# версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
+# лог на старте (logger.info) и проверяется автотестами — так по-прежнему
+# видно, какая сборка реально крутится на сервере, не показывая её людям.
+BOT_BUILD = "22.7"
 
-INSTRUCTIONS_VERSION = "2.4"
+INSTRUCTIONS_VERSION = "2.5"
 
 
 def _default_instructions_text():
@@ -2788,11 +2800,11 @@ def _default_instructions_text():
         'Можно ставить сразу несколько таймеров подряд — после каждого бот предложит поставить ещё один. Напоминания приходят в заданное время и не теряются при перезапуске.\n'
         '6. **Утренние и вечерние уведомления** — настройте удобное время и свой текст для «доброе утро» и «спокойной ночи».\n'
         '7. **День рождения** — бот сам поздравит вас в этот день и (по желанию) напомнит классу.\n'
-        '8. **Погода и праздники** — ежедневный прогноз по вашему городу и напоминания о праздниках.\n'
+        '8. **Погода и праздники** — прогноз по вашему городу и ЛЮБОМУ городу мира (попробуйте в AI Agent: «погода в Париже»), напоминания о праздниках.\n'
         '9. **DEVORKS+ai** — умный помощник: задайте любой вопрос и получите ответ. Всегда отвечает честно. Три режима: Обычный, 😈 Хамло и 🥰 Тепло (переключаются кнопками при входе в чат). AI принимает только ТЕКСТ — фото он не читает.\n'
         '10. **Анонимные сообщения** — отправляйте одноклассникам анонимные сообщения и отвечайте на них.\n'
         '11. **Личные и классные кнопки** — создавайте свои кнопки (ссылки/текст) и делайте меню удобным.\n'
-        '12. **🪄 AI Agent** — напишите обычным языком («русский на пятницу страница 45», «как зовут учителя по физре», «погода на завтра», «скрой кнопку Погода», «напиши анонимно Пете …») — бот сам выполнит. Про учителя КОНКРЕТНОГО предмета пришлёт только его, а не весь список. Управляет всем: ДЗ, учителя, звонки, таймеры, кнопки, анонимки, погода и режимы ИИ.\n\n'
+        '12. **🪄 AI Agent** — напишите обычным языком («русский на пятницу страница 45», «как зовут учителя по физре», «погода на завтра», «погода в Лондоне», «скрой кнопку Погода», «напиши анонимно Пете …») — бот сам выполнит. Про учителя КОНКРЕТНОГО предмета пришлёт только его, а не весь список. Управляет всем: ДЗ, учителя, звонки, таймеры, кнопки, анонимки, погода (любой город мира) и режимы ИИ.\n\n'
         '**⚙️ НАСТРОЙКИ КНОПОК:**\n'
         '• Скрыть/показать любые кнопки\n'
         '• Переименовать кнопки\n'
@@ -2809,7 +2821,7 @@ def _default_instructions_text():
         'так и Telegram Stars (XTR). Если внутренних звёзд не хватает, бот предложит купить их за Telegram Stars.\n'
         '• 💬 **Чат поддержки** — кнопка «💬 Чат поддержки» в главном меню. '
         'Напишите разработчику напрямую и получите ответ в этом же чате.\n'
-        '• 🌦 **Погода по вашему городу** — часовой пояс определяется точно по городу (IANA-пояс), ежедневный прогноз приходит в ваше локальное время, а «🌦 Погода» покажет погоду сейчас и прогноз на 3 дня.\n'
+        '• 🌦 **Погода по вашему городу** — часовой пояс определяется точно по городу (IANA-пояс), ежедневный прогноз приходит в ваше локальное время, а «🌦 Погода» покажет погоду сейчас и прогноз на 3 дня. В AI Agent можно спросить погоду ЛЮБОГО города мира: «погода в Токио», «погода на завтра в Сочи».\n'
         '• 🛡 **Защита от спама** — действия и сообщения ограничены по частоте, '
         'чтобы бот работал стабильно для всех. При срабатывании появится подсказка.\n\n'
         '**💰 ЦЕНЫ (⭐ Telegram Stars):**\n'
@@ -4291,6 +4303,9 @@ def get_anon_buy_space_keyboard():
 
 def get_settings_keyboard(user=None):
     """Главная клавиатура настроек."""
+    # ВОЛНА 22.7: состояние тоггла «удалять файл при «Отменить»».
+    _wipe_on = True if user is None else bool(
+        getattr(user, 'vault_wipe_on_cancel', True))
     keyboard = [
         [InlineKeyboardButton("⏰ Изменить время", callback_data="change_time")],
         [InlineKeyboardButton("✏️ Изменить названия кнопок", callback_data="change_buttons")],
@@ -4303,6 +4318,10 @@ def get_settings_keyboard(user=None):
         # === Погодные / праздничные настройки (новое) ===
         [InlineKeyboardButton("🌦 Настройки погоды", callback_data="weather_settings")],
         [InlineKeyboardButton("🎉 Настройки праздников", callback_data="holiday_settings")],
+        # ВОЛНА 22.7: удалять ли расшифрованный файл из чата при «Отменить».
+        [InlineKeyboardButton(
+            f"🗑 Удалять файл при «Отменить»: {'да' if _wipe_on else 'нет'}",
+            callback_data="toggle_vault_wipe")],
         [InlineKeyboardButton("🌟 Мои кнопки", callback_data="personal_buttons")],
         [InlineKeyboardButton("💡 Предложить функцию", callback_data="suggest_function")],
         # ПУНКТ 3: чат поддержки доступен из настроек (помимо главного меню).
@@ -8252,6 +8271,8 @@ def _vault_menu_text(user):
         "ответите верно — зададите новый пароль и вернёте данные. "
         "Попыток: 3, после — пауза 30 минут. Сами ответы нигде не хранятся — "
         "только пароль, запечатанный ими: без верных ответов он не читается.\n\n"
+        "❌ После распаковки под файлом есть кнопка «Отменить» — "
+        "файл исчезает из чата одной кнопкой (отключить — в ⚙️ Настройках).\n\n"
         "Выберите действие:"
     )
 
@@ -8712,12 +8733,15 @@ def _dvf2_safe_name(name):
 
 class _ProgressEdit:
     """Редкие правки сообщения-прогресса (не чаще раза в 3.5 с — лимиты
-    editMessageText), чтобы потоковые операции 2 ГБ не упирались во флуд."""
+    editMessageText), чтобы потоковые операции 2 ГБ не упирались во флуд.
+    ВОЛНА 22.5: если у сообщения-прогресса есть inline-клавиатура (кнопка
+    «❌ Отмена» выдачи Сейфа) — она СОХРАНЯЕТСЯ при каждой правке."""
 
-    def __init__(self, context, progress_msg, title=""):
+    def __init__(self, context, progress_msg, title="", reply_markup=None):
         self.context = context
         self.msg = progress_msg
         self.title = title or ""
+        self.reply_markup = reply_markup
         self._last = 0.0
 
     async def edit(self, text=None, force=False):
@@ -8731,6 +8755,7 @@ class _ProgressEdit:
             return await self.context.bot.edit_message_text(
                 text or self.title,
                 chat_id=self.msg.chat_id, message_id=self.msg.message_id,
+                reply_markup=self.reply_markup,
             )
         except Exception:
             return None
@@ -9046,10 +9071,13 @@ async def _mt_fetch_document(client, peer_id, msg_id, ah=0):
     raise RuntimeError(f"источник недоступен для MTProto ({last_err})")
 
 
-async def _mt_download_stream(client, doc, doc_size, sink, progress=None, title=""):
+async def _mt_download_stream(client, doc, doc_size, sink, progress=None, title="",
+                              cancel_check=None):
     """Качает документ ПОТОКОМ и скармливает sink() (шифратору или
     расшифровщику). Обрывы и FloodWait — продолжаем с выровненного
-    смещения, ничего не теряя и не дублируя. Возвращает байт скачано."""
+    смещения, ничего не теряя и не дублируя. Возвращает байт скачано.
+    ВОЛНА 22.5: cancel_check (callable) — кооперативная отмена: если он
+    вернул True, бросаем _VaultCancelled (проверка на каждом куске)."""
     got = 0
     attempts = 0
     while True:
@@ -9060,6 +9088,9 @@ async def _mt_download_stream(client, doc, doc_size, sink, progress=None, title=
                 doc, offset=resume_off, request_size=524288,
                 file_size=int(doc_size or 0),
             ):
+                # ВОЛНА 22.5: точка отмены на каждом куске.
+                if cancel_check is not None and cancel_check():
+                    raise _VaultCancelled()
                 if skip:
                     if len(chunk) <= skip:
                         skip -= len(chunk)
@@ -9131,14 +9162,21 @@ async def _mt_upload_container(client, path, size, caption, filename=None):
 
 
 async def _mt_send_file_to_user(client, chat_id, path, size, caption,
-                                context, progress_msg):
+                                context, progress_msg, cancel_check=None,
+                                progress_markup=None):
     """Отправляет РАСШИФРОВАННЫЙ файл пользователю через MTProto (до 2 ГБ)
     с прогрессом. Имя файла = имя временного файла (переименован заранее).
     Ботам разрешён InputPeerUser(id, 0) для тех, кто писал боту; если
-    Telethon не нашёл peer в кэше — подтягиваем hash из этого же чата."""
+    Telethon не нашёл peer в кэше — подтягиваем hash из этого же чата.
+    ВОЛНА 22.5: cancel_check — отмена ЗАГРУЗКИ пользователю (бросок из
+    progress_callback обрывает выгрузку — недосланное сообщение Telegram
+    не создаёт); progress_markup — кнопка «❌ Отмена» сохраняется на прогрессе."""
     state = {"cur": 0, "total": int(size or 0)}
 
     def _pcb(cur, total):
+        # ВОЛНА 22.5: точка отмены прямо в выгрузке пользователю.
+        if cancel_check is not None and cancel_check():
+            raise _VaultCancelled()
         state["cur"] = int(cur or 0)
         if total:
             state["total"] = int(total)
@@ -9158,6 +9196,7 @@ async def _mt_send_file_to_user(client, chat_id, path, size, caption,
                         f"({_fmt_bytes(cur)} из {_fmt_bytes(total)})",
                         chat_id=progress_msg.chat_id,
                         message_id=progress_msg.message_id,
+                        reply_markup=progress_markup,
                     )
                 except Exception:
                     pass
@@ -9520,7 +9559,11 @@ async def _vault_get_dvf2(msg, context, user, rec, password):
     """ВОЛНА 14: выдача БОЛЬШОГО файла Сейфа (DVF2, >20 МБ до 2 ГБ).
     Поток: MTProto качает шифр из канала → расшифровка на лету (в ОЗУ только
     куски) → временный файл → отправка пользователю с прогрессом → временный
-    файл стёрт. САМ ШИФР на диск не пишется вовсе."""
+    файл стёрт. САМ ШИФР на диск не пишется вовсе.
+    ВОЛНА 22.5: на прогрессе кнопка «❌ Отмена» — нажатие в ЛЮБОЙ фазе
+    (скачивание, расшифровка, отправка) останавливает процесс и стирает
+    ВСЕ временные файлы; после выдачи под файлом появляется кнопка
+    «❌ Отменить» — файл исчезает из чата (отмена после распаковки)."""
     if AESGCM is None:
         await msg.reply_text("❌ На сервере нет библиотеки шифрования (cryptography).")
         return MAIN_MENU
@@ -9563,32 +9606,55 @@ async def _vault_get_dvf2(msg, context, user, rec, password):
             reply_markup=get_main_menu_keyboard(user),
         )
         return MAIN_MENU
+    # ВОЛНА 22.5: операция с флагом отмены (ставится кнопкой «❌ Отмена»,
+    # текстом «отмена» или кнопкой клавиатуры — см. vault_getstop_cb и
+    # перехват в vault_get_password).
+    op = _vault_op_begin(getattr(user, "user_id", "") or "", 1)
+    op["phase"] = "Качаю и расшифровываю"
+
+    def _cancelled():
+        return op["event"].is_set()
+
+    # Кнопка отмены ЖИВЁТ на сообщении-прогрессе все фазы выдачи.
+    _get_kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("❌ Отмена", callback_data="vault_getstop")]])
     progress_msg = None
     try:
         progress_msg = await msg.reply_text(
-            "🔓 Качаю шифр и расшифровываю потоком… 0%")
+            "🔓 Качаю шифр и расшифровываю потоком… 0%",
+            reply_markup=_get_kb)
     except Exception:
         progress_msg = None
     prog = _ProgressEdit(context, progress_msg,
-                         "🔓 Качаю шифр и расшифровываю потоком")
+                         "🔓 Качаю шифр и расшифровываю потоком",
+                         reply_markup=_get_kb)
     job = _dvf2_make_job_dir()
+    op["temp"].append(job)  # ВОЛНА 22.5: для отмены (страховка к finally)
     dec = None
     err_text = None
     final_path = None
     real_name = ""
+    cancelled = False
+    sent_mid = 0
     try:
         out_path = os.path.join(job, "data.bin")
         with open(out_path, "wb") as fh:
             dec = _Dvf2Decryptor(password)
 
             def _sink(b):
+                # ВОЛНА 22.5: отмена также проверяется в расшифровщике.
+                if _cancelled():
+                    raise _VaultCancelled()
                 out = dec.push(b)
                 if out:
                     fh.write(out)
 
             await _mt_download_stream(
                 client, doc, doc_size, _sink, prog,
-                "🔓 Качаю шифр и расшифровываю потоком")
+                "🔓 Качаю шифр и расшифровываю потоком",
+                cancel_check=_cancelled)
+            if _cancelled():
+                raise _VaultCancelled()
             tail = dec.finish()
             if tail:
                 fh.write(tail)
@@ -9604,16 +9670,27 @@ async def _vault_get_dvf2(msg, context, user, rec, password):
         _lbl = str(rec.get("label") or "").strip()
         cap = (f"🔓 {_lbl} — {real_name}" if _lbl
                else f"🔓 Расшифровано: {real_name}")
+        if _cancelled():
+            raise _VaultCancelled()
         try:
             await context.bot.send_chat_action(
                 chat_id=msg.chat_id, action="upload_document")
         except Exception:
             pass
+        op["phase"] = "Отправляю файл"
         await _ProgressEdit(context, progress_msg, "").edit(
             "📤 Заливаю расшифрованный файл… 0%", force=True)
-        await _mt_send_file_to_user(
+        _sent = await _mt_send_file_to_user(
             client, msg.chat_id, final_path, real_size, cap,
-            context, progress_msg or msg)
+            context, progress_msg or msg,
+            cancel_check=_cancelled, progress_markup=_get_kb)
+        # ВОЛНА 22.6: id выданного файла — для кнопки «❌ Отменить» (стереть из чата).
+        try:
+            sent_mid = int(getattr(_sent, "id", 0) or 0)
+        except (TypeError, ValueError):
+            sent_mid = 0
+    except _VaultCancelled:
+        cancelled = True
     except ValueError as e:
         err_text = str(e)
     except Exception as e:
@@ -9624,8 +9701,25 @@ async def _vault_get_dvf2(msg, context, user, rec, password):
             _shutil.rmtree(job, ignore_errors=True)
         except Exception:
             pass
+        # ВОЛНА 22.5: операцию закрываем в ЛЮБОМ исходе.
+        _vault_op_end(getattr(user, "user_id", "") or "")
     context.user_data.pop('vault_get_id', None)
     context.user_data.pop('vault_attempts', None)
+    if cancelled:
+        # ВОЛНА 22.5: честный отчёт об отмене — временные файлы уже стёрты
+        # (finally выше), шифр в канале НЕ тронут, в чат ничего не попало.
+        if progress_msg is not None:
+            try:
+                await context.bot.edit_message_text(
+                    "⛔ Отменено — расшифровка остановлена, временные файлы "
+                    "стёрты. Шифр в Сейфе цел: файл можно расшифровать снова.",
+                    chat_id=progress_msg.chat_id,
+                    message_id=progress_msg.message_id)
+            except Exception:
+                pass
+        await msg.reply_text(
+            "Отменено.", reply_markup=get_main_menu_keyboard(user))
+        return MAIN_MENU
     if err_text is not None:
         await msg.reply_text(
             f"❌ Расшифровать/передать не удалось: {err_text}. Если забыли "
@@ -9633,7 +9727,22 @@ async def _vault_get_dvf2(msg, context, user, rec, password):
             reply_markup=get_main_menu_keyboard(user),
         )
         return MAIN_MENU
-    await msg.reply_text("✅ Готово. Файл расшифрован только что и только для вас.")
+    if progress_msg is not None:
+        try:
+            await context.bot.edit_message_text(
+                "✅ Файл расшифрован и отправлен ниже.",
+                chat_id=progress_msg.chat_id,
+                message_id=progress_msg.message_id)
+        except Exception:
+            pass
+    # ВОЛНА 22.6: под выданным файлом — кнопка «❌ Отменить» (плюс
+    # подсказка в самом сообщении — просьба пользователя «прописать в боте»).
+    if sent_mid:
+        await _vault_offer_wipe(
+            context, msg.chat_id, sent_mid,
+            wipe_enabled=bool(getattr(user, "vault_wipe_on_cancel", True)))
+    else:
+        await msg.reply_text("✅ Готово. Файл расшифрован только что и только для вас.")
     return MAIN_MENU
 
 
@@ -9829,7 +9938,13 @@ def _vault_help_text():
         "600 000 раундов), содержимое шифруется AES-256-GCM. В Telegram-канал "
         "уходит ТОЛЬКО шифр — неразличимый от случайного шума.\n"
         "3. Чтобы достать файл, вводите пароль Сейфа: бот скачивает шифр, "
-        "расшифровывает в памяти и присылает файл. На диск ничего не пишется.\n\n"
+        "расшифровывает в памяти и присылает файл. На диск ничего не пишется.\n"
+        "   ❌ ПОСЛЕ РАСПАКОВКИ: под выданным файлом появляется кнопка "
+        "«❌ Отменить» — нажмите, и расшифрованная копия ИСЧЕЗНЕТ из чата "
+        "(это и есть «отмена» после распаковки). Шифр в канале остаётся целым — "
+        "файл можно расшифровать заново в любой момент. Нужен файл — сохраните "
+        "или перешлите его ДО нажатия. Не хотите автоудаления — выключите его "
+        "в ⚙️ Настройках (пункт «Удалять файл при „Отменить“»).\n\n"
         "🔑 ВОССТАНОВЛЕНИЕ (если пароль забылся):\n"
         "• при создании пароля бот просит придумать 3 секретных вопроса и "
         "ответы (вопрос — ваш, ответ знаете только вы);\n"
@@ -9847,7 +9962,13 @@ def _vault_help_text():
         "• разработчик видит в канале лишь зашифрованный контейнер.\n\n"
         "Выйти из Сейфа можно кнопкой «❌ Отмена» в ЛЮБОЙ момент — следы "
         "загруженных файлов и недописанные вопросы/ответы стираются из чата "
-        "(это работает даже после перезапуска бота).\n\n"
+        "(это работает даже после перезапуска бота).\n"
+        "   ⛔ ОТМЕНА ВО ВРЕМЯ ВЫДАЧИ БОЛЬШОГО ФАЙЛА: на прогрессе («качаю и "
+        "расшифровываю», «отправляю») есть кнопка «❌ Отмена» — остановит "
+        "процесс и сотрёт все временные файлы; в чат ничего не попадёт.\n"
+        "   ❌ ОТМЕНА ПОСЛЕ РАСПАКОВКИ: кнопка «❌ Отменить» под выданным "
+        "файлом — расшифрованная копия исчезает из чата (настраивается "
+        "в ⚙️ Настройках).\n\n"
         "Честные ограничения:\n"
         f"• файл до {_fmt_bytes(VAULT_MAX_FILE_BYTES)} — быстрый путь: "
         "качается и шифруется мгновенно;\n"
@@ -10542,8 +10663,22 @@ async def vault_labelskip_cb(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def vault_cancel_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """ВОЛНА 13: кнопка «❌ Отмена» ПОД сообщением — то же, что текст
     «отмена»: выйти из Сейфа и СТЕРЕТЬ все следы из чата (файлы, заметки,
-    подсказки; персистентный след чистится даже после рестарта бота)."""
+    подсказки; персистентный след чистится даже после рестарта бота).
+    ВОЛНА 22.5: если ПРЯМО СЕЙЧАС идёт шифрование/загрузка или выдача файла —
+    кнопка только ставит флаг отмены и ничего не чистит: user_data и следы
+    принадлежат работающему процессу (честную зачистку сделает сам цикл)."""
     query = update.callback_query
+    _uid = str(query.from_user.id)
+    if _vault_op_running(_uid):
+        _VAULT_OPS[_uid]["event"].set()
+        await query.answer()
+        try:
+            await query.edit_message_text(
+                "⛔ Останавливаю операцию Сейфа — секунду, подчищу всё "
+                "недогруженное…")
+        except Exception:
+            pass
+        return None
     await query.answer()
     user = get_user(str(query.from_user.id))
     batch = context.user_data.get('vault_batch')
@@ -10567,6 +10702,132 @@ async def vault_cancel_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(
             "Главное меню:", reply_markup=get_main_menu_keyboard(user))
     return MAIN_MENU
+
+
+async def vault_getstop_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.5: кнопка «❌ Отмена» на прогрессе выдачи большого файла
+    (скачивание шифра → расшифровка → отправка пользователю). Только ставит
+    флаг отмены — сам процесс заметит его на ближайшем куске и ЧЕСТНО
+    подчищает временные файлы; шифр в канале не трогается."""
+    query = update.callback_query
+    _uid = str(query.from_user.id)
+    op = _VAULT_OPS.get(_uid)
+    if op is not None and op.get("active") and not op["event"].is_set():
+        op["event"].set()
+        await query.answer("⛔ Останавливаю — подчищаю временные файлы…")
+    else:
+        await query.answer("Нечего отменять: операция уже завершилась.")
+    return None  # состояние не меняем — работающий процесс сам всё завершит
+
+
+async def _vault_offer_wipe(context, chat_id, file_msg_id, wipe_enabled=True):
+    """ВОЛНА 22.6/22.7: под только что выданным (распакованным) файлом —
+    кнопка «❌ Отменить» и честная подсказка: отмена ПОСЛЕ распаковки = файл
+    исчезает из чата. ВОЛНА 22.7: если в ⚙️ Настройках выключено удаление
+    (vault_wipe_on_cancel=False) — кнопка НЕ предлагается, файл остаётся
+    в чате (честно сообщаем, где это меняется). Работает и для Bot API-выдачи,
+    и для MTProto: сообщение отправлено самим ботом, значит бот может его
+    удалить."""
+    try:
+        if not wipe_enabled:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=("✅ Готово — файл распакован и выдан только вам.\n"
+                      "ℹ️ Автоудаление при «Отменить» выключено в ⚙️ Настройках "
+                      "— файл остаётся в чате. Шифр в Сейфе цел: файл можно "
+                      "получить снова."))
+            return
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=("✅ Готово — файл распакован и выдан только вам.\n"
+                  "❌ Кнопка ниже — «Отменить»: нажмите, и файл исчезнет из "
+                  "чата. Нужен ещё — сохраните/перешлите его заранее; "
+                  "шифр в Сейфе останется целым, файл можно получить снова."),
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "❌ Отменить",
+                    callback_data=f"vault_wipe_{int(file_msg_id)}")]]),
+        )
+    except Exception as e:
+        logger.warning(f"vault wipe: не удалось показать кнопку отмены: {e}")
+
+
+async def vault_wipe_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.6: кнопка «❌ Отменить» ПОД выданным (распакованным) файлом —
+    файл (расшифрованная копия) ИСЧЕЗАЕТ из чата. Сам шифр в
+    канале остаётся: файл всегда можно расшифровать заново."""
+    query = update.callback_query
+    await query.answer()
+    # Стирать может только владелец личного чата (защита от чужих групп).
+    if query.message.chat.id != query.from_user.id:
+        await query.answer("Это можно сделать только в своём чате с ботом.",
+                           show_alert=True)
+        return None
+    try:
+        _mid = int(query.data.replace("vault_wipe_", "", 1))
+    except (TypeError, ValueError):
+        return None
+    # ВОЛНА 22.7: настройка «🗑 Удалять файл при «Отменить»» (⚙️ Настройки).
+    _user = get_user(str(query.from_user.id))
+    _wipe_on = True if _user is None else bool(
+        getattr(_user, "vault_wipe_on_cancel", True))
+    if not _wipe_on:
+        # Удаление выключено в настройках: файл ОСТАЁТСЯ в чате — честно сообщаем.
+        try:
+            await query.edit_message_text(
+                "ℹ️ Файл ОСТАВЛЕН в чате: в ⚙️ Настройках выключено удаление "
+                "расшифрованного файла при «Отменить». Включить обратно "
+                "можно там же.")
+        except Exception:
+            pass
+        if _user:
+            try:
+                await context.bot.send_message(
+                    chat_id=query.message.chat.id, text="Главное меню:",
+                    reply_markup=get_main_menu_keyboard(_user))
+            except Exception:
+                pass
+        return MAIN_MENU
+    _gone = False
+    try:
+        await context.bot.delete_message(
+            chat_id=query.message.chat.id, message_id=_mid)
+        _gone = True
+    except Exception:
+        pass
+    try:
+        await query.edit_message_text(
+            "❌ Готово — файл исчез из чата (отмена после распаковки). "
+            "Шифр в Сейфе цел: расшифровать снова можно в любой момент."
+            if _gone else
+            "Файл уже исчез из чата (или не найден). Шифр в Сейфе цел — "
+            "расшифруйте заново, когда понадобится.")
+    except Exception:
+        pass
+    if _user:
+        try:
+            await context.bot.send_message(
+                chat_id=query.message.chat.id, text="Главное меню:",
+                reply_markup=get_main_menu_keyboard(_user))
+        except Exception:
+            pass
+    return MAIN_MENU
+
+
+async def vault_wipe_toggle_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.7: тоггл в ⚙️ Настройках — «🗑 Удалять файл при «Отменить»».
+    ДА (по умолчанию) — «❌ Отменить» после распаковки удаляет файл из чата;
+    НЕТ — файл остаётся в чате, кнопка под файлом не предлагается."""
+    query = update.callback_query
+    await query.answer()
+    user_id = str(query.from_user.id)
+    user = get_user(user_id)
+    if not user:
+        user = User(user_id)
+    user.vault_wipe_on_cancel = not bool(
+        getattr(user, "vault_wipe_on_cancel", True))
+    save_user(user)
+    return await user_settings(update, context)
 
 
 async def vault_show_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -11202,6 +11463,15 @@ async def vault_get_password(update: Update, context: ContextTypes.DEFAULT_TYPE)
     • ШАГ 1 смены секретных вопросов (vault_qs_stage == "auth", волна 9);
     • команду «восстановить» — переход к восстановлению по вопросам (волна 9)."""
     msg = update.message
+    # ВОЛНА 22.5: прямо сейчас идёт выдача файла Сейфа (скачивание/расшифровка/
+    # отправка)? Тогда «Отмена» ТОЛЬКО ставит флаг отмены — user_data принадлежит
+    # работающему процессу, зачистку сделает он сам (как в vault_put_password).
+    _uid_now = str(update.effective_user.id)
+    if _vault_op_running(_uid_now):
+        _VAULT_OPS[_uid_now]["event"].set()
+        await msg.reply_text(
+            "⛔ Останавливаю выдачу файла — секунду, подчищу временные файлы…")
+        return VAULT_GET_PASSWORD
     user = get_user(str(update.effective_user.id))
     if not user:
         await msg.reply_text("Сначала зарегистрируйтесь — отправьте /start.")
@@ -11331,15 +11601,16 @@ async def vault_get_password(update: Update, context: ContextTypes.DEFAULT_TYPE)
     kind = str(meta.get("k") or "document")
     _lbl = str(rec.get("label") or "").strip()
     caption = (f"🔓 {_lbl} — {name}" if _lbl else f"🔓 Расшифровано: {name}")
+    _sent_msg = None
     try:
         if kind == "photo":
-            await context.bot.send_photo(chat_id=msg.chat_id, photo=payload, caption=caption)
+            _sent_msg = await context.bot.send_photo(chat_id=msg.chat_id, photo=payload, caption=caption)
         elif kind == "video":
-            await context.bot.send_video(chat_id=msg.chat_id, video=payload, caption=caption)
+            _sent_msg = await context.bot.send_video(chat_id=msg.chat_id, video=payload, caption=caption)
         elif kind == "audio":
-            await context.bot.send_audio(chat_id=msg.chat_id, audio=payload, caption=caption)
+            _sent_msg = await context.bot.send_audio(chat_id=msg.chat_id, audio=payload, caption=caption)
         else:
-            await context.bot.send_document(
+            _sent_msg = await context.bot.send_document(
                 chat_id=msg.chat_id, document=InputFile(payload, filename=name),
                 caption=caption,
             )
@@ -11349,7 +11620,14 @@ async def vault_get_password(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return MAIN_MENU
     finally:
         payload = b""
-    await msg.reply_text("✅ Готово. Файл расшифрован только что и только для вас.")
+    # ВОЛНА 22.6: после выдачи — кнопка «❌ Отменить» с подсказкой:
+    # отмена после распаковки = файл исчезает из чата (прописано в боте).
+    if _sent_msg is not None and getattr(_sent_msg, "message_id", None):
+        await _vault_offer_wipe(
+            context, msg.chat_id, _sent_msg.message_id,
+            wipe_enabled=bool(getattr(user, "vault_wipe_on_cancel", True)))
+    else:
+        await msg.reply_text("✅ Готово. Файл расшифрован только что и только для вас.")
     return MAIN_MENU
 
 
@@ -13639,8 +13917,8 @@ def _automation_system_prompt(context_text, is_admin):
         '13) {"action":"show_teachers","subject":"<предмет или null>","subjects":["<предмет>"]} — показать учителей. БЕЗ параметров — весь список. ЕСЛИ пользователь спрашивает про КОНКРЕТНЫЙ предмет/предметы («как зовут учителя по физре», «как зовут учителей по математике, русскому и физре») — передай ТОЛЬКО запрошенные предметы (один — в subject, несколько — массивом в subjects) и НЕ показывай остальных. Названия предметов сопоставляй с классом («физра» → «Физкультура», «русский» → «Русский язык»).\n'
         '14) {"action":"show_bells"} — показать звонки.\n'
         '15) {"action":"show_holidays"} — показать каникулы.\n'
-        '16) {"action":"show_weather"} — показать погоду СЕЙЧАС в городе пользователя.\n'
-        '17) {"action":"weather_forecast","days":<1..3>} — ПРОГНОЗ погоды: «погода на завтра» = days:1, «на 3 дня» = days:3.\n'
+        '16) {"action":"show_weather","city":"<город или null>"} — показать погоду СЕЙЧАС. city — ЛЮБОЙ город мира, названный пользователем («погода в Париже» → city:"Paris", «погода в нью-йорке» → city:"New York"); city:null — свой город из профиля. Если город не назван и в профиле его нет — НЕ отказывайся: верни clarify с вопросом «для какого города показать погоду?».\n'
+        '17) {"action":"weather_forecast","days":<1..3>,"city":"<город или null>"} — ПРОГНОЗ погоды: «погода на завтра» = days:1, «на 3 дня» = days:3. city — ЛЮБОЙ город мира («погода на завтра в Сочи» → days:1, city:"Сочи").\n'
         '18) {"action":"open_section","section":"<раздел или название кнопки>"} — ОТКРЫТЬ раздел интерфейса бота (автоматизация «нажимает» кнопку за пользователя). Стандартные разделы: меню, дз, добавить дз, удалить дз, учителя, расписание, звонки, каникулы, таймер, анонимное сообщение, мои анонимные сообщения, классы, мои кнопки, звезды, ии (чат с AI), ai agent (бывшая автоматизация), погода, инструкция, код класса, написать админу, настройки. ТАКЖЕ можно открыть любую ЛИЧНУЮ, ГЛОБАЛЬНУЮ или КЛАССНУЮ кнопку, передав её точное название в section. Используй, когда пользователь просит открыть/зайти/показать раздел или кнопку («открой дз», «включи чат с ии»). Не используй, если пользователь просит ДАННЫЕ (ДЗ/учителей) — для этого есть show_*.\n'
         '19) {"action":"show_vip"} — показать активные VIP-подписки пользователя и даты их окончания.\n'
         '20) {"action":"send_anon","name":"<имя или @username получателя>","text":"<сообщение>"} — ОТПРАВИТЬ анонимное сообщение однокласснику (доступно всем; имя получателя ищем в классе пользователя).\n'
@@ -13682,7 +13960,7 @@ def _automation_system_prompt(context_text, is_admin):
         "- ПОНИМАЙ СИНОНИМЫ ТОЧНО: «домашка»=ДЗ, «звонки»=время уроков, «училки/преподы»=учителя, «параграф»=задание. Название предмета сопоставляй с существующим по смыслу («русский»→«Русский язык», «матеша»→«Математика»).\n"
         "- КНОПКИ И ИНТЕРФЕЙС: «создай кнопку …»=create_button, «удали кнопку»=delete_button, «спрячь/скрой кнопку»=hide_button, «верни/покажи кнопку»=show_button, «переименуй кнопку»=rename_button, «поставь кнопку на 2 место/перемести»=move_button. Для ЛИЧНОЙ кнопки нужен текст/ссылка — если пользователь не дал содержимое, уточни через clarify.\n"
         "- АНОНИМКА: «напиши анонимно Пете …», «отправь анонимку» = send_anon с именем получателя и текстом. Если текст сообщения не дан — clarify.\n"
-        "- ПОГОДА: «какая погода?» = show_weather (сейчас); «погода на завтра» = weather_forecast days:1; «погода на 3 дня» = weather_forecast days:3.\n"
+        "- ПОГОДА (умею ЛЮБОЙ город мира, отказов НЕТ): «какая погода?» = show_weather (сейчас); «погода на завтра» = weather_forecast days:1; «погода на 3 дня» = weather_forecast days:3. Назван ЧУЖОЙ город — передай его в city («погода в Лондоне» → show_weather city:'London', «в Париже на завтра» → weather_forecast days:1 city:'Paris'). «Погода в мире»/«где сейчас жарко» без конкретного города — обычный разговорный ответ (none) на общую тему климата, БЕЗ фраз «не могу/не умею». НИКОГДА не говори, что не показываешь погоду, — показываю в любой точке мира.\n"
         "- РЕЖИМ ИИ: «включи хамло/режим хамло» = ai_mode mode:hamlo; «режим тепло» = mode:warm; «обычный режим» = mode:normal; «какой у меня режим ии?» = ai_mode без mode.\n"
         "- СМЕНА ТЕМЫ: пользователь может в любой момент резко заговорить о другом (сначала про ДЗ, потом «а какая погода?» или «напиши стих»). ВСЕГДА следуй САМОМУ ПОСЛЕДНЕМУ сообщению, не цепляйся за прошлую тему и не спрашивай «так о чём мы». Общий вопрос вне школы — это действие none, а не школьное действие.\n"
         "- Не угадывай: если запрос можно понять двояко — уточни через clarify. Если всё понятно — выполняй без лишних вопросов."
@@ -13809,10 +14087,19 @@ async def _automation_execute_action(update, context, user, class_obj, action):
         return get_holidays_count(class_obj, user), True
 
     if name == "show_weather":
-        if not getattr(user, "city", None):
-            return ("🏙 Город не установлен. Откройте ⚙️ Настройки → 🌦 Настройки погоды, "
-                    "после этого я смогу показывать погоду.", True)
-        text = await weather_current_text(user.city)
+        # ВОЛНА 22.5: погода ЛЮБОГО города мира — не только своего. Город
+        # можно передать параметром city; если его нет — берём город
+        # пользователя. Когда города нет ВООБЩЕ — вежливый вопрос, а НЕ
+        # отказ (просьба пользователя: никаких «бот не может»).
+        city = str(action.get("city") or "").strip()
+        if not city:
+            city = str(getattr(user, "city", None) or "").strip()
+        if not city:
+            return ("🏙 Для какого города показать погоду? Напишите название — "
+                    "например «погода в Париже» или «погода в Токио» — и я "
+                    "мгновенно покажу. Можно и свой город закрепить: "
+                    "⚙️ Настройки → 🌦 Настройки погоды.", True)
+        text = await weather_current_text(city)
         return text, True
 
     if name == "show_vip":
@@ -14059,16 +14346,22 @@ async def _automation_execute_action(update, context, user, class_obj, action):
         ), True
 
     if name == "weather_forecast":
-        # Доступно всем: прогноз погоды на завтра (days=1) или до 3 дней.
-        if not getattr(user, "city", None):
-            return ("🏙 Город не установлен. Откройте ⚙️ Настройки → 🌦 Настройки погоды, "
-                    "после этого я смогу показывать погоду.", True)
+        # Доступно всем: прогноз на завтра (days=1) или до 3 дней.
+        # ВОЛНА 22.5: город — ЛЮБОЙ в мире (поле city), не только свой;
+        # без города — вопрос пользователю, никаких отказов.
+        city = str(action.get("city") or "").strip()
+        if not city:
+            city = str(getattr(user, "city", None) or "").strip()
+        if not city:
+            return ("🏙 Для какого города показать прогноз? Напишите название — "
+                    "например «погода на завтра в Сочи» — и я покажу. Свой "
+                    "город можно закрепить: ⚙️ Настройки → 🌦 Настройки погоды.", True)
         try:
             days = int(action.get("days") or 1)
         except (TypeError, ValueError):
             days = 1
         days = max(1, min(days, 3))
-        text = await weather_forecast_text(user.city, days)
+        text = await weather_forecast_text(city, days)
         return text, True
 
     if name == "ai_mode":
@@ -15907,10 +16200,9 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, use
     except Exception as e:
         logger.error(f"show_main_menu: ошибка обработки реферального бонуса: {e}")
 
-    # ВОЛНА 22.1: маркер сборки — сразу видно, какая версия реально крутится
-    # на сервере (защита от «архив собран, а деплой не подхватился»).
-    greeting_text = (f"👋 Добро пожаловать в DEVORKS+, {user.first_name}!\n"
-                     f"🛠 Сборка {BOT_BUILD}")
+    # ВОЛНА 22.5: версии/сборки в приветствии БОЛЬШЕ НЕТ (просьба
+    # пользователя) — обычный приветственный текст без технических деталей.
+    greeting_text = f"👋 Добро пожаловать в DEVORKS+, {user.first_name}!"
     keyboard = get_main_menu_keyboard(user)
 
     if hasattr(update, 'message') and update.message:
@@ -23600,6 +23892,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await holiday_settings_start(update, context)
     elif data == "toggle_holidays_notif":
         return await toggle_holidays_notif(update, context)
+    elif data == "toggle_vault_wipe":
+        # ВОЛНА 22.7: тоггл удаления расшифрованного файла при «Отменить».
+        return await vault_wipe_toggle_cb(update, context)
     elif data == "weather_3days":
         return await weather_3days_handler(update, context)
     # === НОВОЕ: разработчик — праздники и быстрая рассылка ===
@@ -23850,6 +24145,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("vault_show_"):
         # ВОЛНА 13: карточка ПОЛНОГО названия файла — раскрыть/свернуть.
         return await vault_show_cb(update, context)
+    elif data == "vault_getstop":
+        # ВОЛНА 22.5: «❌ Отмена» на прогрессе выдачи большого файла —
+        # останавливает скачивание/расшифровку/отправку, стирает временные файлы.
+        return await vault_getstop_cb(update, context)
+    elif data.startswith("vault_wipe_"):
+        # ВОЛНА 22.6: «❌ Отменить» под выданным (распакованным) файлом —
+        # файл исчезает из чата (шифр в канале остаётся целым).
+        return await vault_wipe_cb(update, context)
     # === Хранилище: мультиканальность (волна 7) ===
     elif data.startswith("dev_ch_kind_"):
         return await dev_storage_channel_kind(update, context)
@@ -27742,7 +28045,7 @@ def main():
 
     application.add_error_handler(error_handler)
 
-    logger.info("Запуск бота...")
+    logger.info(f"Запуск бота... (внутренняя сборка {BOT_BUILD})")
 
     # --- Совместимость с Python 3.14 ---------------------------------------
     # python-telegram-bot 21.x внутри Application.run_polling() вызывает
