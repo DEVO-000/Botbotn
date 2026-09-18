@@ -222,6 +222,8 @@ USER_CODES_FILE = _data_file("user_codes.json")
 PRICES_FILE = _data_file("prices.json")
 GLOBAL_BUTTONS_FILE = _data_file("global_buttons.json")
 HOLIDAYS_FILE = _data_file("holidays.json")
+# ВОЛНА 22.12: «Общая база решений» класса (модерация старосты, анонимность).
+SOLUTIONS_FILE = _data_file("solutions.json")
 # Журнал отправленных уведомлений (за какой день уже отправили утреннее/вечернее/
 # погоду/праздник/ДР каждому пользователю). Используется единым тикером
 # (_unified_notification_tick), чтобы не присылать одно и то же дважды.
@@ -428,6 +430,13 @@ VAULT_REN_WAIT = 124
 # ВОЛНА 13: шаг «сразу НАЗВАТЬ, что кладёшь» после кнопки «✅ Готово» —
 # одно название на всю загрузку, видно в «📦 Мои файлы».
 VAULT_LABEL_WAIT = 125
+# ВОЛНА 22.12: выбор КАТЕГОРИИ и ТЕГОВ при загрузке; ПОИСК по «Мои файлы».
+VAULT_CAT_WAIT = 130
+VAULT_TAGS_WAIT = 131
+VAULT_SEARCH_WAIT = 132
+SOL_WAIT_FILE = 133  # ждём фото/файл решения для базы решений класса
+SHARE_INPUT_WAIT = 134  # ввод (url / пароль Сейфа / поиск) в менеджере ссылки
+SHARE_PIN_WAIT = 135    # получатель вводит PIN share-ссылки
 
 # ВОЛНА 22.4: «🎙 Пульт» удалён ПОЛНОСТЬЮ по решению пользователя — кнопки,
 # состояний (бывшие 126–131), хендлеров и хранилищ стилей больше нет.
@@ -439,11 +448,14 @@ VAULT_LABEL_WAIT = 125
 POLL_WAIT_Q = 126        # ждём ВОПРОС опроса
 POLL_WAIT_OPTS = 127     # ждём ВАРИАНТЫ (по одному в строке, 2–10)
 POLL_WAIT_CONFIRM = 128  # превью + кнопки «✅ Отправить» / «❌ Отмена»
+POLL_WAIT_SCHED = 129    # 22.12: ждём время запланированной отправки опроса
 
 # ВОЛНА 13: состояния, где текст = ПРОИЗВОЛЬНОЕ НАЗВАНИЕ (файла/загрузки).
 # Быстрые команды туда НЕ инжектируются: пользователь может назвать файл
 # «⏰ Таймер» — это имя файла, а не команда (глобальная отмена остаётся).
-_QUICK_SKIP_STATES = frozenset({VAULT_REN_WAIT, VAULT_LABEL_WAIT})
+_QUICK_SKIP_STATES = frozenset({VAULT_REN_WAIT, VAULT_LABEL_WAIT,
+                                VAULT_TAGS_WAIT, VAULT_SEARCH_WAIT,
+                                SHARE_INPUT_WAIT, SHARE_PIN_WAIT})
 
 # ==================================
 # === ВОЛНА 12: ГЛОБАЛЬНАЯ КНОПКА ОТМЕНЫ ===
@@ -457,6 +469,7 @@ _QUICK_SKIP_STATES = frozenset({VAULT_REN_WAIT, VAULT_LABEL_WAIT})
 # • инжект перехватчика в КАЖДОЕ состояние с текстовым вводом (как быстрые
 #   команды) + отдельный хендлер для потерянного состояния (state=None).
 import re as _re_cancel
+import re  # ВОЛНА 22.12: планировщик/теги/поиск используют re напрямую
 _GLOBAL_CANCEL_RE = _re_cancel.compile(
     # ВОЛНА 22.9: добавлено «❌ отменить» — кнопка отмены Сейфа теперь живёт
     # в клавиатуре ВСЕГДА (в т. ч. в диалогах Сейфа), и её нажатие обязано
@@ -475,6 +488,7 @@ _VAULT_SESSION_KEYS = (
     'vault_rec_answers', 'vault_rec_oldpw', 'vault_ren_id', 'vault_chat_acks',
     'cloud_file_mode', 'cloud_batch', 'cloud_note', 'cloud_ren_id',
     'vault_pending', 'vault_batch_label',
+    'vault_batch_cat', 'vault_batch_tags',  # 22.12: категория и теги загрузки
     'poll_flow',  # 22.10: недоделанный опрос тоже стираем при отмене
 )
 
@@ -2025,6 +2039,10 @@ class User:
         # жили только в inline-кнопке на сообщении — по просьбе пользователя
         # кнопки на сообщениях больше нет. Хранятся ТОЛЬКО номера сообщений.
         self.vault_kb_wipe = None
+        # === ВОЛНА 22.12: уведомления о новых решениях в базе класса ===
+        # True (по умолчанию) — приходит сообщение «📚 Новое решение…»;
+        # тоггл: ⚙️ Настройки → «🔔 Уведомления о решениях».
+        self.sol_notify = True
         # ВОЛНА 22.4: поле user.pult (Пульт) удалено — функция снесена целиком.
 
     def to_dict(self):
@@ -2105,6 +2123,8 @@ class User:
             'vault_wipe_on_cancel': getattr(self, 'vault_wipe_on_cancel', True),
             # ВОЛНА 22.8: цель кнопки «❌ Отменить» из клавиатуры (id сообщений).
             'vault_kb_wipe': getattr(self, 'vault_kb_wipe', None),
+            # ВОЛНА 22.12: уведомления о новых решениях класса.
+            'sol_notify': getattr(self, 'sol_notify', True),
             # ВОЛНА 22.4: ключ 'pult' больше не сериализуется (Пульт удалён).
         }
 
@@ -2203,6 +2223,9 @@ class User:
         # Бэк-совместимость, волна 22.7: удалять ли файл при «Отменить».
         if not isinstance(getattr(user, 'vault_wipe_on_cancel', None), bool):
             user.vault_wipe_on_cancel = True
+        # Бэк-совместимость, волна 22.12: уведомления о решениях класса.
+        if not isinstance(getattr(user, 'sol_notify', None), bool):
+            user.sol_notify = True
         # Бэк-совместимость, волна 22.8: цель кнопки «❌ Отменить» из клавиатуры.
         _vkw = getattr(user, 'vault_kb_wipe', None)
         if not isinstance(_vkw, dict) or not _vkw.get("msg_id"):
@@ -2816,7 +2839,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.11"
+BOT_BUILD = "22.12"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -4023,6 +4046,8 @@ def get_main_menu_keyboard(user):
         "🌦 Погода",
         # ПУНКТ 3: чат поддержки прямо из главного меню (всегда доступен).
         "💬 Чат поддержки",
+        # ВОЛНА 22.12: общая база решений класса (для списывания честно).
+        "📚 Решения",
         "📚 Инструкция", "🔑 Код класса",
     ]
     # «📨 Мои анонимные сообщения» — отдельный список, чтобы её можно было
@@ -4364,6 +4389,10 @@ def get_settings_keyboard(user=None):
         [InlineKeyboardButton(
             f"🗑 Удалять файл при «Отмене»: {'да' if _wipe_on else 'нет'}",
             callback_data="toggle_vault_wipe")],
+        # ВОЛНА 22.12: уведомления о новых решениях в базе класса.
+        [InlineKeyboardButton(
+            f"🔔 Уведомления о решениях: {'вкл' if getattr(user, 'sol_notify', True) else 'выкл'}",
+            callback_data="sol_toggle_notify")],
         [InlineKeyboardButton("🌟 Мои кнопки", callback_data="personal_buttons")],
         [InlineKeyboardButton("💡 Предложить функцию", callback_data="suggest_function")],
         # ПУНКТ 3: чат поддержки доступен из настроек (помимо главного меню).
@@ -8781,7 +8810,9 @@ class _ProgressEdit:
     editMessageText), чтобы потоковые операции 2 ГБ не упирались во флуд.
     ВОЛНА 22.5: если у сообщения-прогресса есть inline-клавиатура — она
     СОХРАНЯЕТСЯ при каждой правке (22.8: кнопок на прогрессе больше нет,
-    reply_markup остаётся None)."""
+    reply_markup остаётся None).
+    ВОЛНА 22.12: при передаче done/total рисует ПОЛОСУ ПРОГРЕССА в стиле
+    [▓▓▓░░░░░░░] с размерами, скоростью и остатком времени."""
 
     def __init__(self, context, progress_msg, title="", reply_markup=None):
         self.context = context
@@ -8789,14 +8820,43 @@ class _ProgressEdit:
         self.title = title or ""
         self.reply_markup = reply_markup
         self._last = 0.0
+        self._sp_t = None      # время прошлого замера скорости
+        self._sp_done = 0      # байты на прошлом замере
+        self._sp_ema = 0.0     # сглаженная скорость (байт/с)
 
-    async def edit(self, text=None, force=False):
+    def _bar_line(self, text, done, total):
+        """Формирует строку с полосой, скоростью и ETA (22.12)."""
+        now = time.monotonic()
+        try:
+            done = max(0, int(done or 0))
+            total = max(0, int(total or 0))
+        except (TypeError, ValueError):
+            return text or self.title
+        if total > 0 and done >= 0:
+            if self._sp_t is not None and now > self._sp_t:
+                inst = (done - self._sp_done) / (now - self._sp_t)
+                self._sp_ema = (0.65 * self._sp_ema + 0.35 * inst
+                                if self._sp_ema else inst)
+            self._sp_t, self._sp_done = now, done
+            line = (f"[{_vault_bar(done, total)}] {_fmt_bytes(done)} / "
+                    f"{_fmt_bytes(total)} ({done * 100 // total}%)")
+            if self._sp_ema > 1:
+                line += f"\n⚡ {_fmt_bytes(int(self._sp_ema))}/с"
+                _eta = (total - done) / self._sp_ema
+                if 0 <= _eta < 86400 * 7:
+                    line += f" | ⏱ осталось {_fmt_eta(int(_eta))}"
+            return (text + "\n" + line) if text else line
+        return text or self.title
+
+    async def edit(self, text=None, force=False, done=None, total=None):
         if self.msg is None:
             return None
         now = time.monotonic()
         if not force and (now - self._last) < 3.5:
             return None
         self._last = now
+        if done is not None or total is not None:
+            text = self._bar_line(text, done, total)
         try:
             return await self.context.bot.edit_message_text(
                 text or self.title,
@@ -9147,9 +9207,10 @@ async def _mt_download_stream(client, doc, doc_size, sink, progress=None, title=
                 got += len(chunk)
                 if progress is not None and doc_size:
                     pct = min(99, got * 100 // int(doc_size))
+                    # ВОЛНА 22.12: полоса прогресса [▓▓▓░░] + скорость + ETA.
                     await progress.edit(
-                        f"{title}… {pct}% "
-                        f"({_fmt_bytes(got)} из {_fmt_bytes(doc_size)})")
+                        f"{title}… {pct}%",
+                        done=got, total=int(doc_size))
             break
         except _FloodWaitError as e:
             attempts += 1
@@ -9168,9 +9229,11 @@ async def _mt_download_stream(client, doc, doc_size, sink, progress=None, title=
     return got
 
 
-async def _mt_upload_container(client, path, size, caption, filename=None):
+async def _mt_upload_container(client, path, size, caption, filename=None,
+                               progress_cb=None):
     """Заливает ГОТОВЫЙ шифр-контейнер в cloud-канал через MTProto
     (Bot API не умеет больше 50 МБ). Каналы пробует по порядку.
+    ВОЛНА 22.12: progress_cb(current, total) — живая полоса прогресса.
     Возвращает {"message_id", "file_id", "size", "channel_id"} или None."""
     # ВОЛНА 16: каналы «только для базы» тоже годятся для шифров Сейфа —
     # раньше при пустом cloud-списке заливка отказывала, хотя канал был.
@@ -9193,6 +9256,7 @@ async def _mt_upload_container(client, path, size, caption, filename=None):
                 peer, upload_path, force_document=True,
                 caption=(caption or "")[:1024] or None,
                 file_size=int(size or 0) or None,
+                progress_callback=progress_cb,
             ))
             doc = getattr(sent, "document", None)
             return {
@@ -9538,6 +9602,11 @@ async def _vault_seal_item_mtproto_once(msg, context, user, item, password,
             _op_here["sub"] = f"📦 [{idx}/{total}] «{name}»: заливаю шифр в канал…"
         _vault_cap = "🔐 Сейф: зашифрованный файл (открыть без пароля невозможно)."
         _vault_fn = f"vault_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{idx}.bin"
+        # ВОЛНА 22.12: живая полоса заливки шифра (Telethon progress_callback,
+        # синхронная — обновляет op['sub'], аниматор показывает её в сообщении).
+        _up_prog = _VaultSubProg(_op_here, f"📦 [{idx}/{total}] «{name}»")
+        _up_cb = (lambda cur, tot: _up_prog.sync_bar(cur, tot, "📤 Заливаю шифр")) \
+            if _op_here is not None else None
         if enc_total <= (49 * 1024 * 1024 - 1024 * 1024):
             with open(tmp_enc, "rb") as fh:
                 enc_bytes = fh.read()
@@ -9552,11 +9621,13 @@ async def _vault_seal_item_mtproto_once(msg, context, user, item, password,
                     raise _VaultCancelled()
                 up = await _mt_upload_container(
                     client, tmp_enc, enc_total,
-                    caption=_vault_cap, filename=_vault_fn)
+                    caption=_vault_cap, filename=_vault_fn,
+                    progress_cb=_up_cb)
         else:
             up = await _mt_upload_container(
                 client, tmp_enc, enc_total,
-                caption=_vault_cap, filename=_vault_fn)
+                caption=_vault_cap, filename=_vault_fn,
+                progress_cb=_up_cb)
         if up is None:
             raise RuntimeError(
                 "шифр не принят каналом — проверьте, что бот администратор "
@@ -9942,6 +10013,9 @@ def get_vault_files_keyboard(user):
         ])
     if not kb:
         kb.append([InlineKeyboardButton("📥 Положить файл/текст", callback_data="vault_put")])
+    # ВОЛНА 22.12: поиск по названиям, тегам и категориям + share-ссылки.
+    kb.append([InlineKeyboardButton("🔍 Поиск по файлам", callback_data="vault_search"),
+               InlineKeyboardButton("🔗 Поделиться", callback_data="share_open")])
     kb.append([InlineKeyboardButton("⬅️ Назад", callback_data="vault_menu")])
     return InlineKeyboardMarkup(kb)
 
@@ -9964,13 +10038,18 @@ def _vault_files_text(user):
     for idx, rec in enumerate(files[:20], start=1):
         label = str(rec.get("label") or "").strip()
         head = f"• {label} — " if label else f"• Файл #{idx} (без подписи) — "
+        _cat = _VAULT_CAT_TITLES.get(rec.get("cat") or "", "")
+        _tags = " ".join("#" + str(t) for t in (rec.get("tags") or []))
         lines.append(
             f"{head}{_fmt_bytes(rec.get('size_orig', 0))} "
             f"(в шифре {_fmt_bytes(rec.get('size_enc', 0))}), {rec.get('ts', '')}"
+            + (f"  {_cat}" if _cat else "")
+            + (f"\n   {_tags}" if _tags else "")
         )
     lines.append("")
     lines.append("📥 — достать (спросит пароль) • 🔎 — полное название • "
-                 "🔑 — сменить пароль • ✏️ — подписать • 🗑 — удалить.")
+                 "🔑 — сменить пароль • ✏️ — подписать • 🗑 — удалить. "
+                 "🔍 — поиск по названиям, тегам и категориям.")
     return "\n".join(lines)
 
 
@@ -10696,7 +10775,7 @@ async def vault_label_receive(update: Update, context: ContextTypes.DEFAULT_TYPE
             "алгебре», — или нажмите «⏭ Пропустить».")
         return VAULT_LABEL_WAIT
     context.user_data['vault_batch_label'] = text[:80]
-    return await _vault_prompt_password(msg, user, context=context)
+    return await _vault_ask_category(msg, context, user)
 
 
 async def vault_labelskip_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -10712,7 +10791,209 @@ async def vault_labelskip_cb(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not isinstance(batch, list) or not batch:
         await query.answer("Пачка пуста — пришлите файлы.", show_alert=True)
         return VAULT_PUT_WAIT
+    return await _vault_ask_category(query.message, context, user)
+
+
+# === ВОЛНА 22.12: КАТЕГОРИЯ И ТЕГИ при загрузке, ПОИСК по «Мои файлы» ===
+VAULT_CATEGORIES = (
+    ("music", "🎵 Музыка"),
+    ("photo", "📷 Фото"),
+    ("video", "🎬 Видео"),
+    ("file",  "📄 Файл"),
+    ("other", "📦 Другое"),
+)
+_VAULT_CAT_TITLES = dict(VAULT_CATEGORIES)
+
+
+def _vault_cat_by_kind(kind, mime=""):
+    """Автокатегория по типу содержимого (для старых загрузок без выбора)."""
+    _k = str(kind or "").lower()
+    _m = str(mime or "").lower()
+    if "audio" in _k or "audio" in _m:
+        return "music"
+    if "video" in _k or "video" in _m:
+        return "video"
+    if "photo" in _k or "image" in _k or "image" in _m:
+        return "photo"
+    if _k in ("document", "file") or _m:
+        return "file"
+    return "other"
+
+
+async def _vault_ask_category(msg, context, user):
+    """ВОЛНА 22.12: шаг «ВЫБЕРИТЕ КАТЕГОРИЮ» — после названия и ДО пароля.
+    Категория попадает в карточку файла и участвует в поиске."""
+    _kb = [[InlineKeyboardButton(t, callback_data=f"vault_cat_{c}")]
+           for c, t in VAULT_CATEGORIES]
+    _kb.append([InlineKeyboardButton("❌ Отмена", callback_data="vault_cancel")])
+    _ack = await msg.reply_text(
+        "🗂 КАТЕГОРИЯ ЗАГРУЗКИ — что это? (файлов в пачке: "
+        f"{len(context.user_data.get('vault_batch') or [])})\n\n"
+        "Категория поможет находить файлы через 🔍 Поиск «Мои файлов». "
+        "Если не выбрать — подберём по типу файла.",
+        reply_markup=InlineKeyboardMarkup(_kb),
+    )
+    _vault_track_ack(context, _ack, user=user)
+    return VAULT_CAT_WAIT
+
+
+async def vault_cat_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.12: выбор категории — сохраняем и просим теги."""
+    query = update.callback_query
+    await query.answer()
+    user = get_user(str(query.from_user.id))
+    batch = context.user_data.get('vault_batch')
+    if not user or not isinstance(batch, list) or not batch:
+        await query.answer("Сессия загрузки потеряна. Начните заново.",
+                           show_alert=True)
+        return MAIN_MENU
+    code = query.data[len("vault_cat_"):]
+    if code not in _VAULT_CAT_TITLES:
+        await query.answer("Неизвестная категория", show_alert=True)
+        return VAULT_CAT_WAIT
+    context.user_data['vault_batch_cat'] = code
+    return await _vault_ask_tags(query.message, context, user)
+
+
+async def _vault_ask_tags(msg, context, user):
+    """ВОЛНА 22.12: шаг «ТЕГИ» — необязательные метки для поиска."""
+    _ack = await msg.reply_text(
+        "🏷 ТЕГИ ДЛЯ ПОИСКА — необязательно. Пришлите 1–8 меток через запятую "
+        "(каждая до 24 символов): например «алгебра, контрольная, 8А».\n\n"
+        "Теги видны только вам и работают в 🔍 Поиске «Мои файлов».",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⏭ Пропустить", callback_data="vault_tagskip"),
+             InlineKeyboardButton("❌ Отмена", callback_data="vault_cancel")],
+        ]),
+    )
+    _vault_track_ack(context, _ack, user=user)
+    return VAULT_TAGS_WAIT
+
+
+def _vault_parse_tags(text):
+    """ВОЛНА 22.12: разбор тегов — запятые/переводы строк, до 8, по 24 симв."""
+    raw = re.split(r"[,;\n]+", str(text or ""))
+    tags, seen = [], set()
+    for t in raw:
+        t = t.strip()[:24]
+        if not t:
+            continue
+        low = t.lower()
+        if low in seen:
+            continue
+        seen.add(low)
+        tags.append(t)
+        if len(tags) >= 8:
+            break
+    return tags
+
+
+@timeout(CONVERSATION_TIMEOUT)
+async def vault_tags_receive(update: Update,
+                             context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.12: приём тегов загрузки Сейфа."""
+    msg = update.message
+    user = get_user(str(update.effective_user.id))
+    batch = context.user_data.get('vault_batch')
+    if not user or not isinstance(batch, list) or not batch:
+        await msg.reply_text(
+            "Сессия загрузки потеряна. Начните заново: ☁️ Облако → 🔐 Сейф.",
+            reply_markup=get_main_menu_keyboard(user) if user else None,
+        )
+        return MAIN_MENU
+    tags = _vault_parse_tags(msg.text)
+    if not tags:
+        await msg.reply_text(
+            "Не увидел тегов. Пришлите их через запятую — например «алгебра, "
+            "контрольная» — или нажмите «⏭ Пропустить».")
+        return VAULT_TAGS_WAIT
+    context.user_data['vault_batch_tags'] = tags
+    return await _vault_prompt_password(msg, user, context=context)
+
+
+async def vault_tagskip_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.12: «⏭ Пропустить» на шаге тегов — без тегов."""
+    query = update.callback_query
+    await query.answer()
+    user = get_user(str(query.from_user.id))
+    batch = context.user_data.get('vault_batch')
+    if not user or not isinstance(batch, list) or not batch:
+        await query.answer("Сессия загрузки потеряна. Начните заново.",
+                           show_alert=True)
+        return MAIN_MENU
+    context.user_data['vault_batch_tags'] = []
     return await _vault_prompt_password(query.message, user, context=context)
+
+
+@timeout(CONVERSATION_TIMEOUT)
+async def vault_search_receive(update: Update,
+                               context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.12: 🔍 ПОИСК по «Мои файлы» — названия, теги, категория.
+    Все слова запроса должны найтись в названии И/ИЛИ тегах И/ИЛИ категории."""
+    msg = update.message
+    user = get_user(str(update.effective_user.id))
+    if not user:
+        await msg.reply_text("Сначала зарегистрируйтесь — /start")
+        return MAIN_MENU
+    query_text = (msg.text or "").strip()
+    if not query_text:
+        await msg.reply_text("Пришлите запрос словами — например «контрольная "
+                             "алгебра» или «музыка».")
+        return VAULT_SEARCH_WAIT
+    matches = _vault_search_matches(user, query_text)
+    if not matches:
+        await msg.reply_text(
+            "🙈 По запросу «" + query_text[:60] + "» в Сейфе ничего не нашлось.\n\n"
+            "Ищем по НАЗВАНИЮ (🏷 при загрузке или ✏️ в списке), ТЕГАМ и "
+            "КАТЕГОРИИ (🎵/📷/🎬/📄/📦). Попробуйте другое слово.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ К списку файлов",
+                                     callback_data="vault_files")]]),
+        )
+        return MAIN_MENU
+    kb = []
+    for rec in matches:
+        label = str(rec.get("label") or "").strip() or "Файл без подписи"
+        cat = _VAULT_CAT_TITLES.get(rec.get("cat") or "", "")
+        title = (label[:28] + (" • " + cat if cat else ""))
+        kb.append([
+            InlineKeyboardButton(f"📥 {title}",
+                                 callback_data=f"vault_get_{rec.get('id')}"),
+            InlineKeyboardButton("🔎", callback_data=f"vault_show_{rec.get('id')}"),
+        ])
+    kb.append([InlineKeyboardButton("⬅️ К списку файлов",
+                                    callback_data="vault_files")])
+    await msg.reply_text(
+        f"🔍 НАЙДЕНО: {len(matches)} шт. по запросу «{query_text[:60]}»",
+        reply_markup=InlineKeyboardMarkup(kb),
+    )
+    return MAIN_MENU
+
+
+def _vault_search_matches(user, query_text):
+    """ВОЛНА 22.12: поиск по Сейфу — все слова запроса должны найтись в
+    названии И/ИЛИ тегах И/ИЛИ категории файла. Топ-10 по релевантности."""
+    _q = (query_text or "").strip().lower()
+    if not _q:
+        return []
+    toks = [t for t in re.split(r"[\s,;]+", _q) if t][:6]
+    files = [f for f in (getattr(user, "vault_files", []) or [])
+             if isinstance(f, dict)]
+    res = []
+    for rec in files:
+        label = str(rec.get("label") or "")
+        tags = " ".join(str(t) for t in (rec.get("tags") or []))
+        cat_code = str(rec.get("cat") or "") or _vault_cat_by_kind(
+            rec.get("kind"), rec.get("mime"))
+        cat_title = _VAULT_CAT_TITLES.get(cat_code, "")
+        hay = (label + " " + tags + " " + cat_title + " " + cat_code).lower()
+        if not all(t in hay for t in toks):
+            continue
+        score = sum((t in label.lower()) * 2 + (t in tags.lower())
+                    for t in toks)
+        res.append((score, rec))
+    res.sort(key=lambda p: -p[0])
+    return [rec for _s, rec in res[:10]]
 
 
 async def vault_cancel_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -10739,7 +11020,7 @@ async def vault_cancel_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     batch = context.user_data.get('vault_batch')
     _batch_clean = batch if isinstance(batch, list) else None
     for key in ('vault_put_mode', 'vault_batch', 'vault_migrate_ids',
-                'vault_batch_label'):
+                'vault_batch_label', 'vault_batch_cat', 'vault_batch_tags'):
         context.user_data.pop(key, None)
     _cleaned = 0
     try:
@@ -11108,6 +11389,9 @@ async def vault_show_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📥 Достать", callback_data=f"vault_get_{vid}"),
          InlineKeyboardButton("✏️ Подписать", callback_data=f"vault_ren_{vid}"),
          InlineKeyboardButton("🗑 Удалить", callback_data=f"vault_del_{vid}")],
+        # ВОЛНА 22.12: 🔗 — собрать share-ссылку с этим файлом внутри.
+        [InlineKeyboardButton("🔗 Поделиться этим файлом",
+                              callback_data=f"share_open_{vid}")],
     ]
     try:
         await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(kb))
@@ -11322,26 +11606,101 @@ async def _vault_animate_progress(context, progress_msg, op):
             pass  # один сбой правки не должен убивать анимацию
 
 
+def _vault_bar(done, total, width=10):
+    """ВОЛНА 22.12: полоса прогресса [▓▓▓░░░░░░░] для заливки/выдачи Сейфа."""
+    try:
+        done = max(0, int(done or 0))
+        total = max(0, int(total or 0))
+    except (TypeError, ValueError):
+        return "░" * width
+    if total <= 0 or done <= 0:
+        return "░" * width
+    filled = max(0, min(width, int(width * done / total + 0.5)))
+    return "▓" * filled + "░" * (width - filled)
+
+
+def _fmt_eta(seconds):
+    """ВОЛНА 22.12: остаток времени в человекочитаемом виде (3с / 1м 20с / 2ч 5м)."""
+    try:
+        s = max(0, int(seconds))
+    except (TypeError, ValueError):
+        return "—"
+    if s < 60:
+        return f"{s}с"
+    if s < 3600:
+        return f"{s // 60}м {s % 60}с"
+    if s < 86400:
+        return f"{s // 3600}ч {(s % 3600) // 60}м"
+    return f"{s // 86400}д {(s % 86400) // 3600}ч"
+
+
 class _VaultSubProg:
     """Интерфейс как у _ProgressEdit, но текст пишется в op['sub'] — его
     показывает аниматор. Так потоковое шифрование и спиннер не дерутся за
-    одно сообщение (правки не дублируются, лимиты не нарушаются)."""
+    одно сообщение (правки не дублируются, лимиты не нарушаются).
+    ВОЛНА 22.12: done/total рисуют полосу [▓▓▓░░░░░░░] со скоростью и ETA;
+    sync_bar() — синхронная точка для колбэка Telethon (заливка шифра)."""
 
     def __init__(self, op, prefix=""):
         self.op = op
         self.prefix = prefix or ""
         self._last = 0.0
+        self._sp_t = None
+        self._sp_done = 0
+        self._sp_ema = 0.0
+        self._sync_last = 0.0
 
-    async def edit(self, text=None, force=False):
+    def _bar_line(self, text, done, total):
+        now = time.monotonic()
+        try:
+            done = max(0, int(done or 0))
+            total = max(0, int(total or 0))
+        except (TypeError, ValueError):
+            return text
+        if total > 0 and done >= 0:
+            if self._sp_t is not None and now > self._sp_t:
+                inst = (done - self._sp_done) / (now - self._sp_t)
+                self._sp_ema = (0.65 * self._sp_ema + 0.35 * inst
+                                if self._sp_ema else inst)
+            self._sp_t, self._sp_done = now, done
+            line = (f"[{_vault_bar(done, total)}] {_fmt_bytes(done)} / "
+                    f"{_fmt_bytes(total)} ({done * 100 // total}%)")
+            if self._sp_ema > 1:
+                line += f"\n⚡ {_fmt_bytes(int(self._sp_ema))}/с"
+                _eta = (total - done) / self._sp_ema
+                if 0 <= _eta < 86400 * 7:
+                    line += f" | ⏱ осталось {_fmt_eta(int(_eta))}"
+            return (text + "\n" + line) if text else line
+        return text
+
+    async def edit(self, text=None, force=False, done=None, total=None):
         if self.op is None:
             return None
         now = time.monotonic()
         if not force and (now - self._last) < 3.5:
             return None
         self._last = now
+        if done is not None or total is not None:
+            text = self._bar_line(text, done, total)
         t = (text or "").strip()
         self.op["sub"] = f"{self.prefix} {t}".strip() if t else self.prefix
         return None
+
+    def sync_bar(self, current, total, stage="📥 Скачивание"):
+        """ВОЛНА 22.12: СИНХРОННАЯ точка прогресса для Telethon
+        (progress_callback(current, total)) — обновляет op['sub'] не чаще
+        раза в секунду, без await и без правок сообщения."""
+        if self.op is None:
+            return
+        now = time.monotonic()
+        if now - self._sync_last < 1.0:
+            return
+        self._sync_last = now
+        try:
+            self.op["sub"] = self._bar_line(
+                f"{self.prefix} {stage}", current, total).strip()
+        except Exception:
+            pass
 
 
 async def _vault_cancel_cleanup(context, op):
@@ -11423,6 +11782,11 @@ async def _vault_encrypt_batch(msg, context, user, password):
                     continue
                 # ВОЛНА 13: без своей reply-подписи — название всей загрузки.
                 rec_mt["label"] = _vault_item_label(item, _batch_label)
+                # ВОЛНА 22.12: категория и теги — для поиска по «Мои файлы».
+                rec_mt["cat"] = (context.user_data.get('vault_batch_cat')
+                                 or _vault_cat_by_kind(item.get("kind"),
+                                                       item.get("mime")))
+                rec_mt["tags"] = list(context.user_data.get('vault_batch_tags') or [])
                 files.append(rec_mt)
                 ok_n += 1
                 op["done"] = i
@@ -11514,6 +11878,11 @@ async def _vault_encrypt_batch(msg, context, user, password):
                 # ВОЛНА 13: без своей подписи — название всей загрузки.
                 # Содержимое и настоящее имя — по-прежнему под шифром.
                 "label": _vault_item_label(item, _batch_label),
+                # ВОЛНА 22.12: категория и теги — для поиска по «Мои файлы».
+                "cat": (context.user_data.get('vault_batch_cat')
+                        or _vault_cat_by_kind(item.get("kind"),
+                                              item.get("mime"))),
+                "tags": list(context.user_data.get('vault_batch_tags') or []),
             })
             ok_n += 1
             op["done"] = i
@@ -16116,6 +16485,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # звёзд). Защита: пользователь не может быть собственным рефералом,
     # и DEVELOPER_ID не может быть рефералом.
     referrer_candidate = None
+    share_tok = None
     try:
         args = getattr(context, 'args', None) or []
         if args and isinstance(args, list) and args[0] and isinstance(args[0], str):
@@ -16124,10 +16494,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 cand = payload[4:].strip()
                 if cand and cand.isdigit() and cand != user_id:
                     referrer_candidate = cand
+            # ВОЛНА 22.12: deep-link share-ссылки /start dl_xxx — выдаём
+            # файлы после того, как пользователь настроен (ниже).
+            elif payload.startswith("dl_") and len(payload) >= 6:
+                share_tok = payload
     except Exception as e:
         logger.error(f"start: ошибка разбора реферального payload: {e}")
     if referrer_candidate:
         context.user_data['pending_referrer'] = referrer_candidate
+    if share_tok:
+        context.user_data['pending_share_tok'] = share_tok
 
     # Обязательная подписка на канал — требуется уже на старте создания аккаунта.
     # Если пользователь не подписан, просим подписаться и НЕ создаём аккаунт.
@@ -16182,6 +16558,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ENTER_CITY
     else:
+        # ВОЛНА 22.12: pending share-ссылка — сначала выдаём файлы, потом меню.
+        _ptok = context.user_data.pop('pending_share_tok', None)
+        if _ptok:
+            _st = await share_redeem_start(update, context, str(_ptok))
+            if _st == SHARE_PIN_WAIT:
+                return SHARE_PIN_WAIT
+            await show_main_menu(update, context, user)
+            return MAIN_MENU
         await show_main_menu(update, context, user)
         return MAIN_MENU
 
@@ -16848,22 +17232,30 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _GLOBAL_CANCEL_RE.match((message_text or "").strip()):
         return await global_cancel_handler(update, context)
 
-    # ВОЛНА 22.11: анти-гонка опросов. concurrent_updates(True): текст вопроса,
-    # отправленный сразу после нажатия «📊 Опрос», может обогнать колбэк и
-    # прийти, пока состояние ещё MAIN_MENU — тогда он молча уходил в AI/
-    # автоматизацию (бот «молчал»), а следующее сообщение падало уже в шаг
-    # вариантов. Если недоделанный опрос ждёт вопрос — этот текст и есть
-    # вопрос: принимаем и СРАЗУ просим варианты.
+    # ВОЛНА 22.11/22.12: анти-гонка опросов. concurrent_updates(True): текст
+    # вопроса, отправленный сразу после нажатия «📊 Опрос», может обогнать
+    # колбэк и прийти, пока состояние ещё MAIN_MENU — тогда он молча уходил
+    # в AI/автоматизацию (бот «молчал»). Теперь если недоделанный опрос ждёт
+    # — текст принимается: без вопроса это ВОПРОС, с вопросом это ВАРИАНТЫ
+    # (или новый вопрос одной строкой). Отправленный опрос (sent) не ловим.
     _pflow = context.user_data.get("poll_flow") or {}
     if (_pflow.get("scope") in ("all", "class")
-            and not _pflow.get("q")
+            and not _pflow.get("sent")
             and message_text and not message_text.startswith("/")
             and message_text not in QUICK_COMMANDS
             and (message_text or "").strip().lower() not in _MENU_TEXT_ALIASES):
-        return await _poll_accept_question(update, context, _pflow, message_text)
+        if not _pflow.get("q"):
+            return await _poll_accept_question(update, context, _pflow,
+                                               message_text)
+        return await _poll_accept_options(update, context, _pflow,
+                                          message_text)
 
     if context.user_data.get('replying_to_anon'):
         return await send_anonymous_reply(update, context)
+
+    # ВОЛНА 22.12: «📚 Решения» — общая база решений класса.
+    if message_text == "📚 Решения":
+        return await solutions_menu(update, context)
 
     if context.user_data.get('ai_mode'):
         # Любой вариант «выход» — гарантированно выходим из режима AI
@@ -23990,9 +24382,39 @@ async def timer_set_text_handler(update: Update, context: ContextTypes.DEFAULT_T
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
 
+    # ВОЛНА 22.12: анти-гонка опросов v2 — ДО query.answer() и любых await.
+    # concurrent_updates(True): вопрос, отправленный сразу после нажатия
+    # «📊 Опрос», обгонял колбэк и обрабатывался ДО того, как poll_flow
+    # появлялся в user_data (бот «молчал», отвечал только на второй текст),
+    # а двойное нажатие «✅ Отправить» успевало запустить ДВЕ рассылки
+    # (каждому приходило по два одинаковых опроса). Поэтому:
+    # 1) poll_flow ставим синхронно, до первого await;
+    # 2) повторное poll_go глушим мгновенным флагом sent.
     data = query.data
+    if data in ("dev_poll", "admin_poll"):
+        _cb_uid = str(query.from_user.id)
+        _cb_ok = (_cb_uid == DEVELOPER_ID if data == "dev_poll"
+                  else is_user_class_admin(_cb_uid))
+        if _cb_ok:
+            _cb_pf = context.user_data.get("poll_flow")
+            if not (isinstance(_cb_pf, dict)
+                    and _cb_pf.get("scope") in ("all", "class")
+                    and not _cb_pf.get("sent")):
+                context.user_data["poll_flow"] = {
+                    "scope": "all" if data == "dev_poll" else "class",
+                }
+    elif data == "poll_go":
+        _cb_pf = context.user_data.setdefault("poll_flow", {})
+        if _cb_pf.get("sent"):
+            try:
+                await query.answer("Опрос уже отправлен.", show_alert=False)
+            except Exception:
+                pass
+            return MAIN_MENU
+        _cb_pf["sent"] = True
+
+    await query.answer()
 
     # Обязательная подписка на канал: не пускаем пользователя никуда, пока
     # он не подписан. Исключение — сама кнопка проверки подписки и кнопка
@@ -24248,6 +24670,50 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await poll_go_cb(update, context)
     elif data == "poll_results":
         return await poll_results_cb(update, context)
+    elif data in ("poll_edit_q", "poll_edit_opts"):
+        return await poll_edit_cb(update, context)
+    elif data == "poll_sched":
+        return await poll_sched_cb(update, context)
+    elif data == "poll_cancel":
+        return await poll_cancel_cb(update, context)
+    elif data == "sol_menu":
+        # ВОЛНА 22.12: меню базы решений класса.
+        return await sol_menu_cb(update, context)
+    elif data == "sol_send":
+        return await sol_send_cb(update, context)
+    elif data == "sol_cancel":
+        return await sol_cancel_cb(update, context)
+    elif data in ("sol_anon_yes", "sol_anon_no"):
+        return await sol_anon_cb(update, context)
+    elif data.startswith("sol_appr_") or data.startswith("sol_rej_"):
+        return await sol_moderate_cb(update, context)
+    elif data == "sol_list":
+        return await sol_list_cb(update, context)
+    elif data.startswith("sol_view_"):
+        return await sol_view_cb(update, context)
+    elif data == "sol_toggle_notify":
+        return await sol_toggle_notify_cb(update, context)
+    elif data == "share_open" or data.startswith("share_open_"):
+        # ВОЛНА 22.12: 🔗 менеджер share-ссылки (из списка/карточки файла).
+        return await share_open_cb(update, context)
+    elif data == "share_pick":
+        return await share_pick_cb(update, context)
+    elif data.startswith("share_tgl_"):
+        return await share_toggle_cb(update, context)
+    elif data in ("share_url", "share_pw", "share_search"):
+        return await share_input_start_cb(update, context)
+    elif data in ("share_ttl", "share_lim", "share_prot"):
+        return await share_param_cb(update, context)
+    elif data == "share_make":
+        return await share_make_cb(update, context)
+    elif data == "share_cancel":
+        return await share_cancel_cb(update, context)
+    elif data == "share_back":
+        return await share_back_cb(update, context)
+    elif data == "share_list":
+        return await share_list_cb(update, context)
+    elif data.startswith("share_revoke_"):
+        return await share_revoke_cb(update, context)
     elif data == "personal_buttons":
         return await personal_buttons_menu(update, context)
     elif data == "suggest_function":
@@ -24473,6 +24939,29 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "vault_labelskip":
         # ВОЛНА 13: «⏭ Пропустить» на шаге названия загрузки Сейфа.
         return await vault_labelskip_cb(update, context)
+    elif data.startswith("vault_cat_"):
+        # ВОЛНА 22.12: выбор категории загрузки (🎵/📷/🎬/📄/📦).
+        return await vault_cat_cb(update, context)
+    elif data == "vault_tagskip":
+        # ВОЛНА 22.12: «⏭ Пропустить» на шаге тегов загрузки.
+        return await vault_tagskip_cb(update, context)
+    elif data == "vault_search":
+        # ВОЛНА 22.12: 🔍 поиск по названиям/тегам/категориям Сейфа.
+        query2 = update.callback_query
+        try:
+            await query2.answer()
+        except Exception:
+            pass
+        _sack = await query2.message.reply_text(
+            "🔍 ПОИСК ПО СЕЙФУ\n\nПришлите запрос одним сообщением — слова из "
+            "НАЗВАНИЯ, ТЕГИ или КАТЕГОРИЮ (музыка / фото / видео / файл / "
+            "другое). Можно несколько слов — например «контрольная алгебра».",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ Отмена", callback_data="vault_exit")]]),
+        )
+        _vault_track_ack(context, _sack,
+                         user=get_user(str(query2.from_user.id)))
+        return VAULT_SEARCH_WAIT
     elif data.startswith("vault_delyes_"):
         return await vault_del_yes_cb(update, context)
     elif data.startswith("vault_del_"):
@@ -26249,7 +26738,1229 @@ async def dev_instant_broadcast_handler(update: Update, context: ContextTypes.DE
 # опросы в боте». Админ класса — «📊 Опрос классу» (админ-панель), разработчик
 # — «📊 Опрос всем» (панель разработчика). Поток: вопрос → варианты (2–10,
 # по одному в строке) → превью → «✅ Отправить» → бот рассылает НАСТОЯЩИЙ
-# Telegram-опрос (send_poll, НЕ анонимный — иначе Telegram не присылает
+# ============================================================
+# === ВОЛНА 22.12: ОБЩАЯ БАЗА РЕШЕНИЙ КЛАССА ===
+# Участники класса отправляют готовые решения (фото/файл); публикует их
+# староста (админ класса) — МОДЕРАЦИЯ; автор может отправить АНОНИМНО.
+# Одобренные решения лежат в базе, любой участник класса может открыть и
+# списать. О новом решении бот присылает участникам сообщение — эти
+# уведомления отключаются в ⚙️ Настройках или в меню базы.
+# Хранение: SOLUTIONS_FILE (переживает рестарт бота). Файл решения копируется
+# ботом в cloud-канал (как шифры Сейфа) — оригинал в личке не нужен.
+# ============================================================
+
+SOL_WAIT_FILE = 133  # (константа объявлена в блоке состояний выше)
+
+_SOL_MAX_PER_CLASS = 50  # храним последние 50 решений на класс (FIFO)
+_SOL_SUBJECT_MAX = 100
+
+_SOL_CACHE = None
+
+
+def _solutions_all():
+    """Весь реестр решений: {class_code: [entry…]} (ленивая загрузка)."""
+    global _SOL_CACHE
+    if _SOL_CACHE is None:
+        data = load_data(SOLUTIONS_FILE, {})
+        _SOL_CACHE = data if isinstance(data, dict) else {}
+    return _SOL_CACHE
+
+
+def _solutions_save():
+    save_data(SOLUTIONS_FILE, _solutions_all())
+
+
+def _sol_class_entries(class_code):
+    return _solutions_all().setdefault(str(class_code or ""), [])
+
+
+def _sol_gen_id():
+    return "sol_" + "".join(random.choices(
+        string.ascii_lowercase + string.digits, k=8))
+
+
+def _sol_find_entry(sol_id):
+    for _code, entries in _solutions_all().items():
+        for e in entries:
+            if isinstance(e, dict) and e.get("id") == sol_id:
+                return e
+    return None
+
+
+def _sol_menu_kb(user):
+    _on = bool(getattr(user, "sol_notify", True))
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📤 Отправить решение", callback_data="sol_send")],
+        [InlineKeyboardButton("📚 Открыть базу", callback_data="sol_list")],
+        [InlineKeyboardButton(
+            f"🔔 Уведомления о новых: {'вкл' if _on else 'выкл'}",
+            callback_data="sol_toggle_notify")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="back_to_main")],
+    ])
+
+
+def _sol_user_label(user):
+    _nm = (getattr(user, "first_name", "") or "").strip()
+    _un = (getattr(user, "username", "") or "").strip()
+    return _nm or (("@" + _un) if _un else "участник")
+
+
+async def solutions_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.12: кнопка «📚 Решения» главного меню."""
+    msg = update.message
+    user = get_user(str(update.effective_user.id))
+    if not user:
+        await msg.reply_text("Сначала зарегистрируйтесь — /start")
+        return MAIN_MENU
+    class_obj = get_class_by_user(user.user_id)
+    if not class_obj:
+        await msg.reply_text(
+            "📚 База решений — общая у класса. Вы пока не состоите в классе: "
+            "вступите через «🎓 Управление классами» → «🔑 Код класса».")
+        return MAIN_MENU
+    await msg.reply_text(
+        f"📚 БАЗА РЕШЕНИЙ класса «{class_obj.class_name}»\n\n"
+        "Поделитесь своим решением — его проверит староста, и оно появится "
+        "в общей базе. Можно отправить АНОНИМНО. Из базы любой участник "
+        "класса сможет открыть решение и списать.\n\n"
+        "Уведомления о новых решениях включаются/выключаются кнопкой ниже "
+        "или в ⚙️ Настройках.",
+        reply_markup=_sol_menu_kb(user),
+    )
+    return MAIN_MENU
+
+
+async def sol_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.12: то же меню по кнопке «⬅️ Назад» из вложенных экранов."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    user = get_user(str(query.from_user.id))
+    if not user:
+        await query.answer("Сначала зарегистрируйтесь — /start",
+                           show_alert=True)
+        return MAIN_MENU
+    class_obj = get_class_by_user(user.user_id)
+    if not class_obj:
+        await query.edit_message_text("База решений доступна участникам класса.")
+        return MAIN_MENU
+    try:
+        await query.edit_message_text(
+            f"📚 БАЗА РЕШЕНИЙ класса «{class_obj.class_name}»",
+            reply_markup=_sol_menu_kb(user))
+    except Exception:
+        pass
+    return MAIN_MENU
+
+
+async def sol_send_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.12: «📤 Отправить решение» — просим фото/файл."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    user = get_user(str(query.from_user.id))
+    class_obj = get_class_by_user(str(query.from_user.id)) if user else None
+    if not user or not class_obj:
+        await query.answer("База решений доступна участникам класса.",
+                           show_alert=True)
+        return MAIN_MENU
+    if is_user_class_blocked(str(query.from_user.id), class_obj.class_code):
+        await query.answer("Вы заблокированы в классе.", show_alert=True)
+        return MAIN_MENU
+    await query.message.reply_text(
+        "📤 ПРИШЛИТЕ РЕШЕНИЕ — фото или файл одним сообщением.\n\n"
+        "В подписи укажите предмет: например «Алгебра» (не обязательно, "
+        "но так его легче найти в базе).",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("❌ Отмена", callback_data="sol_cancel")]]),
+    )
+    return SOL_WAIT_FILE
+
+
+async def sol_cancel_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.12: отмена отправки решения."""
+    query = update.callback_query
+    try:
+        await query.answer("Отменено.")
+    except Exception:
+        pass
+    context.user_data.pop('sol_pending', None)
+    try:
+        await query.edit_message_text("❌ Отправка решения отменена.")
+    except Exception:
+        pass
+    return MAIN_MENU
+
+
+@timeout(CONVERSATION_TIMEOUT)
+async def sol_file_receive(update: Update,
+                           context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.12: приём фото/файла решения → выбор анонимности."""
+    msg = update.message
+    user = get_user(str(update.effective_user.id))
+    class_obj = get_class_by_user(str(update.effective_user.id)) if user else None
+    if not user or not class_obj:
+        await msg.reply_text("База решений доступна участникам класса.")
+        return MAIN_MENU
+    if not (msg.photo or msg.document):
+        await msg.reply_text(
+            "❌ Нужен ФОТО или ФАЙЛ одним сообщением. Текст решением не "
+            "считается. Попробуйте ещё раз или нажмите «❌ Отмена».")
+        return SOL_WAIT_FILE
+    subject = (msg.caption or "").strip()[:_SOL_SUBJECT_MAX]
+    context.user_data['sol_pending'] = {
+        "ch": int(msg.chat_id),
+        "mid": int(msg.message_id),
+        "ftype": "photo" if msg.photo else "document",
+        "subject": subject,
+    }
+    await msg.reply_text(
+        "✅ Решение получено."
+        + (f"\n📘 Предмет: «{subject}»" if subject else "")
+        + "\n\nКТО автор? Опубликуем с вашим именем или анонимно?",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📝 От моего имени", callback_data="sol_anon_no"),
+             InlineKeyboardButton("🕵️ Анонимно", callback_data="sol_anon_yes")],
+            [InlineKeyboardButton("❌ Отмена", callback_data="sol_cancel")],
+        ]),
+    )
+    return SOL_WAIT_FILE
+
+
+def _sol_author_label(entry):
+    return ("🕵️ Анонимно" if entry.get("anon")
+            else f"👤 {entry.get('author_name') or 'участник'}")
+
+
+async def _sol_notify_class(context, class_obj, entry, skip_uid=None):
+    """Уведомить участников класса о новом решении (кто не выключил)."""
+    users = load_users()
+    _text = ("📚 Новое решение в базе класса!\n\n"
+             f"📘 {entry.get('subject') or 'Без предмета'}\n"
+             f"от {_sol_author_label(entry)} · {entry.get('ts', '')}")
+    _kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("📚 Открыть базу", callback_data="sol_list")]])
+    members = list(dict.fromkeys(
+        [str(m) for m in (class_obj.students + class_obj.admins)]))
+    for uid in members:
+        if uid == skip_uid:
+            continue
+        u = users.get(uid)
+        if u is None or getattr(u, "is_blocked", False):
+            continue
+        if not getattr(u, "sol_notify", True):
+            continue
+        try:
+            await context.bot.send_message(chat_id=int(uid), text=_text,
+                                           reply_markup=_kb)
+        except Exception:
+            pass
+
+
+async def sol_anon_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.12: выбор анонимности → копия в cloud-канал → модерация
+    старосте (или мгновенная публикация, если автор сам староста)."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    data = query.data
+    if data not in ("sol_anon_yes", "sol_anon_no"):
+        return MAIN_MENU
+    user = get_user(str(query.from_user.id))
+    class_obj = get_class_by_user(str(query.from_user.id)) if user else None
+    pend = context.user_data.pop('sol_pending', None)
+    if not user or not class_obj or not isinstance(pend, dict):
+        await query.edit_message_text(
+            "Сессия потеряна — пришлите решение заново: «📚 Решения».")
+        return MAIN_MENU
+    channels = get_cloud_channel_ids()
+    if not channels:
+        await query.edit_message_text(
+            "❌ Хранилище не настроено (нет cloud-каналов) — решение принять "
+            "не могу. Попросите разработчика подключить канал.")
+        return MAIN_MENU
+    _chan = channels[0]
+    _author = user.user_id
+    _author_name = _sol_user_label(user)
+    try:
+        _copied = await context.bot.copy_message(
+            chat_id=_chan, from_chat_id=int(pend["ch"]),
+            message_id=int(pend["mid"]))
+    except Exception as e:
+        logger.error(f"solutions: копия в канал не удалась: {e}")
+        await query.edit_message_text(
+            "❌ Не смог сохранить файл решения в хранилище. Пришлите его "
+            "заново: «📚 Решения» → «📤 Отправить решение».")
+        return MAIN_MENU
+    entry = {
+        "id": _sol_gen_id(),
+        "class_code": class_obj.class_code,
+        "subject": pend.get("subject") or "",
+        "author": _author if data == "sol_anon_no" else "",
+        "author_name": _author_name if data == "sol_anon_no" else "",
+        "real_author": _author,  # внутри бот знает автора (жалобы/злоупотреб)
+        "anon": data == "sol_anon_yes",
+        "file": {"ch": int(_chan), "mid": int(_copied.message_id),
+                 "ftype": pend.get("ftype") or "document"},
+        "status": "pending",
+        "approved_by": "",
+        "ts": datetime.now().strftime("%d.%m %H:%M"),
+    }
+    _sol_class_entries(class_obj.class_code).append(entry)
+    while len(_sol_class_entries(class_obj.class_code)) > _SOL_MAX_PER_CLASS:
+        _sol_class_entries(class_obj.class_code).pop(0)
+    _solutions_save()
+    # Староста (админы класса), КРОМЕ самого автора — своё решение он
+    # видит и так; если модераторов нет — публикуем сразу и честно говорим.
+    moderators = [a for a in dict.fromkeys(
+        [str(m) for m in class_obj.admins]) if a != _author]
+    if not moderators:
+        entry["status"] = "approved"
+        entry["approved_by"] = _author
+        _solutions_save()
+        await query.edit_message_text(
+            "✅ Вы староста этого класса — модерация не нужна, решение "
+            "СРАЗУ опубликовано в базе.")
+        await _sol_notify_class(context, class_obj, entry, skip_uid=_author)
+        return MAIN_MENU
+    _card = ("🛡 МОДЕРАЦИЯ РЕШЕНИЯ — класс «" + class_obj.class_name + "»\n\n"
+             "📘 " + (entry.get("subject") or "Без предмета")
+             + "\nот " + _sol_author_label(entry)
+             + " · " + entry["ts"]
+             + "\n\nОпубликовать в общей базе класса?")
+    _card_kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Одобрить", callback_data=f"sol_appr_{entry['id']}"),
+        InlineKeyboardButton("❌ Отклонить", callback_data=f"sol_rej_{entry['id']}")]])
+    delivered = 0
+    for admin_uid in moderators:
+        try:
+            await context.bot.send_message(chat_id=int(admin_uid), text=_card,
+                                           reply_markup=_card_kb)
+            delivered += 1
+        except Exception:
+            pass
+    await query.edit_message_text(
+        "✅ Решение отправлено на модерацию старосте."
+        if delivered else
+        "⚠️ Староста недоступен — решение ждёт модерации, повторить можно позже.")
+    return MAIN_MENU
+
+
+async def sol_moderate_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.12: ✅ Одобрить / ❌ Отклонить на карточке модерации."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    data = query.data
+    approve = data.startswith("sol_appr_")
+    sol_id = data[len("sol_appr_"):] if approve else data[len("sol_rej_"):]
+    entry = _sol_find_entry(sol_id)
+    if entry is None:
+        await query.edit_message_text("Решение не найдено (уже удалено?).")
+        return MAIN_MENU
+    _uid = str(query.from_user.id)
+    class_obj = get_class_by_code(entry.get("class_code"))
+    if _uid != DEVELOPER_ID and not (
+            class_obj is not None and _uid in class_obj.admins):
+        await query.answer("Модерация — только для старосты класса.",
+                           show_alert=True)
+        return MAIN_MENU
+    if entry.get("status") != "pending":
+        await query.answer("Это решение уже обработано.", show_alert=True)
+        return MAIN_MENU
+    if approve:
+        entry["status"] = "approved"
+        entry["approved_by"] = _uid
+        _solutions_save()
+        try:
+            await query.edit_message_text(
+                "✅ Решение опубликовано в базе класса.\n📘 "
+                + (entry.get("subject") or "Без предмета"))
+        except Exception:
+            pass
+        # Автору (не анонимному) — радостная весть; классу — уведомление.
+        if entry.get("author"):
+            try:
+                await context.bot.send_message(
+                    chat_id=int(entry["author"]),
+                    text="✅ Ваше решение опубликовано в базе класса: "
+                         f"«{entry.get('subject') or 'Без предмета'}».")
+            except Exception:
+                pass
+        if class_obj is not None:
+            await _sol_notify_class(context, class_obj, entry,
+                                    skip_uid=entry.get("author") or None)
+    else:
+        entry["status"] = "rejected"
+        entry["approved_by"] = _uid
+        _solutions_save()
+        try:
+            await query.edit_message_text(
+                "❌ Решение отклонено — в базу класса оно не попадёт.")
+        except Exception:
+            pass
+        if entry.get("author"):
+            try:
+                await context.bot.send_message(
+                    chat_id=int(entry["author"]),
+                    text="❌ Ваше решение отклонено старостой и не попало "
+                         "в базу класса.")
+            except Exception:
+                pass
+    return MAIN_MENU
+
+
+async def sol_list_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.12: «📚 Открыть базу» — последние одобренные решения."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    user = get_user(str(query.from_user.id))
+    class_obj = get_class_by_user(str(query.from_user.id)) if user else None
+    if not user or not class_obj:
+        await query.answer("База решений доступна участникам класса.",
+                           show_alert=True)
+        return MAIN_MENU
+    entries = [e for e in _sol_class_entries(class_obj.class_code)
+               if isinstance(e, dict) and e.get("status") == "approved"]
+    if not entries:
+        try:
+            await query.edit_message_text(
+                f"📚 База решений класса «{class_obj.class_name}» пока пуста.\n\n"
+                "Станьте первым: «📚 Решения» → «📤 Отправить решение». "
+                "Староста одобрит — и все смогут списать.",
+                reply_markup=_sol_menu_kb(user))
+        except Exception:
+            pass
+        return MAIN_MENU
+    kb = []
+    for e in reversed(entries[-10:]):
+        _label = (e.get("subject") or "Без предмета")[:32]
+        kb.append([InlineKeyboardButton(
+            f"📘 {_label} · {e.get('ts', '')}",
+            callback_data=f"sol_view_{e['id']}")])
+    kb.append([InlineKeyboardButton("⬅️ В меню базы", callback_data="sol_menu")])
+    try:
+        await query.edit_message_text(
+            f"📚 БАЗА РЕШЕНИЙ класса «{class_obj.class_name}» "
+            f"(одобрено: {len(entries)})\n\nНажмите на решение, чтобы "
+            "открыть его здесь и списать.",
+            reply_markup=InlineKeyboardMarkup(kb))
+    except Exception:
+        pass
+    return MAIN_MENU
+
+
+async def sol_view_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.12: показать решение (копия файла из канала в чат)."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    sol_id = query.data[len("sol_view_"):]
+    entry = _sol_find_entry(sol_id)
+    user = get_user(str(query.from_user.id))
+    class_obj = get_class_by_user(str(query.from_user.id)) if user else None
+    if (entry is None or user is None or class_obj is None
+            or entry.get("class_code") != class_obj.class_code
+            or entry.get("status") != "approved"):
+        await query.answer("Решение недоступно.", show_alert=True)
+        return MAIN_MENU
+    _f = entry.get("file") or {}
+    _cap = (f"📘 {entry.get('subject') or 'Без предмета'} · "
+            f"{_sol_author_label(entry)} · {entry.get('ts', '')}")
+    try:
+        if _f.get("ftype") == "photo":
+            await context.bot.send_photo(
+                chat_id=query.message.chat_id,
+                from_chat_id=int(_f.get("ch") or 0),
+                photo=int(_f.get("mid") or 0), caption=_cap)
+        else:
+            await context.bot.send_document(
+                chat_id=query.message.chat_id,
+                from_chat_id=int(_f.get("ch") or 0),
+                document=int(_f.get("mid") or 0), caption=_cap)
+    except Exception as e:
+        logger.error(f"solutions: выдача решения не удалась: {e}")
+        await query.answer("Не удалось открыть файл — он удалён из хранилища?",
+                           show_alert=True)
+    return MAIN_MENU
+
+
+async def sol_toggle_notify_cb(update: Update,
+                               context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.12: тоггл уведомлений о новых решениях (⚙️ Настройки)."""
+    query = update.callback_query
+    await query.answer()
+    user_id = str(query.from_user.id)
+    user = get_user(user_id)
+    if not user:
+        user = User(user_id)
+    user.sol_notify = not bool(getattr(user, "sol_notify", True))
+    save_user(user)
+    return await user_settings(update, context)
+
+
+# ============================================================
+# === ВОЛНА 22.12: SHARE-ССЫЛКИ (одноразовые токены обмена файлами) ===
+# Владелец собирает ссылку из файлов Сейфа и внешних URL: TTL (15м/1ч/24ч/3д),
+# лимит скачиваний (1 = «сгорает после первого»), пароль-PIN, режим «без
+# пересылки» (protect_content). Получатель открывает deep-link
+# https://t.me/<бот>?start=dl_xxx — бот проверяет токен и выдаёт файлы.
+# СЕКРЕТЫ: файлы Сейфа зашифрованы ПАРОЛЕМ ВЛАДЕЛЬЦА (zero-knowledge), поэтому
+# при создании ссылки владелец ОДИН раз вводит пароль — бот расшифровывает
+# выбранные файлы (≤20 МБ) и кладёт ОБЫЧНЫЕ копии в cloud-канал. Пароль
+# нигде не сохраняется и получателю не нужен. Ссылки переживают рестарт
+# бота (SHARE_FILE в базе).
+# ============================================================
+
+SHARE_FILE = _data_file("share_tokens.json")
+
+SHARE_TTLS = (("15 минут", 0.25), ("1 час", 1), ("24 часа", 24), ("3 дня", 72))
+SHARE_LIMITS = ((1, "1 (сгорит после первого)"), (3, "3"), (5, "5"),
+                (10, "10"), (0, "∞ (без лимита)"))
+
+_SHARE_CACHE = None
+
+
+def _share_all():
+    """Реестр токенов {tok: rec}; просроченные вычищаются при загрузке."""
+    global _SHARE_CACHE
+    if _SHARE_CACHE is None:
+        data = load_data(SHARE_FILE, {})
+        _SHARE_CACHE = data if isinstance(data, dict) else {}
+        now = time.time()
+        for _tok in [t for t, r in _SHARE_CACHE.items()
+                     if not isinstance(r, dict)
+                     or (r.get("expires_ts") or 0) < now
+                     or r.get("revoked")
+                     or (r.get("limit", 0) > 0
+                         and r.get("used", 0) >= r["limit"])]:
+            _SHARE_CACHE.pop(_tok, None)
+    return _SHARE_CACHE
+
+
+def _share_save():
+    save_data(SHARE_FILE, _share_all())
+
+
+def _share_gen_tok():
+    return "dl_" + "".join(random.choices(
+        string.ascii_letters + string.digits, k=10))
+
+
+def _share_draft(context):
+    d = context.user_data.get("share_draft")
+    if not isinstance(d, dict):
+        d = {"items": [], "ttl_idx": 1, "lim_idx": 0, "pw": "", "protect": False,
+             "q": "", "title": ""}
+        context.user_data["share_draft"] = d
+    return d
+
+
+def _share_item_label(item, user=None):
+    if item.get("ftype") == "url":
+        return "🌐 " + (item.get("title") or item.get("url", ""))[:40]
+    rec = _vault_find_record(user, item.get("fid")) if user else None
+    lbl = str(rec.get("label") or "").strip() if rec else ""
+    return "📄 " + (lbl or item.get("fid", "файл"))[:40]
+
+
+def _share_mgr_text(d, user):
+    n_files = sum(1 for i in d["items"] if i.get("ftype") == "vault")
+    n_urls = len(d["items"]) - n_files
+    ttl = SHARE_TTLS[d["ttl_idx"]][0]
+    lim = SHARE_LIMITS[d["lim_idx"]]
+    lim_s = lim[1] if lim[0] else lim[1]
+    _size_warn = ""
+    if user:
+        for i in d["items"]:
+            if i.get("ftype") != "vault":
+                continue
+            rec = _vault_find_record(user, i.get("fid"))
+            if rec and int(rec.get("size_orig", 0) or 0) > VAULT_MAX_FILE_BYTES:
+                _size_warn = "\n⚠️ В выборе есть файл больше 20 МБ — его нельзя положить в ссылку."
+                break
+    return ("🔗 СОЗДАНИЕ ССЫЛКИ ОБМЕНА\n\n"
+            f"Выбрано: {n_files} файл(ов) Сейфа + {n_urls} ссылок."
+            + _size_warn
+            + f"\n⏳ Срок действия: {ttl}"
+            + f"\n🔢 Лимит скачиваний: {lim_s}"
+            + f"\n🔒 Пароль (PIN): {'есть' if d['pw'] else 'нет'}"
+            + f"\n🚫 Без пересылки: {'вкл' if d['protect'] else 'выкл'}"
+            + "\n\nНастройте параметры кнопками ниже и создайте ссылку.")
+
+
+def _share_mgr_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📎 Выбрать файлы", callback_data="share_pick")],
+        [InlineKeyboardButton("🌐 Добавить внешнюю ссылку", callback_data="share_url")],
+        [InlineKeyboardButton("⏳ Срок действия", callback_data="share_ttl"),
+         InlineKeyboardButton("🔢 Лимит", callback_data="share_lim")],
+        [InlineKeyboardButton("🔒 Пароль (PIN)", callback_data="share_pw"),
+         InlineKeyboardButton("🚫 Без пересылки", callback_data="share_prot")],
+        [InlineKeyboardButton("✅ Создать ссылку", callback_data="share_make")],
+        [InlineKeyboardButton("🗂 Мои активные ссылки", callback_data="share_list")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="share_cancel")],
+    ])
+
+
+async def _share_mgr_render(update, context, user, edit=True):
+    """Показать/обновить экран менеджера ссылки."""
+    query = update.callback_query
+    d = _share_draft(context)
+    txt = _share_mgr_text(d, user)
+    try:
+        if edit and query is not None:
+            await query.edit_message_text(txt, reply_markup=_share_mgr_kb())
+        else:
+            chat_id = (query.message.chat_id if query is not None
+                       else update.message.chat_id)
+            await context.bot.send_message(chat_id=chat_id, text=txt,
+                                           reply_markup=_share_mgr_kb())
+    except Exception:
+        pass
+
+
+async def share_open_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.12: «🔗 Поделиться» — открывает менеджер ссылки. Если нажато
+    у конкретного файла (share_open_<id>) — файл уже выбран."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    user = get_user(str(query.from_user.id))
+    if not user:
+        await query.answer("Сначала зарегистрируйтесь — /start",
+                           show_alert=True)
+        return MAIN_MENU
+    d = _share_draft(context)
+    d["items"] = []
+    d["q"] = ""
+    vid = query.data[len("share_open_"):] if query.data.startswith(
+        "share_open_") else ""
+    if vid:
+        rec = _vault_find_record(user, vid)
+        if rec is None:
+            await query.answer("Файл не найден.", show_alert=True)
+            return MAIN_MENU
+        d["items"].append({"ftype": "vault", "fid": vid})
+    context.user_data["share_draft"] = d
+    await _share_mgr_render(update, context, user, edit=not vid)
+    return MAIN_MENU
+
+
+async def share_param_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.12: переключатели менеджера — TTL / лимит / protect."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    user = get_user(str(query.from_user.id))
+    if not user:
+        return MAIN_MENU
+    d = _share_draft(context)
+    if query.data == "share_ttl":
+        d["ttl_idx"] = (d["ttl_idx"] + 1) % len(SHARE_TTLS)
+    elif query.data == "share_lim":
+        d["lim_idx"] = (d["lim_idx"] + 1) % len(SHARE_LIMITS)
+    elif query.data == "share_prot":
+        d["protect"] = not d["protect"]
+    context.user_data["share_draft"] = d
+    await _share_mgr_render(update, context, user)
+    return MAIN_MENU
+
+
+async def share_pick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.12: файловый менеджер — выбор файлов Сейфа в ссылку."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    user = get_user(str(query.from_user.id))
+    if not user:
+        return MAIN_MENU
+    d = _share_draft(context)
+    q = (d.get("q") or "").lower()
+    files = [f for f in (getattr(user, "vault_files", []) or [])
+             if isinstance(f, dict)]
+    if q:
+        files = [f for f in _vault_search_matches(user, q)] or files
+    sel = {i.get("fid") for i in d["items"] if i.get("ftype") == "vault"}
+    kb = []
+    for rec in files[:20]:
+        fid = rec.get("id")
+        lbl = str(rec.get("label") or "").strip() or "Файл без подписи"
+        mark = "✅" if fid in sel else "⬜"
+        _sz = _fmt_bytes(rec.get("size_orig", 0))
+        kb.append([InlineKeyboardButton(
+            f"{mark} {lbl[:26]} · {_sz}",
+            callback_data=f"share_tgl_{fid}")])
+    if not kb:
+        kb.append([InlineKeyboardButton("📭 Сейф пуст", callback_data="vault_files")])
+    kb.append([InlineKeyboardButton("🔍 Поиск", callback_data="share_search"),
+               InlineKeyboardButton("✅ Готово", callback_data="share_back")])
+    kb.append([InlineKeyboardButton("⬅️ К настройкам ссылки",
+                                    callback_data="share_back")])
+    _txt = ("📎 ВЫБОР ФАЙЛОВ ДЛЯ ССЫЛКИ\n\n✅ — файл в ссылке, ⬜ — нет. "
+            "Нажимайте, чтобы выбрать/снять. Поиск — по названиям, тегам "
+            "и категориям Сейфа.")
+    try:
+        await query.edit_message_text(_txt, reply_markup=InlineKeyboardMarkup(kb))
+    except Exception:
+        pass
+    return MAIN_MENU
+
+
+async def share_toggle_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.12: ✅/⬜ переключение файла в выборе."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    user = get_user(str(query.from_user.id))
+    if not user:
+        return MAIN_MENU
+    fid = query.data[len("share_tgl_"):]
+    d = _share_draft(context)
+    _sel = [i for i in d["items"] if i.get("ftype") == "vault"]
+    if any(i.get("fid") == fid for i in _sel):
+        d["items"] = [i for i in d["items"]
+                      if not (i.get("ftype") == "vault" and i.get("fid") == fid)]
+    else:
+        d["items"].append({"ftype": "vault", "fid": fid})
+    context.user_data["share_draft"] = d
+    await share_pick_cb(update, context)
+    return MAIN_MENU
+
+
+async def share_back_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.12: «✅ Готово» в менеджер из выбора файлов."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    context.user_data.pop("share_q", None)
+    user = get_user(str(query.from_user.id))
+    d = _share_draft(context)
+    d["q"] = ""
+    await _share_mgr_render(update, context, user)
+    return MAIN_MENU
+
+
+async def share_input_start_cb(update: Update,
+                               context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.12: запрос ввода — внешняя ссылка / пароль Сейфа / поиск."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    mode = query.data  # share_url / share_pw / share_search
+    context.user_data["share_input_mode"] = mode
+    _prompts = {
+        "share_url": ("🌐 Пришлите ВНЕШНЮЮ ССЫЛКУ одним сообщением "
+                      "(https://…). Она попадёт в общий индекс и будет "
+                      "выдаваться вместе с файлами."),
+        "share_pw": ("🔒 Придумайте PIN-КОД доступа к ссылке (до 24 символов) "
+                     "и пришлите одним сообщением. Получатель должен будет "
+                     "его ввести. Чтобы убрать пароль — пришлите «-»."),
+        "share_search": ("🔍 Пришлите запрос для поиска по Сейфу — слова из "
+                         "названия, теги или категорию."),
+    }
+    await query.message.reply_text(
+        _prompts.get(mode, "Пришлите данные одним сообщением."),
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("❌ Отмена", callback_data="share_back")]]),
+    )
+    return SHARE_INPUT_WAIT
+
+
+@timeout(CONVERSATION_TIMEOUT)
+async def share_input_receive(update: Update,
+                              context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.12: приём ввода менеджера ссылки."""
+    msg = update.message
+    user = get_user(str(update.effective_user.id))
+    if not user:
+        await msg.reply_text("Сначала зарегистрируйтесь — /start")
+        return MAIN_MENU
+    mode = context.user_data.pop("share_input_mode", "")
+    d = _share_draft(context)
+    text = (msg.text or "").strip()
+    if mode == "share_stage_pw":
+        return await _share_stage_pw_receive(update, context, user, text)
+    if mode == "share_url":
+        low = text.lower()
+        if not (low.startswith("http://") or low.startswith("https://")):
+            await msg.reply_text(
+                "❌ Нужна ссылка, начинающаяся с http:// или https://. "
+                "Пришлите заново.")
+            context.user_data["share_input_mode"] = mode
+            return SHARE_INPUT_WAIT
+        title = text.split("//", 1)[-1][:60]
+        d["items"].append({"ftype": "url", "url": text[:500], "title": title})
+        context.user_data["share_draft"] = d
+        await _share_mgr_render(update, context, user, edit=False)
+        return MAIN_MENU
+    if mode == "share_pw":
+        if text == "-":
+            d["pw"] = ""
+        else:
+            d["pw"] = text[:24]
+        context.user_data["share_draft"] = d
+        await _share_mgr_render(update, context, user, edit=False)
+        return MAIN_MENU
+    if mode == "share_search":
+        d["q"] = text[:60]
+        context.user_data["share_draft"] = d
+        files = _vault_search_matches(user, text)
+        sel = {i.get("fid") for i in d["items"] if i.get("ftype") == "vault"}
+        kb = []
+        for rec in files[:20]:
+            fid = rec.get("id")
+            lbl = str(rec.get("label") or "").strip() or "Файл без подписи"
+            kb.append([InlineKeyboardButton(
+                f"{'✅' if fid in sel else '⬜'} {lbl[:26]} · "
+                f"{_fmt_bytes(rec.get('size_orig', 0))}",
+                callback_data=f"share_tgl_{fid}")])
+        if not kb:
+            kb.append([InlineKeyboardButton("📭 Ничего не нашлось",
+                                            callback_data="share_back")])
+        kb.append([InlineKeyboardButton("⬅️ К настройкам ссылки",
+                                        callback_data="share_back")])
+        await msg.reply_text(
+            f"🔍 НАЙДЕНО: {len(files)} шт.\nНажимайте ✅/⬜, чтобы выбрать.",
+            reply_markup=InlineKeyboardMarkup(kb))
+        return MAIN_MENU
+    await msg.reply_text("Не понял контекст — откройте менеджер ссылки заново.")
+    return MAIN_MENU
+
+
+async def _share_stage_pw_receive(update, context, user, text):
+    """ВОЛНА 22.12: пароль Сейфа для подготовки файлов ссылки. Проверяем по
+    верификатору, расшифровываем каждый выбранный файл и кладём обычные копии
+    в cloud-канал. Пароль нигде не сохраняется."""
+    draft = context.user_data.get("share_pending")
+    if not isinstance(draft, dict):
+        await update.message.reply_text(
+            "Сессия создания ссылки потеряна — начните заново: Сейф → "
+            "🔗 Поделиться.")
+        return MAIN_MENU
+    vault_items = [i for i in draft["items"] if i.get("ftype") == "vault"]
+    if not vault_items:
+        return await _share_finalize(update, context, user)
+    _first = _vault_find_record(user, vault_items[0].get("fid"))
+    if _first is None or not _vault_check_password(user, _first, text):
+        await update.message.reply_text(
+            "❌ Неверный пароль Сейфа. Попробуйте ещё раз (это не пароль «Отмены» "
+            "и не PIN ссылки — это пароль, которым зашифрован ваш Сейф).",
+            reply_markup=_vault_dialog_kb())
+        context.user_data["share_input_mode"] = "share_stage_pw"
+        return SHARE_INPUT_WAIT
+    _status = await update.message.reply_text(
+        "⏳ Готовлю файлы: расшифровываю и кладу копии в хранилище…")
+    doc_items = []
+    _errs = []
+    try:
+        for i in vault_items:
+            rec = _vault_find_record(user, i.get("fid"))
+            if rec is None:
+                _errs.append("файл не найден в Сейфе")
+                continue
+            try:
+                staged = await _share_stage_vault_file(context, user, rec, text)
+                doc_items.append(staged)
+            except Exception as e:
+                logger.error(f"share stage: {e}")
+                _errs.append(str(e))
+    finally:
+        try:
+            await context.bot.delete_message(
+                chat_id=_status.chat_id, message_id=_status.message_id)
+        except Exception:
+            pass
+    if not doc_items:
+        await update.message.reply_text(
+            "❌ Не удалось подготовить файлы: " + "; ".join(_errs[:2])
+            + ". Попробуйте ещё раз — введите пароль заново.",
+            reply_markup=_vault_dialog_kb())
+        context.user_data["share_input_mode"] = "share_stage_pw"
+        return SHARE_INPUT_WAIT
+    draft["items"] = doc_items + [i for i in draft["items"]
+                                   if i.get("ftype") == "url"]
+    context.user_data["share_pending"] = draft
+    if _errs:
+        await update.message.reply_text(
+            "⚠️ Часть файлов не удалось подготовить (" + "; ".join(_errs[:2])
+            + ") — в ссылку попадут остальные.")
+    return await _share_finalize(update, context, user)
+
+
+async def _share_stage_vault_file(context, user, rec, password):
+    """Скачивает шифр записи Сейфа (≤20 МБ), расшифровывает и кладёт ОБЫЧНУЮ
+    копию в cloud-канал. Возвращает {"ch","mid","name"} — элемент ссылки."""
+    size = int(rec.get("size_orig", 0) or 0)
+    if size > VAULT_MAX_FILE_BYTES:
+        raise RuntimeError("файл больше 20 МБ — в ссылку нельзя")
+    container = None
+    fid = rec.get("file_id")
+    if fid:
+        try:
+            container = await _vault_botapi_download(context, fid)
+        except Exception:
+            container = None
+    if container is None:
+        ch = int(rec.get("channel_id") or 0)
+        mid = int(rec.get("msg_id") or 0)
+        if not ch or not mid:
+            raise RuntimeError("шифр файла не найден в хранилище")
+        client = await _mt_client()
+        if client is None:
+            raise RuntimeError("MTProto недоступен — попробуйте позже")
+        _m, doc = await _mt_fetch_document(client, ch, mid, 0)
+        if doc is None:
+            raise RuntimeError("шифр файла не найден в канале")
+        buf = io.BytesIO()
+        await _mt_download_stream(client, doc,
+                                  int(getattr(doc, "size", 0) or 0),
+                                  buf.write, None, "")
+        container = buf.getvalue()
+    if not container:
+        raise RuntimeError("шифр файла пуст")
+    if rec.get("dvf2"):
+        dec = _Dvf2Decryptor(password)
+        out = bytearray()
+        _chunk = dec.push(container)
+        if _chunk:
+            out.extend(_chunk)
+        _tail = dec.finish()
+        if _tail:
+            out.extend(_tail)
+        meta = dec.meta or {}
+        payload = bytes(out)
+    else:
+        meta, payload = _vault_unpack(password, container)
+    if not payload:
+        raise RuntimeError("файл расшифровался пустым (неверный пароль?)")
+    name = _dvf2_safe_name(str(meta.get("n") or "file.bin"))
+    up = await _storage_upload_document(context, payload, filename=name,
+                                        caption="🔗 Файл из ссылки обмена.")
+    payload = b""
+    if not up:
+        raise RuntimeError("хранилище не приняло копию файла")
+    return {"ch": int(up.get("channel_id") or get_storage_channel_id() or 0),
+            "mid": int(up.get("message_id") or 0), "ftype": "document",
+            "name": name}
+
+
+async def share_make_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.12: «✅ Создать ссылку». С файлами Сейфа — сначала пароль
+    (расшифровка и подготовка копий), с одними URL — сразу токен."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    user = get_user(str(query.from_user.id))
+    if not user:
+        return MAIN_MENU
+    d = _share_draft(context)
+    vault_items = [i for i in d["items"] if i.get("ftype") == "vault"]
+    url_items = [i for i in d["items"] if i.get("ftype") == "url"]
+    if not d["items"]:
+        await query.answer("Сначала выберите файлы или добавьте ссылку.",
+                           show_alert=True)
+        return MAIN_MENU
+    for i in vault_items:
+        rec = _vault_find_record(user, i.get("fid"))
+        if rec is None:
+            await query.answer("Один из файлов уже удалён из Сейфа — "
+                               "уберите его из выбора.", show_alert=True)
+            return share_pick_cb(update, context)
+        if int(rec.get("size_orig", 0) or 0) > VAULT_MAX_FILE_BYTES:
+            await query.answer("Файлы больше 20 МБ нельзя положить в ссылку.",
+                               show_alert=True)
+            return MAIN_MENU
+    ttl_h = SHARE_TTLS[d["ttl_idx"]][1]
+    limit = SHARE_LIMITS[d["lim_idx"]][0]
+    rec_draft = {
+        "items": list(d["items"]),
+        "ttl_h": ttl_h,
+        "limit": limit,
+        "pw": d["pw"],
+        "protect": d["protect"],
+        "urls": list(url_items),
+    }
+    context.user_data["share_pending"] = rec_draft
+    if vault_items:
+        context.user_data["share_input_mode"] = "share_stage_pw"
+        await query.message.reply_text(
+            "🔑 ВВЕДИТЕ ПАРОЛЬ СЕЙФА — он нужен ОДИН раз, чтобы бот "
+            "расшифровал выбранные файлы и подготовил их к отправке. "
+            "Пароль нигде не сохраняется и получателю не понадобится.",
+            reply_markup=_vault_dialog_kb(),
+        )
+        return SHARE_INPUT_WAIT
+    return await _share_finalize(update, context, user)
+
+
+async def _share_finalize(update, context, user):
+    """Создаёт токен, отдаёт владельцу deep-link и код."""
+    draft = context.user_data.pop("share_pending", None)
+    if not isinstance(draft, dict):
+        return MAIN_MENU
+    tok = _share_gen_tok()
+    now = time.time()
+    ttl_h = float(draft.get("ttl_h") or 1)
+    entry = {
+        "tok": tok,
+        "owner": user.user_id,
+        "items": list(draft.get("items") or []),
+        "limit": int(draft.get("limit") or 0),
+        "used": 0,
+        "pw": draft.get("pw") or "",
+        "protect": bool(draft.get("protect")),
+        "created_ts": now,
+        "expires_ts": now + ttl_h * 3600,
+        "ts": datetime.now().strftime("%d.%m %H:%M"),
+    }
+    _share_all()[tok] = entry
+    _share_save()
+    context.user_data.pop("share_draft", None)
+    _bot_uname = ""
+    try:
+        _bot_uname = (await context.bot.get_me()).username or ""
+    except Exception:
+        _bot_uname = ""
+    _deep = (f"https://t.me/{_bot_uname}?start={tok}" if _bot_uname else "")
+    _n_items = len(entry["items"])
+    _ttl_s = SHARE_TTLS[[t[1] for t in SHARE_TTLS].index(ttl_h)][0] \
+        if ttl_h in [t[1] for t in SHARE_TTLS] else f"{ttl_h} ч"
+    lines = ["🔗 ССЫЛКА ГОТОВА",
+             "",
+             f"📦 Внутри: {_n_items} элемент(ов)",
+             f"⏳ Действует: {_ttl_s}",
+             f"🔢 Лимит: {entry['limit'] or '∞'} скачиваний",
+             ("🔒 Требуется PIN: " + entry["pw"] if entry["pw"]
+              else "🔒 Без пароля"),
+             ("🚫 Без пересылки: вкл" if entry["protect"]
+              else "🚫 Без пересылки: выкл"),
+             "",
+             "Отправьте другу эту ссылку:"]
+    if _deep:
+        lines.append(_deep)
+    lines.append(f"или короткий код: {tok}")
+    if entry["limit"] == 1:
+        lines.append("🔥 Ссылка сгорит после первого скачивания.")
+    try:
+        await context.bot.send_message(chat_id=update.effective_chat.id,
+                                       text="\n".join(lines),
+                                       disable_web_page_preview=True)
+    except Exception as e:
+        logger.error(f"share finalize: не доставлено: {e}")
+    return MAIN_MENU
+
+
+async def share_cancel_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.12: «❌ Отмена» менеджера ссылки — черновик стирается."""
+    query = update.callback_query
+    try:
+        await query.answer("Отменено.")
+    except Exception:
+        pass
+    context.user_data.pop("share_draft", None)
+    context.user_data.pop("share_pending", None)
+    context.user_data.pop("share_input_mode", None)
+    try:
+        await query.edit_message_text("❌ Создание ссылки отменено.")
+    except Exception:
+        pass
+    return MAIN_MENU
+
+
+async def share_list_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.12: «🗂 Мои активные ссылки» — список с остатком времени
+    и лимитом, у каждой — кнопка «Отозвать»."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    _uid = str(query.from_user.id)
+    now = time.time()
+    mine = []
+    for tok, r in _share_all().items():
+        if (isinstance(r, dict) and str(r.get("owner")) == _uid
+                and (r.get("expires_ts") or 0) > now and not r.get("revoked")):
+            mine.append((tok, r))
+    if not mine:
+        try:
+            await query.edit_message_text(
+                "🗂 Активных ссылок нет.\n\nСоздайте: 🔐 Сейф → 📦 Мои файлы → "
+                "🔗 Поделиться.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("⬅️ К настройкам ссылки",
+                                         callback_data="share_back")]]))
+        except Exception:
+            pass
+        return MAIN_MENU
+    kb = []
+    lines = [f"🗂 ВАШИ АКТИВНЫЕ ССЫЛКИ: {len(mine)}\n"]
+    for tok, r in mine[:10]:
+        left = int((r["expires_ts"] - now) // 60)
+        _lim = r.get("limit") or 0
+        _lim_s = f"{r.get('used', 0)}/{_lim}" if _lim else f"{r.get('used', 0)}/∞"
+        lines.append(f"• {tok} · {_lim_s} · осталось {_fmt_eta(left * 60)}")
+        kb.append([InlineKeyboardButton(
+            f"🚫 Отозвать {tok}", callback_data=f"share_revoke_{tok}")])
+    kb.append([InlineKeyboardButton("⬅️ К настройкам ссылки",
+                                    callback_data="share_back")])
+    try:
+        await query.edit_message_text("\n".join(lines),
+                                      reply_markup=InlineKeyboardMarkup(kb))
+    except Exception:
+        pass
+    return MAIN_MENU
+
+
+async def share_revoke_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.12: досрочный отзыв ссылки в 1 клик."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    tok = query.data[len("share_revoke_"):]
+    rec = _share_all().get(tok)
+    if not rec or str(rec.get("owner")) != str(query.from_user.id):
+        await query.answer("Ссылка не найдена.", show_alert=True)
+        return MAIN_MENU
+    rec["revoked"] = True
+    _share_save()
+    _share_all().pop(tok, None)
+    _share_save()
+    try:
+        await query.edit_message_text(f"🚫 Ссылка {tok} отозвана — больше не работает.")
+    except Exception:
+        pass
+    return MAIN_MENU
+
+
+# === ПОЛУЧЕНИЕ ПО ССЫЛКЕ (deep-link /start dl_xxx или код) ===
+
+async def share_redeem_start(update, context, tok):
+    """Проверяет токен и либо выдаёт файлы, либо просит PIN (state).
+    Вызывается из start() (пользователь уже настроен)."""
+    user_id = str(update.effective_user.id)
+    rec = _share_all().get(tok)
+    if rec is None:
+        await update.effective_message.reply_text(
+            "🙈 Ссылка не найдена — она сгорела, отозвана, истекла или по ней "
+            "уже исчерпан лимит скачиваний.")
+        return MAIN_MENU
+    now = time.time()
+    if rec.get("expires_ts", 0) < now:
+        _share_all().pop(tok, None)
+        _share_save()
+        await update.effective_message.reply_text(
+            "⏳ Срок действия ссылки истёк — файлы больше не выдаются.")
+        return MAIN_MENU
+    if rec.get("limit", 0) and rec.get("used", 0) >= rec["limit"]:
+        _share_all().pop(tok, None)
+        _share_save()
+        await update.effective_message.reply_text(
+            "🔥 Лимит скачиваний по ссылке исчерпан — ссылка сгорела.")
+        return MAIN_MENU
+    if rec.get("pw"):
+        context.user_data["share_pin_tok"] = tok
+        await update.effective_message.reply_text(
+            "🔒 Эта ссылка защищена паролем. Пришлите PIN одним сообщением:")
+        return SHARE_PIN_WAIT
+    return await _share_redeem_deliver(update, context, tok)
+
+
+@timeout(CONVERSATION_TIMEOUT)
+async def share_pin_receive(update: Update,
+                            context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.12: PIN получателя ссылки."""
+    msg = update.message
+    tok = context.user_data.pop("share_pin_tok", None)
+    if not tok:
+        await msg.reply_text("Сессия потеряна — откройте ссылку заново.")
+        return MAIN_MENU
+    rec = _share_all().get(tok)
+    pin = (msg.text or "").strip()
+    if rec is None or pin != str(rec.get("pw") or ""):
+        context.user_data["share_pin_tok"] = tok
+        await msg.reply_text("❌ Неверный PIN. Попробуйте ещё раз.")
+        return SHARE_PIN_WAIT
+    return await _share_redeem_deliver(update, context, tok)
+
+
+async def _share_redeem_deliver(update, context, tok):
+    """Выдача файлов по ссылке + счётчик + уведомление владельца."""
+    rec = _share_all().get(tok)
+    if rec is None:
+        await update.effective_message.reply_text(
+            "🙈 Ссылка уже сгорела — файлы больше не выдаются.")
+        return MAIN_MENU
+    chat_id = update.effective_chat.id
+    protect = bool(rec.get("protect"))
+    ok = 0
+    for item in rec.get("items") or []:
+        try:
+            if item.get("ftype") == "url":
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"🔗 {item.get('title') or 'Ссылка'}\n{item.get('url')}",
+                    protect_content=protect,
+                    disable_web_page_preview=False)
+                ok += 1
+            else:
+                await context.bot.copy_message(
+                    chat_id=chat_id, from_chat_id=int(item.get("ch") or 0),
+                    message_id=int(item.get("mid") or 0),
+                    protect_content=protect)
+                ok += 1
+        except Exception as e:
+            logger.error(f"share deliver: {e}")
+    if not ok:
+        await update.effective_message.reply_text(
+            "❌ Не удалось выдать файлы — сообщите отправителю ссылки.")
+        return MAIN_MENU
+    rec["used"] = int(rec.get("used", 0)) + 1
+    _exhausted = bool(rec.get("limit") and rec["used"] >= rec["limit"])
+    if _exhausted:
+        _share_all().pop(tok, None)
+    _share_save()
+    try:
+        await context.bot.send_message(
+            chat_id=int(rec.get("owner") or 0),
+            text=(f"📥 Вашу ссылку ({rec.get('ts', '')}) использовали: "
+                  f"выдано {ok} файл(ов)."
+                  + ("\n🔥 Лимит исчерпан — ссылка деактивирована." if _exhausted
+                     else f"\nСкачиваний: {rec['used']}"
+                          + (f" из {rec['limit']}" if rec.get("limit") else ""))))
+    except Exception:
+        pass
+    return MAIN_MENU
 # ответы, и итоги не собрать). Голос каждого пользователя виден только боту
 # (опрос живёт в личке), в итогах — ОБЩИЕ числа без имён.
 # Хранение итогов: память процесса (_POLL_LOG/_POLL_INDEX) — честно
@@ -26295,9 +28006,30 @@ async def poll_start(update: Update, context: ContextTypes.DEFAULT_TYPE,
         await query.answer()
     except Exception:
         pass
-    context.user_data["poll_flow"] = {"scope": scope, "class_code": class_code}
+    # ВОЛНА 22.12: poll_flow уже мог быть создан анти-гонкой в
+    # handle_callback (до query.answer()) — НЕ затираем его, иначе вопрос,
+    # принятый между нажатием кнопки и этим кодом, потеряется. Вопрос уже
+    # есть? Сразу показываем шаг 2, не мигая устаревшим «шагом 1».
+    flow = context.user_data.get("poll_flow")
+    if not (isinstance(flow, dict) and flow.get("scope") in ("all", "class")):
+        flow = {}
+    flow["scope"] = scope
+    if class_code:
+        flow["class_code"] = class_code
+    context.user_data["poll_flow"] = flow
     where = ("ВСЕМ пользователям бота" if scope == "all"
              else "всем участникам вашего класса")
+    if flow.get("q"):
+        _step2 = ("✅ Вопрос уже принят: «" + flow["q"] + "»\n\n"
+                  "📊 СОЗДАНИЕ ОПРОСА — шаг 2 из 3\n\n"
+                  "2️⃣ Пришлите ВАРИАНТЫ ОТВЕТА — по одному в строке, "
+                  "от 2 до 10 вариантов (каждый до 100 символов).\n\n"
+                  "Например:\nДа\nНет\nНе знаю")
+        try:
+            await query.edit_message_text(_step2)
+        except Exception:
+            pass
+        return POLL_WAIT_OPTS
     # ВОЛНА 22.11: шаг 1 не может уронить диалог молча. Двойное нажатие
     # («Message is not modified»), медиа-сообщение панели и прочие сбои edit
     # раньше убивали poll_start ДО return — состояние не переключалось, и
@@ -26381,6 +28113,11 @@ async def _poll_accept_question(update, context, flow, text, is_update=False):
     context.user_data["poll_flow"] = flow
     head = (("♻️ Вопрос обновлён: «" + text + "»") if is_update
             else ("✅ Вопрос принят: «" + text + "»"))
+    # ВОЛНА 22.12: редактирование вопроса из превью — варианты УЖЕ есть,
+    # заново их не спрашиваем, сразу показываем обновлённое превью.
+    if flow.get("opts"):
+        return await _poll_send_preview(update, context, flow,
+                                        head + "\n\n📊 ПРЕВЬЮ ОПРОСА обновлено.")
     _prompt = (head + "\n\n"
                "📊 СОЗДАНИЕ ОПРОСА — шаг 2 из 3\n\n"
                "2️⃣ Теперь пришлите ВАРИАНТЫ ОТВЕТА — по одному в строке, "
@@ -26412,19 +28149,26 @@ async def poll_question_handler(update: Update, context: ContextTypes.DEFAULT_TY
 @timeout(CONVERSATION_TIMEOUT)
 async def poll_options_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """ВОЛНА 22.10: шаг 3 — принимаем варианты, показываем превью.
-    ВОЛНА 22.11: тупиков и молчания больше нет —
-    • пришёл шаг вариантов БЕЗ вопроса (гонка/рестарт) → текст становится
-      вопросом, бот сразу просит варианты;
-    • ОДНА строка в шаге вариантов вариантами быть не может (опросу нужно
-      ≥2) → считаем её (новым) вопросом и сразу просим варианты — раньше
-      именно здесь пользователь получал бессмысленное «Нужно от 2 до 10
-      вариантов», пересылая вопрос второй раз."""
+    ВОЛНА 22.12: вся логика живёт в общем хелпере _poll_accept_options —
+    его же вызывают анти-гонка главного меню (текст обогнал переключение
+    состояния) и приём вариантов после редактирования."""
     msg = update.message
     flow = context.user_data.get("poll_flow") or {}
     if not flow.get("scope"):
         await msg.reply_text("Сессия создания опроса потеряна. Начните заново.")
         return MAIN_MENU
-    text = (msg.text or "").strip()
+    return await _poll_accept_options(update, context, flow, msg.text)
+
+
+async def _poll_accept_options(update, context, flow, text, is_update=False):
+    """ВОЛНА 22.12: ЕДИНАЯ точка приёма ВАРИАНТОВ опроса (2–10 строк).
+    Самолечение из 22.11 сохранено:
+    • пришёл шаг вариантов БЕЗ вопроса (гонка/рестарт) → текст становится
+      вопросом, бот сразу просит варианты;
+    • ОДНА строка в шаге вариантов вариантами быть не может (опросу нужно
+      ≥2) → считаем её (новым) вопросом и сразу просим варианты."""
+    msg = update.message
+    text = (text or "").strip()
     if not flow.get("q"):
         # Состояние перескочило к вариантам без вопроса — принимаем текст
         # как ВОПРОС и сразу просим варианты (самолечение, без тупика).
@@ -26453,19 +28197,90 @@ async def poll_options_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         return rejected
     flow["opts"] = opts
     context.user_data["poll_flow"] = flow
+    return await _poll_send_preview(update, context, flow)
+
+
+def _poll_preview_kb():
+    """ВОЛНА 22.12: клавиатура превью — отправить, ОТРЕДАКТИРОВАТЬ вопрос и
+    варианты прямо из превью, запланировать отправку или отменить."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Отправить", callback_data="poll_go")],
+        [InlineKeyboardButton("✏️ Вопрос", callback_data="poll_edit_q"),
+         InlineKeyboardButton("✏️ Варианты", callback_data="poll_edit_opts")],
+        [InlineKeyboardButton("⏰ Запланировать", callback_data="poll_sched")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="poll_cancel")],
+    ])
+
+
+async def _poll_send_preview(update, context, flow, head=None):
+    """Единая отправка превью опроса (создание И редактирование)."""
+    msg = update.message
+    opts = flow.get("opts") or []
     where = ("ВСЕМ пользователям бота" if flow.get("scope") == "all"
              else "всем участникам вашего класса")
-    preview = ("📋 ПРЕВЬЮ ОПРОСА\n\n"
-               "❓ " + flow["q"] + "\n"
-               + "\n".join(f"  • {o}" for o in opts)
-               + f"\n\nОтправить опрос {where}?")
-    await msg.reply_text(
-        preview,
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Отправить", callback_data="poll_go"),
-            InlineKeyboardButton("❌ Отмена", callback_data="cancel_action"),
-        ]]))
+    text = ((head + "\n\n") if head else "📋 ПРЕВЬЮ ОПРОСА\n\n") \
+        + "❓ " + flow.get("q", "") + "\n" \
+        + "\n".join(f"  • {o}" for o in opts) \
+        + f"\n\nОтправить опрос {where}? Или исправьте его кнопками ниже."
+    try:
+        await msg.reply_text(text, reply_markup=_poll_preview_kb())
+    except Exception as e:
+        logger.error(f"poll: превью не доставлено reply-ем: {e}")
+        try:
+            await context.bot.send_message(chat_id=msg.chat_id, text=text,
+                                           reply_markup=_poll_preview_kb())
+        except Exception as e2:
+            logger.error(f"poll: превью не доставлено совсем: {e2}")
     return POLL_WAIT_CONFIRM
+
+
+def _poll_targets(scope, class_code=None, context=None):
+    """ВОЛНА 22.12: ЕДИНЫЙ список адресатов опроса с дедупликацией.
+    Раньше (класс) студент, который одновременно числился и старостой,
+    получал ДВЕ одинаковые копии опроса (students + admins без чистки)."""
+    targets = []
+    class_obj = None
+    _class_name = ""
+    if scope == "all":
+        users = load_users()
+        targets = [uid for uid, u in users.items()
+                   if not getattr(u, "is_blocked", False)]
+    else:
+        code = class_code
+        if not code and context is not None:
+            code = context.user_data.get('current_admin_class')
+        class_obj = get_class_by_code(code) if code else None
+        if class_obj is None:
+            return [], None, ""
+        members = [m for m in (class_obj.students + class_obj.admins)
+                   if m not in (class_obj.blocked_users or [])]
+        targets = [str(m) for m in members]
+        _class_name = class_obj.class_name
+    # Дедупликация с сохранением порядка — никаких двойных копий.
+    return list(dict.fromkeys(targets)), class_obj, _class_name
+
+
+async def _poll_dispatch(bot, q, opts, scope, class_code, creator_id,
+                         context=None):
+    """ВОЛНА 22.12: общая рассылка опроса (send_poll, не анонимный).
+    Используется и «✅ Отправить», и запланированной отправкой."""
+    entry = _poll_register(q, opts, scope, creator_id)
+    targets, _cls, _class_name = _poll_targets(scope, class_code, context)
+    sent = 0
+    for uid in targets:
+        try:
+            _m = await bot.send_poll(
+                chat_id=int(uid), question=q, options=opts,
+                is_anonymous=False, allows_multiple_answers=False)
+            sent += 1
+            try:
+                _pid = str(_m.poll.id)
+                _POLL_INDEX[_pid] = entry
+            except Exception:
+                pass  # без poll_id итоги этой копии не соберутся — не критично
+        except Exception as e:
+            logger.error(f"poll: не доставлено {uid}: {e}")
+    return sent
 
 
 async def poll_go_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -26479,50 +28294,46 @@ async def poll_go_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     flow = context.user_data.get("poll_flow") or {}
     q, opts, scope = flow.get("q"), flow.get("opts"), flow.get("scope")
     if not q or not opts or scope not in ("all", "class"):
+        context.user_data.pop("poll_flow", None)
         await query.edit_message_text(
             "Сессия создания опроса потеряна — опрос не отправлен.")
         return MAIN_MENU
     if scope == "all":
-        users = load_users()
-        targets = [uid for uid, u in users.items()
-                   if not getattr(u, "is_blocked", False)]
         _class_name = ""
     else:
         code = flow.get("class_code") or context.user_data.get(
             'current_admin_class')
-        class_obj = get_class_by_code(code) if code else None
-        if class_obj is None:
+        if not code or get_class_by_code(code) is None:
+            context.user_data.pop("poll_flow", None)
             await query.edit_message_text(
                 "Класс не найден — опрос не отправлен.")
             return MAIN_MENU
-        members = [m for m in (class_obj.students + class_obj.admins)
-                   if m not in (class_obj.blocked_users or [])]
-        targets = [str(m) for m in members]
-        _class_name = class_obj.class_name
-    entry = _poll_register(q, opts, scope, query.from_user.id)
-    sent = 0
-    for uid in targets:
-        try:
-            _m = await context.bot.send_poll(
-                chat_id=int(uid), question=q, options=opts,
-                is_anonymous=False, allows_multiple_answers=False)
-            sent += 1
-            try:
-                _pid = str(_m.poll.id)
-                _POLL_INDEX[_pid] = entry
-            except Exception:
-                pass  # без poll_id итоги этой копии не соберутся — не критично
-        except Exception as e:
-            logger.error(f"poll: не доставлено {uid}: {e}")
+        _class_name = get_class_by_code(code).class_name
+    # ВОЛНА 22.12: флаг sent ставится ещё в handle_callback ДО await —
+    # двойное нажатие «✅ Отправить» больше не может запустить вторую
+    # рассылку (каждому приходило по два одинаковых опроса).
+    sent = await _poll_dispatch(context.bot, q, opts, scope,
+                                flow.get("class_code"),
+                                query.from_user.id, context)
     context.user_data.pop("poll_flow", None)
     who = (f"участникам класса «{_class_name}»" if scope == "class"
            else "пользователям бота")
-    await query.edit_message_text(
-        f"✅ Опрос отправлен {sent} {who}.\n"
-        "📈 Итоги соберутся автоматически: панель → «📈 Итоги опросов» "
-        "(итоги хранятся, пока бот запущен).",
-        reply_markup=_poll_panel_kb(scope),
-    )
+    try:
+        await query.edit_message_text(
+            f"✅ Опрос отправлен {sent} {who}.\n"
+            "📈 Итоги соберутся автоматически: панель → «📈 Итоги опросов» "
+            "(итоги хранятся, пока бот запущен).",
+            reply_markup=_poll_panel_kb(scope),
+        )
+    except Exception as e:
+        logger.error(f"poll_go: edit не удался ({e}) — шлю новым сообщением")
+        try:
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text=f"✅ Опрос отправлен {sent} {who}.",
+                reply_markup=_poll_panel_kb(scope))
+        except Exception:
+            pass
     return DEV_PANEL if scope == "all" else ADMIN_PANEL
 
 
@@ -26564,6 +28375,181 @@ async def poll_results_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=_poll_panel_kb("all" if _is_dev else "class"),
     )
     return DEV_PANEL if _is_dev else ADMIN_PANEL
+
+
+# === ВОЛНА 22.12: редактирование опроса из превью + запланированная
+# отправка. _POLL_SCHEDULES — память процесса (при рестарте бота
+# запланированные опросы не сохраняются — честно предупреждаем). ===
+_POLL_SCHEDULES = []
+
+_POLL_SCHED_PROMPT = (
+    "⏰ ЗАПЛАНИРОВАННАЯ ОТПРАВКА ОПРОСА\n\n"
+    "Когда отправить опрос? Пришлите время одним сообщением:\n"
+    "• 18:30 — сегодня (или завтра, если это время уже прошло)\n"
+    "• 05.10 18:30 — дата и время\n"
+    "• через 30м / через 2ч — через сколько отправить\n\n"
+    "Отменить — «❌ Отмена». Опрос уйдёт с теми вопросом и вариантами, "
+    "что вы видели в превью.")
+
+
+def _parse_sched_time(text, now=None):
+    """Разбор времени запланированной отправки: ЧЧ:ММ | ДД.ММ ЧЧ:ММ |
+    ДД.ММ.ГГГГ ЧЧ:ММ | через Nм/мин/ч/час. Возвращает datetime или None."""
+    now = now or datetime.now()
+    t = (text or "").strip().lower().replace(",", " ").strip()
+    m = re.match(r"^через\s+(\d{1,4})\s*(мин|м|час(?:ов|а)?|ч|h)\.?$", t)
+    if m:
+        n = int(m.group(1))
+        if n <= 0 or n > 43200:  # максимум 30 суток
+            return None
+        return now + timedelta(minutes=n)
+    m = re.match(r"^(\d{1,2}):(\d{2})$", t)
+    if m:
+        hh, mm = int(m.group(1)), int(m.group(2))
+        if not (0 <= hh <= 23 and 0 <= mm <= 59):
+            return None
+        when = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        if when <= now:
+            when += timedelta(days=1)
+        return when
+    m = re.match(r"^(\d{1,2})\.(\d{1,2})(?:\.(\d{2,4}))?\s+(\d{1,2}):(\d{2})$", t)
+    if m:
+        dd, mo, yy, hh, mm = (int(m.group(1)), int(m.group(2)),
+                              m.group(3), int(m.group(4)), int(m.group(5)))
+        if not (1 <= dd <= 31 and 1 <= mo <= 12 and 0 <= hh <= 23
+                and 0 <= mm <= 59):
+            return None
+        year = now.year
+        if yy is not None:
+            _y = int(yy)
+            year = (2000 + _y) if len(str(yy)) <= 2 else _y
+        try:
+            when = datetime(year, mo, dd, hh, mm)
+        except ValueError:
+            return None
+        return when
+    return None
+
+
+async def poll_sched_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.12: «⏰ Запланировать» из превью — спрашиваем время."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    flow = context.user_data.get("poll_flow") or {}
+    if not (flow.get("q") and flow.get("opts")):
+        await query.edit_message_text(
+            "Сессия создания опроса потеряна — опрос не запланирован.")
+        return MAIN_MENU
+    await query.edit_message_text(_POLL_SCHED_PROMPT)
+    return POLL_WAIT_SCHED
+
+
+async def poll_sched_receive(update: Update,
+                             context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.12: приём времени запланированного опроса."""
+    msg = update.message
+    flow = context.user_data.get("poll_flow") or {}
+    if not (flow.get("q") and flow.get("opts")):
+        await msg.reply_text("Сессия создания опроса потеряна. Начните заново.")
+        return MAIN_MENU
+    when = _parse_sched_time(msg.text)
+    if when is None:
+        await msg.reply_text(
+            "❌ Не понял время. Пришлите его в одном из форматов:\n"
+            "• 18:30\n• 05.10 18:30\n• через 30м\n\n"
+            "Или нажмите «❌ Отмена».")
+        return POLL_WAIT_SCHED
+    job = {
+        "when": when.strftime("%d.%m.%Y %H:%M"),
+        "q": flow["q"],
+        "opts": list(flow["opts"]),
+        "scope": flow.get("scope"),
+        "class_code": flow.get("class_code"),
+        "by": str(update.effective_user.id),
+    }
+    _POLL_SCHEDULES.append(job)
+    flow.pop("sched_wait", None)
+    context.user_data.pop("poll_flow", None)
+    application = context.application
+    application.create_task(_poll_scheduled_worker(application, when, job))
+    await msg.reply_text(
+        "✅ Опрос запланирован на " + when.strftime("%d.%m %H:%M") + ":\n\n"
+        "❓ " + job["q"] + "\n"
+        + "\n".join(f"  • {o}" for o in job["opts"])
+        + "\n\n⚠️ Запланированные опросы живут, пока бот запущен: "
+        "если бот перезапустится до отправки, опрос отправлен не будет. "
+        "В момент отправки вам придёт уведомление.")
+    return DEV_PANEL if job["scope"] == "all" else ADMIN_PANEL
+
+
+async def _poll_scheduled_worker(application, when, job):
+    """Спит до назначенного времени и рассылает опрос."""
+    try:
+        delay = (when - datetime.now()).total_seconds()
+        if delay > 0:
+            await asyncio.sleep(delay)
+        sent = await _poll_dispatch(application.bot, job["q"], job["opts"],
+                                    job["scope"], job.get("class_code"),
+                                    job.get("by"))
+        try:
+            await application.bot.send_message(
+                chat_id=int(job["by"]),
+                text=f"⏰ Запланированный опрос отправлен ({sent} получ.):\n\n"
+                     f"❓ {job['q']}")
+        except Exception:
+            pass
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.error(f"poll_sched worker: {e}")
+
+
+async def poll_edit_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.12: «✏️ Вопрос» / «✏️ Варианты» прямо из превью."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    data = query.data
+    flow = context.user_data.get("poll_flow") or {}
+    if not flow.get("scope") or flow.get("sent"):
+        await query.edit_message_text("Сессия создания опроса потеряна.")
+        return MAIN_MENU
+    if data == "poll_edit_q":
+        # Варианты СОХРАНЯЕМ: после нового вопроса сразу покажем превью.
+        flow.pop("q", None)
+        context.user_data["poll_flow"] = flow
+        await query.edit_message_text(
+            "✏️ ПРИШЛИТЕ НОВЫЙ ВОПРОС одним сообщением (до 300 символов).\n\n"
+            "Варианты останутся прежними — превью обновится сразу.")
+        return POLL_WAIT_Q
+    if data == "poll_edit_opts":
+        flow.pop("opts", None)
+        context.user_data["poll_flow"] = flow
+        await query.edit_message_text(
+            "✏️ ПРИШЛИТЕ ВАРИАНТЫ ЗАНОВО — по одному в строке, "
+            "от 2 до 10 (каждый до 100 символов).")
+        return POLL_WAIT_OPTS
+    return POLL_WAIT_CONFIRM
+
+
+async def poll_cancel_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.12: «❌ Отмена» из превью — честная отмена создания опроса."""
+    query = update.callback_query
+    try:
+        await query.answer("Опрос отменён.")
+    except Exception:
+        pass
+    context.user_data.pop("poll_flow", None)
+    try:
+        await query.edit_message_text("❌ Создание опроса отменено.")
+    except Exception:
+        pass
+    return MAIN_MENU
 
 
 async def poll_answer_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -28577,6 +30563,18 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, vault_ren_save),
                 CallbackQueryHandler(handle_callback),
             ],
+            # === ВОЛНА 22.12: категория/теги загрузки и поиск по Сейфу ===
+            VAULT_CAT_WAIT: [
+                CallbackQueryHandler(handle_callback),
+            ],
+            VAULT_TAGS_WAIT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, vault_tags_receive),
+                CallbackQueryHandler(handle_callback),
+            ],
+            VAULT_SEARCH_WAIT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, vault_search_receive),
+                CallbackQueryHandler(handle_callback),
+            ],
             # === ВОЛНА 13: НАЗВАНИЕ загрузки Сейфа (шаг после «✅ Готово»;
             #     быстрые команды сюда не инжектируются — _QUICK_SKIP_STATES,
             #     глобальная отмена инжектируется как везде) ===
@@ -28594,6 +30592,27 @@ def main():
                 CallbackQueryHandler(handle_callback),
             ],
             POLL_WAIT_CONFIRM: [
+                CallbackQueryHandler(handle_callback),
+            ],
+            # === ВОЛНА 22.12: время запланированной отправки опроса ===
+            POLL_WAIT_SCHED: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, poll_sched_receive),
+                CallbackQueryHandler(handle_callback),
+            ],
+            # === ВОЛНА 22.12: фото/файл решения для базы решений класса ===
+            SOL_WAIT_FILE: [
+                MessageHandler((filters.PHOTO | filters.Document.ALL
+                                | filters.TEXT) & ~filters.COMMAND,
+                               sol_file_receive),
+                CallbackQueryHandler(handle_callback),
+            ],
+            # === ВОЛНА 22.12: ввод в менеджере share-ссылок и PIN получателя ===
+            SHARE_INPUT_WAIT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, share_input_receive),
+                CallbackQueryHandler(handle_callback),
+            ],
+            SHARE_PIN_WAIT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, share_pin_receive),
                 CallbackQueryHandler(handle_callback),
             ],
         },
