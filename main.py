@@ -228,6 +228,14 @@ SOLUTIONS_FILE = _data_file("solutions.json")
 # и счётчики использования функций.
 ACTIVITY_FILE = _data_file("activity.json")
 FEATURE_STATS_FILE = _data_file("feature_stats.json")
+# ВОЛНА 22.14: share-ссылки (токены dl_*, TTL, лимиты, PIN-замки). Константа
+# раньше объявлялась в конце файла и НЕ входила в снапшот канал-БД — перенесена
+# сюда, чтобы share-планы и PIN-замки переживали рестарт.
+SHARE_FILE = _data_file("share_tokens.json")
+# ВОЛНА 22.14: запланированные опросы (poll_sched). Раньше планы жили только
+# в памяти процесса и пропадали при рестарте — теперь файл в БД (Supabase →
+# Mongo → файл) + снапшот в канал-БД, с восстановлением воркеров на старте.
+POLL_SCHEDULES_FILE = _data_file("poll_schedules.json")
 # Журнал отправленных уведомлений (за какой день уже отправили утреннее/вечернее/
 # погоду/праздник/ДР каждому пользователю). Используется единым тикером
 # (_unified_notification_tick), чтобы не присылать одно и то же дважды.
@@ -1805,9 +1813,19 @@ def _storage_env_bootstrap():
         logger.info(f"env-бутстрап хранилища: добавлено каналов {added} из STORAGE_CHANNELS/STORAGE_CHANNEL_ID")
     return added
 
-# Все файлы данных, которые уходят в ежедневный бэкап. Хранилище и журнал
-# уведомлений не бэкапим: storage_config — сам себе реестр, notification_log
-# восстановление журнала только мешает (дубли уведомлений после отката).
+# Все файлы данных, которые уходят в снапшот канал-БД (волна 8/10) и в
+# ежедневный бэкап. ВОЛНА 22.14 («всё, что бот считает — в БД и канал»):
+# добавлены solutions (база решений), share_tokens (share-ссылки и PIN-замки),
+# activity (дневная активность), feature_stats (счётчики функций),
+# notification_log (журнал «что уже отправлено» — без него после рестарта
+# утренние/вечерние/погодные уведомления приходили ПО ВТОРОЙ РАЗ) и
+# poll_schedules (запланированные опросы).
+# НЕ бэкапим сознательно:
+#   • storage_config.json — сам себе реестр (иначе бесконечный цикл
+#     «слив → сохранение конфига → слив»);
+#   • mt_session.txt — секрет сессии Telethon (в канал его не сливаем из
+#     гигиены секретов; потеря не страшна — клиент перелогинится токеном бота);
+#   • .forbidden_chars_cleaned — служебный маркер однократной миграции.
 STORAGE_BACKUP_FILES = (
     USERS_FILE, CLASSES_FILE, TIMERS_FILE, ANONYMOUS_MESSAGES_FILE,
     SUGGESTIONS_FILE, HOMEWORK_FILE, CUSTOM_BUTTONS_FILE,
@@ -1815,6 +1833,8 @@ STORAGE_BACKUP_FILES = (
     STARS_STATS_FILE, INSTRUCTIONS_FILE, USER_CODES_FILE, PRICES_FILE,
     GLOBAL_BUTTONS_FILE, HOLIDAYS_FILE, SUBSCRIPTION_CONFIRMATIONS_FILE,
     DEV_SETTINGS_FILE, SUPPORT_MESSAGES_FILE, REFERRALS_FILE,
+    SOLUTIONS_FILE, SHARE_FILE, ACTIVITY_FILE, FEATURE_STATS_FILE,
+    NOTIFICATION_LOG_FILE, POLL_SCHEDULES_FILE,
 )
 
 PRICES = load_prices()
@@ -2811,10 +2831,15 @@ _FSTATS_FLUSH_TS = {"t": 0.0}
 
 def _stat_flush(force=False):
     """Слить счётчики функций на диск/в БД (троттлинг 60 сек — счётчики
-    обновляются часто, а писать на каждый инкремент нельзя)."""
+    обновляются часто, а писать на каждый инкремент нельзя). ВОЛНА 22.14:
+    вызывается и из единого тикера (раз в минуту), и из _post_shutdown
+    (force=True) — счётчики «сколько пользовались» больше не теряются.
+    Кэш None (счётчиков ещё не было) — писать нечего, честно выходим."""
     import time as _t
     now = _t.monotonic()
     if not force and (now - _FSTATS_FLUSH_TS["t"]) < 60.0:
+        return
+    if _FSTATS_CACHE is None:
         return
     _FSTATS_FLUSH_TS["t"] = now
     try:
@@ -3033,7 +3058,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.13"
+BOT_BUILD = "22.17"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -4596,6 +4621,9 @@ def get_settings_keyboard(user=None):
         [InlineKeyboardButton("💡 Предложить функцию", callback_data="suggest_function")],
         # ПУНКТ 3: чат поддержки доступен из настроек (помимо главного меню).
         [InlineKeyboardButton("💬 Чат поддержки", callback_data="open_support_chat")],
+        # ВОЛНА 22.15: честный юридический экран — тот же текст, что при
+        # регистрации; доступен в любой момент.
+        [InlineKeyboardButton("⚖️ Правовая информация", callback_data="legal_info")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="back_to_main")],
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -6376,6 +6404,13 @@ async def _post_shutdown(application):
 
     Render/хостинг может убить процесс жёстко — тогда спасёт тикер (30 сек).
     Но штатный рестарт получит свежий снапшот именно здесь."""
+    try:
+        # ВОЛНА 22.14: сперва принудительно сливаем счётчики функций
+        # (троттлинг 60 с мог «подержать» последние инкременты в памяти),
+        # чтобы финальный снапшот канала содержал самые свежие цифры.
+        _stat_flush(force=True)
+    except Exception as e:
+        logger.error(f"post_shutdown: stat flush не удался: {e}")
     try:
         class _CtxStub:
             bot = application.bot
@@ -8585,6 +8620,9 @@ def _vault_menu_text(user):
         "только пароль, запечатанный ими: без верных ответов он не читается.\n\n"
         "❌ После распаковки файл исчезает из чата кнопкой «Отменить» "
         "В КЛАВИАТУРЕ снизу (отключить — в ⚙️ Настройках).\n\n"
+        "⚖️ Сейф и Облако вы используете на свой риск: даже при сбоях бота "
+        "разработчик не отвечает за ваши данные. Полные условия — «⚖️ "
+        "Правовая информация» в ⚙️ Настройках.\n\n"
         "Выберите действие:"
     )
 
@@ -16903,18 +16941,83 @@ async def send_blocked_message(update, context, user_id):
     else:
         await context.bot.send_message(chat_id=user_id, text=text, reply_markup=keyboard)
 
+# ВОЛНА 22.15: полный честный юридический текст (по требованию пользователя:
+# «за пользование ботом пользователи несут сами ответственность … напиши про
+# всё честно юридически — если что-то случится, то я ни в чём не виноват»).
+# Один и тот же текст показывается: при регистрации (принятие обязательно),
+# на экране «⚖️ Правовая информация» в ⚙️ Настройках; строка про хранилище
+# дублируется в приветствии Сейфа. Текст БЕЗ markdown-спецсимволов — нулевой
+# риск «Can't parse entities».
+# ВОЛНА 22.16 (по сообщению пользователя): добавлен явный пункт 5 «СБОИ И
+# ОШИБКИ САМОГО БОТА» — даже если сбой/баг в коде бота, разработчик НЕ несёт
+# ответственности за данные пользователей и их последствия.
+# ВОЛНА 22.17 (по сообщению пользователя «всё прям все функции упомянуто?»):
+# аудит показал непоименованные функции — добавлены п.6 «ВСЕ ФУНКЦИИ БЕЗ
+# ИСКЛЮЧЕНИЯ» (ИИ/AI Agent, OCR/голос, погода, заполняемое админами, опросы,
+# решения, анонимки, кнопки + покрытие будущих функций), п.7 «ПОКУПКИ» (XTR,
+# слоты — платит Telegram, возвраты — Telegram), в п.2 явно — анонимки,
+# в п.3 — Облако класса, в финале — принятие обновлённых условий.
+_LEGAL_TEXT = (
+    "⚖️ ПРАВОВАЯ ИНФОРМАЦИЯ\n\n"
+    "Пользуясь ботом DEVORKS+, вы подтверждаете и принимаете:\n\n"
+    "1. Бот предоставляется «КАК ЕСТЬ» — без каких-либо гарантий: "
+    "бесперебойной работы, сохранности данных, отсутствия ошибок, "
+    "пригодности для ваших целей.\n\n"
+    "2. ОТВЕТСТВЕННОСТЬ ПОЛЬЗОВАТЕЛЯ. Вы используете бота добровольно и "
+    "на свой риск. Полную ответственность несёте ВЫ:\n"
+    "• за содержимое своих сообщений и файлов, их законность (авторские "
+    "права, персональные данные других людей, запретный контент);\n"
+    "• за анонимные сообщения: анонимность скрывает имя, но ответственность "
+    "за содержимое остаётся на отправителе;\n"
+    "• за то, кому вы передаёте файлы и ссылки (в том числе share-ссылками);\n"
+    "• за свои сообщения и действия в классах.\n\n"
+    "3. ХРАНИЛИЩЕ (СЕЙФ И ОБЛАКО). Файлы Сейфа шифруются так, что их не "
+    "видит даже разработчик. Пароль и секретные вопросы известны только "
+    "вам: если вы их потеряете — данные не откроются НАВСЕГДА, "
+    "восстановить их невозможно в принципе. То же касается файлов класса "
+    "в Облаке и любых других данных в боте: разработчик не отвечает за "
+    "утрату, порчу или недоступность любых данных — из-за сбоя сервера, "
+    "канала, Telegram или собственных действий пользователя.\n\n"
+    "4. РИСКИ TELEGRAM. Бот работает поверх Telegram: сбои, блокировки, "
+    "лимиты и любые изменения Telegram от разработчика не зависят и не "
+    "являются его виной.\n\n"
+    "5. СБОИ И ОШИБКИ САМОГО БОТА. Бот — сложная программа: даже при "
+    "аккуратной разработке в нём возможны ошибки, зависания и сбои "
+    "функций. Если из-за сбоя в самом боте ваши данные (файлы Сейфа, "
+    "домашние задания, расписание, таймеры, статистика — любые) будут "
+    "утрачены, искажены или станут недоступны, а какая-то функция "
+    "сработает не так, как вы ждали, — это ВАШ риск: разработчик в любом "
+    "случае НЕ несёт ответственности за ваши данные и за любые их "
+    "последствия, ДАЖЕ ЕСЛИ СБОЙ ПРОИЗОШЁЛ В САМОМ БОТЕ.\n\n"
+    "6. ВСЕ ФУНКЦИИ БЕЗ ИСКЛЮЧЕНИЯ. Условия распространяются на каждую "
+    "функцию бота — перечисленную здесь и не перечисленную, включая те, "
+    "что добавят позже:\n"
+    "• ИИ-чат (DEVORKS+ai) и AI Agent: ответы и действия ИИ могут быть "
+    "неверными или неполными — это не истина, важное проверяйте сами; за "
+    "действия, выполненные ИИ по вашей просьбе, отвечаете вы;\n"
+    "• распознавание голоса и текста с фото: может ошибаться;\n"
+    "• погода: данные сторонних сервисов, точность не гарантируется;\n"
+    "• расписание, домашние задания, звонки, учителя, каникулы: их "
+    "заполняют люди (админы класса) — за актуальность отвечают они;\n"
+    "• опросы, база решений, анонимные сообщения, share-ссылки, личные "
+    "кнопки, таймеры, напоминания и уведомления — вспомогательные: шлются "
+    "«по мере возможностей», полагаться на них в критичных вопросах "
+    "нельзя.\n\n"
+    "7. ПОКУПКИ. Внутренние покупки (звёзды Telegram XTR, слоты кнопок, "
+    "разблокировки и другие) проводит платёжная система Telegram, а не "
+    "разработчик: за сбои оплаты, списания и возвраты отвечает Telegram. "
+    "Потраченные звёзды возврату не подлежат, если иное не требует закон.\n\n"
+    "8. ЧТО БЫ НИ СЛУЧИЛОСЬ — потеря данных, пропущенное напоминание, "
+    "сбой бота, конфликт, ущерб — разработчик ответственности не несёт и "
+    "убытки не возмещает. Претензии по этим поводам не принимаются.\n\n"
+    "Нажимая «✅ Я согласен(на)», вы подтверждаете: вы прочитали, поняли "
+    "и принимаете эти условия. Продолжая пользоваться ботом после его "
+    "обновлений, вы принимаете обновлённые условия."
+)
+
+
 async def show_disclaimer(update, context):
-    disclaimer_text = (
-        "⚠️ **ВАЖНОЕ УВЕДОМЛЕНИЕ**\n\n"
-        "Перед использованием бота DEVORKS+, пожалуйста, подтвердите:\n\n"
-        "1. ✅ Я прочитал(а) инструкцию по использованию бота\n"
-        "2. ✅ Я понимаю и принимаю, что разработчик не несет ответственности за:\n"
-        "   • Содержание сообщений, создаваемых пользователями\n"
-        "   • Действия других пользователей в классах\n"
-        "   • Возможные сбои в работе бота\n"
-        "   • Потерю данных в результате технических неполадок\n\n"
-        "Продолжая использование бота, вы соглашаетесь с этими условиями."
-    )
+    disclaimer_text = _LEGAL_TEXT
 
     rows = [
         [InlineKeyboardButton("✅ Я согласен(на) с условиями", callback_data="accept_disclaimer")],
@@ -17002,6 +17105,32 @@ async def disclaimer_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     else:
         await query.edit_message_text("Вы отказались от использования бота. Если передумаете — /start")
         return ConversationHandler.END
+
+
+@timeout(CONVERSATION_TIMEOUT)
+async def legal_info_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.15: экран «⚖️ Правовая информация» в ⚙️ Настройках.
+    Показывает ТОТ ЖЕ полный текст условий, что и при регистрации
+    (принятие уже подтверждено кнопкой), кнопка «⬅️ Назад» возвращает
+    в настройки через существующий callback back_to_settings."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    text = _LEGAL_TEXT
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("⬅️ Назад", callback_data="back_to_settings")]])
+    try:
+        await query.edit_message_text(text, reply_markup=keyboard)
+    except Exception:
+        try:
+            await context.bot.send_message(
+                chat_id=update.effective_user.id,
+                text=text, reply_markup=keyboard)
+        except Exception as e:
+            logger.error(f"legal_info_cb: не удалось показать: {e}")
+    return USER_SETTINGS
 
 async def instructions_read_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """ПУНКТ 1: После прочтения инструкции пользователь идёт по обычному пути регистрации."""
@@ -25716,6 +25845,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await dev_support_inbox_handler(update, context)
     elif data.startswith("dev_support_reply_"):
         return await dev_support_reply_start(update, context)
+    # ВОЛНА 22.15: «⚖️ Правовая информация» — полные условия в любой момент.
+    elif data == "legal_info":
+        return await legal_info_cb(update, context)
 
     return MAIN_MENU
 
@@ -28243,10 +28375,9 @@ async def sol_admin_ttl_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # при создании ссылки владелец ОДИН раз вводит пароль — бот расшифровывает
 # выбранные файлы (≤20 МБ) и кладёт ОБЫЧНЫЕ копии в cloud-канал. Пароль
 # нигде не сохраняется и получателю не нужен. Ссылки переживают рестарт
-# бота (SHARE_FILE в базе).
+# бота (SHARE_FILE в базе; волна 22.14 — файл также входит в снапшот
+# канал-БД, а PIN-замки хранятся прямо в записях токенов).
 # ============================================================
-
-SHARE_FILE = _data_file("share_tokens.json")
 
 SHARE_TTLS = (("15 минут", 0.25), ("1 час", 1), ("24 часа", 24), ("3 дня", 72))
 SHARE_LIMITS = ((1, "1 (сгорит после первого)"), (3, "3"), (5, "5"),
@@ -29562,9 +29693,99 @@ async def poll_results_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # === ВОЛНА 22.12: редактирование опроса из превью + запланированная
-# отправка. _POLL_SCHEDULES — память процесса (при рестарте бота
-# запланированные опросы не сохраняются — честно предупреждаем). ===
+# отправка. ВОЛНА 22.14: реестр _POLL_SCHEDULES больше НЕ «память процесса» —
+# каждый план сразу пишется в БД (POLL_SCHEDULES_FILE: Supabase → Mongo →
+# файл + снапшот канал-БД), а на старте _poll_schedules_restore() восстанавливает
+# воркеры: будущие планы уйдут вовремя, опоздание ≤ 6 ч — сразу после старта,
+# более позднее — честная отмена с уведомлением автора. ===
 _POLL_SCHEDULES = []
+
+
+def _poll_sched_save():
+    """ВОЛНА 22.14: слить реестр запланированных опросов в БД. save_data
+    пишет в Supabase/Mongo/файл и помечает снапшот канал-БД «грязным»."""
+    try:
+        save_data(POLL_SCHEDULES_FILE, _POLL_SCHEDULES)
+    except Exception as e:
+        logger.error(f"poll_sched save: {e}")
+
+
+def _poll_sched_discard(job):
+    """Вычеркнуть исполненный/отменённый план из реестра и сохранить БД.
+    Сравнение по identity — воркеры держат ссылку на СВОЙ словарь-план."""
+    for _i, _j in enumerate(_POLL_SCHEDULES):
+        if _j is job:
+            _POLL_SCHEDULES.pop(_i)
+            break
+    _poll_sched_save()
+
+
+# Опоздание, при котором запланированный опрос ещё отправляем сразу после
+# рестарта («лучше поздно, чем никогда»). Больше — честно отменяем.
+_POLL_SCHED_LATE_GRACE = 6 * 3600
+
+
+async def _poll_schedules_restore(application):
+    """ВОЛНА 22.14: восстановить запланированные опросы из БД после старта.
+    Вызывается из _post_init (ШАГ 12). Правила:
+      • срок в будущем → воркер спит и отправит вовремя;
+      • опоздание ≤ _POLL_SCHED_LATE_GRACE → отправляем сразу после старта,
+        автору — честная пометка об отправке с задержкой;
+      • опоздание больше → план отменяется, автору — честное уведомление.
+    Битые строки (нечитаемое время) выбрасываются молча, реестр пересохраняется."""
+    try:
+        data = load_data(POLL_SCHEDULES_FILE, [])
+        if not isinstance(data, list):
+            return
+        now = datetime.now()
+        kept = []
+        for job in data:
+            if not isinstance(job, dict):
+                continue
+            try:
+                when = datetime.strptime(str(job.get("when")),
+                                         "%d.%m.%Y %H:%M")
+            except (TypeError, ValueError):
+                continue
+            late = (now - when).total_seconds()
+            if late <= 0:
+                kept.append(job)
+                try:
+                    application.create_task(
+                        _poll_scheduled_worker(application, when, job))
+                except Exception as e:
+                    logger.error(f"poll_sched restore worker: {e}")
+            elif late <= _POLL_SCHED_LATE_GRACE:
+                try:
+                    await _poll_dispatch(
+                        application.bot, job.get("q"), job.get("opts") or [],
+                        job.get("scope"), job.get("class_code"), job.get("by"))
+                    try:
+                        await application.bot.send_message(
+                            chat_id=int(job["by"]),
+                            text="⏰ Запланированный опрос отправлен С "
+                                 "ЗАДЕРЖКОЙ (бот был выключен в срок "
+                                 "отправки):\n\n❓ " + str(job.get("q")))
+                    except Exception:
+                        pass
+                except Exception as e:
+                    logger.error(f"poll_sched restore late send: {e}")
+            else:
+                try:
+                    await application.bot.send_message(
+                        chat_id=int(job["by"]),
+                        text="❌ Запланированный опрос не отправлен: срок "
+                             "вышел, пока бот был выключен.\n\n❓ "
+                             + str(job.get("q")))
+                except Exception:
+                    pass
+        _POLL_SCHEDULES.clear()
+        _POLL_SCHEDULES.extend(kept)
+        _poll_sched_save()
+        logger.info(f"poll_sched restore: активных планов {len(kept)} "
+                    f"из {len(data)} в БД.")
+    except Exception as e:
+        logger.error(f"poll_sched restore crashed: {e}")
 
 _POLL_SCHED_PROMPT = (
     "⏰ ЗАПЛАНИРОВАННАЯ ОТПРАВКА ОПРОСА\n\n"
@@ -29655,6 +29876,7 @@ async def poll_sched_receive(update: Update,
         "by": str(update.effective_user.id),
     }
     _POLL_SCHEDULES.append(job)
+    _poll_sched_save()  # ВОЛНА 22.14: план сразу в БД (переживает рестарт)
     flow.pop("sched_wait", None)
     context.user_data.pop("poll_flow", None)
     application = context.application
@@ -29663,14 +29885,20 @@ async def poll_sched_receive(update: Update,
         "✅ Опрос запланирован на " + when.strftime("%d.%m %H:%M") + ":\n\n"
         "❓ " + job["q"] + "\n"
         + "\n".join(f"  • {o}" for o in job["opts"])
-        + "\n\n⚠️ Запланированные опросы живут, пока бот запущен: "
-        "если бот перезапустится до отправки, опрос отправлен не будет. "
-        "В момент отправки вам придёт уведомление.")
+        + "\n\n💾 План сохранён в базе и переживёт рестарт бота: если бот "
+        "перезапустится, опрос уйдёт вовремя, а при опоздании — сразу "
+        "после включения (опоздание больше 6 часов — честная отмена с "
+        "уведомлением). В момент отправки вам придёт уведомление.")
     return DEV_PANEL if job["scope"] == "all" else ADMIN_PANEL
 
 
 async def _poll_scheduled_worker(application, when, job):
-    """Спит до назначенного времени и рассылает опрос."""
+    """Спит до назначенного времени и рассылает опрос.
+
+    ВОЛНА 22.14: после исполнения (или сбоя) план вычёркивается из реестра
+    и БД пересохраняется. Единственное исключение — asyncio.CancelledError
+    (бот выключается): план ОСТАЁТСЯ в реестре, чтобы после рестарта
+    _poll_schedules_restore() снова поставил его в очередь."""
     try:
         delay = (when - datetime.now()).total_seconds()
         if delay > 0:
@@ -29685,10 +29913,15 @@ async def _poll_scheduled_worker(application, when, job):
                      f"❓ {job['q']}")
         except Exception:
             pass
+        _poll_sched_discard(job)  # исполнен → из реестра и из БД
     except asyncio.CancelledError:
-        raise
+        raise  # выключение бота: план сохраняем для восстановления
     except Exception as e:
         logger.error(f"poll_sched worker: {e}")
+        try:
+            _poll_sched_discard(job)  # сбой рассылки: не дублируем при рестартах
+        except Exception:
+            pass
 
 
 async def poll_edit_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -30252,6 +30485,14 @@ async def _unified_notification_tick_locked(context):
         logger.error(f"unified_tick: solutions purge crashed: {e}")
         await _notify_dev_error(bot, "Тикер: чистка решений", e)
 
+    # 1d) ВОЛНА 22.14: слив счётчиков функций в БД (троттлинг внутри —
+    # не чаще раза в минуту), чтобы «сколько пользовались» не терялось
+    # даже при жёстком kill хостинга. Ошибки не ломают тикер.
+    try:
+        _stat_flush()
+    except Exception as e:
+        logger.error(f"unified_tick: stat flush crashed: {e}")
+
     # 2) Дневные уведомления по пользователям
     try:
         users = load_users()
@@ -30777,6 +31018,15 @@ async def _post_init(application):
             )
     except Exception as e:
         logger.error(f"anonymous_purge регистрация: {e}")
+
+    # === ШАГ 12 (волна 22.14): восстановление запланированных опросов из БД.
+    # Будущие планы → воркеры; опоздание ≤ 6 ч → отправка сразу; позже —
+    # честная отмена с уведомлением автора. Изолировано в try: сбой здесь
+    # не должен сломать уже зарегистрированные тикеры.
+    try:
+        await _poll_schedules_restore(application)
+    except Exception as e:
+        logger.error(f"poll_sched restore boot: {e}")
 
     logger.info("post_init: все шаги инициализации завершены.")
 
