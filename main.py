@@ -224,6 +224,10 @@ GLOBAL_BUTTONS_FILE = _data_file("global_buttons.json")
 HOLIDAYS_FILE = _data_file("holidays.json")
 # ВОЛНА 22.12: «Общая база решений» класса (модерация старосты, анонимность).
 SOLUTIONS_FILE = _data_file("solutions.json")
+# ВОЛНА 22.13: дневная активность пользователей (для статистики DAU/WAU/MAU)
+# и счётчики использования функций.
+ACTIVITY_FILE = _data_file("activity.json")
+FEATURE_STATS_FILE = _data_file("feature_stats.json")
 # Журнал отправленных уведомлений (за какой день уже отправили утреннее/вечернее/
 # погоду/праздник/ДР каждому пользователю). Используется единым тикером
 # (_unified_notification_tick), чтобы не присылать одно и то же дважды.
@@ -437,6 +441,7 @@ VAULT_SEARCH_WAIT = 132
 SOL_WAIT_FILE = 133  # ждём фото/файл решения для базы решений класса
 SHARE_INPUT_WAIT = 134  # ввод (url / пароль Сейфа / поиск) в менеджере ссылки
 SHARE_PIN_WAIT = 135    # получатель вводит PIN share-ссылки
+DEV_STATS_PERIOD = 136  # 22.13: разработчик вводит произвольный период статистики
 
 # ВОЛНА 22.4: «🎙 Пульт» удалён ПОЛНОСТЬЮ по решению пользователя — кнопки,
 # состояний (бывшие 126–131), хендлеров и хранилищ стилей больше нет.
@@ -453,9 +458,11 @@ POLL_WAIT_SCHED = 129    # 22.12: ждём время запланированн
 # ВОЛНА 13: состояния, где текст = ПРОИЗВОЛЬНОЕ НАЗВАНИЕ (файла/загрузки).
 # Быстрые команды туда НЕ инжектируются: пользователь может назвать файл
 # «⏰ Таймер» — это имя файла, а не команда (глобальная отмена остаётся).
+# ВОЛНА 22.13: + DEV_STATS_PERIOD (там вводят «30», «01.09-15.09» — не команды).
 _QUICK_SKIP_STATES = frozenset({VAULT_REN_WAIT, VAULT_LABEL_WAIT,
                                 VAULT_TAGS_WAIT, VAULT_SEARCH_WAIT,
-                                SHARE_INPUT_WAIT, SHARE_PIN_WAIT})
+                                SHARE_INPUT_WAIT, SHARE_PIN_WAIT,
+                                DEV_STATS_PERIOD})
 
 # ==================================
 # === ВОЛНА 12: ГЛОБАЛЬНАЯ КНОПКА ОТМЕНЫ ===
@@ -2330,6 +2337,11 @@ class Class:
         self.homework = {}
         self.blocked_users = []
         self.class_buttons = []
+        # ВОЛНА 22.13: настройки «Общей базы решений» (решает староста):
+        # авто-модерация (решения публикуются без проверки) и общий срок
+        # автоудаления публикаций в часах (0 = срок выбирает отправитель).
+        self.sol_auto_moder = False
+        self.sol_auto_ttl_h = 0
 
     def to_dict(self):
         return {
@@ -2347,7 +2359,9 @@ class Class:
             'subjects': self.subjects,
             'homework': self.homework,
             'blocked_users': self.blocked_users,
-            'class_buttons': self.class_buttons
+            'class_buttons': self.class_buttons,
+            'sol_auto_moder': bool(getattr(self, 'sol_auto_moder', False)),
+            'sol_auto_ttl_h': int(getattr(self, 'sol_auto_ttl_h', 0) or 0),
         }
 
     @classmethod
@@ -2534,6 +2548,12 @@ def save_classes(classes):
     data = {class_code: class_obj.to_dict() for class_code, class_obj in classes.items()}
     return save_data(CLASSES_FILE, data)
 
+def save_class(class_obj):
+    """ВОЛНА 22.13: сохранить ОДИН класс (обёртка над save_classes)."""
+    classes = load_classes()
+    classes[class_obj.class_code] = class_obj
+    return save_classes(classes)
+
 def load_global_buttons():
     global _global_buttons_cache
     current_time = time.time()
@@ -2717,6 +2737,180 @@ def get_user_rate_limit_message():
     )
 
 
+# === ВОЛНА 22.13: РАСШИРЕННАЯ СТАТИСТИКА ===
+# 1) ACTIVITY_FILE — кто и когда последний раз пользовался ботом (день).
+#    Пишем ТОЛЬКО когда день сменился — не чаще 1 записи на юзера в сутки,
+#    чтобы не грузить БД. Отсюда считаются DAU/WAU/MAU и прирост.
+# 2) FEATURE_STATS_FILE — счётчики функций: {key: {"total": N, "by_day": {...}}}.
+_ACTIVITY_CACHE = None
+_FSTATS_CACHE = None
+_FSTATS_KEYS = (
+    "vault_upload", "vault_get", "poll_sent", "sol_published",
+    "share_created", "share_redeemed", "ai_msg", "timer_set",
+)
+
+
+def _activity_all():
+    global _ACTIVITY_CACHE
+    if _ACTIVITY_CACHE is None:
+        data = load_data(ACTIVITY_FILE, {})
+        _ACTIVITY_CACHE = data if isinstance(data, dict) else {}
+    return _ACTIVITY_CACHE
+
+
+def _touch_activity(user_id):
+    """Отметить день активности пользователя. Запись на диск — только если
+    день изменился (дёшево). Любой сбой молча игнорируется — статистика
+    не должна ломать основной поток."""
+    try:
+        today = datetime.now().strftime("%Y-%m-%d")
+        data = _activity_all()
+        rec = data.get(str(user_id))
+        if isinstance(rec, dict) and rec.get("last") == today:
+            return
+        data[str(user_id)] = {"last": today}
+        save_data(ACTIVITY_FILE, data)
+    except Exception:
+        pass
+
+
+def _activity_counts():
+    """(dau, wau, mau) — сколько уникальных юзеров были активны
+    в последние 1 / 7 / 30 дней."""
+    import time as _t
+    now = _t.time()
+    data = _activity_all()
+    dau = wau = mau = 0
+    for rec in data.values():
+        if not isinstance(rec, dict):
+            continue
+        try:
+            ts = datetime.strptime(str(rec.get("last")), "%Y-%m-%d").timestamp()
+        except (TypeError, ValueError):
+            continue
+        age = now - ts
+        if age <= 86400:
+            dau += 1
+        if age <= 7 * 86400:
+            wau += 1
+        if age <= 30 * 86400:
+            mau += 1
+    return dau, wau, mau
+
+
+def _feature_stats_all():
+    global _FSTATS_CACHE
+    if _FSTATS_CACHE is None:
+        data = load_data(FEATURE_STATS_FILE, {})
+        _FSTATS_CACHE = data if isinstance(data, dict) else {}
+    return _FSTATS_CACHE
+
+
+_FSTATS_FLUSH_TS = {"t": 0.0}
+
+
+def _stat_flush(force=False):
+    """Слить счётчики функций на диск/в БД (троттлинг 60 сек — счётчики
+    обновляются часто, а писать на каждый инкремент нельзя)."""
+    import time as _t
+    now = _t.monotonic()
+    if not force and (now - _FSTATS_FLUSH_TS["t"]) < 60.0:
+        return
+    _FSTATS_FLUSH_TS["t"] = now
+    try:
+        save_data(FEATURE_STATS_FILE, _FSTATS_CACHE)
+    except Exception:
+        pass
+
+
+def _stat_bump(key, n=1):
+    """+1 к счётчику функции (см. _FSTATS_KEYS). Хранит сумму и разбивку
+    по дням (дни старше 60 дней выкидываем, чтобы файл не рос). Пишет на
+    диск не чаще раза в минуту — в памяти всегда актуально."""
+    try:
+        data = _feature_stats_all()
+        rec = data.setdefault(str(key), {"total": 0, "by_day": {}})
+        if not isinstance(rec, dict):
+            rec = data[str(key)] = {"total": 0, "by_day": {}}
+        rec["total"] = int(rec.get("total", 0) or 0) + int(n)
+        today = datetime.now().strftime("%Y-%m-%d")
+        by_day = rec.setdefault("by_day", {})
+        by_day[today] = int(by_day.get(today, 0) or 0) + int(n)
+        cutoff = (datetime.now() - timedelta(days=60)).strftime("%Y-%m-%d")
+        for d in [d for d in by_day if str(d) < cutoff]:
+            by_day.pop(d, None)
+        _stat_flush()
+    except Exception:
+        pass  # статистика не должна ронять фичи
+
+
+def _stat_days_sum(key, days):
+    """Сколько раз функцию key вызывали за последние `days` дней."""
+    data = _feature_stats_all().get(str(key)) or {}
+    by_day = data.get("by_day") or {}
+    total = 0
+    for i in range(max(0, int(days))):
+        d = (datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d")
+        total += int(by_day.get(d, 0) or 0)
+    return total
+
+
+# === ВОЛНА 22.13: УВЕДОМЛЕНИЯ РАЗРАБОТЧИКУ О СБОЯХ ===
+# «Если что-то сломалось — разработчику должно прийти уведомление».
+# Троттлинг: одинаковые ошибки не чаще раза в 90 секунд, максимум 15
+# уведомлений в сутки — чтобы не устроить самому себе спам-апокалипсис
+# и не попасть под флуд-лимиты Telegram.
+_DEV_ERR_STATE = {"sent": {}, "day": "", "count": 0}
+_DEV_ERR_THROTTLE_S = 90.0
+_DEV_ERR_MAX_PER_DAY = 15
+
+
+def _dev_err_key(title, err):
+    return f"{title}:{type(err).__name__ if err is not None else '—'}"
+
+
+def _dev_err_allowed(key):
+    """Проверка троттлинга (вызывать ТОЛЬКО при уже пойманном сбое)."""
+    import time as _t
+    now = _t.monotonic()
+    today = datetime.now().strftime("%Y-%m-%d")
+    if _DEV_ERR_STATE["day"] != today:
+        _DEV_ERR_STATE["day"] = today
+        _DEV_ERR_STATE["count"] = 0
+        _DEV_ERR_STATE["sent"] = {}
+    if _DEV_ERR_STATE["count"] >= _DEV_ERR_MAX_PER_DAY:
+        return False
+    last = _DEV_ERR_STATE["sent"].get(key)
+    if last is not None and (now - last) < _DEV_ERR_THROTTLE_S:
+        return False
+    _DEV_ERR_STATE["sent"][key] = now
+    _DEV_ERR_STATE["count"] += 1
+    return True
+
+
+async def _notify_dev_error(bot, title, err=None, detail="", user_id=""):
+    """Отправить разработчику уведомление о сбое (с троттлингом).
+    Никогда не бросает исключений и не мешает основному потоку."""
+    try:
+        if not DEVELOPER_ID or str(DEVELOPER_ID) in ("0", "", "None"):
+            return
+        key = _dev_err_key(title, err)
+        if not _dev_err_allowed(key):
+            return
+        lines = [f"🛠 СБОЙ: {title}"]
+        if err is not None:
+            lines.append(f"❗ {type(err).__name__}: {err}")
+        if detail:
+            lines.append(f"📄 {str(detail)[:400]}")
+        if user_id:
+            lines.append(f"👤 пользователь: {user_id}")
+        lines.append(f"🕐 {datetime.now().strftime('%d.%m %H:%M:%S')}")
+        await bot.send_message(
+            chat_id=int(DEVELOPER_ID), text="\n".join(lines)[:3500])
+    except Exception as e:
+        logger.warning(f"notify_dev_error: не доставлено: {e}")
+
+
 # ==================================
 # === ЧАТ ПОДДЕРЖКИ ===
 # ==================================
@@ -2839,7 +3033,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.12"
+BOT_BUILD = "22.13"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -3557,6 +3751,8 @@ def get_admin_panel_keyboard():
         [InlineKeyboardButton("📝 Управление ДЗ", callback_data="manage_homework")],
         [InlineKeyboardButton("👤 Управление учениками", callback_data="manage_class_users")],
         [InlineKeyboardButton("🔑 Показать код класса", callback_data="show_class_code_admin")],
+        # ВОЛНА 22.13: настройки базы решений (авто-модерация, автоудаление).
+        [InlineKeyboardButton("📚 База решений · настройки", callback_data="sol_admin_menu")],
         [InlineKeyboardButton("❌ Отмена", callback_data="cancel_action")]
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -4385,9 +4581,12 @@ def get_settings_keyboard(user=None):
         # === Погодные / праздничные настройки (новое) ===
         [InlineKeyboardButton("🌦 Настройки погоды", callback_data="weather_settings")],
         [InlineKeyboardButton("🎉 Настройки праздников", callback_data="holiday_settings")],
-        # ВОЛНА 22.7: удалять ли расшифрованный файл из чата при «Отменить».
+        # ВОЛНА 22.7/22.13: тоггл удаления расшифрованного файла при «Отмене».
+        # МАСКИРОВКА (требование пользователя): название НЕ должно намекать
+        # на удаление файлов — ни один пользователь не должен догадаться,
+        # за чем она скрывается. Внешне это «оптимизация памяти».
         [InlineKeyboardButton(
-            f"🗑 Удалять файл при «Отмене»: {'да' if _wipe_on else 'нет'}",
+            f"🧹 Оптимизация памяти: {'вкл' if _wipe_on else 'выкл'}",
             callback_data="toggle_vault_wipe")],
         # ВОЛНА 22.12: уведомления о новых решениях в базе класса.
         [InlineKeyboardButton(
@@ -8086,6 +8285,45 @@ def _vault_kb_open(enc):
         nonce, data, _VAULT_KB_AAD).decode("utf-8"))
 
 
+# === ВОЛНА 22.13: СЕКРЕТ ХРАНИЛИЩА (bot-side seal) ===
+# Требование пользователя: «файл из ссылки обмена тоже должен шифроваться в
+# канале, чтобы никто не мог посмотреть», и «в канале, где облако, всё должны
+# шифроваться — разработчик не может ничего посмотреть». Файлы Сейфа шифруются
+# ПАРОЛЕМ владельца (zero-knowledge), но копии для share-ссылок и решения в
+# базе класса пароля владельца не имеют к моменту выдачи. Поэтому бот шифрует
+# ИХ собственным ключом: DVF1-контейнер с паролем = PBKDF2(BOT_TOKEN, фикс.
+# соль). В канале-хранилище НИКОГДА не появляется открытого содержимого —
+# только шифр. Ключ живёт только в памяти процесса и выводится из BOT_TOKEN.
+_STORAGE_SEAL_SALT = b"DEVORKS+storage-seal-v13"
+_STORAGE_SEAL_PW_CACHE = None
+
+
+def _storage_seal_pw():
+    """Пароль-ключ бота для шифрования служебных копий файлов в канале.
+    Детерминирован от BOT_TOKEN: переживает рестарт бота."""
+    global _STORAGE_SEAL_PW_CACHE
+    if _STORAGE_SEAL_PW_CACHE is None:
+        secret = (os.environ.get("BOT_TOKEN") or "DEVORKS+").encode("utf-8")
+        _STORAGE_SEAL_PW_CACHE = hashlib.pbkdf2_hmac(
+            "sha256", secret, _STORAGE_SEAL_SALT, 60000, dklen=32).hex()
+    return _STORAGE_SEAL_PW_CACHE
+
+
+def _seal_pack(payload: bytes, name: str, mime: str = "", kind: str = "doc") -> bytes:
+    """Шифрует байты ключом бота (DVF1). Возвращает контейнер."""
+    return _vault_pack(_storage_seal_pw(), payload or b"", {
+        "n": str(name or "file.bin")[:200],
+        "m": str(mime or "")[:100],
+        "k": str(kind or "doc")[:10],
+        "t": datetime.now().strftime("%Y-%m-%d %H:%M"),
+    })
+
+
+def _seal_unpack(container: bytes):
+    """Расшифровывает DVF1-контейнер ключом бота → (meta, payload)."""
+    return _vault_unpack(_storage_seal_pw(), container)
+
+
 def _vault_auth_open(auth) -> dict:
     """ВОЛНА 17: вид vault_auth с ОТКРЫТЫМ списком вопросов.
     enc-форма (вопросы зашифрованы) расшифровывается ключом бота;
@@ -9655,6 +9893,7 @@ async def _vault_seal_item_mtproto_once(msg, context, user, item, password,
             "channel_id": up.get("channel_id"),
             "dvf2": True,
         }
+        _stat_bump("vault_upload")
         # ВОЛНА 17: источник (сообщение в личном чате) стираем ТОЛЬКО при
         # успехе — шифр уже в канале, обещание «оригинал из чата сотру»
         # выполнено. При сбое оригинал ОСТАЁТСЯ в чате (политика волны 11).
@@ -10078,7 +10317,7 @@ def _vault_help_text():
         "(это и есть «отмена» после распаковки). Шифр в канале остаётся целым — "
         "файл можно расшифровать заново в любой момент. Нужен файл — сохраните "
         "или перешлите его ДО нажатия. Не хотите автоудаления — выключите его "
-        "в ⚙️ Настройках (пункт «Удалять файл при „Отмене“»).\n\n"
+        "в ⚙️ Настройках (пункт «🧹 Оптимизация памяти»).\n\n"
         "🔑 ВОССТАНОВЛЕНИЕ (если пароль забылся):\n"
         "• при создании пароля бот просит придумать 3 секретных вопроса и "
         "ответы (вопрос — ваш, ответ знаете только вы);\n"
@@ -12179,6 +12418,8 @@ async def vault_get_password(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # ВОЛНА 14: большой файл (>20 МБ, DVF2) — потоковый путь через MTProto.
     # Обязателен ДО Bot API-пути: тот ограничен 20 МБ и не умеет контейнеры
     # без file_id (большие шифры заливаются только MTProto).
+    # Пароль подтверждён — выдача началась (счётчик статистики).
+    _stat_bump("vault_get")
     if rec.get("dvf2"):
         return await _vault_get_dvf2(msg, context, user, rec, password)
     # Пароль верный: скачиваем шифр из канала (в память).
@@ -13897,6 +14138,7 @@ async def handle_ai_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     базу.
     """
     user_id = str(update.effective_user.id)
+    _stat_bump("ai_msg")  # 22.13: счётчик сообщений ИИ-чату
     msg = update.message
     user_message = (msg.text or msg.caption or "").strip()
     chat_id = update.effective_chat.id
@@ -14534,7 +14776,7 @@ def _automation_system_prompt(context_text, is_admin):
         '6) {"action":"edit_schedule","day":"<Понедельник..Воскресенье>","content":"<номер. предмет через \\n>"} — заменить расписание на день.\n'
         '7) {"action":"edit_bell","lesson":<номер урока числом>,"start":"ЧЧ:ММ","end":"ЧЧ:ММ"} — задать время звонков урока. end обязан быть позже start.\n'
         '8) {"action":"set_holidays","date":"ГГГГ-ММ-ДД"} — дата начала каникул.\n'
-        '9) {"action":"create_timer","date":"ГГГГ-ММ-ДД","time":"ЧЧ:ММ","text":"<текст напоминания>","kind":"timer|wish","repeat_daily":false} — таймер/напоминание/ПОЖЕЛАНИЕ ПО РАСПИСАНИЮ (доступно всем). Если пользователь говорит «через N минут/часов» — используй вместо даты поле in_minutes: {"action":"create_timer","in_minutes":<целое число минут>,"text":"<текст>"}. Разрешено передавать date как «today»/«tomorrow» — исполнитель сам посчитает дату. ПОЛЕ kind: "timer" (по умолчанию) — обычное напоминание; "wish" — когда пользователь просит бота ПОЖЕЛАТЬ/сказать/поздравить его самого («пожелай мне спокойной ночи в 23:00», «говори мне доброе утро в 7:00», «поздравь меня с наступающим в 12:00») — в text запиши САМО ПОЖЕЛАНИЕ живой фразой с уместным эмодзи (например «Спокойной ночи! Пусть тебе приснятся самые добрые сны 🌙»), а не служебный текст. ПОЛЕ repeat_daily: true — ТОЛЬКО если сказано «каждый день», «каждое утро», «всегда в это время»; иначе false.\n'
+        '9) {"action":"create_timer","date":"ГГГГ-ММ-ДД","time":"ЧЧ:ММ","text":"<текст напоминания>","kind":"timer|wish","repeat_daily":false} — таймер/напоминание/ПОЖЕЛАНИЕ ПО РАСПИСАНИЮ (доступно всем). Если пользователь говорит «через N минут/часов» — используй вместо даты поле in_minutes: {"action":"create_timer","in_minutes":<целое число минут>,"text":"<текст>"}. Разрешено передавать date как «today»/«tomorrow» — исполнитель сам посчитает дату. ПОЛЕ kind: "timer" (по умолчанию) — обычное напоминание; "wish" — когда пользователь просит бота ПОЖЕЛАТЬ/сказать/поздравить его самого («пожелай мне спокойной ночи в 23:00», «говори мне доброе утро в 7:00», «поздравь меня с наступающим в 12:00») — в text запиши САМО ПОЖЕЛАНИЕ живой фразой с уместным эмодзи (например «Спокойной ночи! Пусть тебе приснятся самые добрые сны 🌙»), а не служебный текст. ПОЛЕ repeat_daily: true — ТОЛЬКО если сказано «каждый день», «каждое утро», «всегда в это время»; иначе false. ПОЛЕ repeat_weekday — ЕЖЕНЕДЕЛЬНЫЙ повтор: «каждый понедельник в 15:00» = {"repeat_weekday":"mon","time":"15:00"} (дни: mon|tue|wed|thu|fri|sat|sun или по-русски); дата не нужна, исполнитель сам найдёт ближайший день. Напоминаний можно создавать сколько угодно.\n'
         '10) {"action":"send_class_message","text":"<сообщение>"} — объявление всему классу (только админ).\n'
         '11) {"action":"show_homework","subject":"<предмет или null>","date":"ГГГГ-ММ-ДД или null"} — показать ДЗ.\n'
         '12) {"action":"show_schedule","day":"<день или null>"} — показать расписание.\n'
@@ -14572,7 +14814,7 @@ def _automation_system_prompt(context_text, is_admin):
         "- НЕСКОЛЬКО ДЗ ЗА РАЗ: перечисление заданий по разным предметам/датам — это ОДНО действие add_homework_many со ВСЕМИ элементами. Не выкидывай ни одно задание и не добавляй лишние.\n"
         "- НЕСКОЛЬКО УДАЛЕНИЙ ДЗ ЗА РАЗ: «удали всё дз на сегодня, на завтра по математике и послезавтра на русский», «убери дз на пятницу и по физике на завтра» — это ОДНО действие delete_homework_many со ВСЕМИ элементами из фразы. Внутри элемента subject:null = весь день, date:null = весь предмет. Названия предметов сопоставляй с классом («русский» → «Русский язык»).\n"
         "- СЛЕДУЮЩАЯ НЕДЕЛЯ: «на следующей неделе в понедельник/пятницу», «в понедельник следующей недели» — берите дату из строки контекста про СЛЕДУЮЩУЮ неделю, а не из текущей. «Через неделю» = сегодня + 7 дней.\n"
-        "- ПОЖЕЛАНИЯ ПО РАСПИСАНИЮ: «пожелай мне спокойной ночи в 23:00» = create_timer kind:\"wish\" time:\"23:00\" с живой фразой-пожеланием в text; «желай доброе утро в 7:00 каждый день» = то же + repeat_daily:true. Обычные напоминания («напомни…») = kind:\"timer\".\n"
+        "- ПОЖЕЛАНИЯ ПО РАСПИСАНИЮ: «пожелай мне спокойной ночи в 23:00» = create_timer kind:\"wish\" time:\"23:00\" с живой фразой-пожеланием в text; «желай доброе утро в 7:00 каждый день» = то же + repeat_daily:true. Обычные напоминания («напомни…») = kind:\"timer\". ЕЖЕНЕДЕЛЬНЫЕ напоминания: «каждый понедельник в 15:00 напомни про кружок» = create_timer repeat_weekday:\"mon\" time:\"15:00\"; можно создавать сколько угодно напоминаний.\n"
         "- ДЕНЬ РОЖДЕНИЯ: «поменяй мой день рождения на 30 мая 2008», «мой днюха 14 марта 2009» = set_birthday с датой ГГГГ-ММ-ДД; если год не назван — clarify.\n"
         "- КОД КЛАССА: «скажи код класса», «какой у нас код?», «покажи код» = show_class_code.\n"
         "- ХРАНИЛИЩЕ/ОБЛАКО: «облако», «мои файлы», «что в облаке» = show_storage; «сделай бэкап», «сохрани базу» = backup_now (только разработчик); «открой облако» = open_section section:\"облако\".\n"
@@ -14881,8 +15123,34 @@ async def _automation_execute_action(update, context, user, class_obj, action):
         tz_offset = getattr(user, "timezone", 3) if user else 3
         local_now = _now_utc() + timedelta(hours=tz_offset)
 
-        # Формат 1: относительное время «через N минут».
+        # ВОЛНА 22.13: «каждый понедельник в 15:00» — повторяемый день недели.
+        repeat_weekday_raw = str(action.get("repeat_weekday") or "").strip().lower()
+        repeat_weekly = None
+        if repeat_weekday_raw not in ("", "none", "null", "false", "0"):
+            _WD_ALIASES = {
+                "mon": 0, "monday": 0, "понедельник": 0, "пн": 0,
+                "tue": 1, "tuesday": 1, "вторник": 1, "вт": 1,
+                "wed": 2, "wednesday": 2, "среда": 2, "среду": 2, "ср": 2,
+                "thu": 3, "thursday": 3, "четверг": 3, "чт": 3,
+                "fri": 4, "friday": 4, "пятница": 4, "пятницу": 4, "пт": 4,
+                "sat": 5, "saturday": 5, "суббота": 5, "субботу": 5, "сб": 5,
+                "sun": 6, "sunday": 6, "воскресенье": 6, "вс": 6,
+            }
+            repeat_weekly = _WD_ALIASES.get(repeat_weekday_raw)
+            if repeat_weekly is None:
+                try:
+                    _w = int(repeat_weekday_raw)
+                    repeat_weekly = _w if 0 <= _w <= 6 else None
+                except (TypeError, ValueError):
+                    repeat_weekly = None
+            if repeat_weekly is None:
+                return ("❓ День недели не распознан. Скажите, например: "
+                        "«каждый понедельник в 15:00».", False)
+
+        # Формат 1: относительное время «через N минут» (не для еженедельных).
         in_minutes_raw = action.get("in_minutes")
+        if repeat_weekly is not None and str(in_minutes_raw or "").strip() not in ("", "None", "null"):
+            in_minutes_raw = None  # еженедельный таймер — только дата+время
         if in_minutes_raw is not None and str(in_minutes_raw).strip() not in ("", "null", "None"):
             try:
                 in_minutes = int(float(str(in_minutes_raw).strip()))
@@ -14902,6 +15170,31 @@ async def _automation_execute_action(update, context, user, class_obj, action):
                 date_str = local_now.strftime("%Y-%m-%d")
             elif date_norm in ("tomorrow", "завтра"):
                 date_str = (local_now + timedelta(days=1)).strftime("%Y-%m-%d")
+            # ВОЛНА 22.13: еженедельный повтор — дата = ближайший день недели.
+            if repeat_weekly is not None:
+                if not time_str:
+                    return "❓ Назовите ВРЕМЯ напоминания (например, «каждый понедельник в 15:00»).", False
+                try:
+                    datetime.strptime(f"2000-01-01 {time_str}", "%Y-%m-%d %H:%M")
+                except ValueError:
+                    return "❓ Время напоминания не распознано. Назовите его как ЧЧ:ММ.", False
+                date_str = ""
+                # Сегодня уже этот день недели и время ещё не прошло? —
+                # первый запуск СЕГОДНЯ (а не через неделю).
+                if local_now.weekday() == repeat_weekly:
+                    try:
+                        _cand = datetime.strptime(
+                            f"{local_now.strftime('%Y-%m-%d')} {time_str}",
+                            "%Y-%m-%d %H:%M")
+                        if _cand > local_now:
+                            date_str = local_now.strftime("%Y-%m-%d")
+                    except ValueError:
+                        pass
+                if not date_str:
+                    _wd_date = _timer_next_weekday_date(repeat_weekly, local_now)
+                    if _wd_date is None:
+                        return "❓ Не понял день недели. Попробуйте ещё раз.", False
+                    date_str = _wd_date.strftime("%Y-%m-%d")
             if not date_str and time_str:
                 # Только время — считаем «сегодня», а если оно уже прошло — «завтра».
                 today_time = datetime.strptime(
@@ -14948,9 +15241,11 @@ async def _automation_execute_action(update, context, user, class_obj, action):
             "is_active": True,
             "kind": kind,
             "repeat_daily": repeat_daily,
+            "repeat_weekly": repeat_weekly,
             "created_date": datetime.now().strftime("%Y-%m-%d %H:%M"),
         }
         save_data(TIMERS_FILE, timers)
+        _stat_bump("timer_set")
         # Немедленное планирование JobQueue + страховочный тикер подхватят
         # таймер даже если джоба не сработает.
         try:
@@ -14958,7 +15253,12 @@ async def _automation_execute_action(update, context, user, class_obj, action):
         except Exception as e:
             logger.error(f"automation create_timer schedule: {e}")
         when_line = f"📅 {date_str} в {time_str}"
-        if repeat_daily:
+        if repeat_weekly is not None:
+            _WD_NAMES = ("понедельник", "вторник", "среду", "четверг",
+                         "пятницу", "субботу", "воскресенье")
+            when_line = (f"📅 каждый {_WD_NAMES[repeat_weekly]} в {time_str} "
+                         f"(ближайший — {date_str})")
+        elif repeat_daily:
             when_line += " (и каждый день в это время)"
         if kind == "wish":
             return (
@@ -17208,6 +17508,8 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(user_id)
     if not user:
         user = User(user_id)
+    # ВОЛНА 22.13: отметка дневной активности (для DAU/WAU/MAU статистики).
+    _touch_activity(user_id)
     message_text = update.message.text
 
     # ПУНКТ 4: если пользователь переименовал кнопку, отображаемое имя нужно
@@ -21646,27 +21948,276 @@ async def developer_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, reply_markup=get_developer_keyboard(), parse_mode="Markdown")
     return DEV_PANEL
 
-async def dev_stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+# === ВОЛНА 22.13: РАСШИРЕННАЯ СТАТИСТИКА ДЛЯ РАЗРАБОТЧИКА ===
+# «Улучшенная статистика: сколько пользователей пользовались, какой прирост
+# за последние 24 часа / неделю / месяц или любая выбранная дата».
+# Экраны: рост, активность (DAU/WAU/MAU), функции, произвольный период.
+# ПРИВАТНОСТЬ ОПРОСОВ: в статистике НЕТ содержимого чужих опросов — только
+# счётчики (poll_sent), а итоги опросов разработчик видит только свои.
 
+def _dev_stats_growth_text():
     users = load_users()
     classes = load_classes()
-
-    total_users = len(users)
-    active_users = sum(1 for u in users.values() if u.setup_completed)
+    now = datetime.now()
+    total = len(users)
+    by_age = {"24ч": 0, "7д": 0, "30д": 0}
+    for u in users.values():
+        try:
+            reg = datetime.strptime(str(u.joined_date)[:10], "%Y-%m-%d")
+        except (TypeError, ValueError):
+            continue
+        age = now - reg
+        if age <= timedelta(days=1):
+            by_age["24ч"] += 1
+        if age <= timedelta(days=7):
+            by_age["7д"] += 1
+        if age <= timedelta(days=30):
+            by_age["30д"] += 1
     total_classes = len([c for c in classes.values() if c.is_active])
     total_students = sum(len(c.students) for c in classes.values() if c.is_active)
-
-    stats_text = (
-        f"📊 **Статистика бота**\n\n"
-        f"👥 Всего пользователей: {total_users}\n"
-        f"✅ Активных пользователей: {active_users}\n"
-        f"🏫 Всего классов: {total_classes}\n"
-        f"🎓 Всего учеников: {total_students}\n"
+    return (
+        "📈 РОСТ БОТА\n\n"
+        f"👥 Всего пользователей: {total}\n"
+        f"🆕 Прирост за 24 часа: +{by_age['24ч']}\n"
+        f"🆕 Прирост за неделю: +{by_age['7д']}\n"
+        f"🆕 Прирост за месяц: +{by_age['30д']}\n\n"
+        f"🏫 Активных классов: {total_classes}\n"
+        f"🎓 Учеников в классах: {total_students}\n\n"
+        "Точная дата/период — кнопкой «⏱ Период»."
     )
 
-    await query.edit_message_text(stats_text, parse_mode="Markdown", reply_markup=get_developer_keyboard())
+
+def _dev_stats_activity_text():
+    dau, wau, mau = _activity_counts()
+    users = load_users()
+    active_total = sum(1 for u in users.values() if u.setup_completed)
+    return (
+        "🔥 АКТИВНОСТЬ\n\n"
+        f"🟢 За сегодня: {dau}\n"
+        f"🟡 За 7 дней: {wau}\n"
+        f"🟠 За 30 дней: {mau}\n\n"
+        f"✅ Прошли настройку: {active_total} из {len(users)}\n\n"
+        "Счётчик активности пишется с этой версии — история накопится "
+        "по мере работы бота."
+    )
+
+
+_FSTATS_LABELS = {
+    "vault_upload": ("🔐 Загрузок в Сейф", "всего", "за 7 дней"),
+    "vault_get": ("📥 Выдач из Сейфа", "всего", "за 7 дней"),
+    "poll_sent": ("📊 Опросов отправлено", "всего", "за 7 дней"),
+    "sol_published": ("📚 Решений опубликовано", "всего", "за 7 дней"),
+    "share_created": ("🔗 Ссылок обмена создано", "всего", "за 7 дней"),
+    "share_redeemed": ("📎 Скачиваний по ссылкам", "всего", "за 7 дней"),
+    "ai_msg": ("🤖 Сообщений ИИ", "всего", "за 7 дней"),
+    "timer_set": ("⏰ Таймеров создано", "всего", "за 7 дней"),
+}
+
+
+def _dev_stats_features_text():
+    lines = ["🧩 ИСПОЛЬЗОВАНИЕ ФУНКЦИЙ\n"]
+    for key, (lbl, _a, _b) in _FSTATS_LABELS.items():
+        rec = _feature_stats_all().get(key) or {}
+        total = int(rec.get("total", 0) or 0)
+        week = _stat_days_sum(key, 7)
+        lines.append(f"{lbl}: {total} (за 7 дней: {week})")
+    if not _feature_stats_all():
+        lines.append("Пока пусто — счётчики накапливаются с этой версии.")
+    return "\n".join(lines)
+
+
+def get_dev_stats_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📈 Рост", callback_data="dev_stats2_growth"),
+         InlineKeyboardButton("🔥 Активность", callback_data="dev_stats2_act")],
+        [InlineKeyboardButton("🧩 Функции", callback_data="dev_stats2_feat"),
+         InlineKeyboardButton("⏱ Период", callback_data="dev_stats2_period")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="dev_panel_back")],
+    ])
+
+
+async def dev_stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.13: меню расширенной статистики (рост/активность/функции/
+    произвольный период). Сводка по умолчанию — рост."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    _txt = _dev_stats_growth_text() + "\n\n" + (
+        "🔥 Активных сегодня: " + str(_activity_counts()[0]))
+    try:
+        await query.edit_message_text(
+            _txt, reply_markup=get_dev_stats_keyboard())
+    except Exception:
+        await query.message.reply_text(_txt, reply_markup=get_dev_stats_keyboard())
+    return DEV_PANEL
+
+
+async def dev_stats2_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.13: экраны статистики (рост/активность/функции)."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    data = query.data
+    if data == "dev_stats2_growth":
+        _txt = _dev_stats_growth_text()
+    elif data == "dev_stats2_act":
+        _txt = _dev_stats_activity_text()
+    elif data == "dev_stats2_feat":
+        _txt = _dev_stats_features_text()
+    else:
+        return DEV_PANEL
+    try:
+        await query.edit_message_text(_txt, reply_markup=get_dev_stats_keyboard())
+    except Exception:
+        pass
+    return DEV_PANEL
+
+
+async def dev_stats_period_start(update: Update,
+                                 context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.13: «⏱ Период» — произвольный период статистики."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    await query.edit_message_text(
+        "⏱ СТАТИСТИКА ЗА ПРОИЗВОЛЬНЫЙ ПЕРИОД\n\n"
+        "Пришлите ОДНИМ сообщением:\n"
+        "• 30 — за последние 30 дней\n"
+        "• 01.09-15.09 — диапазон дат (день.месяц-день.месяц)\n"
+        "• 05.10 — один день\n\n"
+        "Покажу: новых пользователей, активных, классы, функции.",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("⬅️ Назад", callback_data="dev_stats")]]))
+    return DEV_STATS_PERIOD
+
+
+def _parse_stats_period(text):
+    """Разбор периода: N дней | DD.MM-DD.MM | DD.MM. Возвращает
+    (дата_от, дата_до) включительно или None."""
+    t = (text or "").strip().lower().replace("–", "-").replace(" ", "")
+    m = re.fullmatch(r"(\d{1,4})д?", t)
+    if m:
+        n = int(m.group(1))
+        if not (1 <= n <= 3650):
+            return None
+        to = datetime.now().date()
+        return to - timedelta(days=n - 1), to
+    m = re.fullmatch(r"(\d{1,2})\.(\d{1,2})(?:\.(\d{2,4}))?-(\d{1,2})\.(\d{1,2})(?:\.(\d{2,4}))?", t)
+    if m:
+        d1, mo1, y1, d2, mo2, y2 = (m.group(1), m.group(2), m.group(3),
+                                    m.group(4), m.group(5), m.group(6))
+        year = datetime.now().year
+        try:
+            if y1:
+                _y1 = int(y1)
+                year1 = (2000 + _y1) if len(str(y1)) <= 2 else _y1
+            else:
+                year1 = year
+            if y2:
+                _y2 = int(y2)
+                year2 = (2000 + _y2) if len(str(y2)) <= 2 else _y2
+            else:
+                year2 = year1
+            frm = datetime(year1, int(mo1), int(d1)).date()
+            to = datetime(year2, int(mo2), int(d2)).date()
+        except ValueError:
+            return None
+        if frm > to:
+            frm, to = to, frm
+        return frm, to
+    m = re.fullmatch(r"(\d{1,2})\.(\d{1,2})(?:\.(\d{2,4}))?", t)
+    if m:
+        try:
+            if m.group(3):
+                _y = int(m.group(3))
+                year = (2000 + _y) if len(str(_y)) <= 2 else _y
+            else:
+                year = datetime.now().year
+            d = datetime(year, int(m.group(2)), int(m.group(1))).date()
+        except ValueError:
+            return None
+        return d, d
+    return None
+
+
+@timeout(CONVERSATION_TIMEOUT)
+async def dev_stats_period_receive(update: Update,
+                                   context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.13: приём произвольного периода статистики."""
+    msg = update.message
+    span = _parse_stats_period(msg.text)
+    if span is None:
+        await msg.reply_text(
+            "❌ Не понял период. Форматы: «30» (дней), «01.09-15.09», "
+            "«05.10». Попробуйте ещё раз или нажмите «⬅️ Назад».")
+        return DEV_STATS_PERIOD
+    frm, to = span
+    users = load_users()
+    act = _activity_all()
+    new_users = 0
+    active_users = 0
+    for u in users.values():
+        try:
+            reg = datetime.strptime(str(u.joined_date)[:10], "%Y-%m-%d").date()
+        except (TypeError, ValueError):
+            reg = None
+        if reg is not None and frm <= reg <= to:
+            new_users += 1
+        last = (act.get(str(u.user_id)) or {}).get("last")
+        try:
+            last_d = datetime.strptime(str(last), "%Y-%m-%d").date()
+        except (TypeError, ValueError):
+            last_d = None
+        if last_d is not None and frm <= last_d <= to:
+            active_users += 1
+    classes = load_classes()
+    new_classes = 0
+    for c in classes.values():
+        try:
+            cr = datetime.strptime(str(c.created_date)[:10], "%Y-%m-%d").date()
+        except (TypeError, ValueError):
+            continue
+        if frm <= cr <= to:
+            new_classes += 1
+    days = max(1, (to - frm).days + 1)
+    lines = [
+        f"⏱ СТАТИСТИКА ЗА {frm.strftime('%d.%m.%Y')} — {to.strftime('%d.%m.%Y')} ({days} дн.)\n",
+        f"🆕 Новых пользователей: {new_users}",
+        f"🟢 Пользователей были активны: {active_users}",
+        f"🏫 Новых классов: {new_classes}",
+    ]
+    for key, (lbl, _a, _b) in _FSTATS_LABELS.items():
+        rec = _feature_stats_all().get(key) or {}
+        by_day = rec.get("by_day") or {}
+        s = 0
+        for i in range(days):
+            d = (to - timedelta(days=i)).strftime("%Y-%m-%d")
+            s += int(by_day.get(d, 0) or 0)
+        if s:
+            lines.append(f"{lbl}: {s}")
+    await msg.reply_text(
+        "\n".join(lines), reply_markup=get_dev_stats_keyboard())
+    return DEV_PANEL
+
+
+async def dev_panel_back_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.13: «⬅️ Назад» из статистики в панель разработчика."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    try:
+        await query.edit_message_text(
+            "🛠 ПАНЕЛЬ РАЗРАБОТЧИКА", reply_markup=get_developer_keyboard())
+    except Exception:
+        pass
     return DEV_PANEL
 
 async def dev_broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -21695,6 +22246,9 @@ async def dev_broadcast_handler(update: Update, context: ContextTypes.DEFAULT_TY
                 sent_count += 1
             except Exception as e:
                 logger.error(f"Ошибка рассылки {user_id}: {e}")
+            # ЗАЩИТА (22.13): пауза между отправками — не попадать под
+            # флуд-лимиты Telegram и не рисковать баном бота.
+            await asyncio.sleep(0.05)
 
     await update.message.reply_text(f"✅ Рассылка отправлена {sent_count} пользователям!")
     return await developer_panel(update, context)
@@ -21754,6 +22308,8 @@ async def dev_class_message_handler(update: Update, context: ContextTypes.DEFAUL
             sent_count += 1
         except Exception as e:
             logger.error(f"Ошибка отправки {member_id}: {e}")
+        # ЗАЩИТА (22.13): пауза между отправками (анти-флуд).
+        await asyncio.sleep(0.05)
 
     await update.message.reply_text(f"✅ Сообщение отправлено {sent_count} участникам класса '{class_obj.class_name}'!")
     return await developer_panel(update, context)
@@ -24382,6 +24938,11 @@ async def timer_set_text_handler(update: Update, context: ContextTypes.DEFAULT_T
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    # ВОЛНА 22.13: отметка дневной активности (для статистики).
+    try:
+        _touch_activity(str(query.from_user.id))
+    except Exception:
+        pass
 
     # ВОЛНА 22.12: анти-гонка опросов v2 — ДО query.answer() и любых await.
     # concurrent_updates(True): вопрос, отправленный сразу после нажатия
@@ -24685,6 +25246,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await sol_cancel_cb(update, context)
     elif data in ("sol_anon_yes", "sol_anon_no"):
         return await sol_anon_cb(update, context)
+    elif data.startswith("sol_ttl_"):
+        # ВОЛНА 22.13: выбор срока хранения отправителем.
+        return await sol_ttl_cb(update, context)
+    elif data.startswith("sol_ttlmod_"):
+        # ВОЛНА 22.13: «⏳ Срок» на карточке модерации (меняет староста).
+        return await sol_ttlmod_cb(update, context)
     elif data.startswith("sol_appr_") or data.startswith("sol_rej_"):
         return await sol_moderate_cb(update, context)
     elif data == "sol_list":
@@ -24693,6 +25260,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await sol_view_cb(update, context)
     elif data == "sol_toggle_notify":
         return await sol_toggle_notify_cb(update, context)
+    elif data == "sol_admin_menu":
+        # ВОЛНА 22.13: настройки базы решений для старосты (админ-панель).
+        return await sol_admin_menu_cb(update, context)
+    elif data == "sol_adm_toggle":
+        return await sol_admin_toggle_cb(update, context)
+    elif data == "sol_adm_ttl":
+        return await sol_admin_ttl_cb(update, context)
     elif data == "share_open" or data.startswith("share_open_"):
         # ВОЛНА 22.12: 🔗 менеджер share-ссылки (из списка/карточки файла).
         return await share_open_cb(update, context)
@@ -24712,6 +25286,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await share_back_cb(update, context)
     elif data == "share_list":
         return await share_list_cb(update, context)
+    elif data == "share_exit":
+        # ВОЛНА 22.13: «⬅️ Назад» из менеджера ссылки в файлы Сейфа.
+        return await share_exit_cb(update, context)
     elif data.startswith("share_revoke_"):
         return await share_revoke_cb(update, context)
     elif data == "personal_buttons":
@@ -24778,6 +25355,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "dev_stats":
         return await dev_stats_handler(update, context)
+    elif data in ("dev_stats2_growth", "dev_stats2_act", "dev_stats2_feat"):
+        # ВОЛНА 22.13: экраны расширенной статистики.
+        return await dev_stats2_cb(update, context)
+    elif data == "dev_stats2_period":
+        return await dev_stats_period_start(update, context)
+    elif data == "dev_panel_back":
+        return await dev_panel_back_cb(update, context)
     elif data == "dev_broadcast":
         return await dev_broadcast_start(update, context)
     elif data == "dev_class_message":
@@ -25386,6 +25970,50 @@ def _timer_advance_daily(timer_data):
         return False
 
 
+def _timer_next_weekday_date(weekday, from_local=None):
+    """ВОЛНА 22.13: ближайшая дата нужного дня недели (0=Пн…6=Вс).
+    Если сегодня уже этот день — берём СЛЕДУЮЩУЮ неделю (сдвиг 7)."""
+    from_local = from_local or datetime.now()
+    try:
+        wd = int(weekday)
+    except (TypeError, ValueError):
+        return None
+    if not (0 <= wd <= 6):
+        return None
+    shift = (wd - from_local.weekday()) % 7
+    if shift == 0:
+        shift = 7
+    return from_local + timedelta(days=shift)
+
+
+def _timer_advance_repeat(timer_data):
+    """ВОЛНА 22.13: сдвиг ПОВТОРЯЮЩЕГОСЯ таймера на следующий запуск.
+    repeat_weekly (int 0=Пн…6=Вс) — на ближайшую неделю этого дня;
+    иначе repeat_daily — на завтра. Возвращает True, если сдвинут.
+    (Единая точка для всех трёх путей доставки таймеров.)"""
+    if not isinstance(timer_data, dict):
+        return False
+    if timer_data.get('repeat_weekly') is not None and \
+            not timer_data.get('repeat_daily'):
+        try:
+            wd = int(timer_data.get('repeat_weekly'))
+        except (TypeError, ValueError):
+            return False
+        if not (0 <= wd <= 6):
+            return False
+        try:
+            base = datetime.strptime(str(timer_data.get('target_date')), "%Y-%m-%d")
+        except (TypeError, ValueError):
+            base = datetime.now()
+        nd = _timer_next_weekday_date(wd, base)
+        if nd is None:
+            return False
+        timer_data['target_date'] = nd.strftime("%Y-%m-%d")
+        timer_data.pop('fired_at', None)
+        return True
+    return _timer_advance_daily(timer_data)
+
+
 async def _send_timer_notification(context: ContextTypes.DEFAULT_TYPE):
     """Колбэк JobQueue для отправки таймер-уведомления."""
     job_data = context.job.data or {}
@@ -25442,7 +26070,7 @@ async def _send_timer_notification(context: ContextTypes.DEFAULT_TYPE):
         timers = load_data(TIMERS_FILE, {})
         if timer_id and timer_id in timers:
             td = timers[timer_id]
-            if _timer_advance_daily(td):
+            if _timer_advance_repeat(td):
                 timers[timer_id] = td
                 save_data(TIMERS_FILE, timers)
                 # Планируем срабатывание на завтра (страховка: тикер/safety-net
@@ -25511,9 +26139,9 @@ async def _timer_safety_net(context: ContextTypes.DEFAULT_TYPE):
                     continue
                 # Помечаем активным = False ДО отправки, чтобы параллельный
                 # run_once не отправил то же уведомление второй раз.
-                # ДЛЯ ПОВТОРЯЮЩИХСЯ (repeat_daily): вместо деактивации —
-                # сдвигаем дату на завтра и остаёмся активными.
-                if _timer_advance_daily(timer_data):
+                # ДЛЯ ПОВТОРЯЮЩИХСЯ (repeat_daily/repeat_weekly): вместо
+                # деактивации — сдвигаем на следующий запуск и остаёмся активными.
+                if _timer_advance_repeat(timer_data):
                     timer_data['fired_at'] = datetime.now().strftime("%Y-%m-%d %H:%M")
                 else:
                     timer_data['is_active'] = False
@@ -26725,6 +27353,8 @@ async def dev_instant_broadcast_handler(update: Update, context: ContextTypes.DE
             sent += 1
         except Exception as e:
             logger.error(f"Ошибка анонимной рассылки {uid}: {e}")
+        # ЗАЩИТА (22.13): пауза между отправками (анти-флуд).
+        await asyncio.sleep(0.05)
     await update.message.reply_text(
         f"✅ Сообщение отправлено {sent} пользователям (без подписи разработчика)."
     )
@@ -26753,6 +27383,19 @@ SOL_WAIT_FILE = 133  # (константа объявлена в блоке со
 
 _SOL_MAX_PER_CLASS = 50  # храним последние 50 решений на класс (FIFO)
 _SOL_SUBJECT_MAX = 100
+
+# ВОЛНА 22.13: автоудаление решений. Отправитель выбирает срок при отправке,
+# староста может поменять его при модерации, а староста класса может включить
+# АВТОМАТИЧЕСКУЮ модерацию и задать общий срок удаления публикаций.
+SOL_TTLS = (
+    ("1 час", 1),
+    ("1 день", 24),
+    ("3 дня", 72),
+    ("1 неделя", 168),
+    ("1 месяц", 720),
+    ("не удалять", 0),
+)
+_SOL_EXPIRE_CHECK_EVERY = 300  # чистка просроченных — раз в 5 минут
 
 _SOL_CACHE = None
 
@@ -26785,6 +27428,72 @@ def _sol_find_entry(sol_id):
             if isinstance(e, dict) and e.get("id") == sol_id:
                 return e
     return None
+
+
+# === ВОЛНА 22.13: автоудаление решений ===
+
+def _sol_ttl_label(ttl_h):
+    """Читаемое имя срока хранения по часам (0 = не удалять)."""
+    for _lbl, _h in SOL_TTLS:
+        if int(_h or 0) == int(ttl_h or 0):
+            return _lbl
+    return f"{ttl_h} ч" if ttl_h else "не удалять"
+
+
+def _sol_apply_ttl(entry, ttl_h):
+    """Записать в решение срок хранения (expire_ts). ttl_h=0 — не удалять."""
+    ttl_h = int(ttl_h or 0)
+    entry["ttl_h"] = ttl_h
+    entry["expire_ts"] = (time.time() + ttl_h * 3600) if ttl_h > 0 else None
+
+
+def _sol_alive_entries(class_code):
+    """Только не просроченные одобренные... (все живые) решения класса."""
+    now = time.time()
+    out = []
+    for e in _sol_class_entries(class_code):
+        if not isinstance(e, dict):
+            continue
+        exp = e.get("expire_ts")
+        if exp and float(exp) < now:
+            continue
+        out.append(e)
+    return out
+
+
+async def _sol_delete_channel_file(context, entry):
+    """Лучшие усилия: удалить шифр файла решения из канала-хранилища."""
+    _f = entry.get("file") or {}
+    _ch, _mid = int(_f.get("ch") or 0), int(_f.get("mid") or 0)
+    if not _ch or not _mid:
+        return
+    try:
+        await context.bot.delete_message(chat_id=_ch, message_id=_mid)
+    except Exception:
+        pass
+
+
+async def _sol_purge_expired(context):
+    """ВОЛНА 22.13: удаляет просроченные решения (любой статус) из реестра
+    и их шифры из канала. Вызывается из единого тикера раз в 5 минут."""
+    now = time.time()
+    removed = []
+    for code, entries in _solutions_all().items():
+        keep = []
+        for e in entries:
+            if not isinstance(e, dict):
+                continue
+            exp = e.get("expire_ts")
+            if exp and float(exp) < now:
+                removed.append(e)
+                continue
+            keep.append(e)
+        _solutions_all()[code] = keep
+    if removed:
+        _solutions_save()
+        for e in removed[:20]:  # не больше 20 удалений из канала за цикл
+            await _sol_delete_channel_file(context, e)
+        logger.info(f"solutions: автоудалено просроченных решений: {len(removed)}")
 
 
 def _sol_menu_kb(user):
@@ -26899,7 +27608,9 @@ async def sol_cancel_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @timeout(CONVERSATION_TIMEOUT)
 async def sol_file_receive(update: Update,
                            context: ContextTypes.DEFAULT_TYPE):
-    """ВОЛНА 22.12: приём фото/файла решения → выбор анонимности."""
+    """ВОЛНА 22.12: приём фото/файла решения → выбор анонимности.
+    ВОЛНА 22.13: запоминаем file_id/mime — файл уйдёт в канал ШИФРОМ,
+    и добавляем шаг «⏳ Через сколько удалить»."""
     msg = update.message
     user = get_user(str(update.effective_user.id))
     class_obj = get_class_by_user(str(update.effective_user.id)) if user else None
@@ -26912,11 +27623,33 @@ async def sol_file_receive(update: Update,
             "считается. Попробуйте ещё раз или нажмите «❌ Отмена».")
         return SOL_WAIT_FILE
     subject = (msg.caption or "").strip()[:_SOL_SUBJECT_MAX]
+    if msg.photo:
+        _fid = msg.photo[-1].file_id
+        _mime = "image/jpeg"
+        _fname = "photo.jpg"
+        _ftype = "photo"
+        _size = int(getattr(msg.photo[-1], "file_size", 0) or 0)
+    else:
+        _doc = msg.document
+        _fid = _doc.file_id
+        _mime = str(getattr(_doc, "mime_type", "") or "")
+        _fname = str(getattr(_doc, "file_name", "") or "file.bin")[:120]
+        _ftype = "document"
+        _size = int(getattr(_doc, "file_size", 0) or 0)
+    if _size > VAULT_MAX_FILE_BYTES:
+        await msg.reply_text(
+            "❌ Файл больше 20 МБ — бот не сможет скачать его для шифрования. "
+            "Пришлите файл меньшего размера или нажмите «❌ Отмена».")
+        return SOL_WAIT_FILE
     context.user_data['sol_pending'] = {
         "ch": int(msg.chat_id),
         "mid": int(msg.message_id),
-        "ftype": "photo" if msg.photo else "document",
+        "ftype": _ftype,
         "subject": subject,
+        "fid": _fid,
+        "mime": _mime,
+        "fname": _fname,
+        "size": _size,
     }
     await msg.reply_text(
         "✅ Решение получено."
@@ -26957,13 +27690,14 @@ async def _sol_notify_class(context, class_obj, entry, skip_uid=None):
         try:
             await context.bot.send_message(chat_id=int(uid), text=_text,
                                            reply_markup=_kb)
+            await asyncio.sleep(0.05)  # 22.13: анти-флуд между уведомлениями
         except Exception:
             pass
 
 
 async def sol_anon_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """ВОЛНА 22.12: выбор анонимности → копия в cloud-канал → модерация
-    старосте (или мгновенная публикация, если автор сам староста)."""
+    """ВОЛНА 22.12: выбор анонимности. ВОЛНА 22.13: дальше спрашиваем СРОК
+    хранения (автоудаление), после чего решение шифруется и уходит в канал."""
     query = update.callback_query
     try:
         await query.answer()
@@ -26974,75 +27708,165 @@ async def sol_anon_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return MAIN_MENU
     user = get_user(str(query.from_user.id))
     class_obj = get_class_by_user(str(query.from_user.id)) if user else None
-    pend = context.user_data.pop('sol_pending', None)
+    pend = context.user_data.get('sol_pending')
     if not user or not class_obj or not isinstance(pend, dict):
         await query.edit_message_text(
             "Сессия потеряна — пришлите решение заново: «📚 Решения».")
         return MAIN_MENU
+    if is_user_spamming(str(query.from_user.id), "sol_send", 1.5, 5, 60):
+        await query.answer("⏳ Слишком часто. Подождите минуту.",
+                           show_alert=True)
+        return SOL_WAIT_FILE
+    pend["anon"] = (data == "sol_anon_yes")
+    context.user_data['sol_pending'] = pend
+    # Староста мог задать ОБЯЗАТЕЛЬНЫЙ срок удаления публикаций — тогда
+    # выбор отправителя пропускаем (честно предупреждаем) и публикуем сразу.
+    forced = int(getattr(class_obj, "sol_auto_ttl_h", 0) or 0)
+    if forced > 0:
+        return await _sol_publish_pending(update, context, user, class_obj,
+                                          pend, forced)
+    _rows = [[InlineKeyboardButton(
+        lbl, callback_data=f"sol_ttl_{idx}")]
+        for idx, (lbl, _h) in enumerate(SOL_TTLS)]
+    _rows.append([InlineKeyboardButton("❌ Отмена", callback_data="sol_cancel")])
+    await query.edit_message_text(
+        "⏳ ЧЕРЕЗ СКОЛЬКО УДАЛИТЬ запись из базы?\n\n"
+        "Потом это можно поменять только через старосту при модерации.",
+        reply_markup=InlineKeyboardMarkup(_rows))
+    return SOL_WAIT_FILE
+
+
+async def sol_ttl_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.13: выбор срока хранения отправителем → публикация."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    try:
+        idx = int(query.data[len("sol_ttl_"):])
+    except (TypeError, ValueError):
+        return MAIN_MENU
+    if not (0 <= idx < len(SOL_TTLS)):
+        return MAIN_MENU
+    user = get_user(str(query.from_user.id))
+    class_obj = get_class_by_user(str(query.from_user.id)) if user else None
+    pend = context.user_data.get('sol_pending')
+    if not user or not class_obj or not isinstance(pend, dict):
+        await query.edit_message_text(
+            "Сессия потеряна — пришлите решение заново: «📚 Решения».")
+        return MAIN_MENU
+    return await _sol_publish_pending(update, context, user, class_obj,
+                                      pend, SOL_TTLS[idx][1])
+
+
+async def _sol_publish_pending(update, context, user, class_obj, pend, ttl_h):
+    """ВОЛНА 22.13: скачала файл → зашифровала ключом бота → в канал →
+    запись в реестр → модерация (или мгновенная публикация)."""
+    query = update.callback_query
     channels = get_cloud_channel_ids()
     if not channels:
         await query.edit_message_text(
             "❌ Хранилище не настроено (нет cloud-каналов) — решение принять "
             "не могу. Попросите разработчика подключить канал.")
         return MAIN_MENU
-    _chan = channels[0]
     _author = user.user_id
     _author_name = _sol_user_label(user)
+    _anon = bool(pend.get("anon"))
     try:
-        _copied = await context.bot.copy_message(
-            chat_id=_chan, from_chat_id=int(pend["ch"]),
-            message_id=int(pend["mid"]))
-    except Exception as e:
-        logger.error(f"solutions: копия в канал не удалась: {e}")
         await query.edit_message_text(
-            "❌ Не смог сохранить файл решения в хранилище. Пришлите его "
-            "заново: «📚 Решения» → «📤 Отправить решение».")
+            "🔒 Шифрую файл и кладу в хранилище… (несколько секунд)")
+    except Exception:
+        pass
+    try:
+        raw = await _vault_botapi_download(context, pend["fid"])
+        if not raw:
+            raise RuntimeError("файл пуст")
+        sealed = await asyncio.to_thread(
+            _seal_pack, raw, pend.get("fname") or "file.bin",
+            pend.get("mime") or "", "sol")
+        raw = b""
+    except Exception as e:
+        logger.error(f"solutions: шифрование не удалось: {e}")
+        context.user_data.pop('sol_pending', None)
+        await query.edit_message_text(
+            "❌ Не смог скачать файл для шифрования (он удалён или больше "
+            "20 МБ?). Пришлите решение заново: «📚 Решения».")
+        return MAIN_MENU
+    _up = await _storage_upload_document(
+        context, sealed, filename=f"sol_{_sol_gen_id()}.dvf",
+        caption="", channel_id=channels[0])
+    sealed = b""
+    if not _up:
+        context.user_data.pop('sol_pending', None)
+        await query.edit_message_text(
+            "❌ Хранилище не приняло шифр файла. Попробуйте позже.")
         return MAIN_MENU
     entry = {
         "id": _sol_gen_id(),
         "class_code": class_obj.class_code,
         "subject": pend.get("subject") or "",
-        "author": _author if data == "sol_anon_no" else "",
-        "author_name": _author_name if data == "sol_anon_no" else "",
+        "author": _author if not _anon else "",
+        "author_name": _author_name if not _anon else "",
         "real_author": _author,  # внутри бот знает автора (жалобы/злоупотреб)
-        "anon": data == "sol_anon_yes",
-        "file": {"ch": int(_chan), "mid": int(_copied.message_id),
-                 "ftype": pend.get("ftype") or "document"},
+        "anon": _anon,
+        "file": {"ch": int(_up.get("channel_id") or channels[0]),
+                 "mid": int(_up.get("message_id") or 0),
+                 "fid": str(_up.get("file_id") or ""),
+                 "ftype": "seal",
+                 "name": pend.get("fname") or "file.bin",
+                 "mime": pend.get("mime") or "",
+                 "kind": pend.get("ftype") or "document"},
         "status": "pending",
         "approved_by": "",
         "ts": datetime.now().strftime("%d.%m %H:%M"),
     }
+    _sol_apply_ttl(entry, ttl_h)
+    context.user_data.pop('sol_pending', None)
     _sol_class_entries(class_obj.class_code).append(entry)
     while len(_sol_class_entries(class_obj.class_code)) > _SOL_MAX_PER_CLASS:
         _sol_class_entries(class_obj.class_code).pop(0)
     _solutions_save()
+    # ВОЛНА 22.13: АВТОМАТИЧЕСКАЯ модерация (настройка старосты) —
+    # решение публикуется сразу без карточки.
+    auto_moder = bool(getattr(class_obj, "sol_auto_moder", False))
     # Староста (админы класса), КРОМЕ самого автора — своё решение он
     # видит и так; если модераторов нет — публикуем сразу и честно говорим.
     moderators = [a for a in dict.fromkeys(
         [str(m) for m in class_obj.admins]) if a != _author]
-    if not moderators:
+    if auto_moder or not moderators:
         entry["status"] = "approved"
-        entry["approved_by"] = _author
+        entry["approved_by"] = "auto" if auto_moder else _author
         _solutions_save()
-        await query.edit_message_text(
-            "✅ Вы староста этого класса — модерация не нужна, решение "
-            "СРАЗУ опубликовано в базе.")
+        _ttl_s = _sol_ttl_label(entry.get("ttl_h"))
+        if auto_moder:
+            _msg = ("✅ Решение ОПУБЛИКОВАНО сразу (в классе включена "
+                    f"автоматическая модерация).\n⏳ Удалится: {_ttl_s}")
+        else:
+            _msg = ("✅ Вы староста этого класса — модерация не нужна, "
+                    f"решение СРАЗУ опубликовано в базе.\n⏳ Удалится: {_ttl_s}")
+        await query.edit_message_text(_msg)
+        _stat_bump("sol_published")
         await _sol_notify_class(context, class_obj, entry, skip_uid=_author)
         return MAIN_MENU
     _card = ("🛡 МОДЕРАЦИЯ РЕШЕНИЯ — класс «" + class_obj.class_name + "»\n\n"
              "📘 " + (entry.get("subject") or "Без предмета")
              + "\nот " + _sol_author_label(entry)
              + " · " + entry["ts"]
+             + "\n⏳ Удалить: " + _sol_ttl_label(entry.get("ttl_h"))
              + "\n\nОпубликовать в общей базе класса?")
-    _card_kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Одобрить", callback_data=f"sol_appr_{entry['id']}"),
-        InlineKeyboardButton("❌ Отклонить", callback_data=f"sol_rej_{entry['id']}")]])
+    _card_kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Одобрить", callback_data=f"sol_appr_{entry['id']}"),
+         InlineKeyboardButton("❌ Отклонить", callback_data=f"sol_rej_{entry['id']}")],
+        [InlineKeyboardButton(f"⏳ Срок: {_sol_ttl_label(entry.get('ttl_h'))}",
+                              callback_data=f"sol_ttlmod_{entry['id']}")]])
     delivered = 0
     for admin_uid in moderators:
         try:
             await context.bot.send_message(chat_id=int(admin_uid), text=_card,
                                            reply_markup=_card_kb)
             delivered += 1
+            await asyncio.sleep(0.05)  # анти-флуд: не чаще ~20 сообщений/сек
         except Exception:
             pass
     await query.edit_message_text(
@@ -27053,7 +27877,9 @@ async def sol_anon_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def sol_moderate_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """ВОЛНА 22.12: ✅ Одобрить / ❌ Отклонить на карточке модерации."""
+    """ВОЛНА 22.12: ✅ Одобрить / ❌ Отклонить на карточке модерации.
+    ВОЛНА 22.13: отклонённое решение УДАЛЯЕТСЯ (и шифр из канала тоже);
+    у одобренного сохраняется срок хранения, выбранный отправителем."""
     query = update.callback_query
     try:
         await query.answer()
@@ -27080,10 +27906,12 @@ async def sol_moderate_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         entry["status"] = "approved"
         entry["approved_by"] = _uid
         _solutions_save()
+        _stat_bump("sol_published")
         try:
             await query.edit_message_text(
                 "✅ Решение опубликовано в базе класса.\n📘 "
-                + (entry.get("subject") or "Без предмета"))
+                + (entry.get("subject") or "Без предмета")
+                + "\n⏳ Удалить: " + _sol_ttl_label(entry.get("ttl_h")))
         except Exception:
             pass
         # Автору (не анонимному) — радостная весть; классу — уведомление.
@@ -27099,12 +27927,17 @@ async def sol_moderate_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _sol_notify_class(context, class_obj, entry,
                                     skip_uid=entry.get("author") or None)
     else:
-        entry["status"] = "rejected"
-        entry["approved_by"] = _uid
+        # ВОЛНА 22.13: отклонено → полностью удаляем запись и шифр файла.
+        _code = entry.get("class_code")
+        _all = _solutions_all()
+        if _code in _all:
+            _all[_code] = [e for e in _all[_code]
+                           if not (isinstance(e, dict) and e.get("id") == sol_id)]
         _solutions_save()
+        await _sol_delete_channel_file(context, entry)
         try:
             await query.edit_message_text(
-                "❌ Решение отклонено — в базу класса оно не попадёт.")
+                "❌ Решение отклонено и удалено — в базу класса оно не попадёт.")
         except Exception:
             pass
         if entry.get("author"):
@@ -27115,6 +27948,60 @@ async def sol_moderate_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                          "в базу класса.")
             except Exception:
                 pass
+    return MAIN_MENU
+
+
+async def sol_ttlmod_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.13: «⏳ Срок» на карточке модерации — староста меняет срок
+    хранения решения ДО одобрения (циклический переключатель)."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    sol_id = query.data[len("sol_ttlmod_"):]
+    entry = _sol_find_entry(sol_id)
+    if entry is None:
+        await query.edit_message_text("Решение не найдено (уже удалено?).")
+        return MAIN_MENU
+    _uid = str(query.from_user.id)
+    class_obj = get_class_by_code(entry.get("class_code"))
+    if _uid != DEVELOPER_ID and not (
+            class_obj is not None and _uid in class_obj.admins):
+        await query.answer("Модерация — только для старосты класса.",
+                           show_alert=True)
+        return MAIN_MENU
+    if entry.get("status") != "pending":
+        await query.answer("Уже обработано — срок менять поздно.",
+                           show_alert=True)
+        return MAIN_MENU
+    try:
+        _cur = int(entry.get("ttl_h") or 0)
+    except (TypeError, ValueError):
+        _cur = 0
+    _idxs = [h for _l, h in SOL_TTLS]
+    try:
+        _next = _idxs[(_idxs.index(_cur) + 1) % len(_idxs)]
+    except ValueError:
+        _next = _idxs[0]
+    _sol_apply_ttl(entry, _next)
+    _solutions_save()
+    _kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Одобрить", callback_data=f"sol_appr_{sol_id}"),
+         InlineKeyboardButton("❌ Отклонить", callback_data=f"sol_rej_{sol_id}")],
+        [InlineKeyboardButton(f"⏳ Срок: {_sol_ttl_label(entry.get('ttl_h'))}",
+                              callback_data=f"sol_ttlmod_{sol_id}")]])
+    try:
+        await query.edit_message_text(
+            "🛡 МОДЕРАЦИЯ РЕШЕНИЯ\n\n📘 "
+            + (entry.get("subject") or "Без предмета")
+            + "\nот " + _sol_author_label(entry)
+            + " · " + str(entry.get("ts", ""))
+            + "\n⏳ Удалить: " + _sol_ttl_label(entry.get("ttl_h"))
+            + "\n\nОпубликовать в общей базе класса?",
+            reply_markup=_kb)
+    except Exception:
+        pass
     return MAIN_MENU
 
 
@@ -27131,7 +28018,7 @@ async def sol_list_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("База решений доступна участникам класса.",
                            show_alert=True)
         return MAIN_MENU
-    entries = [e for e in _sol_class_entries(class_obj.class_code)
+    entries = [e for e in _sol_alive_entries(class_obj.class_code)
                if isinstance(e, dict) and e.get("status") == "approved"]
     if not entries:
         try:
@@ -27162,7 +28049,9 @@ async def sol_list_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def sol_view_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """ВОЛНА 22.12: показать решение (копия файла из канала в чат)."""
+    """ВОЛНА 22.12: показать решение (копия файла из канала в чат).
+    ВОЛНА 22.13: файл в канале лежит ШИФОМ — скачиваем, расшифровываем
+    ключом бота и отправляем в чат (фото — как фото, файл — как файл)."""
     query = update.callback_query
     try:
         await query.answer()
@@ -27178,19 +28067,60 @@ async def sol_view_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("Решение недоступно.", show_alert=True)
         return MAIN_MENU
     _f = entry.get("file") or {}
+    _exp = entry.get("expire_ts")
+    if _exp and float(_exp) < time.time():
+        await query.answer("⏳ Срок хранения записи истёк — она удалена.",
+                           show_alert=True)
+        return MAIN_MENU
     _cap = (f"📘 {entry.get('subject') or 'Без предмета'} · "
-            f"{_sol_author_label(entry)} · {entry.get('ts', '')}")
+            f"{_sol_author_label(entry)} · {entry.get('ts', '')}"
+            + (f" · ⏳ удалится: {_sol_ttl_label(entry.get('ttl_h'))}"
+               if entry.get("ttl_h") else ""))
     try:
-        if _f.get("ftype") == "photo":
-            await context.bot.send_photo(
-                chat_id=query.message.chat_id,
-                from_chat_id=int(_f.get("ch") or 0),
-                photo=int(_f.get("mid") or 0), caption=_cap)
+        if _f.get("ftype") == "seal":
+            # 22.13: расшифровка (file_id из Bot API или MTProto-канал).
+            payload = None
+            if _f.get("fid"):
+                try:
+                    payload = await _vault_botapi_download(context, _f["fid"])
+                except Exception:
+                    payload = None
+            if payload is None:
+                _ch, _mid = int(_f.get("ch") or 0), int(_f.get("mid") or 0)
+                client = await _mt_client() if _ch and _mid else None
+                if client is None:
+                    raise RuntimeError("хранилище недоступно")
+                _m, doc = await _mt_fetch_document(client, _ch, _mid, 0)
+                if doc is None:
+                    raise RuntimeError("шифр не найден")
+                buf = io.BytesIO()
+                await _mt_download_stream(client, doc,
+                                          int(getattr(doc, "size", 0) or 0),
+                                          buf.write, None, "")
+                payload = buf.getvalue()
+            meta, plain = await asyncio.to_thread(_seal_unpack, payload)
+            payload = b""
+            name = _dvf2_safe_name(str(meta.get("n") or "file.bin"))
+            if _f.get("kind") == "photo":
+                await context.bot.send_photo(
+                    chat_id=query.message.chat_id, photo=plain, caption=_cap)
+            else:
+                await context.bot.send_document(
+                    chat_id=query.message.chat_id,
+                    document=InputFile(plain, filename=name), caption=_cap)
+            plain = b""
         else:
-            await context.bot.send_document(
-                chat_id=query.message.chat_id,
-                from_chat_id=int(_f.get("ch") or 0),
-                document=int(_f.get("mid") or 0), caption=_cap)
+            # ЛЕГАСИ (до 22.13): открытые копии в канале.
+            if _f.get("ftype") == "photo":
+                await context.bot.send_photo(
+                    chat_id=query.message.chat_id,
+                    from_chat_id=int(_f.get("ch") or 0),
+                    photo=int(_f.get("mid") or 0), caption=_cap)
+            else:
+                await context.bot.send_document(
+                    chat_id=query.message.chat_id,
+                    from_chat_id=int(_f.get("ch") or 0),
+                    document=int(_f.get("mid") or 0), caption=_cap)
     except Exception as e:
         logger.error(f"solutions: выдача решения не удалась: {e}")
         await query.answer("Не удалось открыть файл — он удалён из хранилища?",
@@ -27210,6 +28140,97 @@ async def sol_toggle_notify_cb(update: Update,
     user.sol_notify = not bool(getattr(user, "sol_notify", True))
     save_user(user)
     return await user_settings(update, context)
+
+
+# === ВОЛНА 22.13: НАСТРОЙКИ БАЗЫ РЕШЕНИЙ ДЛЯ СТАРОСТЫ ===
+# Автоматическая модерация (решения публикуются сразу) и общий срок
+# удаления публикаций. Хранится в самом классе (sol_auto_moder/sol_auto_ttl_h).
+
+def _sol_admin_kb(class_obj):
+    _am = bool(getattr(class_obj, "sol_auto_moder", False))
+    _ttl = int(getattr(class_obj, "sol_auto_ttl_h", 0) or 0)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"🤖 Авто-модерация: {'вкл' if _am else 'выкл'}",
+            callback_data="sol_adm_toggle")],
+        [InlineKeyboardButton(
+            f"⏳ Срок публикаций: {_sol_ttl_label(_ttl)}",
+            callback_data="sol_adm_ttl")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="admin_panel")],
+    ])
+
+
+async def sol_admin_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.13: «📚 База решений» в админ-панели — настройки базы."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    _uid = str(query.from_user.id)
+    class_obj = get_class_by_user(_uid)
+    if class_obj is None or (_uid not in class_obj.admins
+                             and _uid != DEVELOPER_ID):
+        await query.answer("Настройки базы — только для старосты класса.",
+                           show_alert=True)
+        return ADMIN_PANEL
+    _am = bool(getattr(class_obj, "sol_auto_moder", False))
+    _ttl = int(getattr(class_obj, "sol_auto_ttl_h", 0) or 0)
+    _ttl_s = _sol_ttl_label(_ttl) + (
+        " — его выбирает каждый отправитель" if _ttl == 0
+        else " — всем новым решениям, выбор отправителя пропускается")
+    await query.edit_message_text(
+        f"📚 БАЗА РЕШЕНИЙ — настройки класса «{class_obj.class_name}»\n\n"
+        "🤖 АВТО-МОДЕРАЦИЯ: решения публикуются сразу, без вашей "
+        "проверки (кнопки «Одобрить/Отклонить» не приходят).\n\n"
+        "⏳ СРОК ПУБЛИКАЦИЙ: через сколько записи автоматически "
+        "удалятся из базы (файлы стираются и из хранилища). Сейчас: "
+        f"{_ttl_s}.\n\nПроверить чужое решение позже можно всегда: "
+        "откройте «📚 Открыть базу» — там видно, кто опубликовал.",
+        reply_markup=_sol_admin_kb(class_obj))
+    return ADMIN_PANEL
+
+
+async def sol_admin_toggle_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.13: тоггл автоматической модерации решений."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    _uid = str(query.from_user.id)
+    class_obj = get_class_by_user(_uid)
+    if class_obj is None or (_uid not in class_obj.admins
+                             and _uid != DEVELOPER_ID):
+        await query.answer("Только для старосты класса.", show_alert=True)
+        return ADMIN_PANEL
+    class_obj.sol_auto_moder = not bool(getattr(class_obj, "sol_auto_moder", False))
+    save_class(class_obj)
+    return await sol_admin_menu_cb(update, context)
+
+
+async def sol_admin_ttl_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.13: циклический выбор общего срока публикаций."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    _uid = str(query.from_user.id)
+    class_obj = get_class_by_user(_uid)
+    if class_obj is None or (_uid not in class_obj.admins
+                             and _uid != DEVELOPER_ID):
+        await query.answer("Только для старосты класса.", show_alert=True)
+        return ADMIN_PANEL
+    _idxs = [h for _l, h in SOL_TTLS]
+    try:
+        _cur = int(getattr(class_obj, "sol_auto_ttl_h", 0) or 0)
+        _next = _idxs[(_idxs.index(_cur) + 1) % len(_idxs)]
+    except (TypeError, ValueError):
+        _next = _idxs[0]
+    class_obj.sol_auto_ttl_h = int(_next)
+    save_class(class_obj)
+    return await sol_admin_menu_cb(update, context)
 
 
 # ============================================================
@@ -27312,8 +28333,31 @@ def _share_mgr_kb():
          InlineKeyboardButton("🚫 Без пересылки", callback_data="share_prot")],
         [InlineKeyboardButton("✅ Создать ссылку", callback_data="share_make")],
         [InlineKeyboardButton("🗂 Мои активные ссылки", callback_data="share_list")],
-        [InlineKeyboardButton("❌ Отмена", callback_data="share_cancel")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="share_exit"),
+         InlineKeyboardButton("❌ Отмена", callback_data="share_cancel")],
     ])
+
+
+async def share_exit_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.13: «⬅️ Назад» из менеджера ссылки — черновик сохраняется,
+    пользователь возвращается к списку файлов Сейфа. query.answer() делает
+    vault_get_start сам — двойной answer дал бы BadRequest."""
+    query = update.callback_query
+    try:
+        await vault_get_start(update, context)
+        return MAIN_MENU
+    except Exception:
+        pass
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    try:
+        await query.edit_message_text(
+            "🔗 Ссылка не создана — черновик сохранён. Откройте Сейф заново.")
+    except Exception:
+        pass
+    return MAIN_MENU
 
 
 async def _share_mgr_render(update, context, user, edit=True):
@@ -27614,8 +28658,11 @@ async def _share_stage_pw_receive(update, context, user, text):
 
 
 async def _share_stage_vault_file(context, user, rec, password):
-    """Скачивает шифр записи Сейфа (≤20 МБ), расшифровывает и кладёт ОБЫЧНУЮ
-    копию в cloud-канал. Возвращает {"ch","mid","name"} — элемент ссылки."""
+    """ВОЛНА 22.13: скачивает шифр записи Сейфа (≤20 МБ), расшифровывает
+    паролем владельца и СРАЗУ ШИФРУЕТ КЛЮЧОМ БОТА — в cloud-канал попадает
+    ТОЛЬКО шифр (требование: «файл из ссылки обмена тоже должен шифроваться
+    в канале, чтобы никто не мог посмотреть что там»). Возвращает элемент
+    ссылки {"ch","mid","fid","ftype":"seal","name"}."""
     size = int(rec.get("size_orig", 0) or 0)
     if size > VAULT_MAX_FILE_BYTES:
         raise RuntimeError("файл больше 20 МБ — в ссылку нельзя")
@@ -27660,14 +28707,20 @@ async def _share_stage_vault_file(context, user, rec, password):
     if not payload:
         raise RuntimeError("файл расшифровался пустым (неверный пароль?)")
     name = _dvf2_safe_name(str(meta.get("n") or "file.bin"))
-    up = await _storage_upload_document(context, payload, filename=name,
-                                        caption="🔗 Файл из ссылки обмена.")
+    mime = str(meta.get("m") or meta.get("mime") or "")
+    # ВОЛНА 22.13: повторное шифрование КЛЮЧОМ БОТА — открытой копии в
+    # канале больше не появляется вообще.
+    sealed = await asyncio.to_thread(_seal_pack, payload, name, mime, "share")
     payload = b""
+    up = await _storage_upload_document(context, sealed, filename="share.bin",
+                                        caption="")
+    sealed = b""
     if not up:
-        raise RuntimeError("хранилище не приняло копию файла")
+        raise RuntimeError("хранилище не приняло шифр файла")
     return {"ch": int(up.get("channel_id") or get_storage_channel_id() or 0),
-            "mid": int(up.get("message_id") or 0), "ftype": "document",
-            "name": name}
+            "mid": int(up.get("message_id") or 0),
+            "fid": str(up.get("file_id") or ""),
+            "ftype": "seal", "name": name, "mime": mime}
 
 
 async def share_make_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -27687,6 +28740,18 @@ async def share_make_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not d["items"]:
         await query.answer("Сначала выберите файлы или добавьте ссылку.",
                            show_alert=True)
+        return MAIN_MENU
+    # ЗАЩИТА (22.13): не больше 20 активных ссылок на одного владельца —
+    # чтобы ссылками нельзя было забить реестр и канал.
+    _uid = str(query.from_user.id)
+    _now = time.time()
+    _active = sum(1 for r in _share_all().values()
+                  if isinstance(r, dict) and str(r.get("owner")) == _uid
+                  and (r.get("expires_ts") or 0) > _now and not r.get("revoked"))
+    if _active >= 20:
+        await query.answer(
+            "У вас уже 20 активных ссылок — отзовите или дождитесь истечения "
+            "старых (🗂 Мои активные ссылки).", show_alert=True)
         return MAIN_MENU
     for i in vault_items:
         rec = _vault_find_record(user, i.get("fid"))
@@ -27743,6 +28808,7 @@ async def _share_finalize(update, context, user):
     }
     _share_all()[tok] = entry
     _share_save()
+    _stat_bump("share_created")
     context.user_data.pop("share_draft", None)
     _bot_uname = ""
     try:
@@ -27867,8 +28933,20 @@ async def share_revoke_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def share_redeem_start(update, context, tok):
     """Проверяет токен и либо выдаёт файлы, либо просит PIN (state).
-    Вызывается из start() (пользователь уже настроен)."""
+    Вызывается из start() (пользователь уже настроен).
+    ВОЛНА 22.13: rate-limit на подбор токенов и проверка формата."""
     user_id = str(update.effective_user.id)
+    # ЗАЩИТА: перебор токенов (dl_xxx) — не чаще 8 попыток в минуту на
+    # пару (пользователь+токен): разные токены не мешают друг другу.
+    if is_user_spamming(user_id + ":" + str(tok or ""), "share_redeem",
+                        0.4, 8, 60):
+        await update.effective_message.reply_text(
+            "⏳ Слишком много попыток открыть ссылки. Подождите минуту.")
+        return MAIN_MENU
+    if not re.fullmatch(r"dl_[A-Za-z0-9]{3,24}", str(tok or "")):
+        await update.effective_message.reply_text(
+            "🙈 Ссылка повреждена или подделана.")
+        return MAIN_MENU
     rec = _share_all().get(tok)
     if rec is None:
         await update.effective_message.reply_text(
@@ -27889,6 +28967,15 @@ async def share_redeem_start(update, context, tok):
             "🔥 Лимит скачиваний по ссылке исчерпан — ссылка сгорела.")
         return MAIN_MENU
     if rec.get("pw"):
+        # ЗАЩИТА от брутфорса PIN: после 5 неверных вводов ссылка
+        # «запирается» на 10 минут, владелец получает уведомление.
+        lock_until = float(rec.get("pin_lock_until") or 0)
+        if lock_until > now:
+            await update.effective_message.reply_text(
+                "🔒 Ссылка временно заблокирована: слишком много неверных "
+                "попыток PIN. Попробуйте через "
+                + _fmt_eta(int(lock_until - now)) + ".")
+            return MAIN_MENU
         context.user_data["share_pin_tok"] = tok
         await update.effective_message.reply_text(
             "🔒 Эта ссылка защищена паролем. Пришлите PIN одним сообщением:")
@@ -27899,23 +28986,56 @@ async def share_redeem_start(update, context, tok):
 @timeout(CONVERSATION_TIMEOUT)
 async def share_pin_receive(update: Update,
                             context: ContextTypes.DEFAULT_TYPE):
-    """ВОЛНА 22.12: PIN получателя ссылки."""
+    """ВОЛНА 22.12: PIN получателя ссылки. ВОЛНА 22.13: анти-брутфорс —
+    5 неверных попыток запирают ссылку на 10 минут + весть владельцу."""
     msg = update.message
     tok = context.user_data.pop("share_pin_tok", None)
     if not tok:
         await msg.reply_text("Сессия потеряна — откройте ссылку заново.")
         return MAIN_MENU
     rec = _share_all().get(tok)
-    pin = (msg.text or "").strip()
-    if rec is None or pin != str(rec.get("pw") or ""):
+    pin = (msg.text or "").strip()[:64]
+    if rec is None:
+        await msg.reply_text("🙈 Ссылка уже не работает.")
+        return MAIN_MENU
+    now = time.time()
+    if float(rec.get("pin_lock_until") or 0) > now:
+        await msg.reply_text(
+            "🔒 Слишком много неверных попыток — ссылка заперта на 10 минут.")
+        return MAIN_MENU
+    if pin != str(rec.get("pw") or ""):
+        fails = int(rec.get("pin_fails", 0) or 0) + 1
+        rec["pin_fails"] = fails
+        _share_save()
+        if fails >= 5:
+            rec["pin_lock_until"] = now + 600
+            _share_save()
+            try:
+                await context.bot.send_message(
+                    chat_id=int(rec.get("owner")),
+                    text=f"🛡 Кто-то 5 раз неверно ввёл PIN вашей ссылки "
+                         f"{tok} — она заперта на 10 минут. Если это не вы, "
+                         "ссылку можно отозвать: Сейф → 🗂 Мои активные ссылки.")
+            except Exception:
+                pass
+            context.user_data.pop("share_pin_tok", None)
+            await msg.reply_text(
+                "🔒 Ссылка заперта на 10 минут: слишком много неверных PIN.")
+            return MAIN_MENU
         context.user_data["share_pin_tok"] = tok
-        await msg.reply_text("❌ Неверный PIN. Попробуйте ещё раз.")
+        await msg.reply_text(
+            f"❌ Неверный PIN. Попыток до блокировки: {5 - fails}.")
         return SHARE_PIN_WAIT
+    rec["pin_fails"] = 0
+    _share_save()
     return await _share_redeem_deliver(update, context, tok)
 
 
 async def _share_redeem_deliver(update, context, tok):
-    """Выдача файлов по ссылке + счётчик + уведомление владельца."""
+    """Выдача файлов по ссылке + счётчик + уведомление владельца.
+    ВОЛНА 22.13: элементы ftype="seal" скачиваются из канала ШИФОМ и
+    расшифровываются ключом бота в момент выдачи; легаси-"document"
+    (до 22.13) по-прежнему копируются напрямую."""
     rec = _share_all().get(tok)
     if rec is None:
         await update.effective_message.reply_text(
@@ -27933,12 +29053,42 @@ async def _share_redeem_deliver(update, context, tok):
                     protect_content=protect,
                     disable_web_page_preview=False)
                 ok += 1
+            elif item.get("ftype") == "seal":
+                payload = None
+                if item.get("fid"):
+                    try:
+                        payload = await _vault_botapi_download(context, item["fid"])
+                    except Exception:
+                        payload = None
+                if payload is None:
+                    _ch, _mid = int(item.get("ch") or 0), int(item.get("mid") or 0)
+                    client = await _mt_client() if _ch and _mid else None
+                    if client is not None:
+                        _m, doc = await _mt_fetch_document(client, _ch, _mid, 0)
+                        if doc is not None:
+                            buf = io.BytesIO()
+                            await _mt_download_stream(
+                                client, doc, int(getattr(doc, "size", 0) or 0),
+                                buf.write, None, "")
+                            payload = buf.getvalue()
+                if not payload:
+                    raise RuntimeError("шифр файла не найден")
+                _meta, plain = await asyncio.to_thread(_seal_unpack, payload)
+                payload = b""
+                _name = _dvf2_safe_name(str(_meta.get("n") or "file.bin"))
+                await context.bot.send_document(
+                    chat_id=chat_id,
+                    document=InputFile(plain, filename=_name),
+                    caption=None, protect_content=protect)
+                plain = b""
+                ok += 1
             else:
                 await context.bot.copy_message(
                     chat_id=chat_id, from_chat_id=int(item.get("ch") or 0),
                     message_id=int(item.get("mid") or 0),
                     protect_content=protect)
                 ok += 1
+            await asyncio.sleep(0.06)  # анти-флуд между файлами
         except Exception as e:
             logger.error(f"share deliver: {e}")
     if not ok:
@@ -27946,6 +29096,7 @@ async def _share_redeem_deliver(update, context, tok):
             "❌ Не удалось выдать файлы — сообщите отправителю ссылки.")
         return MAIN_MENU
     rec["used"] = int(rec.get("used", 0)) + 1
+    _stat_bump("share_redeemed")
     _exhausted = bool(rec.get("limit") and rec["used"] >= rec["limit"])
     if _exhausted:
         _share_all().pop(tok, None)
@@ -27971,8 +29122,10 @@ _POLL_INDEX = {}    # poll_id Telegram -> запись опроса (у кажд
 _POLL_KEEP = 20     # сколько последних опросов помним
 
 
-def _poll_register(question, options, scope, creator_id):
-    """Регистрирует новый опрос (запись общая для всех его копий)."""
+def _poll_register(question, options, scope, creator_id, class_code=None):
+    """Регистрирует новый опрос (запись общая для всех его копий).
+    ВОЛНА 22.13: храним и класс (cls) — для приватности итогов: разработчик
+    видит только СВОИ опросы, админ — только опросы СВОЕГО класса."""
     entry = {
         "q": str(question),
         "opts": [str(o) for o in options],
@@ -27980,6 +29133,7 @@ def _poll_register(question, options, scope, creator_id):
         "votes": 0,
         "scope": str(scope or "all"),
         "by": str(creator_id or ""),
+        "cls": str(class_code or ""),
         "when": datetime.now().strftime("%d.%m.%Y %H:%M"),
     }
     _POLL_LOG.append(entry)
@@ -28263,8 +29417,20 @@ def _poll_targets(scope, class_code=None, context=None):
 async def _poll_dispatch(bot, q, opts, scope, class_code, creator_id,
                          context=None):
     """ВОЛНА 22.12: общая рассылка опроса (send_poll, не анонимный).
-    Используется и «✅ Отправить», и запланированной отправкой."""
-    entry = _poll_register(q, opts, scope, creator_id)
+    Используется и «✅ Отправить», и запланированной отправкой.
+    ЗАЩИТА (22.13): не больше 15 рассылок в минуту от одного создателя
+    (burst-лимит) — чтобы опросы нельзя было использовать для спама."""
+    if is_user_spamming(str(creator_id or "0"), "poll_dispatch", 0, 15, 60):
+        logger.warning(f"poll: rate-limit рассылки для {creator_id}")
+        try:
+            await bot.send_message(
+                chat_id=int(creator_id),
+                text="⏳ Слишком много опросов за минуту — рассылка не "
+                     "выполнена. Подождите немного и повторите.")
+        except Exception:
+            pass
+        return 0
+    entry = _poll_register(q, opts, scope, creator_id, class_code)
     targets, _cls, _class_name = _poll_targets(scope, class_code, context)
     sent = 0
     for uid in targets:
@@ -28280,6 +29446,8 @@ async def _poll_dispatch(bot, q, opts, scope, class_code, creator_id,
                 pass  # без poll_id итоги этой копии не соберутся — не критично
         except Exception as e:
             logger.error(f"poll: не доставлено {uid}: {e}")
+    if sent:
+        _stat_bump("poll_sent")
     return sent
 
 
@@ -28339,7 +29507,10 @@ async def poll_go_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def poll_results_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """ВОЛНА 22.10: «📈 Итоги опросов» — общие числа голосов (без имён).
-    Показываем и разработчику, и админу; возврат — в панель нажавшего."""
+    ВОЛНА 22.13 — ПРИВАТНОСТЬ: разработчик видит итоги ТОЛЬКО опросов,
+    которые отправил сам («статистика опросов у разработчика — только
+    которые он отправлял»); админ — только опросы СВОЕГО класса. Чужие
+    классы не видны никому."""
     query = update.callback_query
     try:
         await query.answer()
@@ -28351,16 +29522,29 @@ async def poll_results_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("Итоги доступны админам и разработчику.",
                            show_alert=True)
         return MAIN_MENU
-    if not _POLL_LOG:
+    if _is_dev:
+        # Только опросы, отправленные самим разработчиком (scope all ИЛИ его личные классовые).
+        visible = [e for e in _POLL_LOG
+                   if str(e.get("by")) == _uid]
+    else:
+        _my_cls = get_class_by_user(_uid)
+        _my_code = _my_cls.class_code if _my_cls else ""
+        visible = [e for e in _POLL_LOG
+                   if e.get("scope") == "class" and str(e.get("cls")) == str(_my_code)]
+    if not _POLL_LOG or not visible:
+        if _is_dev:
+            _why = "Вы ещё не отправляли своих опросов."
+        else:
+            _why = "В вашем классе опросов пока не было."
         await query.edit_message_text(
-            "📊 Опросов пока не было.\n\n"
-            "Создайте: админ — «📊 Опрос классу», разработчик — "
-            "«📊 Опрос всем». Итоги хранятся, пока бот запущен.",
+            "📊 Итогов пока нет.\n\n" + _why + "\n\n"
+            "Создайте опрос кнопкой выше — итоги соберутся автоматически. "
+            "Итоги хранятся, пока бот запущен.",
             reply_markup=_poll_panel_kb("all" if _is_dev else "class"),
         )
         return DEV_PANEL if _is_dev else ADMIN_PANEL
     lines = ["📈 ИТОГИ ОПРОСОВ (последние 5)\n"]
-    for entry in reversed(_POLL_LOG[-5:]):
+    for entry in reversed(visible[-5:]):
         total = entry["votes"]
         _scope_tag = "класс" if entry["scope"] == "class" else "все"
         lines.append(f"❓ {entry['q']}  ·  {entry['when']}  ·  {_scope_tag}")
@@ -28794,9 +29978,9 @@ async def _tick_send_timers(bot):
                 continue  # ещё не время
             # Атомарная пометка: помечаем неактивным ДО отправки, чтобы
             # параллельный safety-net/run_once не отправил дубль.
-            # ДЛЯ ПОВТОРЯЮЩИХСЯ (repeat_daily): переносим на завтра,
-            # оставаясь активными — и ОБЯЗАТЕЛЬНО до отправки.
-            if _timer_advance_daily(timer_data):
+            # ДЛЯ ПОВТОРЯЮЩИХСЯ (repeat_daily/repeat_weekly): переносим на
+            # следующий запуск, оставаясь активными — и ОБЯЗАТЕЛЬНО до отправки.
+            if _timer_advance_repeat(timer_data):
                 timer_data['fired_at'] = datetime.now().strftime("%Y-%m-%d %H:%M")
             else:
                 timer_data['is_active'] = False
@@ -29035,6 +30219,7 @@ async def _unified_notification_tick_locked(context):
         await _tick_send_timers(bot)
     except Exception as e:
         logger.error(f"unified_tick: timers crashed: {e}")
+        await _notify_dev_error(bot, "Тикер: блок таймеров", e)
 
     # 1-минус) ВОЛНА 20: фоновый догрев MTProto (не блокирует тик — задача
     # в фоне; если клиент уже поднят или Telethon нет — мгновенный выход).
@@ -29048,12 +30233,24 @@ async def _unified_notification_tick_locked(context):
         await _storage_auto_backup_tick(context)
     except Exception as e:
         logger.error(f"unified_tick: storage auto-backup crashed: {e}")
+        await _notify_dev_error(bot, "Тикер: авто-бэкап базы", e)
 
     # 1b) ВОЛНА 8: канал-БД — слив «грязной» базы снапшотом (не чаще CDB_MIN_FLUSH_INTERVAL).
     try:
         await _cdb_flush_tick(context)
     except Exception as e:
         logger.error(f"unified_tick: channel-db flush crashed: {e}")
+        await _notify_dev_error(bot, "Тикер: слив базы в канал", e)
+
+    # 1c) ВОЛНА 22.13: чистка просроченных решений (не чаще раза в 5 минут).
+    try:
+        _sol_purge_state = getattr(_unified_notification_tick_locked, "_sol_purge_ts", 0)
+        if time.time() - _sol_purge_state >= _SOL_EXPIRE_CHECK_EVERY:
+            _unified_notification_tick_locked._sol_purge_ts = time.time()
+            await _sol_purge_expired(context)
+    except Exception as e:
+        logger.error(f"unified_tick: solutions purge crashed: {e}")
+        await _notify_dev_error(bot, "Тикер: чистка решений", e)
 
     # 2) Дневные уведомления по пользователям
     try:
@@ -30615,6 +31812,12 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, share_pin_receive),
                 CallbackQueryHandler(handle_callback),
             ],
+            # === ВОЛНА 22.13: произвольный период статистики разработчика ===
+            DEV_STATS_PERIOD: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND,
+                               dev_stats_period_receive),
+                CallbackQueryHandler(handle_callback),
+            ],
         },
         fallbacks=[
             CommandHandler("start", start),
@@ -30796,6 +31999,30 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     import traceback
     error_text = ''.join(traceback.format_exception(type(context.error), context.error, context.error.__traceback__))
     logger.error(f"Ошибка: {context.error}\n{error_text}")
+
+    # ВОЛНА 22.13: «если что-то сломалось — разработчику должно прийти
+    # уведомление». Троттлинг внутри (_notify_dev_error): одинаковые сбои —
+    # не чаще раза в 90 сек, максимум 15 в сутки.
+    try:
+        _uid = ""
+        _hname = ""
+        if update is not None:
+            try:
+                _uid = str(update.effective_user.id or "")
+            except Exception:
+                _uid = ""
+            try:
+                _hname = str((update.callback_query.data if update.callback_query
+                              else (update.message.text or "")[:40] if update.message
+                              else ""))[:60]
+            except Exception:
+                _hname = ""
+        await _notify_dev_error(
+            context.bot, "Обработчик обновления", context.error,
+            detail=f"место: {_hname or '—'}",
+            user_id=_uid)
+    except Exception:
+        pass
 
     if update:
         try:
