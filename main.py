@@ -17542,7 +17542,13 @@ async def _pdn_continue_after_consent(update, context, user):
 async def pdn_consent_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """ВОЛНА 22.18: кнопки экрана согласия на ПДн (152-ФЗ)."""
     query = update.callback_query
-    await query.answer()
+    # ВОЛНА 22.18c: хендлер вызывается и из handle_callback (маршруты
+    # pdn_* / back_to_pdn в конце его цепочки), где query.answer() уже был
+    # сделан — повторный answer поднимает BadRequest, поэтому гасим его.
+    try:
+        await query.answer()
+    except Exception:
+        pass
     user = get_user(str(query.from_user.id))
     if user is None:
         await query.edit_message_text("Профиль не найден. Начните с /start")
@@ -17583,7 +17589,12 @@ async def pdn_consent_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def parent_consent_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """ВОЛНА 22.18: кнопки экрана родительского согласия (до 18 лет)."""
     query = update.callback_query
-    await query.answer()
+    # ВОЛНА 22.18c: см. комментарий в pdn_consent_handler — answer мог
+    # уже быть сделан в handle_callback, повторный гасим.
+    try:
+        await query.answer()
+    except Exception:
+        pass
     user = get_user(str(query.from_user.id))
     if user is None:
         await query.edit_message_text("Профиль не найден. Начните с /start")
@@ -26571,6 +26582,25 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await skip_birthday_cb(update, context)
     elif data == "skip_city":
         return await skip_city_cb(update, context)
+    # === ВОЛНА 22.18c: кнопки экранов согласия на ПДн и родительского согласия. ===
+    # БЕЗ этих маршрутов кнопки «✅ Согласен(на)…» / «📜 Политика ПДн» /
+    # «❌ Не согласен(на)» / «⬅️ Назад к согласию» (и родительские) НЕ РАБОТАЮТ:
+    # allow_reentry=True заставляет PTB проверять entry_points РАНЬШЕ
+    # хендлеров состояния, а в entry_points стоит безпаттерновый
+    # CallbackQueryHandler(handle_callback) — он перехватывает ВСЕ нажатия
+    # кнопок, и они доходят сюда, а не в pdn_consent_handler. Без маршрута
+    # цепочка молча возвращала MAIN_MENU без какого-либо ответа — выглядело
+    # как «кнопка не нажимается». Эти же маршруты оживляют кнопки старых
+    # экранов согласия после рестарта/деплоя (FSM-состояние потеряно).
+    elif data in ("pdn_accept", "pdn_decline", "pdn_privacy_full", "back_to_pdn"):
+        return await pdn_consent_handler(update, context)
+    elif data in ("parent_consent_yes", "parent_consent_no"):
+        return await parent_consent_handler(update, context)
+    # ВОЛНА 22.18c (аудит мёртвых кнопок): «⬅️ Назад» в настройках
+    # «📚 База решений» (_sol_admin_kb) ссылался на admin_panel без маршрута —
+    # кнопка молчала. Ведём на callback-безопасный ререндер админ-панели.
+    elif data == "admin_panel":
+        return await back_to_admin_panel(update, context)
 
     return MAIN_MENU
 
