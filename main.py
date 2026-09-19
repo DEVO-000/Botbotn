@@ -450,6 +450,10 @@ SOL_WAIT_FILE = 133  # ждём фото/файл решения для базы
 SHARE_INPUT_WAIT = 134  # ввод (url / пароль Сейфа / поиск) в менеджере ссылки
 SHARE_PIN_WAIT = 135    # получатель вводит PIN share-ссылки
 DEV_STATS_PERIOD = 136  # 22.13: разработчик вводит произвольный период статистики
+# ВОЛНА 22.18 (152-ФЗ): согласие на обработку ПДн при регистрации и
+# родительское согласие для пользователей до 18 лет (оба — кнопки).
+PDN_CONSENT_WAIT = 137
+PARENT_CONSENT_WAIT = 138
 
 # ВОЛНА 22.4: «🎙 Пульт» удалён ПОЛНОСТЬЮ по решению пользователя — кнопки,
 # состояний (бывшие 126–131), хендлеров и хранилищ стилей больше нет.
@@ -470,7 +474,8 @@ POLL_WAIT_SCHED = 129    # 22.12: ждём время запланированн
 _QUICK_SKIP_STATES = frozenset({VAULT_REN_WAIT, VAULT_LABEL_WAIT,
                                 VAULT_TAGS_WAIT, VAULT_SEARCH_WAIT,
                                 SHARE_INPUT_WAIT, SHARE_PIN_WAIT,
-                                DEV_STATS_PERIOD})
+                                DEV_STATS_PERIOD,
+                                PDN_CONSENT_WAIT, PARENT_CONSENT_WAIT})
 
 # ==================================
 # === ВОЛНА 12: ГЛОБАЛЬНАЯ КНОПКА ОТМЕНЫ ===
@@ -543,6 +548,11 @@ logger = logging.getLogger(__name__)
 # Если MONGO_URI не задан — бот автоматически откатывается на JSON-файлы
 # (как раньше). Это удобно для локальной разработки.
 MONGO_URI = _env("MONGO_URI")
+# ВОЛНА 22.18 (152-ФЗ): отдельный ключ шифрования хранилища. Рекомендуется
+# задать DB_KEY в ENV ОТДЕЛЬНО от BOT_TOKEN: если BOT_TOKEN сменит/утечёт —
+# база останется читаемой. Если DB_KEY не задан, ключ выводится из BOT_TOKEN
+# (работает из коробки, но при смене токена данные станут нечитаемыми).
+DB_KEY = _env("DB_KEY")
 MONGO_DB = _env("MONGO_DB", "telegram_bot") or "telegram_bot"
 _mongo_client = None
 _mongo_kv = None
@@ -1267,14 +1277,14 @@ def load_data(filename, default=None):
     if supabase_available:
         data, found = _supabase_load(filename, default)
         if found:
-            return data
+            return _db_unseal(data, default if default is not None else {})
         # В Supabase пусто. Если рядом есть локальный JSON (миграция со
-        # старой схемы) — однократно перельём его в Supabase.
+        # старой схемы) — однократно перельём его в Supabase (запечатав).
         if os.path.exists(filename):
             try:
                 with open(filename, 'r', encoding='utf-8') as f:
                     legacy = json.load(f)
-                if _supabase_save(filename, legacy):
+                if _supabase_save(filename, _db_seal(legacy)):
                     logger.info(
                         f"Supabase migration: {filename} -> Supabase "
                         f"({len(legacy) if hasattr(legacy, '__len__') else 'scalar'} элементов)"
@@ -1288,12 +1298,12 @@ def load_data(filename, default=None):
     if _mongo_kv is not None:
         data, found = _mongo_load(filename, default)
         if found:
-            return data
+            return _db_unseal(data, default if default is not None else {})
         if os.path.exists(filename):
             try:
                 with open(filename, 'r', encoding='utf-8') as f:
                     legacy = json.load(f)
-                if _mongo_save(filename, legacy):
+                if _mongo_save(filename, _db_seal(legacy)):
                     logger.info(f"Mongo migration: {filename} -> MongoDB ({len(legacy) if hasattr(legacy, '__len__') else 'scalar'} элементов)")
                 return legacy
             except Exception as e:
@@ -1304,7 +1314,8 @@ def load_data(filename, default=None):
     try:
         if os.path.exists(filename):
             with open(filename, 'r', encoding='utf-8') as f:
-                return json.load(f)
+                return _db_unseal(json.load(f),
+                                  default if default is not None else {})
         return default if default is not None else {}
     except Exception as e:
         logger.error(f"Ошибка при загрузке {filename}: {e}")
@@ -1317,14 +1328,125 @@ def _ensure_parent_dir(path: str) -> None:
         os.makedirs(directory, exist_ok=True)
 
 
+# ==================================
+# === ВОЛНА 22.18: ШИФРОВАНИЕ ХРАНИЛИЩА (DVF3, AES-256-GCM, DB_KEY) ===
+# ==================================
+# 152-ФЗ: бот хранит ПДн (имя, ДР, город, сообщения, состав классов). Чтобы
+# утечка базы (Supabase/Mongo/диск/снапшот) не означала утечку ПДн, ВСЁ
+# хранилище запечатывается AES-256-GCM ДО записи в ЛЮБОЙ бэкенд и
+# расшифровывается только в памяти при чтении (_db_unseal в load_data).
+# Ключ: DB_KEY из ENV (рекомендуется; отдельный от BOT_TOKEN). Если DB_KEY
+# не задан — ключ выводится из BOT_TOKEN (PBKDF2, 120k, фикс. соль).
+# Формат запечатанного значения: "DVF3:1:" + base64(nonce(12)+ciphertext+tag).
+# Расшифровка пробует ОБА ключа (DB_KEY, затем BOT_TOKEN-производный): переход
+# на DB_KEY бесшовный — старые записи читаются, новые пишутся с DB_KEY.
+
+_DB_SEAL_MAGIC = "DVF3"
+_DB_SEAL_AAD = b"DVF3:1"
+_DB_SEAL_KDF_SALT = b"DEVORKS+db-seal-v1"
+_DB_SEAL_KDF_ITERS = 120_000
+_DB_SEAL_AESGCM = None
+try:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM as _DB_AESGCM
+    _DB_SEAL_AESGCM = _DB_AESGCM
+except Exception:
+    _DB_SEAL_AESGCM = None
+_DB_SEAL_KEY_CACHE = None
+_DB_SEAL_FALLBACK_CACHE = None
+_DB_SEAL_WARNED = False
+
+
+def _db_seal_derive(secret: str) -> bytes:
+    """AES-256-ключ из секрета (PBKDF2-HMAC-SHA256, фикс. соль)."""
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    from cryptography.hazmat.primitives import hashes
+    kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32,
+                     salt=_DB_SEAL_KDF_SALT, iterations=_DB_SEAL_KDF_ITERS)
+    return kdf.derive(str(secret).encode("utf-8"))
+
+
+def _db_seal_key():
+    """Основной ключ: DB_KEY из ENV, иначе производный от BOT_TOKEN."""
+    global _DB_SEAL_KEY_CACHE
+    if _DB_SEAL_KEY_CACHE is None:
+        _DB_SEAL_KEY_CACHE = _db_seal_derive(DB_KEY if DB_KEY else BOT_TOKEN)
+    return _DB_SEAL_KEY_CACHE
+
+
+def _db_seal_fallback_key():
+    """Запасной ключ для чтения СТАРЫХ записей (до включения DB_KEY) или
+    записей после смены DB_KEY. None — если второго ключа нет."""
+    global _DB_SEAL_FALLBACK_CACHE
+    if _DB_SEAL_FALLBACK_CACHE is None:
+        if DB_KEY and DB_KEY != BOT_TOKEN:
+            _DB_SEAL_FALLBACK_CACHE = _db_seal_derive(BOT_TOKEN)
+        else:
+            _DB_SEAL_FALLBACK_CACHE = False
+    return _DB_SEAL_FALLBACK_CACHE or None
+
+
+def _db_seal(data):
+    """Запечатывает данные строкой DVF3 перед записью в любой бэкенд.
+
+    Честная деградация: если библиотека cryptography недоступна — данные
+    возвращаются как есть (как раньше), warning в лог один раз."""
+    global _DB_SEAL_WARNED
+    if _DB_SEAL_AESGCM is None:
+        if not _DB_SEAL_WARNED:
+            logger.warning(
+                "DVF3: cryptography недоступна — хранилище работает БЕЗ "
+                "шифрования. Для 152-ФЗ установите: pip install cryptography")
+            _DB_SEAL_WARNED = True
+        return data
+    try:
+        raw = json.dumps(data, ensure_ascii=False).encode("utf-8")
+    except Exception as e:
+        logger.error(f"DVF3: данные не сериализуются в JSON ({e}) — без шифра")
+        return data
+    nonce = os.urandom(12)
+    ct = _DB_SEAL_AESGCM(_db_seal_key()).encrypt(nonce, raw, _DB_SEAL_AAD)
+    return _DB_SEAL_MAGIC + ":1:" + base64.b64encode(nonce + ct).decode("ascii")
+
+
+def _db_unseal(value, default=None):
+    """Расшифровывает DVF3-строку в памяти. Легаси-значения (не DVF3)
+    проходят насквозь — миграция на шифр происходит при следующей записи."""
+    if not (isinstance(value, str) and value.startswith(_DB_SEAL_MAGIC + ":")):
+        return value
+    if _DB_SEAL_AESGCM is None:
+        logger.error("DVF3: данные зашифрованы, но cryptography недоступна!")
+        return default
+    try:
+        _, _ver, blob_b64 = value.split(":", 2)
+        blob = base64.b64decode(blob_b64)
+        nonce, ct = blob[:12], blob[12:]
+    except Exception as e:
+        logger.error(f"DVF3: повреждённый контейнер: {e}")
+        return default
+    for key in (_db_seal_key(), _db_seal_fallback_key()):
+        if key is None:
+            continue
+        try:
+            raw = _DB_SEAL_AESGCM(key).decrypt(nonce, ct, _DB_SEAL_AAD)
+            return json.loads(raw.decode("utf-8"))
+        except Exception:
+            continue
+    logger.error(
+        "DVF3: НЕ удалось расшифровать данные (DB_KEY/BOT_TOKEN сменились?). "
+        "Проверьте переменные окружения — без верного ключа файл нечитаем.")
+    return default
+
+
 def save_data(filename, data):
     """Сохраняет данные в облако (Supabase → Mongo → файл).
 
     Добавлена ленивая инициализация Supabase: если _supabase_ready==False,
     но SUPABASE_URL+SUPABASE_KEY заданы — пробуем переподключиться.
 
-    ВОЛНА 8: каждое успешное сохранение файла данных помечает базу «грязной»
-    (_cdb_mark_dirty) — единый тикер сольёт снапшот в канал-БД."""
+    ВАЖНО (волна 22.18, 152-ФЗ): данные перед записью запечатываются
+    _db_seal (AES-256-GCM) — в Supabase/Mongo/файл и в снапшот канала
+    уходит ТОЛЬКО шифр; расшифровка — только в памяти в load_data."""
+    data = _db_seal(data)
     # 1) Supabase
     if _supabase_ready:
         if _supabase_save(filename, data):
@@ -1352,7 +1474,10 @@ def save_data(filename, data):
 
 
 async def _async_save_data(filename, data):
-    """Асинхронная обёртка save_data (с ленивой инициализацией Supabase)."""
+    """Асинхронная обёртка save_data (с ленивой инициализацией Supabase).
+
+    ВОЛНА 22.18: данные запечатываются DVF3-шифром до любого бэкенда."""
+    data = _db_seal(data)
     # 1) Supabase
     if _supabase_ready:
         if _supabase_save(filename, data):
@@ -1940,6 +2065,12 @@ class User:
         self.instructions_read = False
         self.language = "ru"
         self.disclaimer_accepted = False
+        # ВОЛНА 22.18 (152-ФЗ): согласие на обработку ПДн и родительское
+        # согласие (пользователям до 18 лет). pdn_consent_at — ISO-время.
+        self.pdn_accepted = False
+        self.pdn_consent_at = None
+        self.pdn_policy_version = None
+        self.parent_consent = False
         self.hidden_buttons = []
         # === Погодные / праздничные настройки (новые) ===
         # Город для запросов к WeatherAPI. None означает «не задан».
@@ -2107,6 +2238,10 @@ class User:
             'instructions_read': self.instructions_read,
             'language': self.language,
             'disclaimer_accepted': self.disclaimer_accepted,
+            'pdn_accepted': self.pdn_accepted,
+            'pdn_consent_at': self.pdn_consent_at,
+            'pdn_policy_version': self.pdn_policy_version,
+            'parent_consent': self.parent_consent,
             'hidden_buttons': getattr(self, 'hidden_buttons', []),
             # Погодные / праздничные поля (новые)
             'city': getattr(self, 'city', None),
@@ -2161,10 +2296,17 @@ class User:
         for key, value in data.items():
             if hasattr(user, key):
                 setattr(user, key, value)
-        if not hasattr(user, 'hidden_buttons'):
-            user.hidden_buttons = []
-        if not hasattr(user, 'birthday_personal_notification'):
-            user.birthday_personal_notification = True
+        if not hasattr(user, 'disclaimer_accepted'):
+            user.disclaimer_accepted = False
+        # ВОЛНА 22.18 (152-ФЗ): бэк-совместимость полей согласия.
+        if not hasattr(user, 'pdn_accepted'):
+            user.pdn_accepted = False
+        if not hasattr(user, 'pdn_consent_at'):
+            user.pdn_consent_at = None
+        if not hasattr(user, 'pdn_policy_version'):
+            user.pdn_policy_version = None
+        if not hasattr(user, 'parent_consent'):
+            user.parent_consent = False
         # Бэк-совместимость: «рассказывать ли классу о моём ДР».
         # По умолчанию — ВКЛ, чтобы старые пользователи (у которых поле
         # отсутствовало) автоматически получили эту фичу: бот объявляет
@@ -3058,7 +3200,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.17"
+BOT_BUILD = "22.18"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -4624,6 +4766,9 @@ def get_settings_keyboard(user=None):
         # ВОЛНА 22.15: честный юридический экран — тот же текст, что при
         # регистрации; доступен в любой момент.
         [InlineKeyboardButton("⚖️ Правовая информация", callback_data="legal_info")],
+        # ВОЛНА 22.18 (152-ФЗ): политика обработки ПДн + право на удаление.
+        [InlineKeyboardButton("🛡 Политика ПДн", callback_data="privacy_info")],
+        [InlineKeyboardButton("🗑 Удалить мои данные", callback_data="delete_my_data")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="back_to_main")],
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -16886,6 +17031,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif not user.disclaimer_accepted:
         await show_disclaimer(update, context)
         return SHOW_INSTRUCTIONS
+    elif not user.pdn_accepted:
+        # ВОЛНА 22.18 (152-ФЗ): без согласия на обработку ПДн дальше — никак.
+        await show_pdn_consent(update, context)
+        return PDN_CONSENT_WAIT
     elif not user.setup_completed:
         # ПУНКТ 10: ручной ввод времени убран — спрашиваем сразу город,
         # часовой пояс определяется автоматически.
@@ -17090,6 +17239,12 @@ async def disclaimer_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         user.disclaimer_accepted = True
         save_user(user)
 
+        # ВОЛНА 22.18 (152-ФЗ): следующий обязательный шаг — согласие
+        # на обработку персональных данных (до ввода города и любых данных).
+        if not user.pdn_accepted:
+            await show_pdn_consent(update, context)
+            return PDN_CONSENT_WAIT
+
         if not user.setup_completed:
             # ПУНКТ 10: ручной ввод времени убран — часовой пояс определяется
             # автоматически по введённому городу.
@@ -17132,6 +17287,419 @@ async def legal_info_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"legal_info_cb: не удалось показать: {e}")
     return USER_SETTINGS
 
+
+# ============================================================
+# === ВОЛНА 22.18: ПОЛИТИКА ПДн (152-ФЗ) И СОГЛАСИЕ ===
+# ============================================================
+# По требованию пользователя: политика обработки персональных данных
+# (цели/перечень/права/сроки), явное согласие при регистрации, согласие
+# родителей для несовершеннолетних, передача по законному запросу
+# (149-ФЗ), правила Telegram. Текст БЕЗ markdown-спецсимволов.
+
+PDN_POLICY_VERSION = "1.0"
+
+_PRIVACY_TEXT = (
+    "🛡 ПОЛИТИКА ОБРАБОТКИ ПЕРСОНАЛЬНЫХ ДАННЫХ\n\n"
+    "Бот DEVORKS+ (далее — бот). Разработчик бота — оператор "
+    "персональных данных в смысле Федерального закона №152-ФЗ "
+    "«О персональных данных». Версия политики: " + PDN_POLICY_VERSION + ".\n\n"
+    "1. КАКИЕ ДАННЫХ ОБРАБАТЫВАЮТСЯ\n"
+    "• Telegram-ID и имя (и @username, если вы его используете);\n"
+    "• дата рождения (напоминания/поздравления, возрастные функции);\n"
+    "• город (погода и часовой пояс);\n"
+    "• сообщения и файлы, которые вы отправляете боту: домашние задания, "
+    "расписание, решения, таймеры, анонимные сообщения, переписка с "
+    "поддержкой, предложения;\n"
+    "• обезличенные счётчики использования функций.\n\n"
+    "2. ЦЕЛИ ОБРАБОТКИ\n"
+    "Только работа функций бота: расписание и ДЗ, уведомления и "
+    "напоминания, погода, Сейф, база решений, опросы, поддержка. "
+    "Никакой рекламы. Данные не продаются и не передаются третьим лицам.\n\n"
+    "3. ОСНОВАНИЕ И СОГЛАСИЕ\n"
+    "Обработка — на основании вашего согласия (п. 1 ч. 1 ст. 6 152-ФЗ), "
+    "которое вы даёте кнопкой «Согласен на обработку ПДн» при регистрации. "
+    "Пользователям до 18 лет необходимо согласие родителей: оно "
+    "подтверждается отдельной кнопкой при регистрации. Согласие можно "
+    "отозвать в любой момент: ⚙️ Настройки → «🗑 Удалить мои данные».\n\n"
+    "4. ЗАЩИТА ДАННЫХ\n"
+    "Всё хранилище шифруется AES-256-GCM; ключ шифрования хранится "
+    "отдельно от бота. Файлы Сейфа шифруются паролем владельца — их "
+    "содержимое не видит даже разработчик. Данные не публикуются.\n\n"
+    "5. КОГДА ДАННЫЕ МОГУТ БЫТЬ ПЕРЕДАНЫ\n"
+    "• Telegram — как инфраструктура доставки сообщений "
+    "(telegram.org/privacy);\n"
+    "• государственным органам РФ — ТОЛЬКО по законному запросу "
+    "(149-ФЗ, 152-ФЗ): при поступлении законного требования передача "
+    "обязательна по закону;\n"
+    "• больше никому.\n\n"
+    "6. СРОКИ ХРАНЕНИЯ И ВАШИ ПРАВА\n"
+    "Данные хранятся, пока вы пользуетесь ботом. Вы имеете право "
+    "уточнить, исправить и удалить свои данные: правка — в разделах "
+    "настроек (имя, город, ДР), удаление — кнопкой «🗑 Удалить мои "
+    "данные» в ⚙️ Настройках: аккаунт, таймеры, анонимные сообщения, "
+    "личные кнопки и share-ссылки удаляются сразу, копии обновляются "
+    "при ближайшей ротации резервных копий.\n\n"
+    "7. ПРАВИЛА TELEGRAM\n"
+    "Использование бота регулируется также правилами Telegram "
+    "(telegram.org/tos).\n\n"
+    "8. ВОПРОСЫ\n"
+    "По обработке ПДн — «💬 Написать админу» в боте."
+)
+
+_PDN_CONSENT_TEXT = (
+    "🛡 СОГЛАСИЕ НА ОБРАБОТКУ ПЕРСОНАЛЬНЫХ ДАННЫХ\n\n"
+    "Для работы бот обрабатывает: ваш Telegram-ID, имя, @username, дату "
+    "рождения, город, а также сообщения и файлы, которые вы отправляете "
+    "(домашние задания, расписание, решения, таймеры, анонимные "
+    "сообщения, переписка с поддержкой).\n\n"
+    "Зачем: только для функций бота (расписание, уведомления, погода, "
+    "Сейф, опросы, поддержка). Данные шифруются (AES-256-GCM), не "
+    "публикуются, не продаются и не передаются третьим лицам, кроме "
+    "случаев, предусмотренных законом.\n\n"
+    "Полный текст — кнопкой «📜 Политика ПДн» ниже. Отозвать согласие "
+    "можно в любой момент: ⚙️ Настройки → «🗑 Удалить мои данные».\n\n"
+    "Если вам нет 18 лет — нужно согласие родителей: бот спросит об этом "
+    "отдельным шагом.\n\n"
+    "Нажимая «✅ Согласен(на) на обработку ПДн», вы даёте согласие на "
+    "обработку ваших персональных данных (п. 1 ч. 1 ст. 6 152-ФЗ)."
+)
+
+_PDN_DECLINE_TEXT = (
+    "❌ Без согласия на обработку персональных данных бот не может "
+    "работать: у него не будет права хранить даже ваше имя — а без этого "
+    "не работают ни расписание, ни уведомления, ни любые другие функции.\n\n"
+    "Ваши данные сейчас не обрабатываются. Если передумаете — отправьте "
+    "/start, и регистрация начнётся заново."
+)
+
+_PARENT_CONSENT_TEXT = (
+    "👨‍👩‍👧 СОГЛАСИЕ РОДИТЕЛЕЙ\n\n"
+    "По дате рождения вам меньше 18 лет. По 152-ФЗ обработка "
+    "персональных данных несовершеннолетних требует согласия их "
+    "законных представителей (родителей).\n\n"
+    "Нажимая «✅ Мои родители согласны», вы подтверждаете, что получили "
+    "их согласие на обработку ваших данных этим ботом. 100% проверить "
+    "это технически невозможно, поэтому подтверждение — под вашу "
+    "ответственность.\n\n"
+    "Если согласия родителей нет — нажмите «❌»: регистрация не "
+    "продолжится, данные не будут обрабатываться."
+)
+
+
+def _user_age_years(birthday_str):
+    """Возраст в годах по строке ГГГГ-ММ-ДД, или None если не распарсить."""
+    try:
+        b = datetime.strptime(str(birthday_str)[:10], "%Y-%m-%d")
+        today = datetime.now()
+        age = today.year - b.year - ((today.month, today.day) < (b.month, b.day))
+        return age if age >= 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+async def show_pdn_consent(update, context):
+    """Экран согласия на обработку ПДн (22.18). Работает и с message
+    (первый вход из start), и с callback_query (после дисклеймера)."""
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Согласен(на) на обработку ПДн",
+                              callback_data="pdn_accept")],
+        [InlineKeyboardButton("📜 Политика ПДн",
+                              callback_data="pdn_privacy_full")],
+        [InlineKeyboardButton("❌ Не согласен(на)",
+                              callback_data="pdn_decline")],
+    ])
+    if hasattr(update, "callback_query") and update.callback_query:
+        await update.callback_query.edit_message_text(
+            _PDN_CONSENT_TEXT, reply_markup=keyboard)
+    elif hasattr(update, "message") and update.message:
+        await update.message.reply_text(_PDN_CONSENT_TEXT, reply_markup=keyboard)
+
+
+async def show_parent_consent(update, context):
+    """Экран согласия родителей для пользователей до 18 лет."""
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Мои родители согласны",
+                              callback_data="parent_consent_yes")],
+        [InlineKeyboardButton("❌ Согласия нет",
+                              callback_data="parent_consent_no")],
+    ])
+    if hasattr(update, "callback_query") and update.callback_query:
+        await update.callback_query.edit_message_text(
+            _PARENT_CONSENT_TEXT, reply_markup=keyboard)
+    elif hasattr(update, "message") and update.message:
+        await update.message.reply_text(_PARENT_CONSENT_TEXT, reply_markup=keyboard)
+
+
+async def _pdn_continue_after_consent(update, context, user):
+    """Общий хвост согласия: город (первые шаги) или главное меню."""
+    if hasattr(update, "callback_query") and update.callback_query:
+        if not user.setup_completed:
+            await update.callback_query.edit_message_text(
+                "✅ Спасибо!\n\n"
+                "🏙 Введите ваш город (например: Москва, Санкт-Петербург, Казань).\n"
+                "По нему я сам определю часовой пояс и настрою уведомления."
+            )
+            return ENTER_CITY
+        await show_main_menu(update, context, user)
+        return MAIN_MENU
+    # message-вариант (стартовали прямо из /start)
+    if not user.setup_completed:
+        await update.message.reply_text(
+            "✅ Спасибо!\n\n"
+            "🏙 Введите ваш город (например: Москва, Санкт-Петербург, Казань).\n"
+            "По нему я сам определю часовой пояс и настрою уведомления.",
+            reply_markup=get_cancel_keyboard()
+        )
+        return ENTER_CITY
+    await show_main_menu(update, context, user)
+    return MAIN_MENU
+
+
+async def pdn_consent_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.18: кнопки экрана согласия на ПДн (152-ФЗ)."""
+    query = update.callback_query
+    await query.answer()
+    user = get_user(str(query.from_user.id))
+    if user is None:
+        await query.edit_message_text("Профиль не найден. Начните с /start")
+        return ConversationHandler.END
+
+    if query.data == "pdn_privacy_full":
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("⬅️ Назад к согласию",
+                                 callback_data="back_to_pdn")]])
+        try:
+            await query.edit_message_text(_PRIVACY_TEXT, reply_markup=keyboard)
+        except Exception:
+            await context.bot.send_message(
+                chat_id=update.effective_user.id,
+                text=_PRIVACY_TEXT, reply_markup=keyboard)
+        return PDN_CONSENT_WAIT
+    if query.data == "back_to_pdn":
+        await show_pdn_consent(update, context)
+        return PDN_CONSENT_WAIT
+
+    if query.data == "pdn_accept":
+        user.pdn_accepted = True
+        user.pdn_consent_at = datetime.now(timezone.utc).isoformat()
+        user.pdn_policy_version = PDN_POLICY_VERSION
+        age = _user_age_years(getattr(user, "birthday", None))
+        if age is not None and age < 18 and not getattr(user, "parent_consent", False):
+            save_user(user)
+            await show_parent_consent(update, context)
+            return PARENT_CONSENT_WAIT
+        save_user(user)
+        return await _pdn_continue_after_consent(update, context, user)
+
+    # pdn_decline
+    await query.edit_message_text(_PDN_DECLINE_TEXT)
+    return ConversationHandler.END
+
+
+async def parent_consent_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.18: кнопки экрана родительского согласия (до 18 лет)."""
+    query = update.callback_query
+    await query.answer()
+    user = get_user(str(query.from_user.id))
+    if user is None:
+        await query.edit_message_text("Профиль не найден. Начните с /start")
+        return ConversationHandler.END
+    if query.data == "parent_consent_yes":
+        user.parent_consent = True
+        user.pdn_accepted = True
+        user.pdn_consent_at = user.pdn_consent_at or datetime.now(
+            timezone.utc).isoformat()
+        user.pdn_policy_version = PDN_POLICY_VERSION
+        save_user(user)
+        return await _pdn_continue_after_consent(update, context, user)
+    # parent_consent_no
+    await query.edit_message_text(
+        "❌ Регистрация не продолжится без согласия родителей: по 152-ФЗ "
+        "бот не вправе обрабатывать данные несовершеннолетнего без него.\n\n"
+        "Данные не обрабатываются. Если родители согласятся — /start.")
+    return ConversationHandler.END
+
+
+async def privacy_info_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.18: экран «🛡 Политика ПДн» в ⚙️ Настройках — тот же текст,
+    что при согласии; «⬅️ Назад» возвращает в настройки."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("⬅️ Назад", callback_data="back_to_settings")]])
+    try:
+        await query.edit_message_text(_PRIVACY_TEXT, reply_markup=keyboard)
+    except Exception:
+        try:
+            await context.bot.send_message(
+                chat_id=update.effective_user.id,
+                text=_PRIVACY_TEXT, reply_markup=keyboard)
+        except Exception as e:
+            logger.error(f"privacy_info_cb: не удалось показать: {e}")
+    return USER_SETTINGS
+
+
+async def delete_my_data_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.18 (152-ФЗ, право на удаление): подтверждение удаления."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    text = (
+        "⚠️ УДАЛИТЬ ВСЕ ВАШИ ДАННЫЕ?\n\n"
+        "Будут удалены безвозвратно:\n"
+        "• аккаунт (имя, @username, ДР, город);\n"
+        "• ваши таймеры и напоминания;\n"
+        "• ваши анонимные сообщения (входящие и исходящие);\n"
+        "• ваши личные кнопки и share-ссылки;\n"
+        "• ваша запись в классах;\n"
+        "• согласие на обработку ПДн (отзывается).\n\n"
+        "Зашифрованные файлы Сейфа будут удалены из канала при попытке "
+        "выдачи/чистки, если бот не успеет удалить их сам. Отменить "
+        "удаление НЕЛЬЗЯ.")
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🗑 Да, удалить всё",
+                              callback_data="delete_my_data_yes")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="cancel_action")],
+    ])
+    try:
+        await query.edit_message_text(text, reply_markup=keyboard)
+    except Exception:
+        await context.bot.send_message(
+            chat_id=update.effective_user.id,
+            text=text, reply_markup=keyboard)
+    return USER_SETTINGS
+
+
+async def delete_my_data_yes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.18: полное удаление личных данных пользователя.
+    Право на удаление/отзыв согласия — 152-ФЗ (ст. 9, 14, 21)."""
+    query = update.callback_query
+    await query.answer()
+    uid = str(query.from_user.id)
+
+    users = load_users()
+    user = users.pop(uid, None)
+    removed = {"timers": 0, "anon": 0, "buttons": 0, "share": 0}
+
+    # 1) Таймеры и напоминания.
+    try:
+        timers = load_data(TIMERS_FILE, {}) or {}
+        for k in list(timers):
+            rec = timers[k] if isinstance(timers[k], dict) else {}
+            if str(rec.get("user_id") or rec.get("owner") or "") == uid:
+                timers.pop(k)
+                removed["timers"] += 1
+        save_data(TIMERS_FILE, timers)
+    except Exception as e:
+        logger.error(f"delete_my_data: таймеры: {e}")
+
+    # 2) Анонимные сообщения (входящие И исходящие).
+    try:
+        anon = load_data(ANONYMOUS_MESSAGES_FILE, {}) or {}
+        for k in list(anon):
+            rec = anon[k] if isinstance(anon[k], dict) else {}
+            if (str(rec.get("to_user_id") or "") == uid
+                    or str(rec.get("from_user_id") or rec.get("owner") or "") == uid):
+                anon.pop(k)
+                removed["anon"] += 1
+        save_data(ANONYMOUS_MESSAGES_FILE, anon)
+    except Exception as e:
+        logger.error(f"delete_my_data: анонимки: {e}")
+
+    # 3) Личные кнопки.
+    try:
+        pbs = load_data(PERSONAL_BUTTONS_FILE, {}) or {}
+        for k in list(pbs):
+            rec = pbs[k] if isinstance(pbs[k], dict) else {}
+            if str(rec.get("user_id") or rec.get("owner") or "") == uid:
+                pbs.pop(k)
+                removed["buttons"] += 1
+        save_data(PERSONAL_BUTTONS_FILE, pbs)
+    except Exception as e:
+        logger.error(f"delete_my_data: личные кнопки: {e}")
+
+    # 4) Share-ссылки владельца.
+    try:
+        shares = load_data(SHARE_FILE, {}) or {}
+        for k in list(shares):
+            rec = shares[k] if isinstance(shares[k], dict) else {}
+            if str(rec.get("owner") or rec.get("user_id") or "") == uid:
+                shares.pop(k)
+                removed["share"] += 1
+        save_data(SHARE_FILE, shares)
+    except Exception as e:
+        logger.error(f"delete_my_data: share-ссылки: {e}")
+
+    # 5) Запись в классах (создателя класса не вычёркиваем — иначе
+    #    класс «умрёт»; это честно указано в политике удаления).
+    try:
+        classes = load_classes()
+        for code, cls in list(classes.items()):
+            changed = False
+            for attr in ("students", "members", "users"):
+                lst = getattr(cls, attr, None)
+                if isinstance(lst, list) and uid in [str(x) for x in lst]:
+                    setattr(cls, attr, [x for x in lst if str(x) != uid])
+                    changed = True
+            if hasattr(cls, "blocked_users") and isinstance(cls.blocked_users, list) \
+                    and uid in [str(x) for x in cls.blocked_users]:
+                cls.blocked_users = [x for x in cls.blocked_users if str(x) != uid]
+                changed = True
+            if changed:
+                classes[code] = cls
+        save_classes(classes)
+    except Exception as e:
+        logger.error(f"delete_my_data: классы: {e}")
+
+    # 6) Зашифрованные файлы Сейфа: попытка удалить сами сообщения из
+    #    канала (не более 20 за раз, чтобы не зависнуть).
+    try:
+        if user is not None:
+            ch_ids = get_cloud_channel_ids()[:1]
+            vf = list(getattr(user, "vault_files", []) or [])[:20]
+            for f in vf:
+                if not isinstance(f, dict):
+                    continue
+                mid = f.get("mid") or f.get("message_id")
+                if mid and ch_ids:
+                    try:
+                        await context.bot.delete_message(
+                            chat_id=ch_ids[0], message_id=int(mid))
+                    except Exception:
+                        pass
+    except Exception as e:
+        logger.error(f"delete_my_data: файлы Сейфа: {e}")
+
+    # 7) Сохраняем пользователей без удаляемого.
+    try:
+        save_users(users)
+    except Exception as e:
+        logger.error(f"delete_my_data: save_users: {e}")
+
+    # 8) Сброс кэша PTB-данных пользователя.
+    try:
+        await context.application.drop_user_data(int(uid))
+    except Exception:
+        pass
+
+    stat = (f"🗑 Готово. Удалено: аккаунт, таймеров — {removed['timers']}, "
+            f"анонимных сообщений — {removed['anon']}, личных кнопок — "
+            f"{removed['buttons']}, share-ссылок — {removed['share']}, "
+            f"запись в классах. Согласие на обработку ПДн отозвано.\n\n"
+            "Копии хранилища обновятся при ближайшей ротации резервных "
+            "копий.\n\n/start — если захотите вернуться (с чистого листа).")
+    try:
+        await query.edit_message_text(stat)
+    except Exception:
+        await context.bot.send_message(chat_id=int(uid), text=stat)
+    return ConversationHandler.END
+
+
 async def instructions_read_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """ПУНКТ 1: После прочтения инструкции пользователь идёт по обычному пути регистрации."""
     query = update.callback_query
@@ -17159,6 +17727,10 @@ async def instructions_read_handler(update: Update, context: ContextTypes.DEFAUL
     elif not user.disclaimer_accepted:
         await show_disclaimer(update, context)
         return SHOW_INSTRUCTIONS
+    elif not user.pdn_accepted:
+        # ВОЛНА 22.18 (152-ФЗ): без согласия на обработку ПДн дальше — никак.
+        await show_pdn_consent(update, context)
+        return PDN_CONSENT_WAIT
     elif not user.setup_completed:
         # ПУНКТ 10: ручной ввод времени убран — спрашиваем только город,
         # часовой пояс определяется автоматически.
@@ -25848,6 +26420,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ВОЛНА 22.15: «⚖️ Правовая информация» — полные условия в любой момент.
     elif data == "legal_info":
         return await legal_info_cb(update, context)
+    # ВОЛНА 22.18 (152-ФЗ): политика ПДн и удаление данных в настройках.
+    elif data == "privacy_info":
+        return await privacy_info_cb(update, context)
+    elif data == "delete_my_data":
+        return await delete_my_data_cb(update, context)
+    elif data == "delete_my_data_yes":
+        return await delete_my_data_yes(update, context)
 
     return MAIN_MENU
 
@@ -31567,6 +32146,19 @@ def main():
             ENTER_BIRTHDAY: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, enter_birthday_handler),
                 # ПУНКТ 7: чтобы работала кнопка «Отмена» во время ввода даты рождения
+                CallbackQueryHandler(handle_callback),
+            ],
+            # === ВОЛНА 22.18: согласие на ПДн (152-ФЗ) и родительское согласие ===
+            PDN_CONSENT_WAIT: [
+                CallbackQueryHandler(
+                    pdn_consent_handler,
+                    pattern="^(pdn_accept|pdn_decline|pdn_privacy_full|back_to_pdn)$"),
+                CallbackQueryHandler(handle_callback),
+            ],
+            PARENT_CONSENT_WAIT: [
+                CallbackQueryHandler(
+                    parent_consent_handler,
+                    pattern="^(parent_consent_yes|parent_consent_no)$"),
                 CallbackQueryHandler(handle_callback),
             ],
             SET_TIME: [
