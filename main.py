@@ -2048,6 +2048,11 @@ class User:
         self.created_classes = []
         self.setup_completed = False
         self.birthday = None
+        # ПОЛИТИКА ПДн 1.2 (минимизация данных): пользователь мог ОСОЗНАННО
+        # пропустить ввод даты рождения («⏭ Пропустить» при регистрации).
+        # Флаг нужен, чтобы /start не спрашивал ДР у такого пользователя снова
+        # и снова: гейт выглядит как «нет ДР И не пропущено».
+        self.birthday_skipped = False
         self.show_birthday_countdown = True
         self.show_birthday_to_class = True
         self.birthday_personal_notification = True
@@ -2224,6 +2229,7 @@ class User:
             'created_classes': self.created_classes,
             'setup_completed': self.setup_completed,
             'birthday': self.birthday,
+            'birthday_skipped': getattr(self, 'birthday_skipped', False),
             'show_birthday_countdown': self.show_birthday_countdown,
             'show_birthday_to_class': self.show_birthday_to_class,
             'birthday_personal_notification': self.birthday_personal_notification,
@@ -2307,6 +2313,9 @@ class User:
             user.pdn_policy_version = None
         if not hasattr(user, 'parent_consent'):
             user.parent_consent = False
+        # ПОЛИТИКА ПДн 1.2: флаг «ДР пропущен осознанно» у старых пользователей.
+        if not hasattr(user, 'birthday_skipped'):
+            user.birthday_skipped = False
         # Бэк-совместимость: «рассказывать ли классу о моём ДР».
         # По умолчанию — ВКЛ, чтобы старые пользователи (у которых поле
         # отсутствовало) автоматически получили эту фичу: бот объявляет
@@ -3927,6 +3936,25 @@ def get_admin_panel_keyboard():
 def get_cancel_keyboard():
     return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel_action")]])
 
+
+# ПОЛИТИКА ПДн 1.2 (минимизация данных): шаги регистрации, где данные
+# НЕОБЯЗАТЕЛЬНЫ, получают кнопку «⏭ Пропустить». Пользователь сам решает,
+# указывать ли город и дату рождения; оба шага можно заполнить позже
+# в ⚙️ Настройках. Появлены по требованию пользователя: «если пользователь
+# не хочет указывать город — он не будет указывать, также с датой рождения».
+def get_skip_birthday_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⏭ Пропустить", callback_data="skip_birthday")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="cancel_action")],
+    ])
+
+
+def get_skip_city_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⏭ Пропустить", callback_data="skip_city")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="cancel_action")],
+    ])
+
 def get_back_button_keyboard():
     return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="back_to_main")]])
 
@@ -4769,6 +4797,8 @@ def get_settings_keyboard(user=None):
         # ВОЛНА 22.18 (152-ФЗ): политика обработки ПДн + право на удаление.
         [InlineKeyboardButton("🛡 Политика ПДн", callback_data="privacy_info")],
         [InlineKeyboardButton("🗑 Удалить мои данные", callback_data="delete_my_data")],
+        # ПОЛИТИКА ПДн 1.2 (149-ФЗ ст. 10.1): правила сообщества.
+        [InlineKeyboardButton("📜 Правила сообщества", callback_data="community_rules")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="back_to_main")],
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -5665,7 +5695,9 @@ async def _voice_transcription_middleware(update: Update, context: ContextTypes.
                 pass
             raise ApplicationHandlerStop
         # Успех: текст подставлен — обработчики увидят обычное текстовое сообщение.
-        logger.info(f"STT: {user_id} -> «{transcript[:80]}»")
+        # ПОЛИТИКА ПДн 1.2 (минимизация данных в логах): текст расшифровки
+        # пользователя в лог НЕ попадает — только длина (риск утечки ПДн).
+        logger.info(f"STT: user_id={user_id} -> text_len={len(transcript)}")
     except ApplicationHandlerStop:
         raise
     except Exception as e:
@@ -9904,8 +9936,9 @@ async def _vault_seal_item_mtproto(msg, context, user, item, password,
             raise  # ВОЛНА 22.3: отмену пользователя НЕ ретраим — это не сбой
         except Exception as e:
             last_err = e
-            logger.error(f"vault put: попытка {_attempt}/2 не удалась "
-                         f"({item.get('name')}): {e}")
+            # ПОЛИТИКА ПДн 1.2: имя файла пользователя в лог не попадает.
+            logger.error(f"vault put: попытка {_attempt}/2 не удалась, "
+                         f"user_id={getattr(user, 'user_id', '?')}: {e}")
             if _attempt == 1:
                 await asyncio.sleep(5)  # холодный кэш/сеть часто отходят сами
     raise last_err  # обе попытки упали — оригинал остаётся в чате
@@ -12193,8 +12226,9 @@ async def _vault_encrypt_batch(msg, context, user, password):
                 except _VaultCancelled:
                     raise  # ВОЛНА 22.3: отмену НЕ глотаем как сбой файла
                 except Exception as e:
+                    # ПОЛИТИКА ПДн 1.2: имя файла пользователя в лог не попадает.
                     logger.error(
-                        f"vault put: большой файл ({item.get('name')}): {e}")
+                        f"vault put: большой файл, user_id={getattr(user, 'user_id', '?')}: {e}")
                     rec_mt = None
                     fail_reasons.append(
                         f"«{(item.get('name') or 'файл')}»: "
@@ -12223,7 +12257,9 @@ async def _vault_encrypt_batch(msg, context, user, password):
                     },
                 )
             except Exception as e:
-                logger.error(f"vault put: шифрование не удалось ({item.get('name')}): {e}")
+                # ПОЛИТИКА ПДн 1.2: имя файла пользователя в лог не попадает.
+                logger.error(f"vault put: шифрование не удалось, "
+                             f"user_id={getattr(user, 'user_id', '?')}: {e}")
                 fail_n += 1
                 fail_reasons.append(
                     f"«{(item.get('name') or 'файл')}»: {_vault_fail_reason(e)}")
@@ -13606,7 +13642,7 @@ def _storage_dev_status_text(cfg):
         lines.append("   «не новее»), ответит «Готово!», ЗАКРЕПИТ в канале и сотрёт старые.")
     else:
         lines.append("")
-        lines.append("🗄️ База в канале: ВЫКЛ (данные только на сервере/Supabase).")
+        lines.append("🗄️ База в канале: ВЫКЛ (данные только на сервере).")
         lines.append("   При включении бот начнёт непрерывно зеркалить базу в канал.")
     try:
         users = load_users()
@@ -17021,11 +17057,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_instructions(update, context)
         return SHOW_INSTRUCTIONS
 
-    # Если инструкция уже прочитана — продолжаем как раньше
-    if not user.birthday:
+    # Если инструкция уже прочитана — продолжаем как раньше.
+    # ПОЛИТИКА ПДн 1.2: если ДР осознанно пропущен (birthday_skipped) —
+    # больше НЕ спрашиваем: минимизация данных.
+    if not user.birthday and not getattr(user, "birthday_skipped", False):
         await update.message.reply_text(
-            "🎂 Пожалуйста, введите вашу реальную дату рождения в формате ГГГГ-ММ-ДД (например, 2005-04-15):",
-            reply_markup=get_cancel_keyboard()
+            "🎂 Пожалуйста, введите вашу реальную дату рождения в формате ГГГГ-ММ-ДД (например, 2005-04-15):\n\n"
+            "Указывать необязательно: нажмите «⏭ Пропустить», если не хотите.",
+            reply_markup=get_skip_birthday_keyboard()
         )
         return ENTER_BIRTHDAY
     elif not user.disclaimer_accepted:
@@ -17038,10 +17077,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif not user.setup_completed:
         # ПУНКТ 10: ручной ввод времени убран — спрашиваем сразу город,
         # часовой пояс определяется автоматически.
+        # ПОЛИТИКА ПДн 1.2: город необязателен — есть «⏭ Пропустить».
         await update.message.reply_text(
             "🏙 Введите ваш город (например: Москва, Санкт-Петербург, Казань).\n"
-            "По нему я сам определю часовой пояс и настрою уведомления.",
-            reply_markup=get_cancel_keyboard()
+            "По нему я сам определю часовой пояс и настрою уведомления.\n\n"
+            "Указывать необязательно: нажмите «⏭ Пропустить», если не хотите.",
+            reply_markup=get_skip_city_keyboard()
         )
         return ENTER_CITY
     else:
@@ -17159,6 +17200,11 @@ _LEGAL_TEXT = (
     "8. ЧТО БЫ НИ СЛУЧИЛОСЬ — потеря данных, пропущенное напоминание, "
     "сбой бота, конфликт, ущерб — разработчик ответственности не несёт и "
     "убытки не возмещает. Претензии по этим поводам не принимаются.\n\n"
+    "9. ОБРАБОТЧИКИ ДАННЫХ. Для работы бота данные передаются "
+    "обработчикам: Telegram (доставка сообщений и хранение зашифрованных "
+    "контейнеров), Groq (распознавание голоса, вижн-модели), DeepSeek "
+    "(обработка запросов AI Agent), WeatherAPI (погода). Список "
+    "обработчиков может меняться; актуальный — в «🛡 Политике ПДн».\n\n"
     "Нажимая «✅ Я согласен(на)», вы подтверждаете: вы прочитали, поняли "
     "и принимаете эти условия. Продолжая пользоваться ботом после его "
     "обновлений, вы принимаете обновлённые условия."
@@ -17215,7 +17261,9 @@ async def enter_birthday_handler(update: Update, context: ContextTypes.DEFAULT_T
     try:
         birthday = datetime.strptime(birthday_str, "%Y-%m-%d")
         if birthday > datetime.now():
-            await update.message.reply_text("Дата рождения не может быть в будущем. Введите ещё раз в формате ГГГГ-ММ-ДД:")
+            await update.message.reply_text(
+                "Дата рождения не может быть в будущем. Введите ещё раз в формате ГГГГ-ММ-ДД:",
+                reply_markup=get_skip_birthday_keyboard())
             return ENTER_BIRTHDAY
 
         user.birthday = birthday_str
@@ -17225,7 +17273,9 @@ async def enter_birthday_handler(update: Update, context: ContextTypes.DEFAULT_T
         return SHOW_INSTRUCTIONS
 
     except ValueError:
-        await update.message.reply_text("Введите дату в формате ГГГГ-ММ-ДД (например, 2005-04-15):")
+        await update.message.reply_text(
+            "Введите дату в формате ГГГГ-ММ-ДД (например, 2005-04-15):",
+            reply_markup=get_skip_birthday_keyboard())
         return ENTER_BIRTHDAY
 
 async def disclaimer_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -17248,10 +17298,13 @@ async def disclaimer_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if not user.setup_completed:
             # ПУНКТ 10: ручной ввод времени убран — часовой пояс определяется
             # автоматически по введённому городу.
+            # ПОЛИТИКА ПДн 1.2: город необязателен — есть «⏭ Пропустить».
             await query.edit_message_text(
                 "✅ Отлично!\n\n"
                 "🏙 Введите ваш город (например: Москва, Санкт-Петербург, Казань).\n"
-                "По нему я сам определю часовой пояс и настрою уведомления."
+                "По нему я сам определю часовой пояс и настрою уведомления.\n\n"
+                "Указывать необязательно: нажмите «⏭ Пропустить», если не хотите.",
+                reply_markup=get_skip_city_keyboard()
             )
             return ENTER_CITY
         else:
@@ -17295,55 +17348,32 @@ async def legal_info_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # (цели/перечень/права/сроки), явное согласие при регистрации, согласие
 # родителей для несовершеннолетних, передача по законному запросу
 # (149-ФЗ), правила Telegram. Текст БЕЗ markdown-спецсимволов.
+# ПОЛИТИКА 1.2 (по требованию пользователя): краткий текст в боте + полная
+# политика по ссылке telegra.ph; хранение — зашифрованный приватный
+# Telegram-канал (Supabase/Mongo в политике больше не упоминаются);
+# перечислены обработчики (Telegram, Groq, DeepSeek, WeatherAPI) и
+# трансграничная передача.
 
-PDN_POLICY_VERSION = "1.0"
+PDN_POLICY_VERSION = "1.2"
 
 _PRIVACY_TEXT = (
-    "🛡 ПОЛИТИКА ОБРАБОТКИ ПЕРСОНАЛЬНЫХ ДАННЫХ\n\n"
-    "Бот DEVORKS+ (далее — бот). Разработчик бота — оператор "
-    "персональных данных в смысле Федерального закона №152-ФЗ "
-    "«О персональных данных». Версия политики: " + PDN_POLICY_VERSION + ".\n\n"
-    "1. КАКИЕ ДАННЫХ ОБРАБАТЫВАЮТСЯ\n"
-    "• Telegram-ID и имя (и @username, если вы его используете);\n"
-    "• дата рождения (напоминания/поздравления, возрастные функции);\n"
-    "• город (погода и часовой пояс);\n"
-    "• сообщения и файлы, которые вы отправляете боту: домашние задания, "
-    "расписание, решения, таймеры, анонимные сообщения, переписка с "
-    "поддержкой, предложения;\n"
-    "• обезличенные счётчики использования функций.\n\n"
-    "2. ЦЕЛИ ОБРАБОТКИ\n"
-    "Только работа функций бота: расписание и ДЗ, уведомления и "
-    "напоминания, погода, Сейф, база решений, опросы, поддержка. "
-    "Никакой рекламы. Данные не продаются и не передаются третьим лицам.\n\n"
-    "3. ОСНОВАНИЕ И СОГЛАСИЕ\n"
-    "Обработка — на основании вашего согласия (п. 1 ч. 1 ст. 6 152-ФЗ), "
-    "которое вы даёте кнопкой «Согласен на обработку ПДн» при регистрации. "
-    "Пользователям до 18 лет необходимо согласие родителей: оно "
-    "подтверждается отдельной кнопкой при регистрации. Согласие можно "
-    "отозвать в любой момент: ⚙️ Настройки → «🗑 Удалить мои данные».\n\n"
-    "4. ЗАЩИТА ДАННЫХ\n"
-    "Всё хранилище шифруется AES-256-GCM; ключ шифрования хранится "
-    "отдельно от бота. Файлы Сейфа шифруются паролем владельца — их "
-    "содержимое не видит даже разработчик. Данные не публикуются.\n\n"
-    "5. КОГДА ДАННЫЕ МОГУТ БЫТЬ ПЕРЕДАНЫ\n"
-    "• Telegram — как инфраструктура доставки сообщений "
-    "(telegram.org/privacy);\n"
-    "• государственным органам РФ — ТОЛЬКО по законному запросу "
-    "(149-ФЗ, 152-ФЗ): при поступлении законного требования передача "
-    "обязательна по закону;\n"
-    "• больше никому.\n\n"
-    "6. СРОКИ ХРАНЕНИЯ И ВАШИ ПРАВА\n"
-    "Данные хранятся, пока вы пользуетесь ботом. Вы имеете право "
-    "уточнить, исправить и удалить свои данные: правка — в разделах "
-    "настроек (имя, город, ДР), удаление — кнопкой «🗑 Удалить мои "
-    "данные» в ⚙️ Настройках: аккаунт, таймеры, анонимные сообщения, "
-    "личные кнопки и share-ссылки удаляются сразу, копии обновляются "
-    "при ближайшей ротации резервных копий.\n\n"
-    "7. ПРАВИЛА TELEGRAM\n"
-    "Использование бота регулируется также правилами Telegram "
-    "(telegram.org/tos).\n\n"
-    "8. ВОПРОСЫ\n"
-    "По обработке ПДн — «💬 Написать админу» в боте."
+    "🛡 ПОЛИТИКА ОБРАБОТКИ ПЕРСОНАЛЬНЫХ ДАННЫХ (версия " + PDN_POLICY_VERSION + ")\n\n"
+    "Полная политика доступна по ссылке:\n"
+    "https://telegra.ph/Politika-obrabotki-personalnyh-dannyh-09-19-2\n\n"
+    "Кратко:\n"
+    "• Обрабатываются: Telegram-ID, имя, дата рождения, город, "
+    "сообщения и файлы.\n"
+    "• Цель — только работа функций бота (расписание, ДЗ, погода, "
+    "Сейф, опросы, поддержка).\n"
+    "• Основание — ваше согласие (п. 1 ч. 1 ст. 6 152-ФЗ), "
+    "отзывается кнопкой «🗑 Удалить мои данные».\n"
+    "• Данные хранятся в зашифрованном виде в приватном "
+    "Telegram-канале. Ключ шифрования хранится отдельно от бота.\n"
+    "• Данные передаются обработчикам: Telegram, Groq, DeepSeek, "
+    "WeatherAPI (полный список — по ссылке).\n"
+    "• Часть данных хранится за пределами РФ (трансграничная передача).\n\n"
+    "Нажимая «✅ Согласен(на) на обработку ПДн», вы подтверждаете, что "
+    "ознакомились с полной политикой по ссылке выше."
 )
 
 _PDN_CONSENT_TEXT = (
@@ -17362,6 +17392,8 @@ _PDN_CONSENT_TEXT = (
     "отдельным шагом.\n\n"
     "Нажимая «✅ Согласен(на) на обработку ПДн», вы даёте согласие на "
     "обработку ваших персональных данных (п. 1 ч. 1 ст. 6 152-ФЗ)."
+    "\n\nПолная политика: "
+    "https://telegra.ph/Politika-obrabotki-personalnyh-dannyh-09-19-2"
 )
 
 _PDN_DECLINE_TEXT = (
@@ -17434,10 +17466,13 @@ async def _pdn_continue_after_consent(update, context, user):
     """Общий хвост согласия: город (первые шаги) или главное меню."""
     if hasattr(update, "callback_query") and update.callback_query:
         if not user.setup_completed:
+            # ПОЛИТИКА ПДн 1.2: город необязателен — есть «⏭ Пропустить».
             await update.callback_query.edit_message_text(
                 "✅ Спасибо!\n\n"
                 "🏙 Введите ваш город (например: Москва, Санкт-Петербург, Казань).\n"
-                "По нему я сам определю часовой пояс и настрою уведомления."
+                "По нему я сам определю часовой пояс и настрою уведомления.\n\n"
+                "Указывать необязательно: нажмите «⏭ Пропустить», если не хотите.",
+                reply_markup=get_skip_city_keyboard()
             )
             return ENTER_CITY
         await show_main_menu(update, context, user)
@@ -17447,8 +17482,9 @@ async def _pdn_continue_after_consent(update, context, user):
         await update.message.reply_text(
             "✅ Спасибо!\n\n"
             "🏙 Введите ваш город (например: Москва, Санкт-Петербург, Казань).\n"
-            "По нему я сам определю часовой пояс и настрою уведомления.",
-            reply_markup=get_cancel_keyboard()
+            "По нему я сам определю часовой пояс и настрою уведомления.\n\n"
+            "Указывать необязательно: нажмите «⏭ Пропустить», если не хотите.",
+            reply_markup=get_skip_city_keyboard()
         )
         return ENTER_CITY
     await show_main_menu(update, context, user)
@@ -17716,12 +17752,15 @@ async def instructions_read_handler(update: Update, context: ContextTypes.DEFAUL
     user.instructions_read = True
     save_user(user)
 
-    # Дальше — регистрация как раньше
-    if not user.birthday:
+    # Дальше — регистрация как раньше.
+    # ПОЛИТИКА ПДн 1.2: пропущенный ранее ДР (birthday_skipped) повторно не спрашиваем.
+    if not user.birthday and not getattr(user, "birthday_skipped", False):
         await query.edit_message_text(
             "👋 Добро пожаловать в DEVORKS+! Давайте настроим ваш профиль.\n\n"
             "🎂 Введите вашу реальную дату рождения в формате ГГГГ-ММ-ДД (например, 2005-04-15):\n\n"
-            "Бот будет напоминать вам о дне рождения и может поздравить вас в классе!"
+            "Бот будет напоминать вам о дне рождения и может поздравить вас в классе!\n\n"
+            "Указывать необязательно: нажмите «⏭ Пропустить», если не хотите.",
+            reply_markup=get_skip_birthday_keyboard()
         )
         return ENTER_BIRTHDAY
     elif not user.disclaimer_accepted:
@@ -17734,9 +17773,12 @@ async def instructions_read_handler(update: Update, context: ContextTypes.DEFAUL
     elif not user.setup_completed:
         # ПУНКТ 10: ручной ввод времени убран — спрашиваем только город,
         # часовой пояс определяется автоматически.
+        # ПОЛИТИКА ПДн 1.2: город необязателен — есть «⏭ Пропустить».
         await query.edit_message_text(
             "🏙 Введите ваш город (например: Москва, Санкт-Петербург, Казань).\n"
-            "По нему я сам определю часовой пояс и настрою уведомления."
+            "По нему я сам определю часовой пояс и настрою уведомления.\n\n"
+            "Указывать необязательно: нажмите «⏭ Пропустить», если не хотите.",
+            reply_markup=get_skip_city_keyboard()
         )
         return ENTER_CITY
     else:
@@ -25634,6 +25676,37 @@ async def timer_set_text_handler(update: Update, context: ContextTypes.DEFAULT_T
     return MAIN_MENU
 
 # ==================================
+async def community_rules_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ПОЛИТИКА ПДн 1.2: правила сообщества (ст. 10.1 149-ФЗ) —
+    запрет недобросовестного контента, порядок жалоб, срок рассмотрения 24 часа."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    text = (
+        "📜 ПРАВИЛА СООБЩЕСТВА\n\n"
+        "В боте ЗАПРЕЩЕНЫ:\n"
+        "• угрозы, клевета, оскорбления;\n"
+        "• разжигание ненависти по любому признаку;\n"
+        "• NSFW, порнография, жестокость;\n"
+        "• призывы к незаконным действиям;\n"
+        "• спам, реклама без согласия;\n"
+        "• распространение чужих персональных данных.\n\n"
+        "Нарушители блокируются без предупреждения.\n\n"
+        "Жалобы на контент — через «💬 Чат поддержки».\n"
+        "Срок рассмотрения: 24 часа (ст. 10.1 149-ФЗ)."
+    )
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("⬅️ Назад", callback_data="back_to_settings")]])
+    try:
+        await query.edit_message_text(text, reply_markup=keyboard)
+    except Exception:
+        await context.bot.send_message(
+            chat_id=update.effective_user.id, text=text, reply_markup=keyboard)
+    return USER_SETTINGS
+
+
 # === ОБРАБОТЧИКИ CALLBACK ===
 # ==================================
 
@@ -26427,6 +26500,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await delete_my_data_cb(update, context)
     elif data == "delete_my_data_yes":
         return await delete_my_data_yes(update, context)
+    # ПОЛИТИКА ПДн 1.2 (ст. 10.1 149-ФЗ): правила сообщества.
+    elif data == "community_rules":
+        return await community_rules_cb(update, context)
+    # ПОЛИТИКА ПДн 1.2 (минимизация данных): пропуск необязательных шагов
+    # регистрации — города и даты рождения.
+    elif data == "skip_birthday":
+        return await skip_birthday_cb(update, context)
+    elif data == "skip_city":
+        return await skip_city_cb(update, context)
 
     return MAIN_MENU
 
@@ -27573,8 +27655,9 @@ async def enter_city_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     ok, canonical, _loc = await weather_validate_city_full(city_input)
     if not ok:
         await update.message.reply_text(
-            f"❌ Не удалось найти город «{city_input}». Проверьте написание и попробуйте снова:",
-            reply_markup=get_cancel_keyboard()
+            f"❌ Не удалось найти город «{city_input}». Проверьте написание и попробуйте снова:\n\n"
+            "Указывать необязательно: нажмите «⏭ Пропустить», если не хотите.",
+            reply_markup=get_skip_city_keyboard()
         )
         return ENTER_CITY
 
@@ -27637,6 +27720,63 @@ async def enter_city_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"а также уведомления о праздниках и пожелания. "
         f"Время можно изменить в ⚙️ Настройки → 🌦 Настройки погоды."
     )
+    await class_management(update, context)
+    return CLASS_MANAGEMENT
+
+
+async def skip_birthday_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ПОЛИТИКА ПДн 1.2 (минимизация данных): «⏭ Пропустить» на шаге ДР.
+
+    Пользователь не обязан указывать дату рождения: тогда напоминания и
+    поздравления с ДР просто не работают, а гейт /start больше не спрашивает
+    ДР (ставится флаг birthday_skipped). Регистрация продолжается обычным
+    путём — с экрана условий."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    user = get_user(str(query.from_user.id))
+    if not user:
+        await query.edit_message_text("Профиль не найден. Начните с /start")
+        return ConversationHandler.END
+    if not user.birthday:
+        user.birthday_skipped = True
+        save_user(user)
+    await show_disclaimer(update, context)
+    return SHOW_INSTRUCTIONS
+
+
+async def skip_city_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ПОЛИТИКА ПДн 1.2 (минимизация данных): «⏭ Пропустить» на шаге города.
+
+    Город не сохраняется — погода по городу просто не работает. Часовой
+    пояс ставится дефолтным UTC+3 (тот же fallback, что в
+    enter_city_handler при сбое определения). Город можно добавить позже:
+    ⚙️ Настройки → 🌦 Настройки погоды → 🏙 Город."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    user = get_user(str(query.from_user.id))
+    if not user:
+        await query.edit_message_text("Профиль не найден. Начните с /start")
+        return ConversationHandler.END
+    if not user.city:
+        user.timezone = 3  # дефолт UTC+3 — как fallback в enter_city_handler
+        user.set_time = datetime.now().isoformat()
+        user.setup_completed = True
+        save_user(user)
+    try:
+        await query.edit_message_text(
+            "✅ Хорошо, пропускаем.\n\n"
+            "🏙 Город можно добавить в любой момент:\n"
+            "⚙️ Настройки → 🌦 Настройки погоды → 🏙 Город.\n"
+            "🕒 Часовой пояс по умолчанию: UTC+3."
+        )
+    except Exception:
+        pass
     await class_management(update, context)
     return CLASS_MANAGEMENT
 
