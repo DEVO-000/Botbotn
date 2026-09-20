@@ -645,6 +645,25 @@ body.modal-open {
   </div>
 </div>
 
+<!-- 22.24: честное окно «нет доступа» (открыто вне Telegram / не зарегистрирован) -->
+<div id="authModal" class="modal-overlay" onclick="closeAuthModal(event)">
+  <div class="modal-card" onclick="event.stopPropagation()">
+    <div class="sheet-handle-area">
+      <div class="sheet-handle"></div>
+    </div>
+    <h3 style="font-weight:900;font-size:20px;margin-bottom:4px">Нет доступа к облаку</h3>
+    <p id="authText" style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:14px;line-height:1.5">Проверяем…</p>
+    <div style="display:flex;flex-direction:column;gap:8px">
+      <button class="sound-item-btn" id="authOpenBtn" onclick="openBotChat()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg);display:none">
+        <span>Открыть чат бота</span> <i data-lucide="send" style="width:18px;height:18px"></i>
+      </button>
+      <button class="sound-item-btn" onclick="closeAuthModal()">
+        <span>Понятно</span> <i data-lucide="x" style="width:18px;height:18px"></i>
+      </button>
+    </div>
+  </div>
+</div>
+
 <div class="main-wrapper">
 
   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
@@ -1159,8 +1178,47 @@ async function apiJson(url, options) {
   const r = await fetch(url, Object.assign({ headers: authHeaders() }, options || {}));
   let data = {};
   try { data = await r.json(); } catch (e) {}
-  if (!r.ok) throw new Error(data.message || ('HTTP ' + r.status));
+  if (!r.ok) {
+    const err = new Error(data.message || ('HTTP ' + r.status));
+    err.code = String(data.error || '');  // 22.24: код (unauthorized/not_registered/…)
+    err.bot = String(data.bot || '');     // 22.24: @username бота для кнопки «Открыть чат бота»
+    throw err;
+  }
   return data;
+}
+
+/* 22.24: честный текст сбоя облака. Ошибки сервера уже конкретны и по-русски
+   (401 «откройте через Telegram», 403 «бот не админ канала», 503 «бот ещё
+   запускается») — показываем их КАК ЕСТЬ; «Failed to fetch» — вот это по-
+   настоящему «нет связи», его и называем связью. */
+var AUTH_BOT = '';
+function cloudErrText(e) {
+  const m = (e && e.message) ? String(e.message) : '';
+  if (!m || /failed to fetch|networkerror|load failed|timed? ?out/i.test(m))
+    return 'Нет связи с сервером. Сервис мог просыпаться — попробуйте ещё раз через минуту.';
+  if (e && e.bot) AUTH_BOT = e.bot;
+  return m;
+}
+function showAuthCard(text) {
+  const card = document.getElementById('authModal');
+  if (!card) return;
+  document.getElementById('authText').textContent = text || 'Нет доступа к облаку.';
+  const btn = document.getElementById('authOpenBtn');
+  if (btn) btn.style.display = AUTH_BOT ? '' : 'none';
+  card.classList.add('open');
+  document.body.classList.add('modal-open');
+}
+function closeAuthModal(e) {
+  if (e) e.stopPropagation();
+  document.getElementById('authModal').classList.remove('open');
+  document.body.classList.remove('modal-open');
+}
+function openBotChat() {
+  const url = 'https://t.me/' + (AUTH_BOT || '');
+  try {
+    if (tg && tg.openTelegramLink) tg.openTelegramLink(url);
+    else window.open(url, '_blank');
+  } catch (e) { window.open(url, '_blank'); }
 }
 
 let ALL_FILES = [];
@@ -1179,7 +1237,11 @@ async function loadFiles(silent) {
     renderAll();
     return true;
   } catch (e) {
-    if (!silent) showToast('Нет связи с облаком: ' + e.message);
+    if (!silent) {
+      const t = cloudErrText(e); // 22.24: честная причина вместо слепого «нет связи»
+      showToast(t);
+      if (e && (e.code === 'unauthorized' || e.code === 'not_registered')) showAuthCard(t);
+    }
     return false;
   } finally {
     listLoading = false;
@@ -1680,7 +1742,9 @@ async function loadStorageStatus() {
   try {
     renderStorage(await apiJson('/api/storage'));
   } catch (e) {
-    box.textContent = 'Нет связи с облаком: ' + e.message;
+    const t = cloudErrText(e); // 22.24: честная причина, не «нет связи с облаком»
+    box.textContent = '⚠️ ' + t;
+    if (e && (e.code === 'unauthorized' || e.code === 'not_registered')) showAuthCard(t);
   }
 }
 
