@@ -464,6 +464,11 @@ DEV_STATS_PERIOD = 136  # 22.13: разработчик вводит произ�
 # родительское согласие для пользователей до 18 лет (оба — кнопки).
 PDN_CONSENT_WAIT = 137
 PARENT_CONSENT_WAIT = 138
+# ВОЛНА 22.20: «🔗 Моё облако» — пользователь подключает СВОЙ приватный
+# канал как личное хранилище Сейфа (пересылает сообщение из канала или
+# отправляет @username / -100…id). Панель разработчика тут ни при чём:
+# это НАСТРОЙКА САМОГО ПОЛЬЗОВАТЕЛЯ в его облаке.
+VAULT_MYCLOUD_WAIT = 139
 
 # ВОЛНА 22.4: «🎙 Пульт» удалён ПОЛНОСТЬЮ по решению пользователя — кнопки,
 # состояний (бывшие 126–131), хендлеров и хранилищ стилей больше нет.
@@ -485,7 +490,10 @@ _QUICK_SKIP_STATES = frozenset({VAULT_REN_WAIT, VAULT_LABEL_WAIT,
                                 VAULT_TAGS_WAIT, VAULT_SEARCH_WAIT,
                                 SHARE_INPUT_WAIT, SHARE_PIN_WAIT,
                                 DEV_STATS_PERIOD,
-                                PDN_CONSENT_WAIT, PARENT_CONSENT_WAIT})
+                                PDN_CONSENT_WAIT, PARENT_CONSENT_WAIT,
+                                # ВОЛНА 22.20: тут вводят @username/-100…id
+                                # своего канала — это не команда.
+                                VAULT_MYCLOUD_WAIT})
 
 # ==================================
 # === ВОЛНА 12: ГЛОБАЛЬНАЯ КНОПКА ОТМЕНЫ ===
@@ -1203,10 +1211,19 @@ async def health_check(request):
     return web.Response(text="OK", status=200)
 
 async def start_keep_alive_server():
-    """Запускает простой HTTP сервер для keep-alive"""
+    """Запускает HTTP сервер keep-alive.
+    ВОЛНА 22.21: на этом же сервере живёт МИНИ-АПП «DEVO+ Облако» —
+    HTML из miniapp/index.html (дизайн прислан пользователем, НЕ менялся)
+    плюс JSON API к ОСНОВНОЙ базе бота (/api/*). Раньше `/` отдавал только
+    «OK»; теперь отдаёт мини-апп (это тоже честный 200 для health-check),
+    а /health остаётся как был — self-ping и платформы проверяют его."""
     app = web.Application()
-    app.router.add_get('/', health_check)
     app.router.add_get('/health', health_check)
+    try:
+        mount_miniapp_routes(app)
+    except Exception as e:
+        logger.error(f"miniapp: не удалось смонтировать маршруты ({e}) — / работает как раньше")
+        app.router.add_get('/', health_check)
 
     runner = web.AppRunner(app)
     await runner.setup()
@@ -1215,7 +1232,12 @@ async def start_keep_alive_server():
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
 
-    logger.info(f"Keep-alive сервер запущен на порту {port}")
+    if _miniapp_html_path():
+        logger.info(f"Keep-alive сервер запущен на порту {port}: /health + мини-апп "
+                    f"«DEVO+ Облако» (/, /miniapp) + /api/* — реальная база бота")
+    else:
+        logger.warning(f"Keep-alive сервер запущен на порту {port}, но miniapp/index.html "
+                       f"не найден — мини-апп недоступен (файла нет в деплое).")
     return runner
 
 # ==================================
@@ -1766,6 +1788,27 @@ def get_cloud_channel_ids():
     """Каналы для файлов пользователей (режим cloud или both)."""
     return get_storage_channel_ids(("cloud", "both"))
 
+
+def _user_vault_channel(user):
+    """ВОЛНА 22.20: личный канал-хранилище пользователя («🔗 Моё облако»).
+
+    Пользователь сам подключает свой приватный канал в ☁️ Облако / 🔐 Сейф →
+    «🔗 Моё облако» — без всякой панели разработчика (та остаётся только у
+    разработчика). Возвращает (chat_id: int, title: str) или None."""
+    try:
+        vc = getattr(user, "vault_channel", None)
+    except Exception:
+        return None
+    if not isinstance(vc, dict):
+        return None
+    try:
+        cid = int(vc.get("id") or 0)
+    except (TypeError, ValueError):
+        return None
+    if not cid:
+        return None
+    return cid, str(vc.get("title") or cid)
+
 def get_storage_channel_id():
     """ЛЕГАЦИЯ + фолбэк: первый канал любого режима (или None).
 
@@ -2212,6 +2255,14 @@ class User:
         # жили только в inline-кнопке на сообщении — по просьбе пользователя
         # кнопки на сообщениях больше нет. Хранятся ТОЛЬКО номера сообщений.
         self.vault_kb_wipe = None
+        # === ВОЛНА 22.20: ЛИЧНЫЙ КАНАЛ-ХРАНИЛИЩЕ («🔗 Моё облако») ===
+        # {"id": int, "title": str, "added": "YYYY-MM-DD HH:MM"} или None.
+        # Если задан — шифры файлов Сейфа ЭТОГО пользователя уходят только в
+        # ЕГО канал (бот — администратор с правом публикации), а не в общие
+        # каналы разработчика. Указатели (msg_id/channel_id) живут в
+        # vault_files, поэтому выдача работает и после отключения канала —
+        # пока бот остаётся админом того канала.
+        self.vault_channel = None
         # === ВОЛНА 22.12: уведомления о новых решениях в базе класса ===
         # True (по умолчанию) — приходит сообщение «📚 Новое решение…»;
         # тоггл: ⚙️ Настройки → «🔔 Уведомления о решениях».
@@ -2259,6 +2310,8 @@ class User:
             'pdn_policy_version': self.pdn_policy_version,
             'parent_consent': self.parent_consent,
             'hidden_buttons': getattr(self, 'hidden_buttons', []),
+            # ВОЛНА 22.20: личный канал-хранилище («🔗 Моё облако»).
+            'vault_channel': getattr(self, 'vault_channel', None),
             # Погодные / праздничные поля (новые)
             'city': getattr(self, 'city', None),
             'weather_notifications': getattr(self, 'weather_notifications', True),
@@ -2387,6 +2440,12 @@ class User:
         # Бэк-совместимость: Сейф (список зашифрованных файлов).
         if not isinstance(getattr(user, 'vault_files', None), list):
             user.vault_files = []
+        # ВОЛНА 22.20: личный канал-хранилище («🔗 Моё облако»). None или
+        # dict с числовым id — всё остальное честно сбрасываем.
+        _vc = getattr(user, 'vault_channel', None)
+        if _vc is not None:
+            if not isinstance(_vc, dict) or not str(_vc.get('id') or '').lstrip('-').isdigit():
+                user.vault_channel = None
         # Бэк-совместимость, волна 9: пароль Сейфа и восстановление по вопросам.
         if not isinstance(getattr(user, 'vault_auth', None), dict):
             user.vault_auth = None
@@ -5784,25 +5843,31 @@ async def _storage_check_channel(context, channel_id):
 
 
 async def _storage_upload_document(context, data: bytes, filename: str, caption: str = "",
-                                   channel_id=None):
+                                   channel_id=None, user=None):
     """Загружает документ в канал-хранилище.
 
     НОВОЕ (волна 7): если channel_id не задан явно — грузим по КРУГУ во все
     cloud-каналы (указатель cloud_rr в конфиге), при ошибке пробуем следующий.
+    ВОЛНА 22.20: если у user подключён ЛИЧНЫЙ канал («🔗 Моё облако») и
+    channel_id не задан явно — шифр уходит ТОЛЬКО в него, минуя общие каналы.
     Возвращает ({"message_id", "file_id", "size", "channel_id"}) или None."""
     if channel_id:
         targets = [int(channel_id)]
     else:
-        cloud_ids = get_cloud_channel_ids()
-        if not cloud_ids:
-            return None
-        cfg = load_storage_config()
-        try:
-            rr = int(cfg.get("cloud_rr", 0) or 0)
-        except (TypeError, ValueError):
-            rr = 0
-        # Круговая очередь: начинаем с указателя, дальше по порядку.
-        targets = cloud_ids[rr % len(cloud_ids):] + cloud_ids[:rr % len(cloud_ids)]
+        _uch = _user_vault_channel(user)
+        if _uch:
+            targets = [_uch[0]]
+        else:
+            cloud_ids = get_cloud_channel_ids()
+            if not cloud_ids:
+                return None
+            cfg = load_storage_config()
+            try:
+                rr = int(cfg.get("cloud_rr", 0) or 0)
+            except (TypeError, ValueError):
+                rr = 0
+            # Круговая очередь: начинаем с указателя, дальше по порядку.
+            targets = cloud_ids[rr % len(cloud_ids):] + cloud_ids[:rr % len(cloud_ids)]
     for idx, ch in enumerate(targets):
         try:
             sent = await context.bot.send_document(
@@ -5813,7 +5878,8 @@ async def _storage_upload_document(context, data: bytes, filename: str, caption:
             doc = getattr(sent, "document", None)
             # Продвигаем указатель круговой загрузки (только общий путь).
             # Считаем от позиции канала в ИСХОДНОМ списке, а не в повёрнутом.
-            if not channel_id:
+            # ВОЛНА 22.20: у пользователя свой канал — круг не трогаем.
+            if not channel_id and not _user_vault_channel(user):
                 cloud_now = get_cloud_channel_ids()
                 if len(cloud_now) > 1 and ch in cloud_now:
                     try:
@@ -6757,12 +6823,16 @@ def _cloud_menu_text(user):
     # про старые незашифрованные файлы (их можно перенести в Сейф кнопкой 🔐).
     vault_files = [f for f in (getattr(user, "vault_files", []) or []) if isinstance(f, dict)]
     legacy = [f for f in (getattr(user, "cloud_files", []) or []) if isinstance(f, dict)]
-    if not get_cloud_channel_ids():
+    _uch = _user_vault_channel(user)
+    if not get_cloud_channel_ids() and not _uch:
         return (
             "☁️ Облако (всё в Сейфе)\n\n"
-            "❌ Хранилище пока не подключено: разработчик ещё не задал приватный "
-            "канал. Как только он это сделает, здесь появится бесплатное хранилище: "
-            "файлы шифруются вашим паролем и только потом уходят в канал."
+            "❌ Общее хранилище пока не подключено: разработчик ещё не задал "
+            "приватный канал. НО вы можете начать прямо сейчас: подключите "
+            "СВОЙ канал — 🔗 Моё облако → «➕ Подключить мой канал». Как "
+            "только канал будет подключен, здесь появится бесплатное "
+            "хранилище: файлы шифруются вашим паролем и только потом уходят "
+            "в канал."
         )
     total_enc = sum(int(f.get("size_enc", 0) or 0) for f in vault_files)
     total_legacy = sum(int(f.get("size", 0) or 0) for f in legacy)
@@ -6770,7 +6840,9 @@ def _cloud_menu_text(user):
     lines = [
         "☁️ Облако — всё в Сейфе\n\n"
         f"🔐 В Сейфе: {len(vault_files)} файл(ов) • {_fmt_bytes(total_enc)} шифра\n"
-        f"☁️ Каналов-хранилищ: {len(get_cloud_channel_ids())} • лимит: {limit} шт",
+        + (f"☁️ Хранилище: ВАШ личный канал «{_uch[1]}»"
+           if _uch else
+           f"☁️ Каналов-хранилищ: {len(get_cloud_channel_ids())} • лимит: {limit} шт"),
     ]
     if legacy:
         lines.append(
@@ -6802,6 +6874,8 @@ def get_cloud_menu_keyboard(user=None):
     rows = [
         [InlineKeyboardButton("🔐 Сейф (файлы под паролем)", callback_data="vault_menu")],
         [InlineKeyboardButton("📤 Загрузить в Сейф", callback_data="vault_put")],
+        # ВОЛНА 22.20: своя настройка облака — личный канал пользователя.
+        [InlineKeyboardButton("🔗 Моё облако", callback_data="vault_cloud")],
     ]
     if legacy:
         rows.append([InlineKeyboardButton(
@@ -6851,12 +6925,18 @@ def _cloud_files_text(user):
     shown = files[:30]
     lines = [f"🗂 СТАРЫЕ файлы без шифра ({len(files)}/{limit} • {_fmt_bytes(total)}):", ""]
     for rec in shown:
-        lines.append(f"• {rec.get('name', '?')} — {_fmt_bytes(rec.get('size', 0))} ({rec.get('ts', '')})")
+        # ВОЛНА 22.21: 🔒 — файл отмечен в Веб-облаке (Mini App) как Vault
+        # (отдельная папка просмотра, НЕ шифрование Сейфа).
+        _mv = "🔒 " if rec.get("va") else ""
+        lines.append(f"• {_mv}{rec.get('name', '?')} — {_fmt_bytes(rec.get('size', 0))} ({rec.get('ts', '')})")
     if len(files) > len(shown):
         lines.append(f"…и ещё {len(files) - len(shown)} шт.")
     lines.append("")
     lines.append("📥 — выдать файл; 📦 — за-ZIP-ить (LZMA, без потерь); "
                  "🔐 — перенести в Сейф (зашифрую и удалю оригинал); 🗑 — удалить.")
+    if any(isinstance(f, dict) and f.get("va") for f in files):
+        lines.append("🔒 — файлы, отмеченные «Vault» в 🌐 Веб-облаке (Mini App): "
+                     "это их отдельная папка просмотра, шифрованием Сейфа она не является.")
     return "\n".join(lines)
 
 
@@ -6894,8 +6974,10 @@ async def cloud_help_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     text = (
         "❓ Как работает облако (всё в Сейфе)\n\n"
-        "1. Разработчик подключает ОДИН ИЛИ НЕСКОЛЬКО приватных Telegram-каналов "
-        "(🛠️ Панель разработчика → ☁️ Хранилище) и делает бота их админом. "
+        "1. Хранилище — приватные Telegram-каналы: базовое (общее) "
+        "подключает разработчик и делает бота их админом. А ВЫ можете "
+        "подключить СВОЙ личный канал: 🔗 Моё облако (кнопка в меню) — "
+        "тогда шифры только ВАШИХ файлов будут уходить только в ВАШ канал. "
         "Telegram хранит файлы бесплатно и бессрочно.\n"
         "2. 🔐 ФАЙЛЫ ВСЕГДА В СЕЙФЕ: вы присылаете файл (или сразу ПАЧКУ) → "
         "придумываете пароль Сейфа → бот шифрует каждый файл (AES-256, ключ "
@@ -6914,11 +6996,15 @@ async def cloud_help_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "пароль, я перешифрую файлы, и данные снова доступны.\n"
         "7. 💡 СОВЕТ РАЗРАБОТЧИКА: если сомневаетесь в анонимности или "
         "стабильности облака бота — создайте СВОЙ приватный Telegram-канал, "
-        "добавьте туда бота администратором и подключите его (🛠️ Панель "
-        "разработчика → ☁️ Хранилище): шифры будут лежать только в вашем "
-        "канале, под вашим полным контролем.\n"
+        "добавьте туда бота администратором и подключите его в 🔗 Моём "
+        "облаке (кнопка в меню Сейфа и Облака — панель разработчика для "
+        "этого НЕ нужна, это настройка вас самого): шифры будут лежать "
+        "только в вашем канале, под вашим полным контролем.\n"
         "   📸 КАЧЕСТВО: фото/видео присылайте «КАК ФАЙЛ» (скрепка → Файл) — "
-        "без сжатия при отправке; выдача всегда документом, без пережатия.\n\n"
+        "без сжатия при отправке; выдача всегда документом, без пережатия. "
+        "🌐 Веб-облако (Mini App) принимает оригиналы БЕЗ сжатия — файл уходит "
+        "в канал документом — и показывает ТУ ЖЕ базу, что и чат: загрузили "
+        "в вебе — увидите в чате, и наоборот.\n\n"
         "Честные ограничения:\n"
         f"• в Сейф принимаю файлы до {_fmt_bytes(VAULT_MAX_FILE_BYTES)} сразу "
         "и ДО 2 ГБ в режиме больших файлов (потоковое шифрование через "
@@ -7270,6 +7356,535 @@ async def cloud_del_yes_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         await query.message.reply_text(f"🗑 «{rec.get('name', '?')}» удалено.{note}")
     return MAIN_MENU
+
+
+# =====================================================
+# === ВОЛНА 22.21: МИНИ-АПП «DEVO+ ОБЛАКО» — РЕАЛЬНАЯ БАЗА БОТА ===
+# =====================================================
+# Присланный пользователем HTML (дизайн НЕ менялся) раздаёт САМ ПРОЦЕСС БОТА
+# и работает с ОСНОВНОЙ базой: тот же users.json, тот же список cloud_files,
+# что видит чат. Раньше (22.19) мини-апп был отдельным Node-приложением со
+# СВОЕЙ базой на другом хостинге — файлы в чате и в вебе были разными
+# («соедини приложение с базой»). Теперь база одна, Node-хостинг не нужен.
+#
+# Маршруты (живут на keep-alive сервере, порт PORT, по умолчанию 8080):
+#   GET    / , /miniapp          → miniapp/index.html (дизайн как есть)
+#   GET    /health               → keep-alive, как раньше
+#   GET    /api/files            → список файлов пользователя (cloud_files)
+#   PATCH  /api/files/<id>       → переименование / галочка Vault (флаг va)
+#   DELETE /api/files/<id>       → удалить файл (+ сообщение из канала)
+#   GET    /api/files/<id>/download → оригинал БАЙТ-В-БАЙТ (Bot API ≤20 МБ,
+#                                  дальше Telethon/MTProto — до 2 ГБ)
+#   POST   /api/upload/init|chunk|complete|abort → чанковая загрузка:
+#       файл собирается во временном файле (куски по ≤4 МБ от клиента),
+#       complete отправляет его В КАНАЛ КАК ДОКУМЕНТ (_storage_upload_document
+#       — БЕЗ сжатия: фото/видео не портятся, честный ответ на «съедает
+#       качество») и добавляет запись в ОСНОВНУЮ базу пользователя.
+# Канал заливки: ЛИЧНЫЙ канал («🔗 Моё облако») приоритетнее, иначе общий
+# круг — ровно как в чате. Авторизация: initData (HMAC-SHA256 по официальной
+# схеме Telegram, TTL 24 ч) в заголовке X-Telegram-Init-Data; только
+# зарегистрированные пользователи бота; каждая сессия загрузки привязана к
+# своему uid. ПАНЕЛИ РАЗРАБОТЧИКА В МИНИ-АППЕ НЕТ и не нужно: у каждого
+# пользователя — СВОИ файлы и СВОЯ настройка канала в боте («🔗 Моё облако»).
+
+_MINIAPP_PTB_APP = None        # ссылка на Application (ставится в _post_init)
+_MINIAPP_UPLOADS = {}          # uploadId → {path, name, mime, size, uid, received, ts}
+_MINIAPP_UPLOADS_TTL = 6 * 3600
+_MINIAPP_AUTH_TTL = 86400      # 24 часа — как рекомендует Telegram
+_MINIAPP_CHUNK = 4 * 1024 * 1024  # клиент шлёт кусками по 4 МБ (документация)
+
+
+class _MiniappCtx:
+    """Мост aiohttp → хелперы бота: у _storage_upload_document первый аргумент
+    — context с .bot. Даём лёгкую заглушку с application.bot (как _CtxStub
+    в _post_init)."""
+
+    __slots__ = ("bot",)
+
+    def __init__(self, bot):
+        self.bot = bot
+
+
+def _miniapp_html_path():
+    """Путь к miniapp/index.html рядом с main.py (None — файла нет)."""
+    try:
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "miniapp", "index.html")
+        return p if os.path.exists(p) else None
+    except Exception:
+        return None
+
+
+def _miniapp_tmpdir():
+    """Каталог временных файлов загрузки (внутри BOT_DATA_DIR/DATA_DIR, чтобы
+    переживать рестарты на хостингах с постоянным диском)."""
+    base = (_env("BOT_DATA_DIR") or _env("DATA_DIR") or "").strip()
+    d = (os.path.join(base, "miniapp_uploads") if base else
+         os.path.join(os.path.dirname(os.path.abspath(__file__)), "miniapp_uploads"))
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        d = os.path.join(os.path.dirname(os.path.abspath(__file__)), "miniapp_uploads")
+        os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _miniapp_err(status, code, message):
+    return web.json_response({"error": code, "message": message}, status=status)
+
+
+def _miniapp_verify_init_data(raw):
+    """Официальная валидация initData Telegram Mini Apps (HMAC-SHA256):
+    secret = HMAC_SHA256(key=b"WebAppData", data=BOT_TOKEN);
+    hash   = HMAC_SHA256(key=secret, data=data_check_string).
+    data_check_string — все поля, КРОМЕ hash (и необязательного signature,
+    добавленного новыми клиентами), по алфавиту, «k=v» через \\n.
+    Плюс честная проверка свежести (24 ч). Возвращает dict полей или None."""
+    if not raw or not BOT_TOKEN:
+        return None
+    try:
+        from urllib.parse import parse_qsl
+        pairs = parse_qsl(str(raw), keep_blank_values=True)
+        given = next((v for k, v in pairs if k == "hash"), "")
+        if not given:
+            return None
+        check_str = "\n".join(
+            f"{k}={v}" for k, v in sorted(pairs)
+            if k not in ("hash", "signature")
+        )
+        secret = hmac.new(b"WebAppData", BOT_TOKEN.encode("utf-8"), hashlib.sha256).digest()
+        calc = hmac.new(secret, check_str.encode("utf-8"), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(calc, given.lower()):
+            return None
+        try:
+            auth_date = int(dict(pairs).get("auth_date") or 0)
+        except (TypeError, ValueError):
+            return None
+        if not auth_date or abs(time.time() - auth_date) > _MINIAPP_AUTH_TTL:
+            return None
+        return dict(pairs)
+    except Exception as e:
+        logger.warning(f"miniapp auth: {e}")
+        return None
+
+
+async def _miniapp_user_from_request(request):
+    """(user, uid, None) — успех; (None, "", Response) — готовая ошибка."""
+    data = _miniapp_verify_init_data(request.headers.get("X-Telegram-Init-Data") or "")
+    if not data:
+        return None, "", _miniapp_err(
+            401, "unauthorized",
+            "Откройте облако через Telegram (кнопка меню бота «☁️ DEVO+» или "
+            "☁️ Облако → 🌐 Веб-облако): подпись Telegram не подтверждена.")
+    try:
+        u = json.loads(data.get("user") or "{}")
+        uid = str(int(u.get("id") or 0))
+    except (TypeError, ValueError):
+        return None, "", _miniapp_err(401, "unauthorized", "Профиль Telegram не распознан.")
+    if not uid:
+        return None, "", _miniapp_err(401, "unauthorized", "Профиль Telegram не распознан.")
+    user = get_user(uid)
+    if not user:
+        return None, uid, _miniapp_err(
+            401, "not_registered",
+            "Сначала зарегистрируйтесь в боте: откройте чат и отправьте /start.")
+    return user, uid, None
+
+
+def _miniapp_rec_out(rec):
+    """Запись cloud_files → JSON для мини-аппа (те же поля, что были в макете:
+    id/name/kind/size/ts/vault). Флаг va = галочка Vault из веб-облака."""
+    return {
+        "id": str(rec.get("id") or ""),
+        "name": str(rec.get("name") or "файл"),
+        "kind": str(rec.get("kind") or "document"),
+        "size": int(rec.get("size") or 0),
+        "ts": str(rec.get("ts") or ""),
+        "vault": bool(rec.get("va")),
+    }
+
+
+def _miniapp_kind_from(mime, name):
+    """Тип для фильтров мини-аппа по mime/расширению. Сам файл в канале
+    хранится ДОКУМЕНТОМ (без сжатия) — kind нужен только интерфейсу."""
+    m = (mime or "").lower()
+    if m.startswith("image/"):
+        return "photo"
+    if m.startswith("video/"):
+        return "video"
+    if m.startswith("audio/"):
+        return "audio"
+    n = (name or "").lower()
+    for ext, k in ((".jpg", "photo"), (".jpeg", "photo"), (".png", "photo"),
+                   (".gif", "photo"), (".webp", "photo"), (".heic", "photo"),
+                   (".mp4", "video"), (".mov", "video"), (".avi", "video"),
+                   (".mkv", "video"), (".webm", "video"),
+                   (".mp3", "audio"), (".wav", "audio"), (".ogg", "audio"),
+                   (".m4a", "audio"), (".flac", "audio")):
+        if n.endswith(ext):
+            return k
+    return "document"
+
+
+def _miniapp_content_disposition(name):
+    """RFC 5987: ascii-имя + filename* с UTF-8 (кириллица в скачивании)."""
+    try:
+        from urllib.parse import quote
+        safe = (name or "file").replace("\\", "_").replace('"', "'").replace("\r", "").replace("\n", "")
+        ascii_name = safe.encode("ascii", "replace").decode("ascii")
+        return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(safe)}"
+    except Exception:
+        return "attachment"
+
+
+def _miniapp_cleanup_uploads():
+    """Чистка зависших сессий загрузки (старше TTL или без файла)."""
+    now = time.time()
+    for k in list(_MINIAPP_UPLOADS.keys()):
+        s = _MINIAPP_UPLOADS.get(k)
+        if not s or (now - s.get("ts", now)) > _MINIAPP_UPLOADS_TTL or not os.path.exists(s.get("path", "")):
+            if s:
+                try:
+                    os.remove(s["path"])
+                except Exception:
+                    pass
+            _MINIAPP_UPLOADS.pop(k, None)
+
+
+async def miniapp_index(request):
+    """Отдаёт HTML мини-аппа (дизайн пользователя, без изменений)."""
+    path = _miniapp_html_path()
+    if path is None:
+        if request.path == "/":
+            # keep-alive как раньше: платформа проверяет корень на 200.
+            return web.Response(text="OK", status=200)
+        return web.Response(
+            status=503,
+            text="Мини-апп не найден: в деплое отсутствует файл miniapp/index.html",
+            content_type="text/plain", charset="utf-8")
+    try:
+        with open(path, "rb") as f:
+            body = f.read()
+    except Exception as e:
+        return web.Response(status=500, text=f"Не удалось прочитать miniapp/index.html: {e}",
+                            content_type="text/plain", charset="utf-8")
+    return web.Response(body=body, content_type="text/html", charset="utf-8",
+                        headers={"Cache-Control": "no-store"})
+
+
+async def miniapp_files_get(request):
+    """Список файлов ОСНОВНОГО облака пользователя (та же база, что в чате)."""
+    user, _uid, err = await _miniapp_user_from_request(request)
+    if err is not None:
+        return err
+    files = [f for f in (getattr(user, "cloud_files", []) or []) if isinstance(f, dict)]
+    total = sum(int(f.get("size", 0) or 0) for f in files)
+    return web.json_response({
+        "files": [_miniapp_rec_out(f) for f in files],
+        "stats": {"count": len(files), "size": total},
+        "limit": get_price('cloud_max_files', 50),
+    })
+
+
+async def miniapp_files_patch(request):
+    """Переименование и галочка Vault — прямо в записи ОСНОВНОЙ базы."""
+    user, _uid, err = await _miniapp_user_from_request(request)
+    if err is not None:
+        return err
+    rec = _cloud_find_record(user, request.match_info["fid"])
+    if not rec:
+        return _miniapp_err(404, "not_found", "Файл не найден (возможно, уже удалён).")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if "name" in body:
+        new_name = str(body.get("name") or "").strip()
+        if not new_name:
+            return _miniapp_err(400, "bad_name", "Пустое имя файла.")
+        rec["name"] = new_name[:120]
+    if "vault" in body:
+        rec["va"] = bool(body.get("vault"))
+    save_user(user)
+    return web.json_response({"file": _miniapp_rec_out(rec)})
+
+
+async def miniapp_files_delete(request):
+    """Удаление файла: стирает сообщение из канала (как cloud_del_yes_cb,
+    best-effort) и запись из ОСНОВНОЙ базы."""
+    user, _uid, err = await _miniapp_user_from_request(request)
+    if err is not None:
+        return err
+    rec = _cloud_find_record(user, request.match_info["fid"])
+    if not rec:
+        return _miniapp_err(404, "not_found", "Файл не найден (возможно, уже удалён).")
+    app = _MINIAPP_PTB_APP
+    channel_id = rec.get("channel_id") or get_storage_channel_id()
+    if app is not None and channel_id:
+        try:
+            await app.bot.delete_message(chat_id=channel_id, message_id=int(rec["msg_id"]))
+        except Exception:
+            pass  # не смогли стереть из канала — из списка всё равно убираем
+    user.cloud_files = [
+        f for f in (getattr(user, "cloud_files", []) or [])
+        if not (isinstance(f, dict) and f.get("id") == request.match_info["fid"])
+    ]
+    save_user(user)
+    return web.json_response({"ok": True})
+
+
+async def miniapp_files_download(request):
+    """Оригинал байт-в-байт. Путь 1: Bot API (≤20 МБ, есть file_id) — быстрый.
+    Путь 2: Telethon/MTProto по (channel_id, msg_id) — до 2 ГБ (большие
+    файлы, залитые через веб, лежат в канале без file_id Bot API)."""
+    user, _uid, err = await _miniapp_user_from_request(request)
+    if err is not None:
+        return err
+    rec = _cloud_find_record(user, request.match_info["fid"])
+    if not rec:
+        return _miniapp_err(404, "not_found", "Файл не найден (возможно, уже удалён).")
+    name = str(rec.get("name") or "file")
+    size = int(rec.get("size") or 0)
+    app = _MINIAPP_PTB_APP
+    fid = rec.get("file_id")
+
+    # Путь 1: Bot API — быстрый, для файлов ≤20 МБ (или размер неизвестен).
+    if app is not None and fid and size <= 20 * 1024 * 1024:
+        try:
+            tg_file = await app.bot.get_file(fid)
+            buf = await tg_file.download_as_bytearray()
+            return web.Response(
+                body=bytes(buf),
+                content_type="application/octet-stream",
+                headers={
+                    "Content-Disposition": _miniapp_content_disposition(name),
+                    "Cache-Control": "no-store",
+                })
+        except Exception as e:
+            logger.warning(f"miniapp download: Bot API не отдал файл ({e}); пробую MTProto")
+
+    # Путь 2: MTProto.
+    client = await _mt_client()
+    if client is None:
+        return _miniapp_err(
+            503, "mt_unavailable",
+            "Большие файлы (больше 20 МБ) сейчас недоступны: "
+            + (_MT_LAST_ERR or "MTProto не подключён")
+            + ". Скачайте файл через чат: ☁️ Облако → 📥 у файла.")
+    channel_id = rec.get("channel_id") or get_storage_channel_id()
+    if not channel_id or not rec.get("msg_id"):
+        return _miniapp_err(404, "no_source",
+                            "Источник файла недоступен (нет канала/сообщения).")
+    tmppath = os.path.join(_miniapp_tmpdir(), f"dl_{rec.get('id', 'x')}_{os.getpid()}.part")
+    try:
+        _msg, doc = await _mt_fetch_document(client, int(channel_id), int(rec["msg_id"]))
+        if doc is None:
+            raise RuntimeError("в сообщении канала нет документа")
+        doc_size = int(getattr(doc, "size", 0) or size or 0)
+        with open(tmppath, "wb") as sink_file:
+            await _mt_download_stream(
+                client, doc, doc_size,
+                lambda chunk: sink_file.write(chunk))
+        response = web.StreamResponse(status=200, headers={
+            "Content-Type": "application/octet-stream",
+            "Content-Disposition": _miniapp_content_disposition(name),
+            "Cache-Control": "no-store",
+        })
+        if doc_size:
+            response.content_length = doc_size
+        await response.prepare(request)
+        with open(tmppath, "rb") as f:
+            while True:
+                chunk = f.read(1024 * 1024)
+                if not chunk:
+                    break
+                await response.write(chunk)
+        await response.write_eof()
+        return response
+    except Exception as e:
+        logger.error(f"miniapp download MTProto: {e}")
+        try:
+            return _miniapp_err(502, "download_failed",
+                                f"Не удалось скачать файл из хранилища ({e}). "
+                                "Попробуйте через чат: ☁️ Облако → 📥.")
+        except Exception:
+            return _miniapp_err(502, "download_failed", "Не удалось скачать файл.")
+    finally:
+        try:
+            os.remove(tmppath)
+        except Exception:
+            pass
+
+
+async def miniapp_upload_init(request):
+    """Старт загрузки: проверяем лимиты, создаём сессию + временный файл."""
+    user, uid, err = await _miniapp_user_from_request(request)
+    if err is not None:
+        return err
+    try:
+        body = await request.json()
+    except Exception:
+        return _miniapp_err(400, "bad_json", "Ожидался JSON.")
+    name = (str(body.get("name") or "").strip() or "file.bin")[:120]
+    mime = str(body.get("mime") or "")[:120]
+    try:
+        size = int(body.get("size") or 0)
+    except (TypeError, ValueError):
+        size = 0
+    if size < 0:
+        return _miniapp_err(400, "bad_size", "Некорректный размер файла.")
+    if size > VAULT_MTPROTO_MAX_BYTES:
+        return _miniapp_err(
+            413, "too_big",
+            f"Файл больше {_fmt_bytes(VAULT_MTPROTO_MAX_BYTES)} — Telegram не "
+            "пропускает даже через MTProto. Разделите файл на части.")
+    files = [f for f in (getattr(user, "cloud_files", []) or []) if isinstance(f, dict)]
+    limit = get_price('cloud_max_files', 50)
+    if len(files) >= limit:
+        return _miniapp_err(
+            409, "limit",
+            f"Лимит облака ({limit} файлов) достигнут — удалите что-нибудь "
+            "(в вебе или в чате: 🗑 у файла).")
+    _miniapp_cleanup_uploads()
+    upload_id = ''.join(random.choices(string.ascii_lowercase + string.digits, k=16))
+    path = os.path.join(_miniapp_tmpdir(), upload_id + ".part")
+    open(path, "wb").close()
+    _MINIAPP_UPLOADS[upload_id] = {
+        "path": path, "name": name, "mime": mime, "size": size,
+        "uid": uid, "received": 0, "ts": time.time(),
+    }
+    return web.json_response({"uploadId": upload_id, "chunkSize": _MINIAPP_CHUNK})
+
+
+async def miniapp_upload_chunk(request):
+    """Кусок файла (≤4 МБ, application/octet-stream): дописываем на диск."""
+    user, uid, err = await _miniapp_user_from_request(request)
+    if err is not None:
+        return err
+    s = _MINIAPP_UPLOADS.get(request.query.get("uploadId", ""))
+    if not s or s.get("uid") != uid:
+        return _miniapp_err(404, "session_not_found",
+                            "Загрузка не найдена или устарела — начните заново.")
+    data = await request.read()
+    if not data and s["size"] > 0:
+        return _miniapp_err(400, "empty_chunk", "Пустой кусок данных.")
+    if s["received"] + len(data) > s["size"]:
+        return _miniapp_err(400, "size_mismatch",
+                            "Размер данных превысил заявленный — начните загрузку заново.")
+    with open(s["path"], "ab") as f:
+        f.write(data)
+    s["received"] += len(data)
+    s["ts"] = time.time()
+    return web.json_response({"received": s["received"], "size": s["size"]})
+
+
+async def miniapp_upload_abort(request):
+    """Отмена загрузки: сессия и временный файл стираются (идемпотентно)."""
+    user, uid, err = await _miniapp_user_from_request(request)
+    if err is not None:
+        return err
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    s = _MINIAPP_UPLOADS.pop(str(body.get("uploadId") or ""), None)
+    if s and s.get("uid") == uid:
+        try:
+            os.remove(s["path"])
+        except Exception:
+            pass
+    return web.json_response({"ok": True})
+
+
+async def miniapp_upload_complete(request):
+    """Файл собран: отправляем его В КАНАЛ КАК ДОКУМЕНТ (без сжатия!) и
+    дописываем запись в ОСНОВНУЮ базу пользователя.
+    ≤49 МБ — Bot API (_storage_upload_document, личный канал приоритетнее),
+    больше — MTProto (_mt_upload_container, до 2 ГБ)."""
+    user, uid, err = await _miniapp_user_from_request(request)
+    if err is not None:
+        return err
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    s = _MINIAPP_UPLOADS.pop(str(body.get("uploadId") or ""), None)
+    if not s or s.get("uid") != uid:
+        return _miniapp_err(404, "session_not_found",
+                            "Загрузка не найдена или устарела — начните заново.")
+    # ВАЖНО: _mt_upload_container может ПЕРЕИМЕНОВАТЬ временный файл — чистим оба пути.
+    mt_renamed = os.path.join(os.path.dirname(s["path"]), s["name"] or "file.bin")
+    try:
+        if s["size"] and s["received"] != s["size"]:
+            return _miniapp_err(
+                400, "incomplete",
+                f"Получено {s['received']} из {s['size']} байт — загрузка не завершена.")
+        name = s["name"]
+        size = s["size"]
+        app = _MINIAPP_PTB_APP
+        sent = None
+        if size <= STORAGE_MAX_FILE_BYTES:
+            if app is None:
+                return _miniapp_err(503, "no_bot",
+                                    "Бот ещё не завершил запуск — попробуйте через минуту.")
+            with open(s["path"], "rb") as f:
+                data = f.read()
+            sent = await _storage_upload_document(
+                _MiniappCtx(app.bot), data, filename=name,
+                caption=name[:100], user=user)
+        else:
+            client = await _mt_client()
+            if client is None:
+                return _miniapp_err(
+                    503, "mt_unavailable",
+                    "Файлы больше 49 МБ требуют MTProto (Telethon) на сервере: "
+                    + (_MT_LAST_ERR or "недоступен")
+                    + ". Загрузите такой файл через чат «как файл» (до 2 ГБ).")
+            sent = await _mt_upload_container(
+                client, s["path"], size, name[:100], filename=name, user=user)
+        if not sent:
+            return _miniapp_err(
+                502, "upload_failed",
+                "Telegram не принял файл в хранилище. Проверьте канал "
+                "(бот должен быть его админом с правом публикации) и попробуйте ещё раз.")
+        rec = {
+            "id": _cloud_gen_file_id(user),
+            "name": name[:120],
+            "kind": _miniapp_kind_from(s["mime"], name),
+            "msg_id": int(sent.get("message_id") or 0),
+            "file_id": sent.get("file_id"),
+            "size": size,
+            "mime": s["mime"],
+            "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "channel_id": sent.get("channel_id"),
+            "src": "web",  # загружено через Веб-облако
+        }
+        user.cloud_files = [f for f in (getattr(user, "cloud_files", []) or [])
+                            if isinstance(f, dict)]
+        user.cloud_files.append(rec)
+        save_user(user)
+        return web.json_response({"file": _miniapp_rec_out(rec)})
+    finally:
+        for p in (s["path"], mt_renamed):
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+
+
+def mount_miniapp_routes(app):
+    """Добавляет маршруты мини-аппа в aiohttp-приложение (keep-alive сервер).
+    Один вызов из start_keep_alive_server; падение здесь не роняет бот."""
+    app.router.add_get("/", miniapp_index)
+    app.router.add_get("/miniapp", miniapp_index)
+    app.router.add_get("/api/files", miniapp_files_get)
+    app.router.add_patch("/api/files/{fid}", miniapp_files_patch)
+    app.router.add_delete("/api/files/{fid}", miniapp_files_delete)
+    app.router.add_get("/api/files/{fid}/download", miniapp_files_download)
+    app.router.add_post("/api/upload/init", miniapp_upload_init)
+    app.router.add_post("/api/upload/chunk", miniapp_upload_chunk)
+    app.router.add_post("/api/upload/complete", miniapp_upload_complete)
+    app.router.add_post("/api/upload/abort", miniapp_upload_abort)
 
 
 async def cloud_exit_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8794,13 +9409,16 @@ def _vault_find_record(user, vid):
 def _vault_menu_text(user):
     files = [f for f in (getattr(user, "vault_files", []) or []) if isinstance(f, dict)]
     total_enc = sum(int(f.get("size_enc", 0) or 0) for f in files)
+    _uch = _user_vault_channel(user)
     channels_n = len(get_cloud_channel_ids())
-    if not channels_n:
+    if not channels_n and not _uch:
         return (
             "🔐 Сейф\n\n"
-            "❌ Хранилище не подключено: разработчик ещё не задал приватный "
-            "канал. Сейф хранит зашифрованные файлы в том же канале, что и "
-            "облако — пока канала нет, шифровать некуда."
+            "❌ Хранилище пока не подключено. Общее подключает разработчик, "
+            "НО вы можете начать прямо сейчас: подключите СВОЙ приватный "
+            "канал — 🔗 Моё облако → «➕ Подключить мой канал». Сейф хранит "
+            "зашифрованные файлы в приватном канале — пока канала нет, "
+            "шифровать некуда."
         )
     if not _vault_kdf_available():
         return (
@@ -8808,10 +9426,14 @@ def _vault_menu_text(user):
             "шифрования. Разработчику нужно выполнить:\n"
             "pip install cryptography"
         )
+    if _uch:
+        storage_line = f"☁️ Хранилище: ВАШ личный канал «{_uch[1]}»"
+    else:
+        storage_line = f"☁️ Каналов-хранилищ: {channels_n}"
     return (
         "🔐 Сейф — шифрованное хранилище\n\n"
         f"🔒 Файлов: {len(files)} • зашифровано {_fmt_bytes(total_enc)}\n"
-        f"☁️ Каналов-хранилищ: {channels_n}\n\n"
+        f"{storage_line}\n\n"
         "ОДИН ПАРОЛЬ открывает весь Сейф. Файлы шифруются им (AES-256, ключ "
         "выводится 600 000 раундами) и уходят в канал только шифром — открыть "
         "не сможет никто: ни разработчик, ни владелец сервера, ни Telegram.\n\n"
@@ -9707,14 +10329,20 @@ async def _mt_download_stream(client, doc, doc_size, sink, progress=None, title=
 
 
 async def _mt_upload_container(client, path, size, caption, filename=None,
-                               progress_cb=None):
+                               progress_cb=None, user=None):
     """Заливает ГОТОВЫЙ шифр-контейнер в cloud-канал через MTProto
     (Bot API не умеет больше 50 МБ). Каналы пробует по порядку.
+    ВОЛНА 22.20: если у user подключён ЛИЧНЫЙ канал («🔗 Моё облако») —
+    контейнер уходит ТОЛЬКО в него, минуя общие каналы.
     ВОЛНА 22.12: progress_cb(current, total) — живая полоса прогресса.
     Возвращает {"message_id", "file_id", "size", "channel_id"} или None."""
     # ВОЛНА 16: каналы «только для базы» тоже годятся для шифров Сейфа —
     # раньше при пустом cloud-списке заливка отказывала, хотя канал был.
-    targets = get_cloud_channel_ids() or get_db_channel_ids()
+    _uch = _user_vault_channel(user)
+    if _uch:
+        targets = [_uch[0]]
+    else:
+        targets = get_cloud_channel_ids() or get_db_channel_ids()
     if not targets:
         return None
     upload_path = path
@@ -10092,7 +10720,8 @@ async def _vault_seal_item_mtproto_once(msg, context, user, item, password,
                 enc_bytes = fh.read()
             try:
                 up = await _storage_upload_document(
-                    context, enc_bytes, filename=_vault_fn, caption=_vault_cap)
+                    context, enc_bytes, filename=_vault_fn, caption=_vault_cap,
+                    user=user)
             finally:
                 enc_bytes = b""
             # ВОЛНА 18: Bot API отказал — шифр ≤48 МБ можно залить и MTProto.
@@ -10102,12 +10731,12 @@ async def _vault_seal_item_mtproto_once(msg, context, user, item, password,
                 up = await _mt_upload_container(
                     client, tmp_enc, enc_total,
                     caption=_vault_cap, filename=_vault_fn,
-                    progress_cb=_up_cb)
+                    progress_cb=_up_cb, user=user)
         else:
             up = await _mt_upload_container(
                 client, tmp_enc, enc_total,
                 caption=_vault_cap, filename=_vault_fn,
-                progress_cb=_up_cb)
+                progress_cb=_up_cb, user=user)
         if up is None:
             raise RuntimeError(
                 "шифр не принят каналом — проверьте, что бот администратор "
@@ -10411,7 +11040,7 @@ async def _vault_reencrypt_dvf2(msg, context, user, rec, old_pw, new_pw):
                         context, enc_bytes,
                         filename=f"vault_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{rec.get('id', 'f')}.bin",
                         caption="🔐 Сейф: зашифрованный файл (открыть без пароля невозможно).",
-                    )
+                        user=user)
                 finally:
                     enc_bytes = b""
             else:
@@ -10419,7 +11048,7 @@ async def _vault_reencrypt_dvf2(msg, context, user, rec, old_pw, new_pw):
                     client, tmp_enc, enc_total,
                     caption="🔐 Сейф: зашифрованный файл (открыть без пароля невозможно).",
                     filename=f"vault_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{rec.get('id', 'f')}.bin",
-                )
+                    user=user)
             if up is None:
                 raise RuntimeError("новый шифр не удалось загрузить в канал")
         finally:
@@ -10456,6 +11085,9 @@ def get_vault_menu_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📥 Положить файл/текст", callback_data="vault_put")],
         [InlineKeyboardButton("📦 Мои файлы", callback_data="vault_files")],
+        # ВОЛНА 22.20: «🔗 Моё облако» — НАСТРОЙКА САМОГО ПОЛЬЗОВАТЕЛЯ:
+        # свой приватный канал как личное хранилище (без панели разработчика).
+        [InlineKeyboardButton("🔗 Моё облако", callback_data="vault_cloud")],
         # ВОЛНА 9: восстановление и управление вопросами — прямо в меню Сейфа.
         [InlineKeyboardButton("🔑 Забыл пароль (восстановить)", callback_data="vault_rec")],
         [InlineKeyboardButton("❓ Сменить секретные вопросы", callback_data="vault_qs")],
@@ -10596,15 +11228,286 @@ def _vault_help_text():
         "Придумывайте вопросы, ответ на которые знаете только вы.\n\n"
         "💡 СОВЕТ РАЗРАБОТЧИКА: если сомневаетесь в анонимности или "
         "стабильности облака бота — заведите СВОЙ приватный Telegram-канал, "
-        "добавьте туда бота администратором и подключите его в 🛠️ Панель "
-        "разработчика → ☁️ Хранилище. Тогда шифры ваших файлов будут лежать "
-        "только в вашем личном канале: вы полностью контролируете "
-        "хранилище, а бот — лишь инструмент шифрования.\n"
+        "добавьте туда бота администратором и подключите его в 🔗 Моём "
+        "облаке (кнопка в меню Сейфа и Облака): шифры ваших файлов будут "
+        "лежать только в вашем личном канале: вы полностью контролируете "
+        "хранилище, а бот — лишь инструмент шифрования. Панель разработчика "
+        "для этого НЕ нужна — это настройка вас самого.\n"
         "   📸 КАЧЕСТВО БЕЗ ПОТЕРЬ: фото и видео присылайте «КАК ФАЙЛ» "
         "(скрепка → «Файл», или «Отправить как файл» в меню вложения) — "
         "Telegram не сожмёт их при отправке; выдача всегда документом, "
-        "без пережатия."
+        "без пережатия. Оригиналы без сжатия принимает и 🌐 Веб-облако "
+        "(Mini App)."
     )
+
+
+# ============================================================
+# === ВОЛНА 22.20: «🔗 Моё облако» — ЛИЧНЫЙ канал-хранилище ===
+# ============================================================
+# По прямому требованию пользователя: «панель разработчика только у
+# разработчика», а у обычного пользователя СВОЯ настройка в его облаке.
+# Пользователь подключает свой приватный канал (бот — админ с правом
+# публикации), и шифры ЕГО загрузок уходят только в ЕГО канал. Это настройка
+# самого пользователя в ☁️ Облако / 🔐 Сейф → «🔗 Моё облако» — доступ к
+# 🛠️ Панели разработчика для неё НЕ нужен и не предполагается.
+
+
+def _vault_cloud_text(user):
+    """Экран «🔗 Моё облако»: статус личного канала + честные правила."""
+    _uch = _user_vault_channel(user)
+    if _uch:
+        return (
+            "🔗 Моё облако\n\n"
+            f"✅ Подключён ВАШ личный канал: «{_uch[1]}» ({_uch[0]}).\n\n"
+            "Шифры ВАШИХ новых загрузок Сейфа уходят ТОЛЬКО в него: ни "
+            "разработчик, ни Telegram не читают канал — там только шум, "
+            "открыть который может лишь ваш пароль. Файлы, уже лежащие в "
+            "общем хранилище, остаются там и открываются как раньше — у "
+            "каждого файла свой адрес.\n\n"
+            "❗ ВАЖНО: не удаляйте бота из вашего канала. Бот — администратор "
+            "с правом публикации; без него шифры в канале станут "
+            "недоступны (их не откроет никто — включая вас). Если случайно "
+            "удалили — верните бота в канал, и всё снова заработает.\n\n"
+            "ℹ️ Хотите вернуть загрузки в общее хранилище — «🗑 Отключить "
+            "мой канал» ниже (уже сохранённое никуда не денется)."
+        )
+    return (
+        "🔗 Моё облако — ваш личный канал\n\n"
+        "Сейчас шифры ваших загрузок лежат в общем хранилище бота. Если "
+        "хотите ПОЛНЫЙ контроль и независимость — подключите СВОЙ приватный "
+        "канал (это официальная рекомендация разработчика для всех, кому "
+        "важна анонимность и стабильность хранилища).\n\n"
+        "Как это работает:\n"
+        "1. Создайте свой канал в Telegram (можно приватный, без ссылки).\n"
+        "2. Добавьте этого бота администратором — право «Публикация "
+        "сообщений» обязательно.\n"
+        "3. Нажмите «➕ Подключить мой канал» и перешлите сюда ЛЮБОЕ "
+        "сообщение из вашего канала (или отправьте его @username / -100…id).\n\n"
+        "После проверки бот запомнит канал, и шифры ВАШИХ новых загрузок "
+        "будут уходить только в него: анонимно, под вашим полным контролем "
+        "— бот лишь инструмент шифрования. Общее хранилище разработчика "
+        "вами больше не используется.\n\n"
+        "🗑 Отключить можно в любой момент — уже сохранённые файлы останутся "
+        "доступны (пока бот остаётся админом их канала)."
+    )
+
+
+def get_vault_cloud_keyboard(user):
+    """Клавиатура «🔗 Моё облако»: зависит от того, подключён ли канал."""
+    _uch = _user_vault_channel(user)
+    rows = []
+    if _uch:
+        rows.append([InlineKeyboardButton("🔄 Заменить канал",
+                                          callback_data="vault_cloud_add")])
+        rows.append([InlineKeyboardButton("🗑 Отключить мой канал",
+                                          callback_data="vault_cloud_off")])
+    else:
+        rows.append([InlineKeyboardButton("➕ Подключить мой канал",
+                                          callback_data="vault_cloud_add")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="vault_menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def vault_cloud_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.20: экран «🔗 Моё облако» — настройка ЛИЧНОГО канала."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    user = get_user(str(query.from_user.id))
+    if not user:
+        try:
+            await query.answer("Сначала зарегистрируйтесь — /start", show_alert=True)
+        except Exception:
+            pass
+        return MAIN_MENU
+    try:
+        await query.edit_message_text(
+            _vault_cloud_text(user), reply_markup=get_vault_cloud_keyboard(user))
+    except Exception:
+        await query.message.reply_text(
+            _vault_cloud_text(user), reply_markup=get_vault_cloud_keyboard(user))
+    return MAIN_MENU
+
+
+async def vault_cloud_add_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.20: шаг «➕ Подключить мой канал» — ждём пересланное
+    сообщение из канала пользователя (или @username / -100…id)."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    user = get_user(str(query.from_user.id))
+    if not user:
+        try:
+            await query.answer("Сначала зарегистрируйтесь — /start", show_alert=True)
+        except Exception:
+            pass
+        return MAIN_MENU
+    try:
+        await query.edit_message_text(
+            "🔗 Подключение МОЕГО канала\n\n"
+            "1️⃣ Создайте свой канал (можно приватный).\n"
+            "2️⃣ Добавьте бота администратором — право «Публикация "
+            "сообщений» ОБЯЗАТЕЛЬНО.\n"
+            "3️⃣ Перешлите сюда ЛЮБОЕ сообщение из этого канала — или "
+            "отправьте его @username (для публичного) / числовой id "
+            "(-100…).\n\n"
+            "Я проверю, что бот — администратор канала с правом публикации, "
+            "и подключу его: шифры ваших новых загрузок Сейфа будут уходить "
+            "только туда.\n\n"
+            "«отмена» — выйти без изменений.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ Назад", callback_data="vault_cloud")]]),
+        )
+    except Exception:
+        pass
+    return VAULT_MYCLOUD_WAIT
+
+
+async def vault_cloud_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.20: принимает ЛИЧНЫЙ канал пользователя для «🔗 Моё облако».
+
+    Понимает: пересланное сообщение из канала/супергруппы, @username
+    публичного канала, числовой -100…id. Честно проверяет, что бот —
+    администратор канала с правом «Публикация сообщений», иначе отказ с
+    понятной причиной. Успех → user.vault_channel (id, title, дата)."""
+    msg = update.message
+    user_id = str(update.effective_user.id)
+    user = get_user(user_id)
+    if not user:
+        await msg.reply_text("Сначала зарегистрируйтесь — отправьте /start.")
+        return ConversationHandler.END
+    raw_text = (msg.text or "").strip()
+    low = raw_text.lower()
+    if (low in ("отмена", "cancel", "/cancel", "❌ отмена", "❌ отменить")
+            or "отмена" in low or "cancel" in low or "назад в меню" in low):
+        await msg.reply_text(
+            "Отменено — настройки облака не менялись.",
+            reply_markup=get_main_menu_keyboard(user))
+        return MAIN_MENU
+
+    # 1) Определяем канал: пересланное сообщение / @username / -100…id.
+    fwd = getattr(msg, "forward_from_chat", None)
+    target = None
+    if fwd is not None:
+        target = int(getattr(fwd, "id", 0) or 0)
+    elif raw_text.startswith("@") and len(raw_text) > 2 and " " not in raw_text:
+        target = raw_text
+    elif raw_text.startswith("-100") and raw_text[1:].isdigit():
+        target = int(raw_text)
+    else:
+        await msg.reply_text(
+            "Не похоже на канал. Перешлите ЛЮБОЕ сообщение ИЗ вашего канала "
+            "или отправьте его @username / -100…id. «отмена» — выйти.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ Назад", callback_data="vault_cloud")]]),
+        )
+        return VAULT_MYCLOUD_WAIT
+
+    # 2) Честная проверка: бот в канале и может публиковать.
+    try:
+        tc = await context.bot.get_chat(target)
+    except TGBadRequest as e:
+        await msg.reply_text(
+            "❌ Telegram не дал посмотреть канал: "
+            f"{(getattr(e, 'message', None) or e)}.\n"
+            "Проверьте: бот ДОБАВЛЕН в канал (администратором) и вы "
+            "переслали сообщение именно из него.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ Назад", callback_data="vault_cloud")]]),
+        )
+        return VAULT_MYCLOUD_WAIT
+    except Exception as e:
+        logger.warning(f"mycloud: get_chat не удался: {e}")
+        await msg.reply_text(
+            "❌ Не смог проверить канал (сбой сети?). Попробуйте ещё раз.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ Назад", callback_data="vault_cloud")]]),
+        )
+        return VAULT_MYCLOUD_WAIT
+    if str(getattr(tc, "type", "")) not in ("channel", "supergroup"):
+        await msg.reply_text(
+            "❌ Это не канал и не супергруппа. Нужен именно КАНАЛ "
+            "(можно приватный).",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ Назад", callback_data="vault_cloud")]]),
+        )
+        return VAULT_MYCLOUD_WAIT
+    try:
+        member = await context.bot.get_chat_member(tc.id, context.bot.id)
+    except Exception:
+        member = None
+    status = str(getattr(member, "status", "") or "")
+    can_post = bool(getattr(member, "can_post_messages", False))
+    if status != "administrator" or not can_post:
+        await msg.reply_text(
+            "❌ Бот не администратор этого канала (или без права «Публикация "
+            "сообщений»).\n\nДобавьте бота админом с этим правом и пришлите "
+            "сообщение из канала ещё раз — без права публикации шифрам "
+            "физически некуда лечь.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ Назад", callback_data="vault_cloud")]]),
+        )
+        return VAULT_MYCLOUD_WAIT
+
+    # 3) Сохраняем — и честно объясняем, что теперь где лежит.
+    title = str(getattr(tc, "title", "") or raw_text or tc.id)[:80]
+    user.vault_channel = {
+        "id": int(tc.id),
+        "title": title,
+        "added": datetime.now().strftime("%Y-%m-%d %H:%M"),
+    }
+    save_user(user)
+    _q_note = (
+        "\n\n📸 И СОВЕТ ПРО КАЧЕСТВО: фото/видео присылайте «КАК ФАЙЛ» "
+        "(скрепка → «Файл») или грузите оригиналы через 🌐 Веб-облако — "
+        "тогда в вашем канале будут лежать байты ровно с вашего устройства, "
+        "без сжатия Telegram."
+    )
+    await msg.reply_text(
+        "✅ Готово! Ваш личный канал подключён:\n"
+        f"«{title}» ({tc.id})\n\n"
+        "Шифры ВАШИХ новых загрузок Сейфа теперь уходят только в него — "
+        "общее хранилище бота больше не используется. Файлы, уже лежащие в "
+        "общем хранилище, открываются как раньше." + _q_note,
+        reply_markup=get_main_menu_keyboard(user),
+    )
+    return MAIN_MENU
+
+
+async def vault_cloud_off_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.20: «🗑 Отключить мой канал» — новые загрузки пойдут в
+    общее хранилище; уже сохранённые остаются в канале пользователя."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    user = get_user(str(query.from_user.id))
+    if not user:
+        try:
+            await query.answer("Сначала зарегистрируйтесь — /start", show_alert=True)
+        except Exception:
+            pass
+        return MAIN_MENU
+    user.vault_channel = None
+    save_user(user)
+    text = (
+        "🗑 Личный канал отключён.\n\n"
+        "Новые загрузки снова пойдут в общее хранилище бота. Файлы, уже "
+        "лежавшие в вашем канале, ОТКРЫВАЮТСЯ как раньше — у каждого файла "
+        "свой адрес; главное — не удаляйте бота из того канала."
+    )
+    try:
+        await query.edit_message_text(
+            text, reply_markup=get_vault_cloud_keyboard(user))
+    except Exception:
+        await query.message.reply_text(
+            text, reply_markup=get_vault_cloud_keyboard(user))
+    return MAIN_MENU
 
 
 @timeout(CONVERSATION_TIMEOUT)
@@ -10637,7 +11540,7 @@ async def vault_menu_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for key in ('vault_batch', 'vault_migrate_ids', 'vault_setup_pw', 'vault_qs_data',
                 'vault_qs_pw', 'vault_qs_stage', 'vault_rec_answers', 'vault_rec_oldpw',
                 'vault_batch_label',
-                'vault_ack_mid', 'vault_ack_last'):
+                'vault_ack_mid', 'vault_ack_last', 'vault_q_warned'):
         context.user_data.pop(key, None)
     await update.message.reply_text(_vault_menu_text(user), reply_markup=get_vault_menu_keyboard())
     return MAIN_MENU
@@ -10664,7 +11567,7 @@ async def vault_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
                 'vault_batch', 'vault_migrate_ids', 'vault_setup_pw', 'vault_qs_data',
                 'vault_qs_pw', 'vault_qs_stage', 'vault_rec_answers', 'vault_rec_oldpw',
                 'vault_batch_label',
-                'vault_ack_mid', 'vault_ack_last'):
+                'vault_ack_mid', 'vault_ack_last', 'vault_q_warned'):
         context.user_data.pop(key, None)
     try:
         await query.edit_message_text(_vault_menu_text(user), reply_markup=get_vault_menu_keyboard())
@@ -10690,11 +11593,15 @@ async def vault_put_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user:
         await query.answer("Сначала зарегистрируйтесь — /start", show_alert=True)
         return MAIN_MENU
-    if not get_cloud_channel_ids():
+    # ВОЛНА 22.20: если общего хранилища нет, но у пользователя подключён
+    # СВОЙ канал — Сейф полностью работает и без разработчика.
+    if not get_cloud_channel_ids() and not _user_vault_channel(user):
         try:
             await query.edit_message_text(
-                "❌ Хранилище не подключено. Попросите разработчика: "
-                "🛠️ Панель разработчика → ☁️ Хранилище → 🔗 Каналы.",
+                "❌ Общее хранилище пока не подключено. НО вы можете начать "
+                "СЕЙЧАС: подключите СВОЙ приватный канал — 🔗 Моё облако → "
+                "«➕ Подключить мой канал» (свой канал + бот админом = шифры "
+                "только в вашем канале, под вашим полным контролем).",
                 reply_markup=get_vault_menu_keyboard(),
             )
         except Exception:
@@ -10716,6 +11623,7 @@ async def vault_put_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop('vault_setup_pw', None)
     context.user_data.pop('vault_ack_mid', None)   # 22.19: новое уведомление
     context.user_data.pop('vault_ack_last', None)  # для новой сессии
+    context.user_data.pop('vault_q_warned', None)  # 22.20: совет про качество — заново
     try:
         await query.edit_message_text(
             "📥 Шифруем файлы в Сейфе\n\n"
@@ -10923,10 +11831,12 @@ async def vault_put_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop('vault_put_mode', None)
         await msg.reply_text("Сначала зарегистрируйтесь — отправьте /start.")
         return ConversationHandler.END
-    if not get_cloud_channel_ids():
+    if not get_cloud_channel_ids() and not _user_vault_channel(user):
         context.user_data.pop('vault_put_mode', None)
         await msg.reply_text(
-            "❌ Хранилище отключено. Попросите разработчика настроить каналы.",
+            "❌ Общего хранилища нет, и личный канал не подключён. "
+            "Подключите СВОЙ канал: 🔗 Моё облако → «➕ Подключить мой "
+            "канал» — тогда Сейф заработает без разработчика.",
             reply_markup=get_main_menu_keyboard(user),
         )
         return MAIN_MENU
@@ -10969,6 +11879,7 @@ async def vault_put_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop('vault_migrate_ids', None)
         context.user_data.pop('vault_ack_mid', None)   # 22.19: сессия закрыта
         context.user_data.pop('vault_ack_last', None)
+        context.user_data.pop('vault_q_warned', None)  # 22.20
         _cleaned = await _vault_cleanup_chat(context, msg.chat_id, _batch_clean, user=user)
         await msg.reply_text(
             "Отменено — ничего не зашифровано и не загружено."
@@ -11065,6 +11976,22 @@ async def vault_put_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _vext = name[name.rfind("."):].lower()[:12]
         name = _vcap[:100] + (_vext if _vext and not _vcap.lower().endswith(_vext) else "")
 
+    # ВОЛНА 22.20 (КАЧЕСТВО, честно): Telegram сжимает фото/видео, присланные
+    # НЕ «как файл», ЕЩЁ НА ОТПРАВКЕ в чат — бот получает уже сжатые байты и
+    # сохраняет/выдаёт их байт-в-байт (двойного сжатия в Сейфе больше нет с
+    # 22.19). Чтобы пользователь понимал, ОТКУДА потери, и как их избежать —
+    # предупреждение в ОДНОМ редактируемом уведомлении, один раз за сессию.
+    _q_note = ""
+    if kind in ("photo", "video") and not context.user_data.get('vault_q_warned'):
+        context.user_data['vault_q_warned'] = True
+        _q_note = (
+            "⚠️ КАЧЕСТВО: этот файл Telegram сжал ЕЩЁ ПРИ ОТПРАВКЕ в чат (так "
+            "работает Telegram с фото/видео, отправленными не «как файл»). Я "
+            "сохраню и верну его байт-в-байт, но исходного качества в нём уже "
+            "нет. Чтобы потерь НЕ БЫЛО ВООБЩЕ: присылайте «как файл» (скрепка "
+            "→ «Файл») или грузите оригиналы через 🌐 Веб-облако (Mini App)."
+        )
+
     # ВОЛНА 14: больше ~2 ГБ — жёсткий потолок Telegram даже для MTProto
     # (2000 МиБ для ботов; 4 ГБ — только Premium у людей, ботам недоступен).
     if fsize > VAULT_MTPROTO_MAX_BYTES:
@@ -11103,13 +12030,18 @@ async def vault_put_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # ВОЛНА 16: каналы «только для базы» тоже годятся для шифров Сейфа —
         # раньше при пустом cloud-списке большие файлы отказывали, хотя
         # канал у пользователя был.
-        _cloud_ids = get_cloud_channel_ids() or get_db_channel_ids()
+        # ВОЛНА 22.20: у пользователя свой канал — шифр пойдёт только в него.
+        _uch = _user_vault_channel(user)
+        _cloud_ids = ([_uch[0]] if _uch
+                      else (get_cloud_channel_ids() or get_db_channel_ids()))
         if not _cloud_ids:
             await msg.reply_text(
-                "❌ Хранилище не настроено: добавьте бота администратором в "
-                "свой канал и подключите его (Панель разработчика → "
-                "Хранилище) — туда уйдёт шифр. Без канала большим файлам "
-                "(до 2 ГБ) физически некуда лечь.")
+                "❌ Некуда класть шифр: нет ни общего хранилища, ни вашего "
+                "личного канала. Подключите СВОЙ канал: 🔐 Сейф → 🔗 Моё "
+                "облако → «➕ Подключить мой канал» (создайте приватный "
+                "канал, добавьте бота администратором с правом «Публикация "
+                "сообщений» и перешлите сюда любое сообщение из него). "
+                "Без канала большим файлам (до 2 ГБ) физически некуда лечь.")
             return VAULT_PUT_WAIT
         try:
             await context.bot.send_chat_action(
@@ -11131,14 +12063,16 @@ async def vault_put_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _vault_trace_add(context, user, msg.chat_id, msg.message_id)  # ВОЛНА 12
         # ВОЛНА 22.19 (C.1): то же ОДНО редактируемое уведомление; важная
         # информация о потоковом режиме — с force=True (не гасится тротлингом).
-        _ack = await _vault_put_ack(
-            update, context, user,
-            note=(f"📦 Большой файл {_fmt_bytes(fsize)}: зашифрую ПОТОКОМ после "
-                  "«✅ Готово» прямо из этого чата (несколько минут — это "
-                  "нормально; в канал уйдёт ТОЛЬКО шифр, никаких "
-                  "незашифрованных копий, оригинал из чата сотру после "
-                  "шифрования)."),
-            force=True)
+        # ВОЛНА 22.20: + предупреждение о качестве фото/видео (если это они).
+        _big_note = (f"📦 Большой файл {_fmt_bytes(fsize)}: зашифрую ПОТОКОМ после "
+                     "«✅ Готово» прямо из этого чата (несколько минут — это "
+                     "нормально; в канал уйдёт ТОЛЬКО шифр, никаких "
+                     "незашифрованных копий, оригинал из чата сотру после "
+                     "шифрования).")
+        if _q_note:
+            _big_note += "\n\n" + _q_note
+        _ack = await _vault_put_ack(update, context, user, note=_big_note,
+                                    force=True)
         # ВОЛНА 18: ранний прогрев источника — фоном, ПОКА пользователь
         # называет файлы и вводит пароль; access_hash запомнится заранее,
         # и к моменту «✅ Готово» источник уже проверен.
@@ -11175,8 +12109,10 @@ async def vault_put_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     })
     _vault_trace_add(context, user, msg.chat_id, msg.message_id)  # ВОЛНА 12
     # ВОЛНА 22.19 (C.1): ОДНО редактируемое уведомление вместо нового
-    # сообщения на каждый файл.
-    await _vault_put_ack(update, context, user)
+    # сообщения на каждый файл. ВОЛНА 22.20: + заметка про качество
+    # (первое фото/видео сессии — с force=True, чтобы точно было видно).
+    await _vault_put_ack(update, context, user, note=_q_note,
+                         force=bool(_q_note))
     return VAULT_PUT_WAIT
 
 
@@ -12401,14 +13337,16 @@ async def _vault_encrypt_batch(msg, context, user, password):
                 raise _VaultCancelled()
             op["sub"] = f"«{(item.get('name') or 'файл')}»: заливаю шифр…"
             up = await _storage_upload_document(context, container,
-                                                filename=_vfn, caption=_vcap)
+                                                filename=_vfn, caption=_vcap,
+                                                user=user)
             if up is None:
                 # ВОЛНА 18: вторая попытка Bot API (одноразовые сбои бывают),
                 # затем заливка шифра через MTProto — ≤48 МБ ботам разрешено.
                 if op["event"].is_set():
                     raise _VaultCancelled()
                 up = await _storage_upload_document(context, container,
-                                                    filename=_vfn, caption=_vcap)
+                                                    filename=_vfn, caption=_vcap,
+                                                    user=user)
                 if up is None and _TELETHON_OK and BOT_TOKEN:
                     if op["event"].is_set():
                         raise _VaultCancelled()
@@ -12422,7 +13360,7 @@ async def _vault_encrypt_batch(msg, context, user, password):
                                 _ufh.write(container)
                             up = await _mt_upload_container(
                                 _mtc, _uppath, len(container),
-                                caption=_vcap, filename=_vfn)
+                                caption=_vcap, filename=_vfn, user=user)
                         finally:
                             _shutil.rmtree(_updir, ignore_errors=True)
             container = b""
@@ -12493,7 +13431,7 @@ async def _vault_encrypt_batch(msg, context, user, password):
         for key in ('vault_put_mode', 'vault_batch', 'vault_migrate_ids',
                     'vault_attempts', 'vault_setup_pw', 'vault_qs_data',
                     'vault_batch_label',
-                    'vault_ack_mid', 'vault_ack_last'):
+                    'vault_ack_mid', 'vault_ack_last', 'vault_q_warned'):
             context.user_data.pop(key, None)
         await msg.reply_text(
             "⛔ Остановлено по вашему «❌ Отмена».\n\n"
@@ -12535,7 +13473,7 @@ async def _vault_encrypt_batch(msg, context, user, password):
     for key in ('vault_put_mode', 'vault_batch', 'vault_migrate_ids',
                 'vault_attempts', 'vault_setup_pw', 'vault_qs_data',
                 'vault_batch_label',
-                'vault_ack_mid', 'vault_ack_last'):
+                'vault_ack_mid', 'vault_ack_last', 'vault_q_warned'):
         context.user_data.pop(key, None)
     lines = []
     if ok_n:
@@ -13164,7 +14102,7 @@ async def vault_rec_newpass(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context, new_container,
             filename=f"vault_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{rec.get('id', 'f')}.bin",
             caption="🔐 Сейф: зашифрованный файл (открыть без пароля невозможно).",
-        )
+            user=user)
         salt_hex = new_container[9:25].hex()
         nonce_hex = new_container[25:37].hex()
         new_container = b""
@@ -13551,7 +14489,7 @@ async def vault_chpass_new_password(update: Update, context: ContextTypes.DEFAUL
     up = await _storage_upload_document(
         context, new_container, filename=f"vault_{vid}.bin",
         caption="🔐 Сейф: зашифрованный файл (открыть без пароля невозможно).",
-    )
+        user=user)
     new_container = b""
     if up is None:
         for key in ('vault_chp_id', 'vault_chp_stage', 'vault_chp_old'):
@@ -13674,7 +14612,7 @@ async def vault_exit_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 'vault_batch', 'vault_migrate_ids', 'vault_setup_pw', 'vault_qs_data',
                 'vault_qs_pw', 'vault_qs_stage', 'vault_rec_answers', 'vault_rec_oldpw',
                 'vault_batch_label',
-                'vault_ack_mid', 'vault_ack_last'):
+                'vault_ack_mid', 'vault_ack_last', 'vault_q_warned'):
         context.user_data.pop(key, None)
     try:
         await query.edit_message_text("🔐 Сейф закрыт.")
@@ -26482,6 +27420,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await vault_qs_cb(update, context)
     elif data == "vault_exit":
         return await vault_exit_cb(update, context)
+    elif data == "vault_cloud":
+        # ВОЛНА 22.20: «🔗 Моё облако» — личный канал-хранилище пользователя
+        # (своя настройка в облаке; панель разработчика тут ни при чём).
+        return await vault_cloud_cb(update, context)
+    elif data == "vault_cloud_add":
+        return await vault_cloud_add_cb(update, context)
+    elif data == "vault_cloud_off":
+        return await vault_cloud_off_cb(update, context)
     elif data == "vault_done":
         # ВОЛНА 13: кнопка «✅ Готово» ПОД сообщением загрузки — закончить
         # пачку без набора текста (дальше шаг названия и пароль Сейфа).
@@ -31665,6 +32611,10 @@ async def _post_init(application):
     не регистрировались, и утро/вечер не приходили, а в логах было лишь
     одно «Ошибка post_init».
     """
+    # === ШАГ 0 (ВОЛНА 22.21): Application → веб-API мини-аппа «DEVO+ Облако». ===
+    global _MINIAPP_PTB_APP
+    _MINIAPP_PTB_APP = application
+
     # === ШАГ 1: ЕДИНЫЙ ТИКЕР УВЕДОМЛЕНИЙ — регистрируем САМЫМ ПЕРВЫМ. ===
     # Это критичный шаг: если он не выполнится, утро/вечер/праздники не
     # будут приходить никому. Поэтому делаем его до всех остальных
@@ -32987,6 +33937,13 @@ def main():
             #     глобальная отмена инжектируется как везде) ===
             VAULT_LABEL_WAIT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, vault_label_receive),
+                CallbackQueryHandler(handle_callback),
+            ],
+            # === ВОЛНА 22.20: «🔗 Моё облако» — ждём пересланное сообщение
+            #     из ЛИЧНОГО канала пользователя (или @username / -100…id).
+            #     Любой некомандный апдейт: пересылка может быть и медиа. ===
+            VAULT_MYCLOUD_WAIT: [
+                MessageHandler(~filters.COMMAND, vault_cloud_receive),
                 CallbackQueryHandler(handle_callback),
             ],
             # === ВОЛНА 22.10: опросы (админ — классу, разработчик — всем) ===
