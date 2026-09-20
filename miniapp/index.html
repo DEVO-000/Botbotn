@@ -616,12 +616,45 @@ body.modal-open {
   </div>
 </div>
 
+<!-- Модальное окно хранилища («Моё облако» — волна 22.23) -->
+<div id="storageModal" class="modal-overlay" onclick="closeStorageModal(event)">
+  <div class="modal-card" onclick="event.stopPropagation()">
+    <div class="sheet-handle-area">
+      <div class="sheet-handle"></div>
+    </div>
+    <h3 style="font-weight:900;font-size:20px;margin-bottom:4px">Хранилище</h3>
+    <p style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:12px">Куда попадают ваши файлы</p>
+
+    <div id="storageStatus" style="padding:12px;background:var(--card-bg);border:1px solid var(--border-color);border-radius:14px;margin-bottom:14px;font-size:13px;font-weight:700;color:var(--subtext-color);line-height:1.5">Загружаю…</div>
+
+    <div style="margin-bottom:14px">
+      <label style="font-size:11px;font-weight:800;color:var(--subtext-color);text-transform:uppercase;letter-spacing:0.04em">Ваш канал: @имя или -100…id</label>
+      <input type="text" id="storageInput" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;margin-top:4px;outline:none;font-size:15px" placeholder="@my_cloud или -100…">
+    </div>
+
+    <div style="display:flex;flex-direction:column;gap:8px">
+      <button class="sound-item-btn" id="storageConnectBtn" onclick="connectStorage()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
+        <span>Подключить канал</span> <i data-lucide="link" style="width:18px;height:18px"></i>
+      </button>
+      <button class="sound-item-btn" id="storageOffBtn" onclick="disconnectStorage()" style="color:#ef4444;display:none">
+        <span>Отключить мой канал</span> <i data-lucide="unlink" style="width:18px;height:18px;stroke:#ef4444"></i>
+      </button>
+    </div>
+
+    <p style="font-size:11px;font-weight:600;color:var(--subtext-color);margin-top:12px;line-height:1.5">Бот должен быть админом канала с правом «Публикация сообщений». Приватный канал без @username: перешлите любое сообщение из него боту в чат (Сейф → 🔗 Моё облако).</p>
+  </div>
+</div>
+
 <div class="main-wrapper">
 
   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
     <h1 class="logo-font">DEVO+</h1>
     <div style="display:flex;gap:8px;position:relative">
-      
+
+      <button class="action-btn" onclick="openStorageModal()" title="Хранилище (Моё облако)">
+        <i data-lucide="cloud" style="width:18px;height:18px"></i>
+      </button>
+
       <button class="action-btn" id="themeToggleBtn" onclick="toggleThemeMenu(event)" title="Тема оформления">
         <i id="themeIcon" data-lucide="sun" style="width:18px;height:18px"></i>
       </button>
@@ -1637,6 +1670,72 @@ function closeNameModal(e) {
   if (e) e.stopPropagation();
   const modal = document.getElementById('nameModal');
   modal.classList.remove('open');
+  document.body.classList.remove('modal-open');
+}
+
+/* ===== Хранилище («Моё облако») — волна 22.23: реальное API бота ===== */
+async function loadStorageStatus() {
+  const box = document.getElementById('storageStatus');
+  box.textContent = 'Загружаю…';
+  try {
+    renderStorage(await apiJson('/api/storage'));
+  } catch (e) {
+    box.textContent = 'Нет связи с облаком: ' + e.message;
+  }
+}
+
+function renderStorage(d) {
+  const box = document.getElementById('storageStatus');
+  const offBtn = document.getElementById('storageOffBtn');
+  const connLabel = document.querySelector('#storageConnectBtn span');
+  if (d.connected) {
+    box.innerHTML = '✅ Ваш канал: <b style="color:var(--text-color)">' + escapeHtml(d.title || '') + '</b>'
+      + '<br><span style="font-size:11px">подключён ' + escapeHtml(d.added || '') + ' — новые загрузки уходят только в него</span>';
+    offBtn.style.display = '';
+    connLabel.textContent = 'Заменить канал';
+  } else {
+    box.innerHTML = d.has_general
+      ? '☁️ Сейчас файлы уходят в общее хранилище бота. Подключите свой приватный канал — и они будут лежать только у вас.'
+      : '⚠️ Хранилище не настроено — загрузки будут неудачными. Подключите свой канал ниже.';
+    offBtn.style.display = 'none';
+    connLabel.textContent = 'Подключить канал';
+  }
+}
+
+async function connectStorage() {
+  const v = document.getElementById('storageInput').value.trim();
+  if (!v) { showToast('Введите @имя или -100…id канала'); return; }
+  const btn = document.getElementById('storageConnectBtn');
+  btn.disabled = true;
+  try {
+    const d = await apiJson('/api/storage/connect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ channel: v }) });
+    document.getElementById('storageInput').value = '';
+    renderStorage(d);
+    showToast('✅ Канал «' + d.title + '» подключён');
+  } catch (e) {
+    showToast('❌ ' + e.message);
+  } finally { btn.disabled = false; }
+}
+
+async function disconnectStorage() {
+  try {
+    const d = await apiJson('/api/storage/disconnect', { method: 'POST' });
+    renderStorage(d);
+    showToast('🗑 Личный канал отключён');
+  } catch (e) {
+    showToast('❌ ' + e.message);
+  }
+}
+
+function openStorageModal() {
+  document.getElementById('storageModal').classList.add('open');
+  document.body.classList.add('modal-open');
+  loadStorageStatus();
+}
+
+function closeStorageModal(e) {
+  if (e) e.stopPropagation();
+  document.getElementById('storageModal').classList.remove('open');
   document.body.classList.remove('modal-open');
 }
 
