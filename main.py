@@ -7899,6 +7899,126 @@ async def miniapp_upload_complete(request):
                 pass
 
 
+# --- ВОЛНА 22.23: «МОЁ ОБЛАКО» В МИНИ-АППЕ (хранилище пользователя) ---
+# Раньше подключить свой канал можно было ТОЛЬКО в чате бота (Сейф/Облако →
+# «🔗 Моё облако», волна 22.20) — в веб-облаке настройки не было, и
+# пользователь честно жаловался: «в мини-апп не подключить свой канал — нет
+# связи с облаком». Теперь статус/подключение/отключение доступны прямо в
+# мини-аппе: ВАЛИДАЦИЯ ТОЧНО ТА ЖЕ, что в чате (get_chat → channel/supergroup
+# → бот-администратор с правом «Публикация сообщений»), ошибки — с точной
+# причиной. Публичный канал: @username (или ссылка t.me/…); частный:
+# -100…id; частный БЕЗ id — по-прежнему пересылкой в чат (честная подсказка).
+# Дизайн мини-аппа не менялся: новое окно собрано из ТЕХ ЖЕ классов
+# (modal-overlay/modal-card/sound-item-btn), кнопка в шапке добавлена
+# левым краем — существующие кнопки и меню не сдвинулись ни на пиксель.
+
+async def miniapp_storage_get(request):
+    """Статус хранилища пользователя для мини-аппа (честно: куда уйдут файлы)."""
+    user, uid, err = await _miniapp_user_from_request(request)
+    if err:
+        return err
+    vc = _user_vault_channel(user)
+    added = ""
+    if vc:
+        try:
+            added = str((getattr(user, "vault_channel", None) or {}).get("added") or "")
+        except Exception:
+            added = ""
+    return web.json_response({
+        "connected": bool(vc),
+        "id": int(vc[0]) if vc else None,
+        "title": vc[1] if vc else "",
+        "added": added,
+        "has_general": bool(get_cloud_channel_ids()),
+    })
+
+
+async def miniapp_storage_connect(request):
+    """Подключение ЛИЧНОГО канала из мини-аппа — та же проверка, что в чате."""
+    user, uid, err = await _miniapp_user_from_request(request)
+    if err:
+        return err
+    _app = _MINIAPP_PTB_APP
+    bot = getattr(_app, "bot", None) if _app is not None else None
+    if bot is None:
+        return _miniapp_err(503, "no_bot",
+                            "Бот ещё запускается — попробуйте через минуту.")
+    try:
+        body = await request.json()
+    except Exception:
+        return _miniapp_err(400, "bad_json", "Некорректный запрос.")
+    raw = str((body or {}).get("channel") or "").strip()
+    # Честное удобство: ссылку t.me/имя превращаем в @имя (тот же канал).
+    _low = raw.lower()
+    for _pref in ("https://t.me/", "http://t.me/", "t.me/"):
+        if _low.startswith(_pref):
+            raw = "@" + raw[len(_pref):].strip("/")
+            break
+    if raw.startswith("@") and len(raw) > 2 and " " not in raw:
+        target = raw
+    elif raw.startswith("-100") and raw[1:].isdigit():
+        target = int(raw)
+    else:
+        return _miniapp_err(400, "bad_channel",
+                            "Не похоже на канал. Пришлите @username публичного "
+                            "канала или -100…id приватного.")
+    try:
+        tc = await bot.get_chat(target)
+    except TGBadRequest as e:
+        return _miniapp_err(400, "get_chat_failed",
+                            "Telegram не дал посмотреть канал: "
+                            f"{(getattr(e, 'message', None) or e)}. Проверьте, "
+                            "что бот ДОБАВЛЕН в канал администратором.")
+    except Exception:
+        logger.warning(f"miniapp storage: get_chat не удался: {e}")
+        return _miniapp_err(502, "get_chat_error",
+                            "Не смог проверить канал (сбой сети?). Попробуйте ещё раз.")
+    if str(getattr(tc, "type", "")) not in ("channel", "supergroup"):
+        return _miniapp_err(400, "not_channel",
+                            "Это не канал и не супергруппа. Нужен именно КАНАЛ "
+                            "(можно приватный).")
+    try:
+        member = await bot.get_chat_member(tc.id, bot.id)
+    except Exception:
+        member = None
+    status = str(getattr(member, "status", "") or "")
+    can_post = bool(getattr(member, "can_post_messages", False))
+    if status != "administrator" or not can_post:
+        return _miniapp_err(403, "not_admin",
+                            "Бот не администратор этого канала (или без права "
+                            "«Публикация сообщений»). Добавьте бота админом с "
+                            "этим правом и попробуйте снова — без права "
+                            "публикации файлам физически некуда лечь.")
+    title = str(getattr(tc, "title", "") or raw or tc.id)[:80]
+    user.vault_channel = {
+        "id": int(tc.id),
+        "title": title,
+        "added": datetime.now().strftime("%Y-%m-%d %H:%M"),
+    }
+    save_user(user)
+    logger.info(f"miniapp storage: пользователь {uid} подключил личный канал "
+                f"{tc.id} («{title}»)")
+    return web.json_response({
+        "ok": True, "connected": True, "id": int(tc.id),
+        "title": title, "added": user.vault_channel["added"],
+        "has_general": bool(get_cloud_channel_ids()),
+    })
+
+
+async def miniapp_storage_disconnect(request):
+    """Отключение личного канала из мини-аппа (как «🗑 Отключить» в чате)."""
+    user, uid, err = await _miniapp_user_from_request(request)
+    if err:
+        return err
+    user.vault_channel = None
+    save_user(user)
+    logger.info(f"miniapp storage: пользователь {uid} отключил личный канал")
+    return web.json_response({
+        "ok": True, "connected": False,
+        "has_general": bool(get_cloud_channel_ids()),
+    })
+
+
 def mount_miniapp_routes(app):
     """Добавляет маршруты мини-аппа в aiohttp-приложение (keep-alive сервер).
     Один вызов из start_keep_alive_server; падение здесь не роняет бот."""
@@ -7912,6 +8032,10 @@ def mount_miniapp_routes(app):
     app.router.add_post("/api/upload/chunk", miniapp_upload_chunk)
     app.router.add_post("/api/upload/complete", miniapp_upload_complete)
     app.router.add_post("/api/upload/abort", miniapp_upload_abort)
+    # ВОЛНА 22.23: «Моё облако» в мини-аппе (статус/подключить/отключить канал)
+    app.router.add_get("/api/storage", miniapp_storage_get)
+    app.router.add_post("/api/storage/connect", miniapp_storage_connect)
+    app.router.add_post("/api/storage/disconnect", miniapp_storage_disconnect)
 
 
 async def cloud_exit_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
