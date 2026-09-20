@@ -7456,8 +7456,23 @@ def _miniapp_tmpdir():
     return d
 
 
-def _miniapp_err(status, code, message):
-    return web.json_response({"error": code, "message": message}, status=status)
+def _miniapp_err(status, code, message, extra=None):
+    """Честная ошибка мини-аппа. extra — дополнительные поля JSON
+    (например, bot=@username для кнопки «Открыть чат бота»)."""
+    payload = {"error": code, "message": message}
+    if extra:
+        payload.update(extra)
+    return web.json_response(payload, status=status)
+
+
+def _miniapp_bot_username() -> str:
+    """ВОЛНА 22.24: @username бота для ссылок «зарегистрироваться» прямо из
+    мини-аппа. Честно: пустая строка, пока бот ещё не поднялся (username
+    появляется после initialize() — get_me)."""
+    try:
+        return str(getattr(getattr(_MINIAPP_PTB_APP, "bot", None), "username", "") or "")
+    except Exception:
+        return ""
 
 
 def _miniapp_verify_init_data(raw):
@@ -7502,7 +7517,8 @@ async def _miniapp_user_from_request(request):
         return None, "", _miniapp_err(
             401, "unauthorized",
             "Откройте облако через Telegram (кнопка меню бота «☁️ DEVO+» или "
-            "☁️ Облако → 🌐 Веб-облако): подпись Telegram не подтверждена.")
+            "☁️ Облако → 🌐 Веб-облако): подпись Telegram не подтверждена.",
+            extra={"bot": _miniapp_bot_username()})
     try:
         u = json.loads(data.get("user") or "{}")
         uid = str(int(u.get("id") or 0))
@@ -7514,7 +7530,8 @@ async def _miniapp_user_from_request(request):
     if not user:
         return None, uid, _miniapp_err(
             401, "not_registered",
-            "Сначала зарегистрируйтесь в боте: откройте чат и отправьте /start.")
+            "Сначала зарегистрируйтесь в боте: откройте чат и отправьте /start.",
+            extra={"bot": _miniapp_bot_username()})
     return user, uid, None
 
 
@@ -11540,19 +11557,43 @@ async def vault_cloud_receive(update: Update, context: ContextTypes.DEFAULT_TYPE
             reply_markup=get_main_menu_keyboard(user))
         return MAIN_MENU
 
-    # 1) Определяем канал: пересланное сообщение / @username / -100…id.
-    fwd = getattr(msg, "forward_from_chat", None)
+    # 1) Определяем канал: пересланное сообщение / ссылка t.me / @username / -100…id.
+    # ВОЛНА 22.24 (КЛЮЧЕВОЙ ФИКС): в PTB 21.x поле forward_from_chat УДАЛЕНО
+    # (Bot API 7.0 заменил его на msg.forward_origin — MessageOriginChannel).
+    # Раньше ЛЮБАЯ пересылка из канала сюда не доезжала: атрибут был None, и
+    # пользователь честно получал «Не похоже на канал» на настоящий канал.
+    fwd_origin = getattr(msg, "forward_origin", None)
+    fwd = getattr(fwd_origin, "chat", None) if fwd_origin is not None else None
+    if fwd is None:  # страховка для старых версий PTB, где поле ещё живо
+        fwd = getattr(msg, "forward_from_chat", None)
     target = None
     if fwd is not None:
         target = int(getattr(fwd, "id", 0) or 0)
+    elif raw_text.lower().startswith(("https://t.me/", "http://t.me/", "t.me/")):
+        # Честное удобство (как в мини-аппе): ссылку на канал превращаем в id.
+        # «t.me/имя» или «t.me/имя/123» → @имя (публичный канал);
+        # «t.me/c/2266…/12» — внутренняя ссылка ЧАСТНОГО канала → -100…id:
+        # число после /c/ — это id канала без префикса -100.
+        _m = re.match(r"(?i)^(?:https?://)?t\.me/c/(\d+)(?:/\d+)?/?$", raw_text)
+        if _m:
+            target = int("-100" + _m.group(1))
+        else:
+            _rest = re.sub(r"(?i)^(?:https?://)?t\.me/", "", raw_text).strip("/")
+            _uname = _rest.split("/")[0] if _rest else ""
+            if _uname and not _uname.startswith("+"):
+                target = "@" + _uname
     elif raw_text.startswith("@") and len(raw_text) > 2 and " " not in raw_text:
         target = raw_text
     elif raw_text.startswith("-100") and raw_text[1:].isdigit():
         target = int(raw_text)
-    else:
+    if target is None:
         await msg.reply_text(
-            "Не похоже на канал. Перешлите ЛЮБОЕ сообщение ИЗ вашего канала "
-            "или отправьте его @username / -100…id. «отмена» — выйти.",
+            "Не похоже на пересылку из канала. Перешлите ЛЮБОЕ сообщение ИЗ "
+            "вашего канала или отправьте его @username / -100…id / ссылку "
+            "t.me из канала (подойдёт и «Поделиться → скопировать ссылку» — "
+            "я пойму и t.me/имя, и t.me/c/… частного канала).\n\n"
+            "Если Telegram не даёт переслать сообщение — в канале включён "
+            "«Запрет пересылки»: пришлите ссылку или id. «отмена» — выйти.",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("⬅️ Назад", callback_data="vault_cloud")]]),
         )
