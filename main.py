@@ -19,7 +19,7 @@ except ImportError:  # pragma: no cover
     ZoneInfo = None
 from telegram import (
     Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup,
-    LabeledPrice, InputFile,
+    LabeledPrice, InputFile, WebAppInfo,
 )
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters, ContextTypes,
@@ -81,6 +81,13 @@ GROQ_STT_MODEL = _env("GROQ_STT_MODEL", "whisper-large-v3-turbo")
 # WeatherAPI ключ. По умолчанию — ключ, выданный пользователем; при необходимости
 # можно переопределить через переменную окружения WEATHER_API_KEY.
 WEATHER_API_KEY = _env("WEATHER_API_KEY", "62ee0b66d804499d95e153315263004")
+# ВОЛНА 22.19: HTTPS-ссылка на Mini App «DEVO+ Облако» (мини-приложение
+# Telegram). Хостится ОТДЕЛЬНО от бота на любом статическом HTTPS-хостинге
+# (GitHub Pages / Netlify / Vercel): страница — файл devo-cloud-miniapp.html.
+# Задана в ENV → в меню Сейфа и Облака появляется кнопка «🌐 DEVO+ Облако»,
+# открывающая мини-приложение прямо в Telegram. Пусто (по умолчанию) → кнопки
+# нет, бот работает как раньше. HTTP-ссылки Telegram не принимает — только HTTPS.
+MINI_APP_URL = _env("MINI_APP_URL")
 
 # === DeepSeek API (режим «🪄 AI Agent», бывшая «🪄 Автоматизация») ===
 # DeepSeek используется как «мозг», который превращает свободный текст
@@ -506,6 +513,7 @@ _VAULT_SESSION_KEYS = (
     'vault_chp_old', 'vault_attempts', 'vault_batch', 'vault_migrate_ids',
     'vault_setup_pw', 'vault_qs_data', 'vault_qs_pw', 'vault_qs_stage',
     'vault_rec_answers', 'vault_rec_oldpw', 'vault_ren_id', 'vault_chat_acks',
+    'vault_status_msg_id',
     'cloud_file_mode', 'cloud_batch', 'cloud_note', 'cloud_ren_id',
     'vault_pending', 'vault_batch_label',
     'vault_batch_cat', 'vault_batch_tags',  # 22.12: категория и теги загрузки
@@ -6779,6 +6787,21 @@ def _cloud_menu_text(user):
     return "\n".join(lines)
 
 
+def _mini_app_row():
+    """ВОЛНА 22.19: ряд с кнопкой «🌐 DEVO+ Облако» (Mini App).
+    Кнопка появляется ТОЛЬКО если задан MINI_APP_URL (HTTPS-ссылка на
+    захостенную страницу мини-приложения — файл devo-cloud-miniapp.html,
+    GitHub Pages / Netlify / любой статический хостинг). WebApp-кнопка
+    открывает приложение ПРЯМО в Telegram (мобильные и десктоп-клиенты)."""
+    if not MINI_APP_URL:
+        return None
+    try:
+        return [InlineKeyboardButton("🌐 DEVO+ Облако",
+                                     web_app=WebAppInfo(url=MINI_APP_URL))]
+    except Exception:
+        return None
+
+
 def get_cloud_menu_keyboard(user=None):
     """ВОЛНА 9: файлы всегда живут в Сейфе облака.
 
@@ -6797,6 +6820,10 @@ def get_cloud_menu_keyboard(user=None):
         rows.append([InlineKeyboardButton(
             f"🗂 Старые файлы ({legacy}) — без шифра", callback_data="cloud_files")])
     rows.append([InlineKeyboardButton("❓ Как это работает", callback_data="cloud_help")])
+    # ВОЛНА 22.19: Mini App «DEVO+ Облако» — если MINI_APP_URL задан в ENV.
+    _ma = _mini_app_row()
+    if _ma:
+        rows.append(_ma)
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_to_main")])
     return InlineKeyboardMarkup(rows)
 
@@ -6902,7 +6929,14 @@ async def cloud_help_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "MTProto, несколько минут — прогресс видно в чате); больше 2 ГБ не "
         "пропускает ни один бот Telegram — делите на части;\n"
         "• лимит файлов на человека задаёт разработчик (по умолчанию 50);\n"
-        "• бот не может читать историю канала — только файлы, которые прошли через него."
+        "• бот не может читать историю канала — только файлы, которые прошли через него.\n\n"
+        "💡 КАЧЕСТВО: выдаю файлы ДОКУМЕНТОМ — без повторного сжатия. Для "
+        "оригинала 1:1 присылайте фото/видео ФАЙЛОМ: то, что отправлено "
+        "«фото», Telegram сжимает ещё на вашем устройстве.\n\n"
+        "🏰 СВОЙ ПРИВАТНЫЙ КАНАЛ (рекомендация разработчика): сомневаетесь в "
+        "анонимности или стабильности облака бота? Создайте свой приватный "
+        "канал, добавьте туда бота администратором и передайте разработчику "
+        "для подключения — тогда файлы будут лежать только в вашем канале."
     )
     try:
         await query.edit_message_text(text, reply_markup=get_cloud_menu_keyboard(user=get_user(str(query.from_user.id))))
@@ -10428,15 +10462,20 @@ async def _vault_reencrypt_dvf2(msg, context, user, rec, old_pw, new_pw):
 
 
 def get_vault_menu_keyboard():
-    return InlineKeyboardMarkup([
+    rows = [
         [InlineKeyboardButton("📥 Положить файл/текст", callback_data="vault_put")],
         [InlineKeyboardButton("📦 Мои файлы", callback_data="vault_files")],
         # ВОЛНА 9: восстановление и управление вопросами — прямо в меню Сейфа.
         [InlineKeyboardButton("🔑 Забыл пароль (восстановить)", callback_data="vault_rec")],
         [InlineKeyboardButton("❓ Сменить секретные вопросы", callback_data="vault_qs")],
         [InlineKeyboardButton("❓ Как это работает", callback_data="vault_help")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="back_to_main")],
-    ])
+    ]
+    # ВОЛНА 22.19: Mini App «DEVO+ Облако» — если MINI_APP_URL задан в ENV.
+    _ma = _mini_app_row()
+    if _ma:
+        rows.append(_ma)
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_to_main")])
+    return InlineKeyboardMarkup(rows)
 
 
 def get_vault_files_keyboard(user):
@@ -10568,7 +10607,18 @@ def _vault_help_text():
         "• больше 2 ГБ не может НИ ОДИН бот в Telegram (4 ГБ — только "
         "Premium у людей, ботам он недоступен): делите файл на части;\n"
         "• вопросы — ваша страховка: КТО ЗНАЕТ ОТВЕТЫ, ТОТ ПОЛУЧИТ ДОСТУП. "
-        "Придумывайте вопросы, ответ на которые знаете только вы."
+        "Придумывайте вопросы, ответ на который знаете только вы.\n\n"
+        "💡 КАЧЕСТВО ФАЙЛОВ: выдаю файлы ДОКУМЕНТОМ — Telegram НЕ пережимает "
+        "их при выдаче, и всё, что было зашифровано, возвращается байт-в-байт. "
+        "Но фото, присланное именно «фото», уже сжато самим Telegram ещё на "
+        "вашем устройстве при отправке (это не зависит от бота) — для "
+        "оригинального качества присылайте фото и видео ФАЙЛОМ (документом).\n\n"
+        "🏰 СВОЙ ПРИВАТНЫЙ КАНАЛ (рекомендация разработчика): сомневаетесь в "
+        "анонимности или стабильности облака бота? Создайте СВОЙ приватный "
+        "канал в Telegram, добавьте туда бота администратором и передайте "
+        "разработчику его название для подключения — тогда шифры будут "
+        "лежать ТОЛЬКО в вашем канале, и хранение будет зависеть только "
+        "от вас и Telegram, а не от чужих сервисов."
     )
 
 
@@ -10675,8 +10725,10 @@ async def vault_put_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return MAIN_MENU
     context.user_data['vault_put_mode'] = True
     context.user_data.pop('vault_batch', None)
+    context.user_data.pop('vault_status_msg_id', None)  # 22.19
     context.user_data.pop('vault_migrate_ids', None)
     context.user_data.pop('vault_setup_pw', None)
+    context.user_data.pop('vault_status_msg_id', None)  # ВОЛНА 22.19
     try:
         await query.edit_message_text(
             "📥 Шифруем файлы в Сейфе\n\n"
@@ -10686,6 +10738,10 @@ async def vault_put_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📏 Размеры: до {_fmt_bytes(VAULT_MAX_FILE_BYTES)} — мгновенно; "
             "от 20 МБ до 2 ГБ — режим больших файлов (зашифрую ПОТОКОМ, "
             "это займёт несколько минут — прогресс будет виден).\n\n"
+            "💡 КАЧЕСТВО: выдают файлы ДОКУМЕНТОМ — без повторного сжатия. "
+            "Оригинал 1:1 сохраняется, только если прислать фото/видео ФАЙЛОМ: "
+            "то, что отправлено «фото», Telegram сжимает ещё на вашем "
+            "устройстве (это не зависит от бота).\n\n"
             "✅ ЗАКОНЧИЛИ? Нажмите кнопку «✅ Готово» ПОД сообщением — писать "
             "«готово» не нужно (можно и написать, кнопка просто быстрее).\n\n"
             "🏷 НАЗВАНИЕ: сразу после «Готово» бот попросит назвать то, что вы "
@@ -10703,6 +10759,12 @@ async def vault_put_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=_vault_put_kb(),
     )
     _vault_track_ack(context, _ack, user=user)
+    # ВОЛНА 22.19: это и есть ЕДИНОЕ сообщение-статус пачки — все следующие
+    # файлы/заметки/подписи будут РЕДАКТИРОВАТЬ его, а не плодить новые.
+    try:
+        context.user_data['vault_status_msg_id'] = int(_ack.message_id)
+    except (TypeError, ValueError, AttributeError):
+        pass
     return VAULT_PUT_WAIT
 
 
@@ -10865,6 +10927,71 @@ async def _vault_cleanup_chat(context, chat_id, batch, user=None, keep_ids=None)
     return deleted
 
 
+# ============================================================
+# === ВОЛНА 22.19: ОДНО сообщение-статус пачки Сейфа ===
+# Просьба пользователя: «не должно отправляться столько уведомлений, сколько
+# файлов — одно сообщение просто должно редактироваться». Раньше на КАЖДЫЙ
+# файл/заметку/подпись бот отправлял ОТДЕЛЬНОЕ подтверждение: пачка из 10
+# файлов = 10 лишних сообщений. Теперь в чате живёт ОДНО сообщение-статус
+# (создаётся на первом файле / сразу при входе в режим), и каждый новый
+# файл просто РЕДАКТИРУЕТ его: счётчик, размер, последнее действие.
+# ============================================================
+
+def _vault_batch_status_text(batch, last_action=""):
+    """Текст ЕДИНОГО сообщения-статуса пачки Сейфа (волна 22.19)."""
+    items = [it for it in (batch if isinstance(batch, list) else [])
+             if isinstance(it, dict)]
+    n = len(items)
+    total = 0
+    for it in items:
+        try:
+            total += int(it.get("size") or 0)
+        except (TypeError, ValueError):
+            pass
+    lines = [f"🔐 ПАЧКА СЕЙФА: {n} шт • {_fmt_bytes(total)}"]
+    if last_action:
+        lines.append("")
+        lines.append(str(last_action))
+    lines.append("")
+    lines.append("🏷 Подписать файл — ответьте (reply) на СВОЁ сообщение с ним.")
+    lines.append("Пришлите ещё файл/заметку или нажмите «✅ Готово» — дальше "
+                 "название и пароль Сейфа.")
+    return "\n".join(lines)
+
+
+async def _vault_status_update(msg, context, user, last_action):
+    """ВОЛНА 22.19: обновляет ЕДИНСТВЕННОЕ сообщение-статус пачки Сейфа.
+    Если оно ещё не создано (или удалено) — создаёт и запоминает его id
+    (и трекает для очистки чата вместе с пачкой, как раньше). Возвращает
+    объект сообщения или None — пригодится как ack для precheck."""
+    batch = context.user_data.get('vault_batch')
+    text = _vault_batch_status_text(batch, last_action)
+    status_id = 0
+    try:
+        status_id = int(context.user_data.get('vault_status_msg_id') or 0)
+    except (TypeError, ValueError):
+        status_id = 0
+    if status_id:
+        try:
+            edited = await context.bot.edit_message_text(
+                text, chat_id=msg.chat_id, message_id=status_id,
+                reply_markup=_vault_put_kb())
+            return edited
+        except Exception:
+            # Сообщение удалено/устарело — тихо создаём новое ниже.
+            context.user_data.pop('vault_status_msg_id', None)
+    try:
+        new_msg = await msg.reply_text(text, reply_markup=_vault_put_kb())
+    except Exception:
+        return None
+    try:
+        context.user_data['vault_status_msg_id'] = int(new_msg.message_id)
+    except (TypeError, ValueError, AttributeError):
+        pass
+    _vault_track_ack(context, new_msg, user=user)
+    return new_msg
+
+
 async def vault_put_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """ВОЛНА 9: принимает ФАЧКУ файлов/заметок для Сейфа.
 
@@ -10922,6 +11049,7 @@ async def vault_put_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _batch_clean = batch if isinstance(batch, list) else None
         context.user_data.pop('vault_put_mode', None)
         context.user_data.pop('vault_batch', None)
+        context.user_data.pop('vault_status_msg_id', None)  # 22.19
         context.user_data.pop('vault_migrate_ids', None)
         _cleaned = await _vault_cleanup_chat(context, msg.chat_id, _batch_clean, user=user)
         await msg.reply_text(
@@ -10961,12 +11089,12 @@ async def vault_put_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ) if _rt_mid else None
         if _target is not None:
             _target["label"] = raw_text.strip()[:80]
-            _ack = await msg.reply_text(
-                f"✏️ Подпись сохранена: «{_target['label']}» — она будет видна "
-                "в списке Сейфа (сам файл по-прежнему под шифром). Пришлите "
-                "ещё файл/заметку или нажмите «✅ Готово» ниже.",
-                reply_markup=_vault_put_kb())
-            _vault_track_ack(context, _ack, user=user)
+            # ВОЛНА 22.19: подтверждение подписи — в общее статус-сообщение
+            # (без отдельного уведомления на каждую подпись).
+            await _vault_status_update(
+                msg, context, user,
+                f"✏️ Подпись сохранена: «{_target['label']}» — будет видна в "
+                "списке Сейфа (сам файл по-прежнему под шифром).")
             return VAULT_PUT_WAIT
 
     if att is None:
@@ -10992,12 +11120,10 @@ async def vault_put_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "chat_msg_id": int(getattr(msg, "message_id", 0) or 0),  # ВОЛНА 11
         })
         _vault_trace_add(context, user, msg.chat_id, msg.message_id)  # ВОЛНА 12
-        _ack = await msg.reply_text(
-            f"📥 Принято: {len(batch)} шт. Пришлите ещё файл/заметку или "
-            "нажмите «✅ Готово» ниже — дальше попросят название и пароль Сейфа.",
-            reply_markup=_vault_put_kb(),
-        )
-        _vault_track_ack(context, _ack, user=user)
+        # ВОЛНА 22.19: одно статус-сообщение вместо уведомления на каждый файл.
+        await _vault_status_update(
+            msg, context, user,
+            f"📝 Заметка принята ({len(text.encode('utf-8'))} симв.).")
         return VAULT_PUT_WAIT
 
     # Файл.
@@ -11085,16 +11211,15 @@ async def vault_put_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
                        "msg_id": int(getattr(msg, "message_id", 0) or 0)},
         })
         _vault_trace_add(context, user, msg.chat_id, msg.message_id)  # ВОЛНА 12
-        _ack = await msg.reply_text(
-            f"📦 Принято: {_fmt_bytes(fsize)} — зашифрую ПОТОКОМ после "
-            "«✅ Готово» прямо из этого чата (большие файлы шифруются "
-            "несколько минут — это нормально; в канал уйдёт ТОЛЬКО шифр, "
-            "никаких незашифрованных копий, оригинал из чата сотру после "
-            "шифрования). Подписать файл — ответьте (reply) на СВОЁ "
-            "сообщение с ним названием; пришлите ещё или нажмите «✅ Готово» ниже.",
-            reply_markup=_vault_put_kb(),
-        )
-        _vault_track_ack(context, _ack, user=user)
+        # ВОЛНА 22.19: одно статус-сообщение вместо уведомления на каждый файл.
+        # Возвращённый объект идёт в precheck как ack (там правят предупреждения —
+        # теперь они появляются в том же статус-сообщении).
+        _ack = await _vault_status_update(
+            msg, context, user,
+            f"📦 Большой файл «{name[:60]}» ({_fmt_bytes(fsize)}) принят — "
+            "зашифрую ПОТОКОМ после «✅ Готово» (это займёт несколько минут; "
+            "в канал уйдёт ТОЛЬКО шифр, оригинал из чата сотру после "
+            "шифрования).")
         # ВОЛНА 18: ранний прогрев источника — фоном, ПОКА пользователь
         # называет файлы и вводит пароль; access_hash запомнится заранее,
         # и к моменту «✅ Готово» источник уже проверен.
@@ -11130,14 +11255,11 @@ async def vault_put_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "chat_msg_id": int(getattr(msg, "message_id", 0) or 0),  # ВОЛНА 11
     })
     _vault_trace_add(context, user, msg.chat_id, msg.message_id)  # ВОЛНА 12
-    _ack = await msg.reply_text(
-        f"📥 Принято: {len(batch)} шт (файл в памяти, в чат не попадёт). "
-        "Подписать файл — ответьте (reply) на СВОЁ сообщение с ним названием; "
-        "пришлите ещё или нажмите «✅ Готово» ниже — дальше попросят название "
-        "и пароль Сейфа.",
-        reply_markup=_vault_put_kb(),
-    )
-    _vault_track_ack(context, _ack, user=user)
+    # ВОЛНА 22.19: одно статус-сообщение вместо уведомления на каждый файл.
+    await _vault_status_update(
+        msg, context, user,
+        f"📄 Файл «{name[:60]}» ({_fmt_bytes(len(payload))}) принят — "
+        "пока в памяти бота, в чат не попадёт.")
     return VAULT_PUT_WAIT
 
 
@@ -11476,6 +11598,7 @@ async def vault_cancel_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     batch = context.user_data.get('vault_batch')
     _batch_clean = batch if isinstance(batch, list) else None
     for key in ('vault_put_mode', 'vault_batch', 'vault_migrate_ids',
+                'vault_status_msg_id',
                 'vault_batch_label', 'vault_batch_cat', 'vault_batch_tags'):
         context.user_data.pop(key, None)
     _cleaned = 0
@@ -11907,6 +12030,7 @@ async def vault_put_password(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not user or not isinstance(batch, list) or not batch:
         context.user_data.pop('vault_put_mode', None)
         context.user_data.pop('vault_batch', None)
+        context.user_data.pop('vault_status_msg_id', None)  # 22.19
         context.user_data.pop('vault_migrate_ids', None)
         await msg.reply_text(
             "Сессия шифрования потеряна. Начните заново: 🔐 Сейф → 📥 Положить.",
@@ -11929,6 +12053,7 @@ async def vault_put_password(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await _vault_cleanup_chat(context, msg.chat_id, batch, user=user)
         context.user_data.pop('vault_put_mode', None)
         context.user_data.pop('vault_batch', None)
+        context.user_data.pop('vault_status_msg_id', None)  # 22.19
         context.user_data.pop('vault_migrate_ids', None)
         await msg.reply_text(
             "Отменено — файлы НЕ зашифрованы и НЕ загружены, следы в чате стёрты.",
@@ -11941,6 +12066,7 @@ async def vault_put_password(update: Update, context: ContextTypes.DEFAULT_TYPE)
         # ВОЛНА 11: пачка уходит из памяти — следы файлов из чата тоже.
         await _vault_cleanup_chat(context, msg.chat_id, batch, user=user)
         context.user_data.pop('vault_batch', None)
+        context.user_data.pop('vault_status_msg_id', None)  # 22.19
         context.user_data.pop('vault_migrate_ids', None)
         context.user_data.pop('vault_put_mode', None)
         context.user_data.pop('vault_attempts', None)
@@ -11956,7 +12082,8 @@ async def vault_put_password(update: Update, context: ContextTypes.DEFAULT_TYPE)
             if attempts >= VAULT_ATTEMPTS_MAX:
                 # ВОЛНА 11: файлы не зашифрованы — их следы из чата тоже стираем.
                 await _vault_cleanup_chat(context, msg.chat_id, batch, user=user)
-                for key in ('vault_put_mode', 'vault_batch', 'vault_migrate_ids', 'vault_attempts'):
+                for key in ('vault_put_mode', 'vault_batch', 'vault_migrate_ids', 'vault_attempts',
+                            'vault_status_msg_id'):
                     context.user_data.pop(key, None)
                 await msg.reply_text(
                     f"🚫 Неверный пароль Сейфа {VAULT_ATTEMPTS_MAX} раза — файлы "
@@ -12371,6 +12498,7 @@ async def _vault_encrypt_batch(msg, context, user, password):
                 pass
         for key in ('vault_put_mode', 'vault_batch', 'vault_migrate_ids',
                     'vault_attempts', 'vault_setup_pw', 'vault_qs_data',
+                    'vault_status_msg_id',
                     'vault_batch_label'):
             context.user_data.pop(key, None)
         await msg.reply_text(
@@ -12412,6 +12540,7 @@ async def _vault_encrypt_batch(msg, context, user, password):
     was_setup = bool(context.user_data.get('vault_setup_pw'))
     for key in ('vault_put_mode', 'vault_batch', 'vault_migrate_ids',
                 'vault_attempts', 'vault_setup_pw', 'vault_qs_data',
+                'vault_status_msg_id',
                 'vault_batch_label'):
         context.user_data.pop(key, None)
     lines = []
@@ -12687,17 +12816,15 @@ async def vault_get_password(update: Update, context: ContextTypes.DEFAULT_TYPE)
     caption = (f"🔓 {_lbl} — {name}" if _lbl else f"🔓 Расшифровано: {name}")
     _sent_msg = None
     try:
-        if kind == "photo":
-            _sent_msg = await context.bot.send_photo(chat_id=msg.chat_id, photo=payload, caption=caption)
-        elif kind == "video":
-            _sent_msg = await context.bot.send_video(chat_id=msg.chat_id, video=payload, caption=caption)
-        elif kind == "audio":
-            _sent_msg = await context.bot.send_audio(chat_id=msg.chat_id, audio=payload, caption=caption)
-        else:
-            _sent_msg = await context.bot.send_document(
-                chat_id=msg.chat_id, document=InputFile(payload, filename=name),
-                caption=caption,
-            )
+        # ВОЛНА 22.19 (просьба пользователя: «после облака скачиваю — качество
+        # хуже»): выдаём ВСЕГДА ДОКУМЕНТОМ. Раньше фото/видео/аудио повторно
+        # загружались как медиа — Telegram пережимал их ЕЩЁ РАЗ при каждой
+        # выдаче, и качество терялось. Документ доезжает байт-в-байт: то,
+        # что было зашифровано, то и вернётся. Настоящее имя сохранено.
+        _sent_msg = await context.bot.send_document(
+            chat_id=msg.chat_id, document=InputFile(payload, filename=name),
+            caption=caption,
+        )
     except Exception as e:
         logger.error(f"vault get: выдача файла не удалась: {e}")
         await msg.reply_text("❌ Не удалось отправить файл. Попробуйте ещё раз.")
@@ -13218,6 +13345,7 @@ async def vault_qs_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         if was_setup:
             context.user_data.pop('vault_batch', None)
+            context.user_data.pop('vault_status_msg_id', None)  # 22.19
             context.user_data.pop('vault_put_mode', None)
             await msg.reply_text(
                 "Отменено — вопросы и ответы не сохранены, следы из чата "
@@ -13265,6 +13393,7 @@ async def vault_qs_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not password:
             context.user_data.pop('vault_qs_data', None)
             context.user_data.pop('vault_batch', None)
+            context.user_data.pop('vault_status_msg_id', None)  # 22.19
             await msg.reply_text(
                 "❌ Сессия настройки потеряна. Начните заново: 🔐 Сейф → 📥 Положить.")
             return MAIN_MENU
@@ -29044,26 +29173,24 @@ async def sol_view_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             meta, plain = await asyncio.to_thread(_seal_unpack, payload)
             payload = b""
             name = _dvf2_safe_name(str(meta.get("n") or "file.bin"))
-            if _f.get("kind") == "photo":
-                await context.bot.send_photo(
-                    chat_id=query.message.chat_id, photo=plain, caption=_cap)
-            else:
-                await context.bot.send_document(
-                    chat_id=query.message.chat_id,
-                    document=InputFile(plain, filename=name), caption=_cap)
+            # ВОЛНА 22.19: фото тоже ДОКУМЕНТОМ — раньше send_photo пережимал
+            # расшифрованное фото ещё раз при каждой выдаче (потеря качества).
+            await context.bot.send_document(
+                chat_id=query.message.chat_id,
+                document=InputFile(plain, filename=name), caption=_cap)
             plain = b""
         else:
             # ЛЕГАСИ (до 22.13): открытые копии в канале.
-            if _f.get("ftype") == "photo":
-                await context.bot.send_photo(
-                    chat_id=query.message.chat_id,
-                    from_chat_id=int(_f.get("ch") or 0),
-                    photo=int(_f.get("mid") or 0), caption=_cap)
-            else:
-                await context.bot.send_document(
-                    chat_id=query.message.chat_id,
-                    from_chat_id=int(_f.get("ch") or 0),
-                    document=int(_f.get("mid") or 0), caption=_cap)
+            # ВОЛНА 22.19: раньше тут был вызов send_photo/send_document с
+            # несуществующими параметрами (from_chat_id + id сообщения) —
+            # ветка всегда падала с «Не удалось открыть файл». Копируем
+            # сообщение канала КАК ЕСТЬ (copy_message): байт-в-байт, без
+            # пересжатия, честно для открытых легаси-копий.
+            await context.bot.copy_message(
+                chat_id=query.message.chat_id,
+                from_chat_id=int(_f.get("ch") or 0),
+                message_id=int(_f.get("mid") or 0),
+                caption=_cap)
     except Exception as e:
         logger.error(f"solutions: выдача решения не удалась: {e}")
         await query.answer("Не удалось открыть файл — он удалён из хранилища?",
