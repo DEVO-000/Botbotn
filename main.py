@@ -245,6 +245,10 @@ BLOCKED_USERS_FILE = _data_file("blocked_users.json")
 PERSONAL_BUTTONS_FILE = _data_file("personal_buttons.json")
 CLASS_BLOCKED_USERS_FILE = _data_file("class_blocked_users.json")
 STARS_STATS_FILE = _data_file("stars_stats.json")
+# ВОЛНА 22.27: жалобы («🚨 Пожаловаться» под анонимками/решениями) и
+# ЖУРНАЛ ДЕЙСТВИЙ АДМИНОВ (защита разработчика: кто реально рассылал).
+REPORTS_FILE = _data_file("reports.json")
+ADMIN_LOG_FILE = _data_file("admin_log.json")
 INSTRUCTIONS_FILE = _data_file("instructions.json")
 USER_CODES_FILE = _data_file("user_codes.json")
 PRICES_FILE = _data_file("prices.json")
@@ -487,6 +491,13 @@ PARENT_CONSENT_WAIT = 138
 # отправляет @username / -100…id). Панель разработчика тут ни при чём:
 # это НАСТРОЙКА САМОГО ПОЛЬЗОВАТЕЛЯ в его облаке.
 VAULT_MYCLOUD_WAIT = 139
+
+# ВОЛНА 22.27: срок блокировки (выбор разработчика), правка напоминаний и
+# возрастной гейт 13+ (принудительная проверка при каждом входе).
+DEV_BLOCK_DURATION = 140   # разработчик выбирает, НА СКОЛЬКО заблокировать
+TIMER_EDIT_TEXT = 141      # «Мои напоминания» → правка текста напоминания
+TIMER_EDIT_TIME = 142      # «Мои напоминания» → правка времени напоминания
+AGE_BLOCKED = 143          # пользователь с ДР <13 — бот закрыт для него
 
 # ВОЛНА 22.4: «🎙 Пульт» удалён ПОЛНОСТЬЮ по решению пользователя — кнопки,
 # состояний (бывшие 126–131), хендлеров и хранилищ стилей больше нет.
@@ -1171,6 +1182,8 @@ _SANITIZE_TARGET_FILES = [
     USER_CODES_FILE,
     PRICES_FILE,
     GLOBAL_BUTTONS_FILE,
+    REPORTS_FILE,
+    ADMIN_LOG_FILE,
 ]
 
 
@@ -2071,6 +2084,9 @@ STORAGE_BACKUP_FILES = (
     DEV_SETTINGS_FILE, SUPPORT_MESSAGES_FILE, REFERRALS_FILE,
     SOLUTIONS_FILE, SHARE_FILE, ACTIVITY_FILE, FEATURE_STATS_FILE,
     NOTIFICATION_LOG_FILE, POLL_SCHEDULES_FILE,
+    # ВОЛНА 22.27: жалобы и журнал действий админов тоже переживают рестарт
+    # и живут в канале-БД (без них доказательства терялись бы при деплое).
+    REPORTS_FILE, ADMIN_LOG_FILE,
 )
 
 PRICES = load_prices()
@@ -2889,6 +2905,54 @@ def load_class_blocked_users():
 def save_class_blocked_users(class_blocked):
     return save_data(CLASS_BLOCKED_USERS_FILE, class_blocked)
 
+# === ВОЛНА 22.27: ЖАЛОБЫ («🚨 Пожаловаться») ===
+def load_reports():
+    return load_data(REPORTS_FILE, {})
+
+def save_reports(reports):
+    return save_data(REPORTS_FILE, reports)
+
+# === ВОЛНА 22.27: ЖУРНАЛ ДЕЙСТВИЙ АДМИНОВ ===
+def load_admin_log():
+    return load_data(ADMIN_LOG_FILE, [])
+
+def save_admin_log(entries):
+    return save_data(ADMIN_LOG_FILE, entries)
+
+def _log_admin_action(admin_id, class_code, action, details=""):
+    """Журналируем ДЕЙСТВИЕ АДМИНИСТРАТОРА КЛАССА.
+
+    Зачем (просьба разработчика): если админ класса рассылает запрещённый
+    контент, разработчик может ДОКАЗАТЬ, что рассылал не он — в журнале
+    стоит id админа, время, класс и суть действия. Журнал пишется только
+    на изменяющие действия админов класса (не на действия разработчика
+    и не на действия обычных пользователей). Хвост журнала обрезается
+    до 500 записей, чтобы файл не рос бесконечно."""
+    try:
+        entries = load_admin_log()
+        if not isinstance(entries, list):
+            entries = []
+        admin = get_user(str(admin_id))
+        _who = ""
+        if admin is not None:
+            _who = (admin.first_name or "")
+            if getattr(admin, 'username', None):
+                _who += f" (@{admin.username})"
+        entries.append({
+            'ts': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            'admin_id': str(admin_id),
+            'admin_name': _who,
+            'class_code': str(class_code or ""),
+            'action': str(action),
+            'details': str(details)[:300],
+        })
+        if len(entries) > 500:
+            entries = entries[-500:]
+        save_admin_log(entries)
+    except Exception as e:
+        # Журнал не должен ронять само действие админа.
+        logger.error(f"_log_admin_action: {e}")
+
 def load_stars_stats():
     """Агрегированная статистика Stars БЕЗ подробной истории переводов.
 
@@ -3336,7 +3400,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.26"
+BOT_BUILD = "22.27"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -3448,8 +3512,24 @@ def save_user_codes(codes):
     return save_data(USER_CODES_FILE, codes)
 
 def is_user_blocked(user_id):
+    """ВОЛНА 22.27: ленивое истечение ВРЕМЕННОЙ блокировки.
+
+    Запись вида {'until_ts': <unix>} считается протухшей, когда время вышло:
+    блокировка снимается прямо здесь (и сохраняется), поэтому «заблокировал
+    на 2 часа» означает ровно 2 часа, а не «до ручного разблока»."""
     blocked_users = load_blocked_users()
-    return str(user_id) in blocked_users
+    rec = blocked_users.get(str(user_id))
+    if rec is None:
+        return False
+    until_ts = rec.get('until_ts')
+    if until_ts:
+        try:
+            if float(until_ts) <= time.time():
+                # Срок вышел — честно снимаем блокировку.
+                return not unblock_user(user_id)
+        except (TypeError, ValueError):
+            pass
+    return True
 
 def is_user_class_blocked(user_id, class_code):
     class_obj = get_class_by_code(class_code)
@@ -3457,7 +3537,8 @@ def is_user_class_blocked(user_id, class_code):
         return True
     return False
 
-def block_user(user_id, blocked_by=DEVELOPER_ID, unblock_price=None):
+def block_user(user_id, blocked_by=DEVELOPER_ID, unblock_price=None,
+               until_hours=None):
     # === Защита от самоблокировки ===
     # Разработчик и любой администратор класса не могут заблокировать сами
     # себя — это защита от случайной/ошибочной потери доступа к управлению.
@@ -3481,6 +3562,18 @@ def block_user(user_id, blocked_by=DEVELOPER_ID, unblock_price=None):
     }
     if unblock_price is not None:
         blocked_data['unblock_price'] = unblock_price
+    # ВОЛНА 22.27: ВРЕМЕННАЯ блокировка («на сколько заблокировать»).
+    # until_hours=None — навсегда (как раньше). Число > 0 — блокировка
+    # истечёт сама: храним и человекочитаемую дату, и unix-время.
+    if until_hours is not None:
+        try:
+            _h = float(until_hours)
+            if _h > 0:
+                _until = datetime.now() + timedelta(hours=_h)
+                blocked_data['until'] = _until.strftime("%d.%m.%Y %H:%M")
+                blocked_data['until_ts'] = _until.timestamp()
+        except (TypeError, ValueError):
+            pass
     blocked_users[str(user_id)] = blocked_data
 
     users = load_users()
@@ -4108,6 +4201,9 @@ def get_quick_timer_keyboard():
             InlineKeyboardButton("7 дней", callback_data="quick_timer_10080"),
         ],
         [InlineKeyboardButton("📅 Указать дату и время", callback_data="timer_custom_datetime")],
+        # ВОЛНА 22.27: «все таймеры должны быть указаны» — список всех
+        # напоминаний с управлением (выключить/удалить/изменить).
+        [InlineKeyboardButton("📋 Мои напоминания", callback_data="timer_list")],
         [InlineKeyboardButton("❌ Отмена", callback_data="cancel_action")],
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -5051,6 +5147,8 @@ def get_developer_keyboard():
         [InlineKeyboardButton("⭐ Начислить звёзды пользователю", callback_data="dev_grant_stars")],
         # ПУНКТ 3 (саппорт): обзор/ответ на сообщения чата поддержки.
         [InlineKeyboardButton("💬 Чат поддержки (входящие)", callback_data="dev_support_inbox")],
+        # ВОЛНА 22.27: журнал действий админов — доказательство, кто рассылал.
+        [InlineKeyboardButton("📜 Журнал админов", callback_data="dev_adminlog")],
         # НОВОЕ: хранилище (приватный канал) — облако, авто-бэкапы, восстановление.
         [InlineKeyboardButton("☁️ Хранилище (канал)", callback_data="dev_storage")],
         [InlineKeyboardButton("❌ Отмена", callback_data="cancel_action")]
@@ -5124,6 +5222,8 @@ def get_anonymous_reply_keyboard(message_id):
             "💬 Ответить анонимно",
             callback_data=f"reply_anon_{message_id}",
         )],
+        # ВОЛНА 22.27: жалоба разработчику — отправитель об этом не узнает.
+        [InlineKeyboardButton("🚨 Пожаловаться", callback_data=f"rep_anon_{message_id}")],
         [InlineKeyboardButton("❌ Закрыть", callback_data="cancel_anon_reply")],
     ])
 
@@ -19385,7 +19485,7 @@ def _automation_system_prompt(context_text, is_admin):
         '6) {"action":"edit_schedule","day":"<Понедельник..Воскресенье>","content":"<номер. предмет через \\n>"} — заменить расписание на день.\n'
         '7) {"action":"edit_bell","lesson":<номер урока числом>,"start":"ЧЧ:ММ","end":"ЧЧ:ММ"} — задать время звонков урока. end обязан быть позже start.\n'
         '8) {"action":"set_holidays","date":"ГГГГ-ММ-ДД"} — дата начала каникул.\n'
-        '9) {"action":"create_timer","date":"ГГГГ-ММ-ДД","time":"ЧЧ:ММ","text":"<текст напоминания>","kind":"timer|wish","repeat_daily":false} — таймер/напоминание/ПОЖЕЛАНИЕ ПО РАСПИСАНИЮ (доступно всем). Если пользователь говорит «через N минут/часов» — используй вместо даты поле in_minutes: {"action":"create_timer","in_minutes":<целое число минут>,"text":"<текст>"}. Разрешено передавать date как «today»/«tomorrow» — исполнитель сам посчитает дату. ПОЛЕ kind: "timer" (по умолчанию) — обычное напоминание; "wish" — когда пользователь просит бота ПОЖЕЛАТЬ/сказать/поздравить его самого («пожелай мне спокойной ночи в 23:00», «говори мне доброе утро в 7:00», «поздравь меня с наступающим в 12:00») — в text запиши САМО ПОЖЕЛАНИЕ живой фразой с уместным эмодзи (например «Спокойной ночи! Пусть тебе приснятся самые добрые сны 🌙»), а не служебный текст. ПОЛЕ repeat_daily: true — ТОЛЬКО если сказано «каждый день», «каждое утро», «всегда в это время»; иначе false. ПОЛЕ repeat_weekday — ЕЖЕНЕДЕЛЬНЫЙ повтор: «каждый понедельник в 15:00» = {"repeat_weekday":"mon","time":"15:00"} (дни: mon|tue|wed|thu|fri|sat|sun или по-русски); дата не нужна, исполнитель сам найдёт ближайший день. Напоминаний можно создавать сколько угодно.\n'
+        '9) {"action":"create_timer","date":"ГГГГ-ММ-ДД","time":"ЧЧ:ММ","text":"<текст напоминания>","kind":"timer|wish","repeat_daily":false} — таймер/напоминание/ПОЖЕЛАНИЕ ПО РАСПИСАНИЮ (доступно всем). Если пользователь говорит «через N минут/часов» — используй вместо даты поле in_minutes: {"action":"create_timer","in_minutes":<целое число минут>,"text":"<текст>"}. Разрешено передавать date как «today»/«tomorrow» — исполнитель сам посчитает дату. ПОЛЕ kind: "timer" (по умолчанию) — обычное напоминание; "wish" — когда пользователь просит бота ПОЖЕЛАТЬ/сказать/поздравить его самого («пожелай мне спокойной ночи в 23:00», «говори мне доброе утро в 7:00», «поздравь меня с наступающим в 12:00») — в text запиши САМО ПОЖЕЛАНИЕ живой фразой с уместным эмодзи (например «Спокойной ночи! Пусть тебе приснятся самые добрые сны 🌙»), а не служебный текст. ПОЛЕ repeat_daily: true — ТОЛЬКО если сказано «каждый день», «каждое утро», «всегда в это время» и НЕ названы исключения; иначе false. ПОЛЕ repeat_weekday — ЕЖЕНЕДЕЛЬНЫЙ повтор: «каждый понедельник в 15:00» = {"repeat_weekday":"mon","time":"15:00"} (дни: mon|tue|wed|thu|fri|sat|sun или по-русски); дата не нужна, исполнитель сам найдёт ближайший день. ПОЛЯ repeat_days/skip_days — ПОВТОР ПО НЕСКОЛЬКИМ ДНЯМ С ИСКЛЮЧЕНИЯМИ: «напоминай каждое утро в 7:00, но не считай понедельник и выходные» = {"repeat_days":["tue","wed","thu","fri"],"time":"07:00"} — перечисли ОСТАЮЩИЕСЯ дни; можно вместо этого передать skip_days (исключённые): {"skip_days":["mon","sat","sun"],"time":"07:00"} = «каждый день кроме пн, сб, вс». Понимай любые формулировки: «по будням» = repeat_days:["mon","tue","wed","thu","fri"], «кроме выходных» = skip_days:["sat","sun"], «только в школу» = будни. Напоминаний можно создавать сколько угодно.\n'
         '10) {"action":"send_class_message","text":"<сообщение>"} — объявление всему классу (только админ).\n'
         '11) {"action":"show_homework","subject":"<предмет или null>","date":"ГГГГ-ММ-ДД или null"} — показать ДЗ.\n'
         '12) {"action":"show_schedule","day":"<день или null>"} — показать расписание.\n'
@@ -19423,7 +19523,7 @@ def _automation_system_prompt(context_text, is_admin):
         "- НЕСКОЛЬКО ДЗ ЗА РАЗ: перечисление заданий по разным предметам/датам — это ОДНО действие add_homework_many со ВСЕМИ элементами. Не выкидывай ни одно задание и не добавляй лишние.\n"
         "- НЕСКОЛЬКО УДАЛЕНИЙ ДЗ ЗА РАЗ: «удали всё дз на сегодня, на завтра по математике и послезавтра на русский», «убери дз на пятницу и по физике на завтра» — это ОДНО действие delete_homework_many со ВСЕМИ элементами из фразы. Внутри элемента subject:null = весь день, date:null = весь предмет. Названия предметов сопоставляй с классом («русский» → «Русский язык»).\n"
         "- СЛЕДУЮЩАЯ НЕДЕЛЯ: «на следующей неделе в понедельник/пятницу», «в понедельник следующей недели» — берите дату из строки контекста про СЛЕДУЮЩУЮ неделю, а не из текущей. «Через неделю» = сегодня + 7 дней.\n"
-        "- ПОЖЕЛАНИЯ ПО РАСПИСАНИЮ: «пожелай мне спокойной ночи в 23:00» = create_timer kind:\"wish\" time:\"23:00\" с живой фразой-пожеланием в text; «желай доброе утро в 7:00 каждый день» = то же + repeat_daily:true. Обычные напоминания («напомни…») = kind:\"timer\". ЕЖЕНЕДЕЛЬНЫЕ напоминания: «каждый понедельник в 15:00 напомни про кружок» = create_timer repeat_weekday:\"mon\" time:\"15:00\"; можно создавать сколько угодно напоминаний.\n"
+        "- ПОЖЕЛАНИЯ ПО РАСПИСАНИЮ: «пожелай мне спокойной ночи в 23:00» = create_timer kind:\"wish\" time:\"23:00\" с живой фразой-пожеланием в text; «желай доброе утро в 7:00 каждый день» = то же + repeat_daily:true. Обычные напоминания («напомни…») = kind:\"timer\". ЕЖЕНЕДЕЛЬНЫЕ напоминания: «каждый понедельник в 15:00 напомни про кружок» = create_timer repeat_weekday:\"mon\" time:\"15:00\"; можно создавать сколько угодно напоминаний. НАБОР ДНЕЙ С ИСКЛЮЧЕНИЯМИ: «напоминай каждое утро в 7:00, но не считай понедельник и выходные» = create_timer repeat_days:[\"tue\",\"wed\",\"thu\",\"fri\"] time:\"07:00\"; «каждый день кроме выходных» = skip_days:[\"sat\",\"sun\"]; «по будням» = repeat_days:[\"mon\",\"tue\",\"wed\",\"thu\",\"fri\"].\n"
         "- ДЕНЬ РОЖДЕНИЯ: «поменяй мой день рождения на 30 мая 2008», «мой днюха 14 марта 2009» = set_birthday с датой ГГГГ-ММ-ДД; если год не назван — clarify.\n"
         "- КОД КЛАССА: «скажи код класса», «какой у нас код?», «покажи код» = show_class_code.\n"
         "- ХРАНИЛИЩЕ/ОБЛАКО: «облако», «мои файлы», «что в облаке» = show_storage; «сделай бэкап», «сохрани базу» = backup_now (только разработчик); «открой облако» = open_section section:\"облако\".\n"
@@ -19756,10 +19856,69 @@ async def _automation_execute_action(update, context, user, class_obj, action):
                 return ("❓ День недели не распознан. Скажите, например: "
                         "«каждый понедельник в 15:00».", False)
 
+        # ВОЛНА 22.27: «каждое утро в 7:00, но не считай понедельник и
+        # выходные» — НАБОР дней недели. DeepSeek присылает repeat_days
+        # (список дней, которые НУЖНЫ) и/или skip_days (которые ИСКЛЮЧИТЬ
+        # из «каждый день»). Итог: список 0=Пн…6=Вс.
+        _WD_ALIASES27 = {
+            "mon": 0, "monday": 0, "понедельник": 0, "пн": 0, "понедельника": 0,
+            "tue": 1, "tuesday": 1, "вторник": 1, "вт": 1, "вторника": 1,
+            "wed": 2, "wednesday": 2, "среда": 2, "среду": 2, "ср": 2, "среды": 2,
+            "thu": 3, "thursday": 3, "четверг": 3, "чт": 3, "четверга": 3,
+            "fri": 4, "friday": 4, "пятница": 4, "пятницу": 4, "пт": 4, "пятницы": 4,
+            "sat": 5, "saturday": 5, "суббота": 5, "субботу": 5, "сб": 5, "субботы": 5,
+            "sun": 6, "sunday": 6, "воскресенье": 6, "вс": 6, "воскресенья": 6,
+            "будни": "weekdays", "будней": "weekdays", "weekdays": "weekdays",
+            "weekend": "weekend", "выходные": "weekend", "выходных": "weekend",
+        }
+
+        def _wd_list27(raw):
+            """Список алиасов дней -> список int; None если пусто/не распознано."""
+            if isinstance(raw, str):
+                items = [x for x in raw.replace(";", ",").split(",") if x.strip()]
+            elif isinstance(raw, (list, tuple)):
+                items = [str(x) for x in raw]
+            else:
+                return None
+            out = []
+            for it in items:
+                key = it.strip().lower()
+                val = _WD_ALIASES27.get(key)
+                if val == "weekdays":
+                    out.extend([0, 1, 2, 3, 4])
+                elif val == "weekend":
+                    out.extend([5, 6])
+                elif val is not None:
+                    out.append(val)
+                else:
+                    try:
+                        w = int(key)
+                        if 0 <= w <= 6:
+                            out.append(w)
+                    except (TypeError, ValueError):
+                        return None  # нераспознанный день — честно уточним
+            return sorted(set(out)) if out else None
+
+        repeat_days = _wd_list27(action.get("repeat_days"))
+        skip_days = _wd_list27(action.get("skip_days"))
+        if repeat_days is None and skip_days is None and repeat_weekly is None:
+            repeat_days = []  # не еженедельный и не многодневный — обычный
+        if skip_days:
+            # «каждый день, КРОМЕ …»: все 7 дней минус исключённые.
+            _base = set(repeat_days) if repeat_days else {0, 1, 2, 3, 4, 5, 6}
+            repeat_days = sorted(_base - set(skip_days))
+            skip_days = None
+        if repeat_days:
+            repeat_weekly = None  # многодневный режим сильнее одиночного
+        if repeat_days == [0, 1, 2, 3, 4, 5, 6]:
+            repeat_days = []      # «каждый день без исключений» = repeat_daily
+        if isinstance(repeat_days, list) and len(repeat_days) == 0:
+            repeat_days = None
+
         # Формат 1: относительное время «через N минут» (не для еженедельных).
         in_minutes_raw = action.get("in_minutes")
-        if repeat_weekly is not None and str(in_minutes_raw or "").strip() not in ("", "None", "null"):
-            in_minutes_raw = None  # еженедельный таймер — только дата+время
+        if (repeat_weekly is not None or repeat_days) and str(in_minutes_raw or "").strip() not in ("", "None", "null"):
+            in_minutes_raw = None  # повторяемый таймер — только дата+время
         if in_minutes_raw is not None and str(in_minutes_raw).strip() not in ("", "null", "None"):
             try:
                 in_minutes = int(float(str(in_minutes_raw).strip()))
@@ -19804,6 +19963,32 @@ async def _automation_execute_action(update, context, user, class_obj, action):
                     if _wd_date is None:
                         return "❓ Не понял день недели. Попробуйте ещё раз.", False
                     date_str = _wd_date.strftime("%Y-%m-%d")
+            elif repeat_days:
+                # ВОЛНА 22.27: НАБОР дней — первый запуск = ближайший подходящий
+                # день (сегодня, если день подходит и время ещё не прошло).
+                if not time_str:
+                    return ("❓ Назовите ВРЕМЯ напоминания (например, "
+                            "«напоминай каждое утро в 7:00 кроме выходных»)."), False
+                try:
+                    datetime.strptime(f"2000-01-01 {time_str}", "%Y-%m-%d %H:%M")
+                except ValueError:
+                    return "❓ Время напоминания не распознано. Назовите его как ЧЧ:ММ.", False
+                date_str = ""
+                if local_now.weekday() in set(repeat_days):
+                    try:
+                        _cand = datetime.strptime(
+                            f"{local_now.strftime('%Y-%m-%d')} {time_str}",
+                            "%Y-%m-%d %H:%M")
+                        if _cand > local_now:
+                            date_str = local_now.strftime("%Y-%m-%d")
+                    except ValueError:
+                        pass
+                if not date_str:
+                    _nd = _timer_next_days_date(repeat_days, local_now)
+                    if _nd is None:
+                        return ("❓ Не понял дни недели. Скажите, например: "
+                                "«каждое утро в 7:00 кроме субботы и воскресенья»."), False
+                    date_str = _nd.strftime("%Y-%m-%d")
             if not date_str and time_str:
                 # Только время — считаем «сегодня», а если оно уже прошло — «завтра».
                 today_time = datetime.strptime(
@@ -19835,6 +20020,8 @@ async def _automation_execute_action(update, context, user, class_obj, action):
             repeat_daily = repeat_daily_raw.strip().lower() in ("true", "да", "1", "yes")
         else:
             repeat_daily = bool(repeat_daily_raw)
+        if repeat_days:
+            repeat_daily = False  # набор дней точнее «каждый день»
         # Пожелание без текста — это clarify, а не таймер.
         if kind == "wish" and not text:
             return (
@@ -19851,6 +20038,9 @@ async def _automation_execute_action(update, context, user, class_obj, action):
             "kind": kind,
             "repeat_daily": repeat_daily,
             "repeat_weekly": repeat_weekly,
+            # ВОЛНА 22.27: «каждое утро кроме выходных и понедельника» —
+            # набор дней недели (0=Пн…6=Вс), по которым таймер срабатывает.
+            "repeat_days": list(repeat_days) if repeat_days else None,
             "created_date": datetime.now().strftime("%Y-%m-%d %H:%M"),
         }
         save_data(TIMERS_FILE, timers)
@@ -19862,7 +20052,18 @@ async def _automation_execute_action(update, context, user, class_obj, action):
         except Exception as e:
             logger.error(f"automation create_timer schedule: {e}")
         when_line = f"📅 {date_str} в {time_str}"
-        if repeat_weekly is not None:
+        if repeat_days:
+            _WD_NAMES27 = ("понедельник", "вторник", "среда", "четверг",
+                           "пятница", "суббота", "воскресенье")
+            if len(repeat_days) == 5 and set(repeat_days) == {0, 1, 2, 3, 4}:
+                _days_line = "по будням"
+            elif set(repeat_days) == {1, 2, 3, 4, 5}:
+                _days_line = "со вторника по субботу"
+            else:
+                _days_line = "по " + ", ".join(_WD_NAMES27[d] for d in repeat_days)
+            when_line = (f"📅 {_days_line} в {time_str} "
+                         f"(ближайший — {date_str})")
+        elif repeat_weekly is not None:
             _WD_NAMES = ("понедельник", "вторник", "среду", "четверг",
                          "пятницу", "субботу", "воскресенье")
             when_line = (f"📅 каждый {_WD_NAMES[repeat_weekly]} в {time_str} "
@@ -21447,6 +21648,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_instructions(update, context)
         return SHOW_INSTRUCTIONS
 
+    # ВОЛНА 22.27: возрастной порог 13+ — принудительная проверка
+    # ПРИ КАЖДОМ входе (в т.ч. для зарегистрированных до этой волны).
+    if _age_gate_violation(user):
+        await _send_age_block(update, context)
+        return AGE_BLOCKED
+
     # Если инструкция уже прочитана — продолжаем как раньше.
     # ПОЛИТИКА ПДн 1.2: если ДР осознанно пропущен (birthday_skipped) —
     # больше НЕ спрашиваем: минимизация данных.
@@ -21476,6 +21683,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ENTER_CITY
     else:
+        # ВОЛНА 22.27: ДР пропущен — порог 13+ проверить нельзя. При каждом
+        # входе предлагаем указать дату (отказ возможен — минимизация данных).
+        if not user.birthday:
+            try:
+                await update.message.reply_text(
+                    _AGE_ASK_TEXT, reply_markup=_AGE_ASK_KB)
+            except Exception:
+                pass
         # ВОЛНА 22.12: pending share-ссылка — сначала выдаём файлы, потом меню.
         _ptok = context.user_data.pop('pending_share_tok', None)
         if _ptok:
@@ -21503,10 +21718,23 @@ async def send_blocked_message(update, context, user_id):
         price = blocked_data.get('unblock_price', prices.get('unblock', 40))
         block_type = "администратором"
 
+    # ВОЛНА 22.27: если блокировка ВРЕМЕННАЯ — честно показываем, когда кончится.
+    _until_line = ""
+    _until_ts = blocked_data.get('until_ts')
+    if _until_ts:
+        try:
+            _until_dt = datetime.fromtimestamp(float(_until_ts))
+            if _until_dt > datetime.now():
+                _until_line = (f"\n\n⏳ Блокировка временная — снимется "
+                               f"автоматически: {_until_dt.strftime('%d.%m.%Y в %H:%M')}.")
+        except (TypeError, ValueError, OSError):
+            pass
+
     text = (
         f"🚫 Вы заблокированы {block_type}.\n\n"
         f"Чтобы разблокировать аккаунт, нажмите кнопку ниже.\n"
         f"С вашего баланса (или через Telegram Stars) будет списано {price} ⭐."
+        + _until_line
     )
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton(f"🔓 Разблокироваться за {price} ⭐", callback_data="unblock_self")]
@@ -22642,6 +22870,10 @@ def _inject_global_cancel(states_dict):
         if _state == MAIN_MENU:
             # 22.10: главное меню обрабатывает отмену сам (handle_main_menu).
             continue
+        if _state == AGE_BLOCKED:
+            # ВОЛНА 22.27: «❌ Отмена» не должна выкидывать пользователя
+            # с возрастным гейтом 13+ обратно в меню — гейт держим намертво.
+            continue
         has_text_input = any(isinstance(h, MessageHandler) for h in _handlers)
         if has_text_input:
             _handlers.insert(0, MessageHandler(
@@ -22699,6 +22931,11 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(user_id)
     if not user:
         user = User(user_id)
+    # ВОЛНА 22.27: возрастной порог 13+ — проверка и в главном меню
+    # (не только на /start: у пользователя мог поменяться/исправиться ДР).
+    if _age_gate_violation(user):
+        await _send_age_block(update, context)
+        return AGE_BLOCKED
     # ВОЛНА 22.13: отметка дневной активности (для DAU/WAU/MAU статистики).
     _touch_activity(user_id)
     message_text = update.message.text
@@ -25835,6 +26072,10 @@ async def send_class_message_handler(update: Update, context: ContextTypes.DEFAU
 
     success_text = f"✅ Сообщение отправлено {sent_count} участникам класса!"
 
+    # ВОЛНА 22.27: журнал действий админов — доказуемая авторство рассылки.
+    _log_admin_action(user_id, class_code, "Рассылка классу",
+                      message_text[:200])
+
     await update.message.reply_text(success_text)
     return await admin_panel(update, context)
 
@@ -25951,6 +26192,9 @@ async def edit_schedule_content_handler(update: Update, context: ContextTypes.DE
         ok = save_classes(classes)
 
         if ok:
+            # ВОЛНА 22.27: журнал действий админов.
+            _log_admin_action(user_id, class_code,
+                              f"Расписание ({day_name}) — текст", new_schedule[:200])
             success_text = (
                 f"✅ Расписание на {day_name} успешно обновлено!\n\n"
                 f"Новое расписание:\n{new_schedule}"
@@ -26022,6 +26266,9 @@ async def edit_schedule_image_handler(update: Update, context: ContextTypes.DEFA
     ok = save_classes(classes)
 
     if ok:
+        # ВОЛНА 22.27: журнал действий админов (расписание картинкой).
+        _log_admin_action(str(update.effective_user.id), class_code,
+                          f"Расписание ({day_name}) — КАРТИНКА", caption[:200])
         success_text = (
             f"✅ Расписание на {day_name} сохранено КАРТИНКОЙ!"
             + (f"\n📝 Подпись: {caption}" if caption else "")
@@ -27585,12 +27832,100 @@ async def dev_block_user_handler(update: Update, context: ContextTypes.DEFAULT_T
     user_id = query.data.split("_")[2]
     context.user_data['blocking_user_id'] = user_id
 
+    return await _render_block_duration(update, context)
+
+
+def _render_block_duration_kb():
+    """ВОЛНА 22.27: «на сколько заблокировать» — разработчик выбирает срок."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⏱ 2 часа", callback_data="dev_blockdur_h_2")],
+        [InlineKeyboardButton("🕐 1 день", callback_data="dev_blockdur_h_24")],
+        [InlineKeyboardButton("🕑 3 дня", callback_data="dev_blockdur_h_72")],
+        [InlineKeyboardButton("📅 7 дней", callback_data="dev_blockdur_h_168")],
+        [InlineKeyboardButton("🗓 30 дней", callback_data="dev_blockdur_h_720")],
+        [InlineKeyboardButton("♾ Навсегда", callback_data="dev_blockdur_inf")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="cancel_action")],
+    ])
+
+
+async def _render_block_duration(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает выбор срока блокировки для user_data['blocking_user_id'].
+    Используется и из панели разработчика, и из жалобы («🚨 Пожаловаться»)."""
+    query = update.callback_query
+    user_id = context.user_data.get('blocking_user_id')
+    if not user_id:
+        try:
+            await query.edit_message_text("Пользователь не выбран.",
+                                          reply_markup=get_cancel_keyboard())
+        except Exception:
+            pass
+        return DEV_USER_MANAGEMENT
+
     user = get_user(user_id)
     user_name = user.first_name if user else f"User {user_id}"
     username_str = f" (@{user.username})" if user and getattr(user, 'username', None) else ""
 
-    text = f"🚫 Блокировка пользователя {user_name}{username_str}\n\nВведите цену разблокировки (в звездах):"
+    text = (
+        f"🚫 Блокировка пользователя {user_name}{username_str}\n\n"
+        "НА СКОЛЬКО заблокировать?\n"
+        "• Временная блокировка истечёт сама — пользователь снова сможет "
+        "писать, когда срок закончится.\n"
+        "• «Навсегда» — как раньше, до вашего ручного разблока."
+    )
+    try:
+        await query.edit_message_text(text, reply_markup=_render_block_duration_kb())
+    except Exception:
+        await context.bot.send_message(
+            chat_id=int(query.from_user.id), text=text,
+            reply_markup=_render_block_duration_kb())
+    return DEV_BLOCK_DURATION
 
+
+async def dev_block_duration_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.27: разработчик выбрал срок — теперь спрашиваем цену разблока
+    (0 — разблокировка бесплатная)."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    user_id = str(update.effective_user.id)
+    if user_id != DEVELOPER_ID:
+        try:
+            await query.answer("Доступ запрещён.", show_alert=True)
+        except Exception:
+            pass
+        return DEV_PANEL
+
+    if data == "dev_blockdur_inf":
+        context.user_data['block_until_hours'] = None
+        _dur_label = "навсегда"
+    else:
+        try:
+            _h = int(data.split("_")[3])
+        except (IndexError, TypeError, ValueError):
+            _h = 0
+        if _h <= 0:
+            context.user_data['block_until_hours'] = None
+            _dur_label = "навсегда"
+        else:
+            context.user_data['block_until_hours'] = _h
+            _dur_label = f"{_h} ч. (≈ {_h // 24} дн.)" if _h >= 24 else f"{_h} ч."
+
+    blocking_user_id = context.user_data.get('blocking_user_id')
+    if not blocking_user_id:
+        await query.edit_message_text("Пользователь не выбран.",
+                                      reply_markup=get_cancel_keyboard())
+        return DEV_USER_MANAGEMENT
+
+    user = get_user(blocking_user_id)
+    user_name = user.first_name if user else f"User {blocking_user_id}"
+    username_str = f" (@{user.username})" if user and getattr(user, 'username', None) else ""
+
+    text = (
+        f"🚫 Блокировка пользователя {user_name}{username_str}\n"
+        f"⏳ Срок: {_dur_label}\n\n"
+        "Введите цену разблокировки (в звёздах). "
+        "Можно 0 — тогда разблокировка будет бесплатной:"
+    )
     await query.edit_message_text(text, reply_markup=get_cancel_keyboard())
     return DEV_BLOCK_USER_PRICE
 
@@ -27610,27 +27945,67 @@ async def dev_block_user_price_handler(update: Update, context: ContextTypes.DEF
             await update.message.reply_text("Пользователь не выбран.")
             return await developer_panel(update, context)
 
-        block_user(blocking_user_id, user_id, price)
+        if price < 0:
+            await update.message.reply_text("Цена не может быть отрицательной. Введите число (0 — бесплатный разблок):")
+            return DEV_BLOCK_USER_PRICE
+
+        # ВОЛНА 22.27: применяем выбранный СРОК блокировки и цену (0 = бесплатно).
+        until_hours = context.user_data.get('block_until_hours')
+        block_user(blocking_user_id, user_id, price if price > 0 else None,
+                   until_hours=until_hours)
 
         user = get_user(blocking_user_id)
         user_name = user.first_name if user else f"User {blocking_user_id}"
         username_str = f" (@{user.username})" if user and getattr(user, 'username', None) else ""
 
-        await update.message.reply_text(f"✅ Пользователь {user_name}{username_str} заблокирован!\nЦена разблокировки: {price} ⭐")
+        _dur_line = ""
+        if until_hours:
+            try:
+                _until = datetime.now() + timedelta(hours=float(until_hours))
+                _dur_line = f"\n⏳ Разблокируется сам: {_until.strftime('%d.%m.%Y %H:%M')}"
+            except Exception:
+                pass
+
+        await update.message.reply_text(
+            f"✅ Пользователь {user_name}{username_str} заблокирован!\n"
+            f"Цена разблокировки: {price if price > 0 else 'бесплатно'} ⭐"
+            + _dur_line)
 
         try:
+            _until_line = ""
+            if until_hours:
+                try:
+                    _until = datetime.now() + timedelta(hours=float(until_hours))
+                    _until_line = (f"\n\n⏳ Блокировка снимется автоматически: "
+                                   f"{_until.strftime('%d.%m.%Y %H:%M')}")
+                except Exception:
+                    pass
             await context.bot.send_message(
                 chat_id=blocking_user_id,
-                text=f"🚫 Вы были заблокированы разработчиком.\n\nДля разблокировки нужно: {price} ⭐"
+                text=(f"🚫 Вы были заблокированы разработчиком.\n\n"
+                      f"Для разблокировки нужно: {price} ⭐" + _until_line)
             )
         except Exception as e:
             logger.error(f"Ошибка уведомления заблокированного пользователя: {e}")
 
+        # ВОЛНА 22.27: если блокировка началась с жалобы — закрываем жалобу.
+        _from_report = context.user_data.pop('block_from_report', None)
+        if _from_report:
+            try:
+                _reports = load_reports()
+                if _from_report in _reports:
+                    _reports[_from_report]['status'] = 'blocked'
+                    _reports[_from_report]['resolved_at'] = datetime.now().strftime("%Y-%m-%d %H:%M")
+                    save_reports(_reports)
+            except Exception as e:
+                logger.error(f"Не удалось закрыть жалобу {_from_report}: {e}")
+
         context.user_data.pop('blocking_user_id', None)
+        context.user_data.pop('block_until_hours', None)
         return await developer_panel(update, context)
 
     except ValueError:
-        await update.message.reply_text("Введите число (цена в звёздах):")
+        await update.message.reply_text("Введите число (цена в звёздах, 0 — бесплатно):")
         return DEV_BLOCK_USER_PRICE
 
 async def dev_unblock_user_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -27643,15 +28018,29 @@ async def dev_unblock_user_start(update: Update, context: ContextTypes.DEFAULT_T
         await query.edit_message_text("✅ Нет заблокированных пользователей.", reply_markup=get_developer_keyboard())
         return DEV_PANEL
 
-    text = "✅ Выберите пользователя для разблокировки:"
-
-    keyboard = []
+    text = "✅ Выберите пользователя для разблокировки:\n\n"
+    _details = []
     for blocked_id in blocked_users.keys():
         user = get_user(blocked_id)
         name = user.first_name if user else f"User {blocked_id}"
         if user and getattr(user, 'username', None):
             name += f" (@{user.username})"
         keyboard.append([InlineKeyboardButton(name, callback_data=f"dev_unblock_{blocked_id}")])
+        # ВОЛНА 22.27: честная сводка по каждой блокировке (кто/когда/до каких пор).
+        _rec = blocked_users.get(blocked_id) or {}
+        _line = f"• {name}: {(_rec.get('blocked_at') or '?')}"
+        if _rec.get('until_ts'):
+            try:
+                _until_dt = datetime.fromtimestamp(float(_rec['until_ts']))
+                _line += f" → до {_until_dt.strftime('%d.%m.%Y %H:%M')}"
+            except (TypeError, ValueError, OSError):
+                pass
+        else:
+            _line += " → навсегда"
+        _details.append(_line)
+
+    if _details:
+        text += "\n".join(_details)
 
     keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel_action")])
 
@@ -28539,6 +28928,10 @@ async def save_bell_end_handler(update: Update, context: ContextTypes.DEFAULT_TY
             classes[class_code] = class_obj
             save_classes(classes)
 
+            # ВОЛНА 22.27: журнал действий админов (звонки).
+            _log_admin_action(user_id, class_code,
+                              f"Звонки ({lesson_num} урок)", f"{start_time} - {time_str}")
+
             await update.message.reply_text(f"✅ Время {lesson_num} урока обновлено: {start_time} - {time_str}")
         else:
             await update.message.reply_text("Не удалось сохранить. Попробуйте снова.")
@@ -28594,6 +28987,9 @@ async def save_holidays_handler(update: Update, context: ContextTypes.DEFAULT_TY
             classes = load_classes()
             classes[class_code] = class_obj
             save_classes(classes)
+
+            # ВОЛНА 22.27: журнал действий админов (каникулы).
+            _log_admin_action(user_id, class_code, "Каникулы", date_str)
 
             await update.message.reply_text(f"✅ Дата каникул установлена: {date_str}")
         else:
@@ -29255,6 +29651,11 @@ async def save_homework_handler(update: Update, context: ContextTypes.DEFAULT_TY
         classes[class_code] = class_obj
         save_classes(classes)
 
+        # ВОЛНА 22.27: журнал действий админов (ДЗ добавлено).
+        _log_admin_action(user_id, class_code,
+                          f"ДЗ добавлено ({subject}, {date_str})",
+                          homework_text[:200])
+
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("➕ Ещё ДЗ", callback_data="add_homework")],
             [InlineKeyboardButton("⬅️ В админ-панель", callback_data="back_to_admin")],
@@ -29626,6 +30027,10 @@ async def delete_homework_item_handler(update: Update, context: ContextTypes.DEF
             classes[class_code] = class_obj
             save_classes(classes)
 
+            # ВОЛНА 22.27: журнал действий админов (ДЗ удалено).
+            _log_admin_action(str(query.from_user.id), class_code,
+                              f"ДЗ удалено ({subject})")
+
             await query.edit_message_text("✅ Домашнее задание удалено!")
         else:
             await query.edit_message_text("Задание не найдено.")
@@ -29719,6 +30124,10 @@ async def class_block_user_handler(update: Update, context: ContextTypes.DEFAULT
             except Exception as e:
                 logger.error(f"Ошибка при уведомлении заблокированного пользователя: {e}")
 
+            # ВОЛНА 22.27: журнал действий админов (блок в классе).
+            _log_admin_action(user_id, class_code,
+                              f"Блокировка участника {blocked_user_id} в классе")
+
             await query.edit_message_text(f"✅ Пользователь {blocked_name} заблокирован!")
         else:
             await query.edit_message_text("Пользователь уже заблокирован.")
@@ -29743,6 +30152,10 @@ async def class_unblock_user_handler(update: Update, context: ContextTypes.DEFAU
     if class_obj:
         if unblocked_user_id in class_obj.blocked_users:
             unblock_user_in_class(unblocked_user_id, class_code)
+
+            # ВОЛНА 22.27: журнал действий админов (разблок в классе).
+            _log_admin_action(user_id, class_code,
+                              f"Разблокировка участника {unblocked_user_id} в классе")
 
             unblocked_user = get_user(unblocked_user_id)
             unblocked_name = unblocked_user.first_name if unblocked_user else f"User {unblocked_user_id}"
@@ -30153,11 +30566,25 @@ async def community_rules_cb(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "• призывы к незаконным действиям;\n"
         "• спам, реклама без согласия;\n"
         "• распространение чужих персональных данных.\n\n"
+        "СТРОГИЕ ЗАПРЕТЫ ПО ЗАКОНУ (22.27):\n"
+        "• материалы экстремистской направленности — ст. 282 УК РФ;\n"
+        "• материалы сексуального характера с участием несовершеннолетних "
+        "— ст. 242.1 УК РФ;\n"
+        "• призывы к самоубийству и/или способы его совершения — "
+        "ст. 110.1 УК РФ;\n"
+        "• пропаганда наркотиков и способов их приобретения — "
+        "ст. 230 УК РФ.\n\n"
         "Нарушители блокируются без предупреждения.\n\n"
-        "Жалобы на контент — через «💬 Чат поддержки».\n"
+        "Жалобы на контент:\n"
+        "• кнопка «🚨 Пожаловаться» под анонимным сообщением или решением "
+        "класса — жалоба уходит разработчику (анонимно для автора);\n"
+        "• или через «💬 Чат поддержки».\n"
         "Срок рассмотрения: 24 часа (ст. 10.1 149-ФЗ).\n"
         "О результатах рассмотрения жалобы пользователь уведомляется "
-        "в течение 24 часов с момента подачи."
+        "в течение 24 часов с момента подачи.\n\n"
+        "ВАЖНО: действия админов классов (рассылки, ДЗ, расписание) "
+        "логируются с id и временем — автор запрещённой рассылки будет "
+        "установлен точно."
     )
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("⬅️ Назад", callback_data="back_to_settings")]])
@@ -30167,6 +30594,659 @@ async def community_rules_cb(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await context.bot.send_message(
             chat_id=update.effective_user.id, text=text, reply_markup=keyboard)
     return USER_SETTINGS
+
+
+# ==================================
+# === ВОЛНА 22.27: ЖАЛОБЫ, ЖУРНАЛ АДМИНОВ, ТАЙМЕРЫ, ВОЗРАСТ 13+ ===
+# ==================================
+
+_REPORT_MAX_SHOW = 300  # сколько символов спорного текста показываем разработчику
+
+
+async def _report_create_and_notify(context, rtype, reporter_id, ref_id,
+                                    real_author_id, headline, excerpt):
+    """Сохранить жалобу и уведомить РАЗРАБОТЧИКА (только его — там могут
+    быть персональные данные: id автора и жалобщика). Возвращает id жалобы."""
+    rid = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
+    reports = load_reports()
+    reports[rid] = {
+        'type': rtype,              # 'anon' | 'solution'
+        'ref': str(ref_id or ""),
+        'reporter': str(reporter_id),
+        'real_author': str(real_author_id or ""),
+        'headline': str(headline or "")[:200],
+        'excerpt': str(excerpt or "")[:_REPORT_MAX_SHOW],
+        'ts': datetime.now().strftime("%Y-%m-%d %H:%M"),
+        'status': 'open',           # open | blocked | dismissed
+    }
+    save_reports(reports)
+
+    # Кто автор и кто жалуется (для разработчика).
+    def _who(uid):
+        u = get_user(str(uid)) if uid else None
+        if not u:
+            return f"id {uid}"
+        _n = u.first_name or f"id {uid}"
+        if getattr(u, 'username', None):
+            _n += f" (@{u.username})"
+        return f"{_n} · id {uid}"
+
+    _type_label = ("АНОНИМНОЕ СООБЩЕНИЕ" if rtype == "anon"
+                   else "РЕШЕНИЕ КЛАССА")
+    _text = (
+        f"🚨 НОВАЯ ЖАЛОБА — {_type_label}\n\n"
+        f"{headline}\n"
+        + (f"\n📄 Фрагмент:\n«{excerpt}»\n" if excerpt else "")
+        + f"\n👤 Автор: {_who(real_author_id)}\n"
+        f"📨 Пожаловался: {_who(reporter_id)}\n"
+        f"🕒 {reports[rid]['ts']}\n\n"
+        "Решение за вами: заблокировать автора или отклонить жалобу."
+    )
+    _kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🚫 Заблокировать автора",
+                              callback_data=f"rep_block_{rid}")],
+        [InlineKeyboardButton("✅ Отклонить жалобу",
+                              callback_data=f"rep_dismiss_{rid}")],
+    ])
+    try:
+        await context.bot.send_message(
+            chat_id=int(DEVELOPER_ID), text=_text, reply_markup=_kb)
+    except Exception as e:
+        logger.error(f"report: не удалось уведомить разработчика: {e}")
+    return rid
+
+
+async def report_anon_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """«🚨 Пожаловаться» под ПОЛУЧЕННЫМ анонимным сообщением. Жалоба
+    анонимна для отправителя: он не узнаёт, что на него нажали."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    reporter_id = str(query.from_user.id)
+    msg_id = query.data[len("rep_anon_"):]
+    anon = load_data(ANONYMOUS_MESSAGES_FILE, {})
+    rec = anon.get(msg_id)
+    if not isinstance(rec, dict) or str(rec.get('to_user_id')) != reporter_id:
+        await query.answer("Сообщение не найдено.", show_alert=True)
+        return MAIN_MENU
+    if is_user_spamming(reporter_id, "report", 2, 5, 60):
+        await query.answer("⏳ Слишком часто. Подождите минуту.", show_alert=True)
+        return MAIN_MENU
+    # Помечаем сообщение жалобой (требование: «сообщение помечается»).
+    if not rec.get('reported'):
+        rec['reported'] = True
+        rec['reported_at'] = datetime.now().strftime("%Y-%m-%d %H:%M")
+        anon[msg_id] = rec
+        save_data(ANONYMOUS_MESSAGES_FILE, anon)
+    _excerpt = str(rec.get('message') or "")[:_REPORT_MAX_SHOW]
+    await _report_create_and_notify(
+        context, rtype="anon", reporter_id=reporter_id, ref_id=msg_id,
+        real_author_id=rec.get('from_user_id'),
+        headline="🕵️ Анонимное сообщение получателю " + reporter_id,
+        excerpt=_excerpt)
+    await query.answer("🚨 Жалоба отправлена разработчику. Спасибо!",
+                       show_alert=True)
+    return MAIN_MENU
+
+
+async def report_sol_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """«🚨 Пожаловаться» под решением класса (уведомление или просмотр)."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    reporter_id = str(query.from_user.id)
+    sol_id = query.data[len("rep_sol_"):]
+    entry = _sol_find_entry(sol_id)
+    user = get_user(reporter_id)
+    class_obj = get_class_by_user(reporter_id) if user else None
+    if (entry is None or user is None or class_obj is None
+            or entry.get("class_code") != class_obj.class_code):
+        await query.answer("Решение не найдено.", show_alert=True)
+        return MAIN_MENU
+    if is_user_spamming(reporter_id, "report", 2, 5, 60):
+        await query.answer("⏳ Слишком часто. Подождите минуту.", show_alert=True)
+        return MAIN_MENU
+    # Помечаем запись решения (видно старосте/в списке 🚩).
+    entry['flagged'] = True
+    entry['reports'] = int(entry.get('reports') or 0) + 1
+    _solutions_save()
+    await _report_create_and_notify(
+        context, rtype="solution", reporter_id=reporter_id, ref_id=sol_id,
+        real_author_id=entry.get("real_author") or entry.get("author"),
+        headline=f"📘 Решение «{(entry.get('subject') or 'Без предмета')[:80]}» "
+                 f"· класс «{class_obj.class_name}» · от "
+                 f"{_sol_author_label(entry)} · {entry.get('ts', '')}",
+        excerpt=str(entry.get('file', {}).get('name') or ""))
+    await query.answer("🚨 Жалоба отправлена разработчику. Спасибо!",
+                       show_alert=True)
+    return MAIN_MENU
+
+
+async def report_block_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Разработчик нажал «Заблокировать автора» в жалобе → выбор СРОКА."""
+    query = update.callback_query
+    await query.answer()
+    if str(query.from_user.id) != DEVELOPER_ID:
+        await query.answer("Только для разработчика.", show_alert=True)
+        return DEV_PANEL
+    rid = query.data[len("rep_block_"):]
+    reports = load_reports()
+    rec = reports.get(rid)
+    if not rec:
+        await query.answer("Жалоба не найдена.", show_alert=True)
+        return DEV_PANEL
+    if rec.get('status') != 'open':
+        await query.answer("Эта жалоба уже закрыта.", show_alert=True)
+        return DEV_PANEL
+    author = str(rec.get('real_author') or "")
+    if not author:
+        await query.answer("Автор неизвестен — некого блокировать.",
+                           show_alert=True)
+        return DEV_PANEL
+    context.user_data['blocking_user_id'] = author
+    context.user_data['block_from_report'] = rid
+    # Показываем выбор срока (та же клавиатура, что в панели разработчика).
+    _u = get_user(author)
+    _name = _u.first_name if _u else f"User {author}"
+    _text = (f"🚨 Жалоба: {rec.get('headline', '')}\n"
+             f"👤 Автор: {_name} · id {author}\n\n"
+             "НА СКОЛЬКО заблокировать?")
+    try:
+        await query.edit_message_text(_text, reply_markup=_render_block_duration_kb())
+    except Exception:
+        await context.bot.send_message(
+            chat_id=int(query.from_user.id), text=_text,
+            reply_markup=_render_block_duration_kb())
+    return DEV_BLOCK_DURATION
+
+
+async def report_dismiss_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Разработчик отклонил жалобу."""
+    query = update.callback_query
+    await query.answer()
+    if str(query.from_user.id) != DEVELOPER_ID:
+        await query.answer("Только для разработчика.", show_alert=True)
+        return DEV_PANEL
+    rid = query.data[len("rep_dismiss_"):]
+    reports = load_reports()
+    rec = reports.get(rid)
+    if not rec:
+        await query.answer("Жалоба не найдена.", show_alert=True)
+        return DEV_PANEL
+    rec['status'] = 'dismissed'
+    rec['resolved_at'] = datetime.now().strftime("%Y-%m-%d %H:%M")
+    save_reports(reports)
+    try:
+        await query.edit_message_text(
+            (query.message.text or "Жалоба") + "\n\n✅ Жалоба ОТКЛОНЕНА.")
+    except Exception:
+        await query.answer("Жалоба отклонена.")
+    return DEV_PANEL
+
+
+def _get_developer_adminlog_text():
+    """Текст «📜 Журнал админов» — последние 25 записей."""
+    entries = load_admin_log()
+    if not entries:
+        return ("📜 ЖУРНАЛ ДЕЙСТВИЙ АДМИНОВ\n\nПока пусто. Сюда попадают "
+                "действия админов классов: рассылки, ДЗ, расписание, звонки, "
+                "каникулы, модерация решений, блокировки в классе.")
+    lines = ["📜 ЖУРНАЛ ДЕЙСТВИЙ АДМИНОВ (последние 25)\n"]
+    for e in entries[-25:]:
+        lines.append(
+            f"🕒 {e.get('ts', '')} · 👤 {e.get('admin_name') or e.get('admin_id', '?')} "
+            f"· класс «{e.get('class_code', '')}»\n"
+            f"   {e.get('action', '')}"
+            + (f" — {e.get('details', '')}" if e.get('details') else ""))
+    lines.append("\nЭтот журнал — ваше доказательство: рассылал не вы, "
+                 "а конкретный админ (id и время зафиксированы).")
+    return "\n".join(lines)
+
+
+async def dev_adminlog_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """«📜 Журнал админов» в панели разработчика."""
+    query = update.callback_query
+    await query.answer()
+    if str(query.from_user.id) != DEVELOPER_ID:
+        await query.answer("Только для разработчика.", show_alert=True)
+        return DEV_PANEL
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("⬅️ В панель разработчика", callback_data="back_to_dev")]])
+    try:
+        await query.edit_message_text(
+            _get_developer_adminlog_text(), reply_markup=kb)
+    except Exception:
+        await context.bot.send_message(
+            chat_id=int(query.from_user.id),
+            text=_get_developer_adminlog_text(), reply_markup=kb)
+    return DEV_PANEL
+
+
+# === ВОЛНА 22.27: «📋 Мои напоминания» — список всех таймеров ===
+_WD_SHORT = ("пн", "вт", "ср", "чт", "пт", "сб", "вс")
+
+
+def _timer_schedule_label(td):
+    """Человекочитаемое описание расписания таймера (для списка)."""
+    parts = []
+    if td.get('repeat_days'):
+        try:
+            days = sorted({int(d) for d in td['repeat_days'] if 0 <= int(d) <= 6})
+            if len(days) == 7:
+                parts.append("каждый день")
+            elif days:
+                parts.append("по " + ", ".join(_WD_SHORT[d] for d in days))
+        except (TypeError, ValueError):
+            pass
+    elif td.get('repeat_weekly') is not None and not td.get('repeat_daily'):
+        try:
+            parts.append("каждый " + _WD_SHORT[int(td['repeat_weekly'])])
+        except (TypeError, ValueError):
+            pass
+    elif td.get('repeat_daily'):
+        parts.append("каждый день")
+    if td.get('kind') == 'wish':
+        parts.append("пожелание")
+    return (" · " + ", ".join(parts)) if parts else ""
+
+
+def _timer_status_emoji(td):
+    if not td.get('is_active', True):
+        return "⏸"
+    if td.get('fired_at') and not (td.get('repeat_daily') or td.get('repeat_weekly') is not None or td.get('repeat_days')):
+        return "✔️"
+    return "🟢"
+
+
+def _timer_list_kb(timers, uid):
+    """Список таймеров пользователя: правка / пауза-пуск / удаление."""
+    kb = []
+    for tid, td in sorted(timers.items(), key=lambda kv: str(kv[1].get('target_date', '')) + kv[1].get('target_time', '')):
+        if str(td.get('user_id')) != uid:
+            continue
+        _txt = (td.get('text') or "(без текста)")[:28]
+        _when = str(td.get('target_time') or "")
+        _date = str(td.get('target_date') or "")
+        if td.get('repeat_days') or td.get('repeat_daily') or td.get('repeat_weekly') is not None:
+            _when = (_date[5:] + " " + _when) if _date else _when  # первая дата ММ-ДД
+        else:
+            _when = _date + " " + _when
+        kb.append([InlineKeyboardButton(
+            f"{_timer_status_emoji(td)} {_when} · {_txt}",
+            callback_data=f"tmr_edit_{tid}")])
+        kb.append([InlineKeyboardButton(
+            ("▶️ Включить" if not td.get('is_active', True) else "⏸ Выключить"),
+            callback_data=(f"tmr_on_{tid}" if not td.get('is_active', True)
+                           else f"tmr_off_{tid}")),
+            InlineKeyboardButton("🗑 Удалить", callback_data=f"tmr_del_{tid}")])
+    kb.append([InlineKeyboardButton("⬅️ Назад к таймерам", callback_data="timer_back")])
+    return InlineKeyboardMarkup(kb)
+
+
+async def timer_list_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """«Все таймеры должны быть указаны» — полный список напоминаний
+    пользователя: любое можно выключить, удалить или отредактировать."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    uid = str(query.from_user.id)
+    timers = load_data(TIMERS_FILE, {})
+    mine = {t: d for t, d in timers.items()
+            if isinstance(d, dict) and str(d.get('user_id')) == uid}
+    if not mine:
+        try:
+            await query.edit_message_text(
+                "📋 Мои напоминания\n\nПока пусто — ни одного таймера нет.\n"
+                "Поставьте первый: быстрые кнопки ниже или через "
+                "«🪄 AI Agent» обычными словами.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("⬅️ Назад к таймерам",
+                                         callback_data="timer_back")]]))
+        except Exception:
+            pass
+        return TIMER_SET_DATE
+    _txt = (f"📋 Мои напоминания — {len(mine)} шт.\n\n"
+            "🟢 активен · ⏸ выключен · ✔️ сработал\n"
+            "Нажмите на напоминание, чтобы изменить текст или время.")
+    try:
+        await query.edit_message_text(
+            _txt, reply_markup=_timer_list_kb(mine, uid))
+    except Exception:
+        await context.bot.send_message(
+            chat_id=int(uid), text=_txt, reply_markup=_timer_list_kb(mine, uid))
+    return TIMER_SET_DATE
+
+
+async def timer_back_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """«⬅️ Назад к таймерам» — меню быстрых таймеров."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    try:
+        await query.edit_message_text(
+            "⏰ Установка таймера\n\nВыберите быстрый таймер или задайте своё время:",
+            reply_markup=get_quick_timer_keyboard())
+    except Exception:
+        await context.bot.send_message(
+            chat_id=int(query.from_user.id),
+            text="⏰ Установка таймера\n\nВыберите быстрый таймер или задайте своё время:",
+            reply_markup=get_quick_timer_keyboard())
+    return TIMER_SET_DATE
+
+
+def _timer_owner_guard(query, timers, tid):
+    """Таймер существует и принадлежит нажавшему? Иначе None + alert."""
+    td = timers.get(tid)
+    if not isinstance(td, dict) or str(td.get('user_id')) != str(query.from_user.id):
+        return None
+    return td
+
+
+async def timer_toggle_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """⏸ Выключить / ▶️ Включить напоминание."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    if data.startswith("tmr_off_"):
+        tid, new_active = data[len("tmr_off_"):], False
+    else:
+        tid, new_active = data[len("tmr_on_"):], True
+    timers = load_data(TIMERS_FILE, {})
+    td = _timer_owner_guard(query, timers, tid)
+    if td is None:
+        await query.answer("Не найдено.", show_alert=True)
+        return TIMER_SET_DATE
+    td['is_active'] = new_active
+    timers[tid] = td
+    save_data(TIMERS_FILE, timers)
+    mine = {t: d for t, d in timers.items()
+            if isinstance(d, dict) and str(d.get('user_id')) == str(query.from_user.id)}
+    try:
+        await query.edit_message_reply_markup(reply_markup=_timer_list_kb(mine, str(query.from_user.id)))
+    except Exception:
+        pass
+    await query.answer("⏸ Выключено" if not new_active else "▶️ Включено")
+    return TIMER_SET_DATE
+
+
+async def timer_delete_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """🗑 Удалить напоминание навсегда."""
+    query = update.callback_query
+    await query.answer()
+    tid = query.data[len("tmr_del_"):]
+    timers = load_data(TIMERS_FILE, {})
+    if _timer_owner_guard(query, timers, tid) is None:
+        await query.answer("Не найдено.", show_alert=True)
+        return TIMER_SET_DATE
+    del timers[tid]
+    save_data(TIMERS_FILE, timers)
+    try:
+        _app = context.application
+        for j in _app.job_queue.get_jobs_by_name(f"timer_{tid}"):
+            j.schedule_removal()
+    except Exception:
+        pass
+    mine = {t: d for t, d in timers.items()
+            if isinstance(d, dict) and str(d.get('user_id')) == str(query.from_user.id)}
+    if mine:
+        try:
+            await query.edit_message_text(
+                "🗑 Напоминание удалено.\n\n" + f"📋 Осталось: {len(mine)} шт.",
+                reply_markup=_timer_list_kb(mine, str(query.from_user.id)))
+        except Exception:
+            pass
+    else:
+        try:
+            await query.edit_message_text(
+                "🗑 Напоминание удалено. У вас больше нет таймеров.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("⬅️ Назад к таймерам",
+                                         callback_data="timer_back")]]))
+        except Exception:
+            pass
+    return TIMER_SET_DATE
+
+
+async def timer_edit_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """✏️ Нажатие на напоминание — карточка правки."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    tid = query.data[len("tmr_edit_"):]
+    timers = load_data(TIMERS_FILE, {})
+    td = _timer_owner_guard(query, timers, tid)
+    if td is None:
+        await query.answer("Напоминание не найдено.", show_alert=True)
+        return TIMER_SET_DATE
+    _when = f"{td.get('target_date', '')} {td.get('target_time', '')}".strip()
+    _txt = (
+        f"✏️ Напоминание\n\n"
+        f"📝 Текст: {td.get('text') or '(без текста)'}\n"
+        f"🕐 Когда: {_when}{_timer_schedule_label(td)}\n"
+        f"Статус: {'🟢 активен' if td.get('is_active', True) else '⏸ выключен'}\n\n"
+        "Что изменить?"
+    )
+    _kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📝 Изменить текст", callback_data=f"tmr_edittext_{tid}")],
+        [InlineKeyboardButton("🕐 Изменить время", callback_data=f"tmr_editt_{tid}")],
+        [InlineKeyboardButton("⬅️ К списку", callback_data="timer_list")],
+    ])
+    try:
+        await query.edit_message_text(_txt, reply_markup=_kb)
+    except Exception:
+        await context.bot.send_message(
+            chat_id=int(query.from_user.id), text=_txt, reply_markup=_kb)
+    return TIMER_SET_DATE
+
+
+async def timer_edit_text_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    tid = query.data[len("tmr_edittext_"):]
+    timers = load_data(TIMERS_FILE, {})
+    if _timer_owner_guard(query, timers, tid) is None:
+        await query.answer("Напоминание не найдено.", show_alert=True)
+        return TIMER_SET_DATE
+    context.user_data['tmr_edit_id'] = tid
+    try:
+        await query.edit_message_text("📝 Пришлите НОВЫЙ текст напоминания:")
+    except Exception:
+        await context.bot.send_message(
+            chat_id=int(query.from_user.id), text="📝 Пришлите НОВЫЙ текст напоминания:")
+    return TIMER_EDIT_TEXT
+
+
+@timeout(CONVERSATION_TIMEOUT)
+async def timer_edit_text_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tid = context.user_data.get('tmr_edit_id')
+    new_text = (update.message.text or "").strip()
+    if not tid:
+        await update.message.reply_text("Напоминание не выбрано.")
+        return TIMER_SET_DATE
+    if not new_text:
+        await update.message.reply_text("Текст пустой. Пришлите текст напоминания:")
+        return TIMER_EDIT_TEXT
+    rejected = await reject_if_forbidden_chars(update, new_text, TIMER_EDIT_TEXT)
+    if rejected is not None:
+        return rejected
+    timers = load_data(TIMERS_FILE, {})
+    td = timers.get(tid)
+    if not isinstance(td, dict) or str(td.get('user_id')) != str(update.effective_user.id):
+        await update.message.reply_text("Напоминание не найдено.")
+        context.user_data.pop('tmr_edit_id', None)
+        return TIMER_SET_DATE
+    td['text'] = new_text
+    timers[tid] = td
+    save_data(TIMERS_FILE, timers)
+    context.user_data.pop('tmr_edit_id', None)
+    await update.message.reply_text("✅ Текст напоминания обновлён!")
+    return TIMER_SET_DATE
+
+
+async def timer_edit_time_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    tid = query.data[len("tmr_editt_"):]
+    timers = load_data(TIMERS_FILE, {})
+    if _timer_owner_guard(query, timers, tid) is None:
+        await query.answer("Напоминание не найдено.", show_alert=True)
+        return TIMER_SET_DATE
+    context.user_data['tmr_edit_id'] = tid
+    try:
+        await query.edit_message_text(
+            "🕐 Пришлите НОВОЕ время в формате ЧЧ:ММ (например 07:30).\n"
+            "Для разового напоминания дата останется прежней — если время "
+            "уже прошло, переносится на ближайший свободный день.")
+    except Exception:
+        await context.bot.send_message(
+            chat_id=int(query.from_user.id),
+            text="🕐 Пришлите НОВОЕ время в формате ЧЧ:ММ (например 07:30).")
+    return TIMER_EDIT_TIME
+
+
+@timeout(CONVERSATION_TIMEOUT)
+async def timer_edit_time_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tid = context.user_data.get('tmr_edit_id')
+    time_str = (update.message.text or "").strip()
+    if not tid:
+        await update.message.reply_text("Напоминание не выбрано.")
+        return TIMER_SET_DATE
+    try:
+        datetime.strptime(time_str, "%H:%M")
+    except ValueError:
+        await update.message.reply_text("Не понял время. Формат ЧЧ:ММ (например 07:30):")
+        return TIMER_EDIT_TIME
+    timers = load_data(TIMERS_FILE, {})
+    td = timers.get(tid)
+    if not isinstance(td, dict) or str(td.get('user_id')) != str(update.effective_user.id):
+        await update.message.reply_text("Напоминание не найдено.")
+        context.user_data.pop('tmr_edit_id', None)
+        return TIMER_SET_DATE
+    td['target_time'] = time_str
+    td.pop('fired_at', None)
+    # Пересчитать дату ближайшего запуска.
+    _reps = td.get('repeat_days') or []
+    tz_offset = 3
+    try:
+        _u = get_user(str(update.effective_user.id))
+        if _u is not None:
+            tz_offset = getattr(_u, 'timezone', 3)
+    except Exception:
+        pass
+    now_local = _now_utc() + timedelta(hours=tz_offset)
+    if _reps:
+        try:
+            days = {int(d) for d in _reps if 0 <= int(d) <= 6}
+        except (TypeError, ValueError):
+            days = set()
+        _nd = now_local if (now_local.weekday() in days
+                            and datetime.strptime(
+                                f"{now_local.strftime('%Y-%m-%d')} {time_str}",
+                                "%Y-%m-%d %H:%M") > now_local) \
+            else _timer_next_days_date(list(days), now_local)
+        if _nd is not None:
+            td['target_date'] = _nd.strftime("%Y-%m-%d")
+    elif td.get('repeat_weekly') is not None and not td.get('repeat_daily'):
+        try:
+            _wd = int(td['repeat_weekly'])
+            _nd = now_local if (now_local.weekday() == _wd
+                                and datetime.strptime(
+                                    f"{now_local.strftime('%Y-%m-%d')} {time_str}",
+                                    "%Y-%m-%d %H:%M") > now_local) \
+                else _timer_next_weekday_date(_wd, now_local)
+            if _nd is not None:
+                td['target_date'] = _nd.strftime("%Y-%m-%d")
+        except (TypeError, ValueError):
+            pass
+    else:
+        # Разовый: та же дата, а если она уже прошла — завтра.
+        try:
+            _cand = datetime.strptime(f"{td.get('target_date')} {time_str}",
+                                      "%Y-%m-%d %H:%M")
+            if _cand <= now_local:
+                td['target_date'] = (now_local + timedelta(days=1)).strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+    td['is_active'] = True
+    timers[tid] = td
+    save_data(TIMERS_FILE, timers)
+    try:
+        schedule_timer_job(context.application, tid, td)
+    except Exception as e:
+        logger.error(f"timer edit: не удалось перепланировать {tid}: {e}")
+    context.user_data.pop('tmr_edit_id', None)
+    await update.message.reply_text(
+        f"✅ Время обновлено: {td.get('target_date')} в {time_str}")
+    return TIMER_SET_DATE
+
+
+# === ВОЛНА 22.27: возрастной гейт 13+ ===
+_AGE_BLOCK_TEXT = (
+    "🚫 Бот не предназначен для детей младше 13 лет.\n\n"
+    "По указанной дате рождения вам меньше 13 — доступ к боту закрыт "
+    "(проверяется при каждом входе).\n\n"
+    "Если дата указана неверно — напишите нам, разберёмся."
+)
+
+# 22.27: для тех, кто ДР ПРОПУСТИЛ: порог проверить нельзя — при каждом
+# входе предлагаем указать дату (отказаться можно, данные минимизируются).
+_AGE_ASK_TEXT = (
+    "🎂 Подтвердите возраст (13+)\n\n"
+    "Вы не указали дату рождения, поэтому возраст проверить нельзя. "
+    "Бот предназначен для пользователей от 13 лет.\n\n"
+    "Указать дату? Это необязательно — можно продолжить без неё."
+)
+_AGE_ASK_KB = InlineKeyboardMarkup([
+    [InlineKeyboardButton("🎂 Указать дату рождения", callback_data="age_set_birthday")],
+    [InlineKeyboardButton("⏭ Продолжить без даты", callback_data="age_continue")],
+])
+
+
+async def _send_age_block(update, context):
+    """Единый текст возрастного отказа + путь в поддержку (если ошибка)."""
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("💬 Чат поддержки", callback_data="open_support_chat")]])
+    if hasattr(update, 'message') and update.message:
+        await update.message.reply_text(_AGE_BLOCK_TEXT, reply_markup=kb)
+    elif hasattr(update, 'callback_query') and update.callback_query:
+        try:
+            await update.callback_query.message.reply_text(_AGE_BLOCK_TEXT, reply_markup=kb)
+        except Exception:
+            pass
+    else:
+        try:
+            await context.bot.send_message(
+                chat_id=int(update.effective_user.id),
+                text=_AGE_BLOCK_TEXT, reply_markup=kb)
+        except Exception:
+            pass
+
+
+async def age_blocked_echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Любое сообщение из «закрытого» состояния — снова честный отказ."""
+    await _send_age_block(update, context)
+    return AGE_BLOCKED
+
+
+def _age_gate_violation(user):
+    """True, если у пользователя указан ДР и по нему он младше 13 лет."""
+    if not user:
+        return False
+    _bd = (getattr(user, "birthday", "") or "").strip()
+    if not _bd:
+        return False
+    _age = _user_age_years(_bd)
+    return _age is not None and _age < 13
 
 
 # === ОБРАБОТЧИКИ CALLBACK ===
@@ -30223,6 +31303,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "check_subscription":
         await check_subscription_handler(update, context)
         return MAIN_MENU
+
+    # ВОЛНА 22.27: возрастной гейт 13+. Если по указанному ДР пользователю
+    # меньше 13 — ЛЮБЫЕ колбэки, кроме поддержки/подписки/разблока, закрыты
+    # (иначе старые inline-кнопки обходили бы проверку при входе).
+    _cb_uid = str(query.from_user.id)
+    if _cb_uid != DEVELOPER_ID and data not in (
+            "open_support_chat", "check_subscription", "unblock_self",
+            "cancel_action"):
+        _cb_user = get_user(_cb_uid)
+        if _age_gate_violation(_cb_user):
+            await _send_age_block(update, context)
+            return AGE_BLOCKED
 
     # ВОЛНА 22.4: маршрутизатор pult_* удалён вместе с Пультом.
 
@@ -30393,11 +31485,56 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "move_buttons":
         return await move_buttons_start(update, context)
 
+    # === ВОЛНА 22.27: жалобы, журнал админов, таймеры, возраст 13+ ===
+    if data.startswith("rep_anon_"):
+        return await report_anon_cb(update, context)
+    elif data.startswith("rep_sol_"):
+        return await report_sol_cb(update, context)
+    elif data.startswith("rep_block_"):
+        return await report_block_cb(update, context)
+    elif data.startswith("rep_dismiss_"):
+        return await report_dismiss_cb(update, context)
+    elif data == "dev_adminlog":
+        return await dev_adminlog_cb(update, context)
+    elif data == "age_set_birthday":
+        # Пропустивший ДР пользователь решил указать дату (порог 13+).
+        await update.callback_query.answer()
+        await context.bot.send_message(
+            chat_id=update.effective_user.id,
+            text=("🎂 Введите вашу реальную дату рождения в формате "
+                  "ГГГГ-ММ-ДД (например, 2005-04-15):\n\n"
+                  "Указывать необязательно: нажмите «⏭ Пропустить», если "
+                  "не хотите."),
+            reply_markup=get_skip_birthday_keyboard())
+        return ENTER_BIRTHDAY
+    elif data == "age_continue":
+        await update.callback_query.answer()
+        user = get_user(str(update.effective_user.id))
+        if user is not None:
+            await show_main_menu(update, context, user)
+        return MAIN_MENU
+
     if data.startswith("quick_timer_"):
         return await quick_timer_handler(update, context)
     elif data == "timer_custom_datetime":
         return await timer_custom_datetime_handler(update, context)
-    elif data == "timer_add_more":
+    elif data == "timer_list":
+        # ВОЛНА 22.27: «📋 Мои напоминания» — все таймеры с управлением.
+        return await timer_list_cb(update, context)
+    elif data == "timer_back":
+        return await timer_back_cb(update, context)
+    elif data.startswith("tmr_edittext_"):
+        return await timer_edit_text_prompt(update, context)
+    elif data.startswith("tmr_editt_"):
+        return await timer_edit_time_prompt(update, context)
+    elif data.startswith("tmr_edit_"):
+        return await timer_edit_menu_cb(update, context)
+    elif data.startswith("tmr_off_") or data.startswith("tmr_on_"):
+        return await timer_toggle_cb(update, context)
+    elif data.startswith("tmr_del_"):
+        return await timer_delete_cb(update, context)
+
+    if data == "timer_add_more":
         # Позволяет поставить следующий таймер сразу после сохранения предыдущего,
         # без возврата в главное меню.
         try:
@@ -30661,6 +31798,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await dev_delete_class_handler(update, context)
     elif data == "dev_block_user":
         return await dev_block_user_start(update, context)
+    elif data.startswith("dev_blockdur_"):
+        # ВОЛНА 22.27: выбор СРОКА блокировки (до префикса dev_block_,
+        # чтобы dev_blockdur_h_2 не поймался обработчиком выбора пользователя).
+        return await dev_block_duration_cb(update, context)
     elif data.startswith("dev_block_"):
         return await dev_block_user_handler(update, context)
     elif data == "dev_unblock_user":
@@ -31284,13 +32425,52 @@ def _timer_next_weekday_date(weekday, from_local=None):
     return from_local + timedelta(days=shift)
 
 
+def _timer_next_days_date(days, from_local=None):
+    """ВОЛНА 22.27: ближайшая дата СТРОГО ПОСЛЕ from_local, чей день недели
+    входит в список days (0=Пн…6=Вс). Для таймеров «каждое утро, кроме…»."""
+    try:
+        _days = {int(d) for d in (days or []) if 0 <= int(d) <= 6}
+    except (TypeError, ValueError):
+        return None
+    if not _days:
+        return None
+    base = from_local or datetime.now()
+    nd = base + timedelta(days=1)
+    for _ in range(8):
+        if nd.weekday() in _days:
+            return nd
+        nd += timedelta(days=1)
+    return None
+
+
 def _timer_advance_repeat(timer_data):
     """ВОЛНА 22.13: сдвиг ПОВТОРЯЮЩЕГОСЯ таймера на следующий запуск.
+    ВОЛНА 22.27: repeat_days (список дней 0=Пн…6=Вс) — «каждое утро,
+    кроме выходных и понедельника» и любые другие наборы дней.
     repeat_weekly (int 0=Пн…6=Вс) — на ближайшую неделю этого дня;
     иначе repeat_daily — на завтра. Возвращает True, если сдвинут.
     (Единая точка для всех трёх путей доставки таймеров.)"""
     if not isinstance(timer_data, dict):
         return False
+    # 22.27: НАБОР дней недели (приоритет выше repeat_weekly/repeat_daily).
+    _rd = timer_data.get('repeat_days')
+    if isinstance(_rd, (list, tuple)) and len(_rd) > 0:
+        try:
+            _days = {int(d) for d in _rd if 0 <= int(d) <= 6}
+        except (TypeError, ValueError):
+            return False
+        if not _days:
+            return False
+        try:
+            base = datetime.strptime(str(timer_data.get('target_date')), "%Y-%m-%d")
+        except (TypeError, ValueError):
+            base = datetime.now()
+        nd = _timer_next_days_date(list(_days), base)
+        if nd is None:
+            return False
+        timer_data['target_date'] = nd.strftime("%Y-%m-%d")
+        timer_data.pop('fired_at', None)
+        return True
     if timer_data.get('repeat_weekly') is not None and \
             not timer_data.get('repeat_daily'):
         try:
@@ -33031,8 +34211,12 @@ async def _sol_notify_class(context, class_obj, entry, skip_uid=None):
     _text = ("📚 Новое решение в базе класса!\n\n"
              f"📘 {entry.get('subject') or 'Без предмета'}\n"
              f"от {_sol_author_label(entry)} · {entry.get('ts', '')}")
-    _kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("📚 Открыть базу", callback_data="sol_list")]])
+    _kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📚 Открыть базу", callback_data="sol_list")],
+        # ВОЛНА 22.27: жалоба разработчику под каждым уведомлением о решении.
+        [InlineKeyboardButton("🚨 Пожаловаться",
+                              callback_data=f"rep_sol_{entry.get('id')}")],
+    ])
     members = list(dict.fromkeys(
         [str(m) for m in (class_obj.students + class_obj.admins)]))
     for uid in members:
@@ -33263,6 +34447,10 @@ async def sol_moderate_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         entry["approved_by"] = _uid
         _solutions_save()
         _stat_bump("sol_published")
+        # ВОЛНА 22.27: журнал действий админов (модерация решения).
+        _log_admin_action(_uid, entry.get("class_code"),
+                          "Решение ОДОБРЕНО",
+                          str(entry.get("subject") or "")[:150])
         try:
             await query.edit_message_text(
                 "✅ Решение опубликовано в базе класса.\n📘 "
@@ -33284,6 +34472,10 @@ async def sol_moderate_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                     skip_uid=entry.get("author") or None)
     else:
         # ВОЛНА 22.13: отклонено → полностью удаляем запись и шифр файла.
+        # ВОЛНА 22.27: журнал действий админов (отклонение решения).
+        _log_admin_action(_uid, entry.get("class_code"),
+                          "Решение ОТКЛОНЕНО",
+                          str(entry.get("subject") or "")[:150])
         _code = entry.get("class_code")
         _all = _solutions_all()
         if _code in _all:
@@ -33389,8 +34581,10 @@ async def sol_list_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = []
     for e in reversed(entries[-10:]):
         _label = (e.get("subject") or "Без предмета")[:32]
+        # ВОЛНА 22.27: помеченные жалобой решения честно видны в списке.
+        _flag = " 🚩" if e.get("flagged") else ""
         kb.append([InlineKeyboardButton(
-            f"📘 {_label} · {e.get('ts', '')}",
+            f"📘 {_flag}{_label} · {e.get('ts', '')}",
             callback_data=f"sol_view_{e['id']}")])
     kb.append([InlineKeyboardButton("⬅️ В меню базы", callback_data="sol_menu")])
     try:
@@ -33432,6 +34626,10 @@ async def sol_view_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{_sol_author_label(entry)} · {entry.get('ts', '')}"
             + (f" · ⏳ удалится: {_sol_ttl_label(entry.get('ttl_h'))}"
                if entry.get("ttl_h") else ""))
+    # ВОЛНА 22.27: под выданным решением — кнопка жалобы разработчику.
+    _rep_kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🚨 Пожаловаться",
+                             callback_data=f"rep_sol_{sol_id}")]])
     try:
         if _f.get("ftype") == "seal":
             # 22.13: расшифровка (file_id из Bot API или MTProto-канал).
@@ -33459,11 +34657,13 @@ async def sol_view_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             name = _dvf2_safe_name(str(meta.get("n") or "file.bin"))
             if _f.get("kind") == "photo":
                 await context.bot.send_photo(
-                    chat_id=query.message.chat_id, photo=plain, caption=_cap)
+                    chat_id=query.message.chat_id, photo=plain, caption=_cap,
+                    reply_markup=_rep_kb)
             else:
                 await context.bot.send_document(
                     chat_id=query.message.chat_id,
-                    document=InputFile(plain, filename=name), caption=_cap)
+                    document=InputFile(plain, filename=name), caption=_cap,
+                    reply_markup=_rep_kb)
             plain = b""
         else:
             # ЛЕГАСИ (до 22.13): открытые копии в канале.
@@ -33471,12 +34671,14 @@ async def sol_view_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_photo(
                     chat_id=query.message.chat_id,
                     from_chat_id=int(_f.get("ch") or 0),
-                    photo=int(_f.get("mid") or 0), caption=_cap)
+                    photo=int(_f.get("mid") or 0), caption=_cap,
+                    reply_markup=_rep_kb)
             else:
                 await context.bot.send_document(
                     chat_id=query.message.chat_id,
                     from_chat_id=int(_f.get("ch") or 0),
-                    document=int(_f.get("mid") or 0), caption=_cap)
+                    document=int(_f.get("mid") or 0), caption=_cap,
+                    reply_markup=_rep_kb)
     except Exception as e:
         logger.error(f"solutions: выдача решения не удалась: {e}")
         await query.answer("Не удалось открыть файл — он удалён из хранилища?",
@@ -37091,6 +38293,25 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, dev_block_user_price_handler),
                 CallbackQueryHandler(handle_callback),
             ],
+            # ВОЛНА 22.27: выбор срока блокировки (только inline-кнопки).
+            DEV_BLOCK_DURATION: [
+                CallbackQueryHandler(handle_callback),
+            ],
+            # ВОЛНА 22.27: правка напоминаний из «📋 Мои напоминания».
+            TIMER_EDIT_TEXT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, timer_edit_text_save),
+                CallbackQueryHandler(handle_callback),
+            ],
+            TIMER_EDIT_TIME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, timer_edit_time_save),
+                CallbackQueryHandler(handle_callback),
+            ],
+            # ВОЛНА 22.27: пользователю с ДР <13 бот закрыт; любое сообщение
+            # получает честный отказ, кнопка поддержки остаётся доступной.
+            AGE_BLOCKED: [
+                MessageHandler(filters.ALL, age_blocked_echo),
+                CallbackQueryHandler(handle_callback),
+            ],
             DEV_SET_PRICES: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, dev_set_prices_handler),
                 CallbackQueryHandler(handle_callback),
@@ -37360,10 +38581,12 @@ def main():
             if _state == MAIN_MENU:
                 # Главное меню уже само обрабатывает все кнопки.
                 continue
-            if _state in _QUICK_SKIP_STATES:
+            if _state in _QUICK_SKIP_STATES or _state == AGE_BLOCKED:
                 # ВОЛНА 13: здесь текст = произвольное НАЗВАНИЕ файла/загрузки
                 # (✏️ подпись Сейфа, 🏷 название загрузки) — быстрые команды
                 # похитили бы имя и утащили пользователя в чужой раздел.
+                # ВОЛНА 22.27: AGE_BLOCKED — возрастной гейт, никакие
+                # быстрые команды не должны его пробивать.
                 continue
             has_text_input = any(
                 isinstance(h, MessageHandler) for h in _handlers
