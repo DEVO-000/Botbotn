@@ -1259,12 +1259,20 @@ async def start_keep_alive_server():
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
 
-    if _miniapp_html_path():
+    # ВОЛНА 22.25: HTML мини-аппа ВСТРОЕН ПРЯМО В КОД (MINIAPP_HTML) — бот и
+    # веб-облако больше не могут разъехаться по версиям («ничего не
+    # синхронизируется»): что в боте, то и в вебе, всегда. Файл
+    # miniapp/index.html остался запасным путём и для правок дизайна.
+    if MINIAPP_HTML:
+        logger.info(f"Keep-alive сервер запущен на порту {port}: /health + мини-апп "
+                    f"«DEVO+ Облако» (/, /miniapp, встроен в код: "
+                    f"{len(MINIAPP_HTML)} симв.) + /api/* — реальная база бота")
+    elif _miniapp_html_path():
         logger.info(f"Keep-alive сервер запущен на порту {port}: /health + мини-апп "
                     f"«DEVO+ Облако» (/, /miniapp) + /api/* — реальная база бота")
     else:
-        logger.warning(f"Keep-alive сервер запущен на порту {port}, но miniapp/index.html "
-                       f"не найден — мини-апп недоступен (файла нет в деплое).")
+        logger.warning(f"Keep-alive сервер запущен на порту {port}, но мини-аппа нет: "
+                       f"ни встроенного HTML, ни файла miniapp/index.html.")
     return runner
 
 # ==================================
@@ -1835,6 +1843,29 @@ def _user_vault_channel(user):
     if not cid:
         return None
     return cid, str(vc.get("title") or cid)
+
+def _vault_channel_plain(user) -> bool:
+    """ВОЛНА 22.25: режим «файлы БЕЗ шифрования» для ЛИЧНОГО канала.
+
+    Пользователь сам может выключить шифрование Сейфа для СВОЕГО канала
+    («🔗 Моё облако» → кнопка 🔓/🔒 или мини-апп → Хранилище). Хранится как
+    user.vault_channel["plain"]=True — то есть режим существует ТОЛЬКО вместе
+    с подключённым личным каналом: в общее хранилище бота незашифрованные
+    файлы Сейфа не попадают НИКОГДА (zero-knowledge общего хранилища не
+    трогаем). По умолчанию шифрование ВКЛЮЧЕНО (plain=False)."""
+    try:
+        vc = getattr(user, "vault_channel", None)
+    except Exception:
+        return False
+    if not isinstance(vc, dict):
+        return False
+    try:
+        if not int(vc.get("id") or 0):
+            return False
+    except (TypeError, ValueError):
+        return False
+    return bool(vc.get("plain"))
+
 
 def get_storage_channel_id():
     """ЛЕГАЦИЯ + фолбэк: первый канал любого режима (или None).
@@ -3305,7 +3336,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.18"
+BOT_BUILD = "22.25"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -7595,23 +7626,2167 @@ def _miniapp_cleanup_uploads():
             _MINIAPP_UPLOADS.pop(k, None)
 
 
+# --- MINIAPP_EMBED_BEGIN (ВОЛНА 22.25: сюда сборщик scripts/embed_miniapp.py
+#     вставляет содержимое miniapp/index.html БАЙТ-В-БАЙТ — одна версия с ботом) ---
+MINIAPP_HTML = r"""<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>DEVO+ Облако</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;800;900&display=swap" rel="stylesheet">
+<script src="https://unpkg.com/lucide@latest"></script>
+<style>
+:root {
+  --bg-color: #f8f9fa;
+  --bg-gradient: none;
+  --text-color: #0d0d0d;
+  --card-bg: rgba(255, 255, 255, 0.8);
+  --card-active: rgba(240, 242, 245, 0.9);
+  --stat-bg: rgba(255, 255, 255, 0.8);
+  --btn-bg: #000000;
+  --btn-text: #ffffff;
+  --border-color: rgba(226, 232, 240, 0.85);
+  --subtext-color: #64748b;
+  --drop-bg: rgba(241, 245, 249, 0.7);
+  --drop-active: rgba(226, 232, 240, 0.85);
+  --dropdown-bg: #ffffff;
+  --loader-bg: #cbd5e1;
+  --loader-bar: #000000;
+  --blob-1: #60a5fa;
+  --blob-2: #c084fc;
+}
+
+[data-theme="dark"] {
+  --bg-color: #121212;
+  --bg-gradient: none;
+  --text-color: #ffffff;
+  --card-bg: rgba(30, 30, 32, 0.8);
+  --card-active: rgba(42, 42, 45, 0.9);
+  --stat-bg: rgba(24, 24, 26, 0.8);
+  --btn-bg: #ffffff;
+  --btn-text: #000000;
+  --border-color: rgba(46, 46, 50, 0.85);
+  --subtext-color: #aaaaaa;
+  --drop-bg: rgba(34, 34, 37, 0.7);
+  --drop-active: rgba(44, 44, 48, 0.85);
+  --dropdown-bg: #1e1e20;
+  --loader-bg: #444448;
+  --loader-bar: #ffffff;
+  --blob-1: #3b82f6;
+  --blob-2: #9333ea;
+}
+
+[data-theme="custom"] {
+  --bg-color: var(--custom-bg1, #4f46e5);
+  --bg-gradient: linear-gradient(var(--custom-angle, 135deg), var(--custom-bg1, #4f46e5), var(--custom-bg2, #9333ea));
+  --text-color: #ffffff;
+  --card-bg: rgba(255, 255, 255, 0.18);
+  --card-active: rgba(255, 255, 255, 0.28);
+  --stat-bg: rgba(255, 255, 255, 0.15);
+  --btn-bg: var(--custom-btn-bg, #ffffff);
+  --btn-text: var(--custom-btn-text, #000000);
+  --border-color: rgba(255, 255, 255, 0.3);
+  --subtext-color: rgba(255, 255, 255, 0.8);
+  --drop-bg: rgba(255, 255, 255, 0.12);
+  --drop-active: rgba(255, 255, 255, 0.22);
+  --dropdown-bg: #1e1e20;
+  --loader-bg: rgba(255, 255, 255, 0.3);
+  --loader-bar: var(--custom-btn-bg, #ffffff);
+  --blob-1: var(--custom-bg1, #4f46e5);
+  --blob-2: var(--custom-bg2, #9333ea);
+}
+
+*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent;user-select:none}
+
+html, body {
+  min-height: 100%;
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+
+body{
+  font-family:'Nunito',sans-serif;
+  background: var(--bg-gradient, var(--bg-color));
+  background-color: var(--bg-color);
+  color:var(--text-color);
+  transition: background 1.2s cubic-bezier(0.25, 1, 0.5, 1), color 1.2s cubic-bezier(0.25, 1, 0.5, 1);
+  position: relative;
+}
+
+body.modal-open {
+  overflow: hidden;
+  touch-action: none;
+}
+
+/* ВСПЫШКА В ЦВЕТАХ ТЕМЫ */
+.theme-flash {
+  position: fixed;
+  inset: 0;
+  z-index: 999;
+  pointer-events: none;
+  opacity: 0;
+  mix-blend-mode: screen;
+}
+.theme-flash.active {
+  animation: themeFlash 1.1s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+@keyframes themeFlash {
+  0%   { opacity: 0; filter: brightness(1); }
+  15%  { opacity: 0.55; filter: brightness(1.4); }
+  40%  { opacity: 0.35; filter: brightness(1.2); }
+  70%  { opacity: 0.45; filter: brightness(1.3); }
+  100% { opacity: 0; filter: brightness(1); }
+}
+
+.theme-flash::before,
+.theme-flash::after {
+  content: '';
+  position: absolute;
+  border-radius: 50%;
+  filter: blur(80px);
+}
+.theme-flash::before {
+  width: 70vw; height: 70vw;
+  background: var(--blob-1);
+  top: 10%; left: -10%;
+  animation: flashMove1 1.1s ease-out forwards;
+}
+.theme-flash::after {
+  width: 75vw; height: 75vw;
+  background: var(--blob-2);
+  bottom: 10%; right: -10%;
+  animation: flashMove2 1.1s ease-out forwards;
+}
+@keyframes flashMove1 {
+  0%   { transform: scale(0.6); opacity: 0; }
+  30%  { transform: scale(1.15); opacity: 0.8; }
+  100% { transform: scale(1.4); opacity: 0; }
+}
+@keyframes flashMove2 {
+  0%   { transform: scale(0.6); opacity: 0; }
+  30%  { transform: scale(1.15); opacity: 0.8; }
+  100% { transform: scale(1.4); opacity: 0; }
+}
+
+.bg-blobs-container {
+  position: fixed;
+  top: 0; left: 0; width: 100vw; height: 100vh;
+  z-index: 0;
+  pointer-events: none;
+  overflow: hidden;
+  transition: opacity 1.5s ease;
+}
+
+.blob {
+  position: absolute;
+  border-radius: 50%;
+  filter: blur(90px);
+  opacity: 0.65;
+  will-change: transform;
+  transition: transform 3s cubic-bezier(0.25, 1, 0.5, 1);
+}
+
+.blob-1 {
+  width: 320px; height: 320px;
+  background: var(--blob-1);
+  top: 20%; left: 10%;
+}
+
+.blob-2 {
+  width: 360px; height: 360px;
+  background: var(--blob-2);
+  bottom: 20%; right: 10%;
+}
+
+.main-wrapper {
+  position: relative;
+  z-index: 1;
+  width: 100%;
+  max-width: 560px;
+  min-height: 100vh;
+  margin: 0 auto;
+  padding: 20px 18px 40px 18px;
+  display: flex;
+  flex-direction: column;
+}
+
+.logo-font{font-weight:900;letter-spacing:-.04em;color:var(--text-color);font-size:32px;line-height:1}
+
+.animate-fade-in{
+  animation: smoothInsert 0.8s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  will-change: transform, opacity;
+  opacity: 0;
+  transform: translateY(20px) scale(0.98);
+}
+
+@keyframes smoothInsert {
+  0% { opacity: 0; transform: translateY(20px) scale(0.98); }
+  100% { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+.toast-msg{animation:fadeInOut 3.5s cubic-bezier(.16,1,.3,1) forwards}
+@keyframes fadeInOut{
+  0%{opacity:0;transform:translateY(15px)}
+  15%{opacity:1;transform:translateY(0)}
+  85%{opacity:1;transform:translateY(0)}
+  100%{opacity:0;transform:translateY(10px)}
+}
+
+.file-card{
+  background:var(--card-bg);
+  border: 1px solid var(--border-color);
+  border-radius:20px;
+  cursor: pointer;
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  padding: 12px 14px;
+  transition: transform 0.4s cubic-bezier(0.2, 0.8, 0.2, 1), background 0.6s ease;
+}
+.file-card:active{transform:scale(.98);background:var(--card-active)}
+
+.icon-wrap{
+  width:46px;height:46px;border-radius:14px;
+  background:var(--btn-bg);
+  color:var(--btn-text);
+  display:flex;align-items:center;justify-content:center;
+  transition: background 0.6s ease, color 0.6s ease;
+}
+
+.action-btn{
+  width:40px;height:40px;border-radius:9999px;
+  background:var(--btn-bg);
+  display:flex;align-items:center;justify-content:center;
+  color:var(--btn-text);border:none;cursor:pointer;
+  transition: transform 0.35s cubic-bezier(0.2, 0.8, 0.2, 1), opacity 0.5s ease, background 0.6s ease, color 0.6s ease;
+}
+.action-btn:active{transform:scale(.92);opacity:.8}
+
+.chip{
+  padding:8px 10px;border-radius:9999px;
+  background:var(--card-bg);color:var(--text-color);font-weight:700;font-size:14px;
+  border: 1px solid var(--border-color);cursor:pointer;
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  transition: transform 0.4s cubic-bezier(0.2, 0.8, 0.2, 1), background 0.6s ease, color 0.6s ease;
+  white-space:nowrap;
+  display:inline-flex;align-items:center;justify-content:center;gap:6px;
+  flex-shrink:0;
+}
+.chip:active{transform:scale(.95)}
+.chip.active{background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)}
+
+.filters-scroll-wrap{
+  display:flex;gap:6px;padding-bottom:6px;margin-bottom:12px;
+  justify-content: space-between;
+  width: 100%;
+}
+.filters-scroll-wrap .chip {
+  flex: 1 1 0;
+  min-width: 0;
+  padding: 8px 4px;
+}
+
+.search-box{
+  position:relative;border:1.5px solid var(--border-color);
+  background: var(--card-bg);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  border-radius:9999px;
+  padding:8px 16px 8px 40px;
+  transition: border-color 0.6s ease;
+}
+.search-box input{
+  width:100%;background:transparent;border:none;outline:none;
+  font-family:'Nunito',sans-serif;font-weight:700;font-size:15px;color:var(--text-color);
+}
+.search-box input::placeholder{color:var(--subtext-color);font-weight:600}
+
+.drop-zone{
+  background:var(--drop-bg);
+  border: 1.5px dashed var(--border-color);
+  border-radius:24px;
+  padding:16px;
+  text-align:center;
+  cursor:pointer;
+  display:flex;
+  flex-direction:column;
+  align-items:center;
+  justify-content:center;
+  min-height:110px;
+  position:relative;
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  transition: transform 0.4s cubic-bezier(0.2, 0.8, 0.2, 1), background 0.6s ease;
+  margin-bottom: 12px;
+}
+.drop-zone:active{transform:scale(.99);background:var(--drop-active)}
+
+.initial-state{
+  display:flex;
+  flex-direction:column;
+  align-items:center;
+  gap:4px;
+}
+
+.upload-filename{
+  font-weight:800;
+  font-size:13px;
+  color:var(--text-color);
+  margin-bottom:6px;
+  max-width:300px;
+  text-align:center;
+  display:none;
+  word-break: break-word;
+}
+
+.download-progress-wrap{
+  display:none;
+  flex-direction:column;
+  align-items:center;
+  justify-content:center;
+  gap:8px;
+  opacity:0;
+  transition: opacity 0.6s ease;
+}
+.download-progress-wrap.active{
+  display:flex;
+  opacity:1;
+}
+
+.drop-loader{
+  width:58px;height:58px;position:relative;
+  display:flex;align-items:center;justify-content:center;
+  cursor: pointer;
+}
+.drop-loader svg{width:58px;height:58px}
+.drop-loader > svg:first-child{transform:rotate(-90deg)}
+.drop-loader circle.bg{stroke:var(--loader-bg);stroke-width:6;fill:none}
+.drop-loader circle.bar{
+  stroke:var(--loader-bar);stroke-width:6;fill:none;
+  stroke-dasharray:157;stroke-dashoffset:157;stroke-linecap:round;
+  transition: stroke-dashoffset 0.3s linear, stroke 0.6s ease;
+}
+.drop-loader circle.bar.success {
+  stroke: #22c55e !important;
+}
+
+/* === ПРАВИЛЬНАЯ ГАЛОЧКА (SVG) === */
+.checkmark-svg {
+  position: absolute;
+  width: 58px;
+  height: 58px;
+  top: 0;
+  left: 0;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.3s ease;
+}
+.checkmark-svg path {
+  stroke-dasharray: 60;
+  stroke-dashoffset: 60;
+  transition: stroke-dashoffset 0.6s cubic-bezier(0.65, 0, 0.35, 1);
+}
+.checkmark-svg.show {
+  opacity: 1;
+}
+.checkmark-svg.show path {
+  stroke-dashoffset: 0;
+}
+
+.square-stop{
+  width:16px;height:16px;background:var(--btn-bg);border-radius:4px;
+  position:absolute; transition: transform 0.4s ease, opacity 0.4s ease;
+}
+
+.download-text{font-weight:800;font-size:13px;color:var(--subtext-color);}
+
+.files-container {
+  width: 100%;
+  margin-top: 6px;
+}
+
+.empty-state{padding:40px 20px;text-align:center;display:none}
+
+.dropdown-menu{
+  position:absolute;top:calc(100% + 10px);right:0;
+  background:var(--card-bg);border:1px solid var(--border-color);border-radius:20px;
+  box-shadow:0 15px 35px rgba(0,0,0,.18);
+  padding:10px;min-width:260px;z-index:30;
+  opacity:0;pointer-events:none;
+  transform:translateY(-8px) scale(0.96);
+  transition: transform 0.4s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.3s ease, background 0.6s ease;
+  transform-origin:top right;
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  will-change: transform, opacity;
+}
+.dropdown-menu.open{opacity:1;pointer-events:auto;transform:translateY(0) scale(1)}
+
+.sound-item-btn {
+  width: 100%;text-align: left;padding: 10px 12px;border-radius: 14px;
+  background: var(--card-bg);border: 1px solid var(--border-color);cursor: pointer;
+  font-family: 'Nunito', sans-serif;font-weight: 700;font-size: 14px;
+  color: var(--text-color);display: flex;align-items: center;justify-content: space-between;
+  gap: 10px;margin-bottom: 6px;transition: transform 0.3s ease, background-color 0.6s ease, color 0.6s ease;
+}
+.sound-item-btn:last-child { margin-bottom: 0; }
+.sound-item-btn:active { transform: scale(0.98); }
+.sound-item-btn.active-sound {
+  background: var(--btn-bg) !important;
+  color: var(--btn-text) !important;
+  border-color: var(--btn-bg) !important;
+}
+
+.check-circle-icon {
+  width: 22px;height: 22px;border-radius: 50%;background: #34c759;
+  display: flex;align-items: center;justify-content: center;flex-shrink: 0;
+}
+.check-circle-icon svg { stroke: #fff !important; width: 13px; height: 13px; }
+
+.custom-theme-picker {
+  display: none;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  background: var(--card-bg);
+  border: 1px solid var(--border-color);
+  border-radius: 14px;
+  margin-top: 8px;
+}
+.custom-theme-picker.active { display: flex; }
+.color-picker-row { display: flex; align-items: center; justify-content: space-between; font-size: 13px; font-weight: 700; }
+.color-picker-wrap {
+  position: relative; width: 32px; height: 32px; border-radius: 50%;
+  border: 2px solid var(--border-color); overflow: hidden; cursor: pointer;
+}
+.color-picker-wrap input[type="color"] {
+  position: absolute; top: -10px; left: -10px; width: 50px; height: 50px;
+  border: none; cursor: pointer; background: none;
+}
+
+.modal-overlay {
+  position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+  background: rgba(0,0,0,0.5);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  z-index: 100; display: flex; align-items: flex-end; justify-content: center;
+  opacity: 0; pointer-events: none;
+  transition: opacity 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+  overscroll-behavior: contain;
+  touch-action: none;
+}
+.modal-overlay.open { opacity: 1; pointer-events: auto; }
+
+.modal-card {
+  background: var(--card-bg);
+  border: 1px solid var(--border-color);
+  border-bottom: none;
+  border-top-left-radius: 32px; border-top-right-radius: 32px;
+  padding: 14px 22px 32px 22px; width: 100%; max-width: 560px;
+  box-shadow: 0 -10px 40px rgba(0,0,0,0.25);
+  transform: translateY(100%);
+  transition: transform 0.5s cubic-bezier(0.16, 1, 0.3, 1);
+  will-change: transform;
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  overscroll-behavior: contain;
+  touch-action: pan-y;
+}
+.modal-overlay.open .modal-card { transform: translateY(0); }
+
+.sheet-handle-area {
+  width: 100%;
+  padding: 6px 0 16px 0;
+  cursor: grab;
+  display: flex;
+  justify-content: center;
+}
+.sheet-handle {
+  width: 48px; height: 5px; background: var(--border-color);
+  border-radius: 999px; opacity: 0.8;
+}
+</style>
+</head>
+<body>
+
+<div class="theme-flash" id="themeFlash"></div>
+
+<div class="bg-blobs-container" id="bgBlobs">
+  <div class="blob blob-1" id="blob1"></div>
+  <div class="blob blob-2" id="blob2"></div>
+</div>
+
+<div id="toastContainer" style="position:fixed;bottom:24px;left:50%;transform:translateX(-50%);z-index:150;display:flex;flex-direction:column;align-items:center;gap:8px;pointer-events:none;width:100%;max-width:400px;padding:0 16px"></div>
+
+<!-- Модальное окно действий с файлом -->
+<div id="editModal" class="modal-overlay" onclick="closeEditModal(event)">
+  <div class="modal-card" id="modalCard" onclick="event.stopPropagation()">
+    <div class="sheet-handle-area" id="modalHandle">
+      <div class="sheet-handle"></div>
+    </div>
+    <h3 style="font-weight:900;font-size:20px;margin-bottom:4px">Действия с файлом</h3>
+    <p id="modalFileName" style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:14px;word-break:break-all"></p>
+    
+    <div style="margin-bottom:14px">
+      <label style="font-size:11px;font-weight:800;color:var(--subtext-color);text-transform:uppercase;letter-spacing:0.04em">Название файла</label>
+      <input type="text" id="modalInputName" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;margin-top:4px;outline:none;font-size:15px">
+    </div>
+
+    <div style="display:flex;flex-direction:column;gap:8px">
+      <button class="sound-item-btn" onclick="saveFileName()">
+        <span>Сохранить имя</span> <i data-lucide="check" style="width:18px;height:18px"></i>
+      </button>
+      <button class="sound-item-btn" id="modalVaultBtn" onclick="toggleFileVault()">
+        <span id="modalVaultText">Защитить в Vault</span> <i data-lucide="lock" style="width:18px;height:18px"></i>
+      </button>
+      <button class="sound-item-btn" onclick="downloadCurrentFile()">
+        <span>Скачать файл</span> <i data-lucide="download" style="width:18px;height:18px"></i>
+      </button>
+      <button class="sound-item-btn" style="color:#ef4444" onclick="deleteCurrentFile()">
+        <span>Удалить файл</span> <i data-lucide="trash-2" style="width:18px;height:18px;stroke:#ef4444"></i>
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- Модальное окно выбора режима именования -->
+<div id="nameChoiceModal" class="modal-overlay" onclick="closeNameChoiceModal(event)">
+  <div class="modal-card" onclick="event.stopPropagation()">
+    <div class="sheet-handle-area">
+      <div class="sheet-handle"></div>
+    </div>
+    <h3 style="font-weight:900;font-size:20px;margin-bottom:4px">Выбрано файлов: <span id="nameChoiceCount">0</span></h3>
+    <p style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:16px">Как назвать эти файлы?</p>
+
+    <div style="display:flex;flex-direction:column;gap:8px">
+      <button class="sound-item-btn" onclick="chooseNameMode('album')" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
+        <div style="text-align:left">
+          <div style="font-weight:800">Назвать альбомом</div>
+          <div style="font-size:11px;opacity:0.7;margin-top:2px">Одно имя для всех: Имя 1, Имя 2, ...</div>
+        </div>
+        <i data-lucide="layers" style="width:18px;height:18px"></i>
+      </button>
+      <button class="sound-item-btn" onclick="chooseNameMode('each')">
+        <div style="text-align:left">
+          <div style="font-weight:800">Назвать по одному</div>
+          <div style="font-size:11px;opacity:0.7;margin-top:2px">Каждому файлу своё имя</div>
+        </div>
+        <i data-lucide="list" style="width:18px;height:18px"></i>
+      </button>
+      <button class="sound-item-btn" onclick="chooseNameMode('skip')">
+        <div style="text-align:left">
+          <div style="font-weight:800">Пропустить всё</div>
+          <div style="font-size:11px;opacity:0.7;margin-top:2px">Оставить оригинальные имена</div>
+        </div>
+        <i data-lucide="fast-forward" style="width:18px;height:18px"></i>
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- Модальное окно именования одного файла -->
+<div id="nameModal" class="modal-overlay" onclick="closeNameModal(event)">
+  <div class="modal-card" onclick="event.stopPropagation()">
+    <div class="sheet-handle-area">
+      <div class="sheet-handle"></div>
+    </div>
+    <h3 style="font-weight:900;font-size:20px;margin-bottom:4px">Назовите файл</h3>
+    <p id="nameModalCounter" style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:14px"></p>
+    
+    <div style="margin-bottom:14px">
+      <label style="font-size:11px;font-weight:800;color:var(--subtext-color);text-transform:uppercase;letter-spacing:0.04em">Новое название</label>
+      <input type="text" id="nameModalInput" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;margin-top:4px;outline:none;font-size:15px" placeholder="Оставьте пустым для оригинала">
+    </div>
+
+    <p id="nameModalOriginal" style="font-size:12px;font-weight:600;color:var(--subtext-color);margin-bottom:16px;word-break:break-all"></p>
+
+    <div style="display:flex;flex-direction:column;gap:8px">
+      <button class="sound-item-btn" onclick="confirmNameAndNext()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
+        <span>Сохранить и продолжить</span> <i data-lucide="arrow-right" style="width:18px;height:18px"></i>
+      </button>
+      <button class="sound-item-btn" onclick="skipNameAndNext()">
+        <span>Пропустить</span> <i data-lucide="skip-forward" style="width:18px;height:18px"></i>
+      </button>
+      <button class="sound-item-btn" onclick="skipAllNames()">
+        <span>Пропустить все</span> <i data-lucide="fast-forward" style="width:18px;height:18px"></i>
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- Модальное окно альбомного именования -->
+<div id="albumModal" class="modal-overlay" onclick="closeAlbumModal(event)">
+  <div class="modal-card" onclick="event.stopPropagation()">
+    <div class="sheet-handle-area">
+      <div class="sheet-handle"></div>
+    </div>
+    <h3 style="font-weight:900;font-size:20px;margin-bottom:4px">Название альбома</h3>
+    <p id="albumModalCounter" style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:14px"></p>
+    
+    <div style="margin-bottom:14px">
+      <label style="font-size:11px;font-weight:800;color:var(--subtext-color);text-transform:uppercase;letter-spacing:0.04em">Общее название</label>
+      <input type="text" id="albumModalInput" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;margin-top:4px;outline:none;font-size:15px" placeholder="Например: Отпуск 2026">
+    </div>
+
+    <div style="padding:12px;background:var(--card-bg);border:1px solid var(--border-color);border-radius:14px;margin-bottom:16px;font-size:12px;font-weight:600;color:var(--subtext-color)">
+      <div style="font-weight:800;color:var(--text-color);margin-bottom:6px">Файлы получат имена:</div>
+      <div id="albumPreview"></div>
+    </div>
+
+    <div style="display:flex;flex-direction:column;gap:8px">
+      <button class="sound-item-btn" onclick="confirmAlbumName()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
+        <span>Применить ко всем</span> <i data-lucide="check" style="width:18px;height:18px"></i>
+      </button>
+      <button class="sound-item-btn" onclick="closeAlbumModal()">
+        <span>Отмена</span> <i data-lucide="x" style="width:18px;height:18px"></i>
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- Модальное окно хранилища («Моё облако» — волна 22.23) -->
+<div id="storageModal" class="modal-overlay" onclick="closeStorageModal(event)">
+  <div class="modal-card" onclick="event.stopPropagation()">
+    <div class="sheet-handle-area">
+      <div class="sheet-handle"></div>
+    </div>
+    <h3 style="font-weight:900;font-size:20px;margin-bottom:4px">Хранилище</h3>
+    <p style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:12px">Куда попадают ваши файлы</p>
+
+    <div id="storageStatus" style="padding:12px;background:var(--card-bg);border:1px solid var(--border-color);border-radius:14px;margin-bottom:14px;font-size:13px;font-weight:700;color:var(--subtext-color);line-height:1.5">Загружаю…</div>
+
+    <!-- 22.25: переключатель «хранить файлы БЕЗ шифрования» (виден при подключённом канале) -->
+    <button class="sound-item-btn" id="storagePlainBtn" onclick="togglePlain()" style="display:none;margin-bottom:14px">
+      <span id="storagePlainLabel">Шифрование файлов</span> <i data-lucide="lock" style="width:18px;height:18px"></i>
+    </button>
+
+    <div style="margin-bottom:14px">
+      <label style="font-size:11px;font-weight:800;color:var(--subtext-color);text-transform:uppercase;letter-spacing:0.04em">Ваш канал: @имя или -100…id</label>
+      <input type="text" id="storageInput" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;margin-top:4px;outline:none;font-size:15px" placeholder="@my_cloud или -100…">
+    </div>
+
+    <div style="display:flex;flex-direction:column;gap:8px">
+      <button class="sound-item-btn" id="storageConnectBtn" onclick="connectStorage()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
+        <span>Подключить канал</span> <i data-lucide="link" style="width:18px;height:18px"></i>
+      </button>
+      <button class="sound-item-btn" id="storageOffBtn" onclick="disconnectStorage()" style="color:#ef4444;display:none">
+        <span>Отключить мой канал</span> <i data-lucide="unlink" style="width:18px;height:18px;stroke:#ef4444"></i>
+      </button>
+    </div>
+
+    <p style="font-size:11px;font-weight:600;color:var(--subtext-color);margin-top:12px;line-height:1.5">Бот должен быть админом канала с правом «Публикация сообщений». Приватный канал без @username: перешлите любое сообщение из него боту в чат (Сейф → 🔗 Моё облако).</p>
+  </div>
+</div>
+
+<!-- 22.24: честное окно «нет доступа» (открыто вне Telegram / не зарегистрирован) -->
+<div id="authModal" class="modal-overlay" onclick="closeAuthModal(event)">
+  <div class="modal-card" onclick="event.stopPropagation()">
+    <div class="sheet-handle-area">
+      <div class="sheet-handle"></div>
+    </div>
+    <h3 style="font-weight:900;font-size:20px;margin-bottom:4px">Нет доступа к облаку</h3>
+    <p id="authText" style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:14px;line-height:1.5">Проверяем…</p>
+    <div style="display:flex;flex-direction:column;gap:8px">
+      <button class="sound-item-btn" id="authOpenBtn" onclick="openBotChat()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg);display:none">
+        <span>Открыть чат бота</span> <i data-lucide="send" style="width:18px;height:18px"></i>
+      </button>
+      <button class="sound-item-btn" onclick="closeAuthModal()">
+        <span>Понятно</span> <i data-lucide="x" style="width:18px;height:18px"></i>
+      </button>
+    </div>
+  </div>
+</div>
+
+<div class="main-wrapper">
+
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+    <h1 class="logo-font">DEVO+</h1>
+    <div style="display:flex;gap:8px;position:relative">
+
+      <button class="action-btn" onclick="openStorageModal()" title="Хранилище (Моё облако)">
+        <i data-lucide="cloud" style="width:18px;height:18px"></i>
+      </button>
+
+      <button class="action-btn" id="themeToggleBtn" onclick="toggleThemeMenu(event)" title="Тема оформления">
+        <i id="themeIcon" data-lucide="sun" style="width:18px;height:18px"></i>
+      </button>
+
+      <div id="themeMenu" class="dropdown-menu" style="right:96px" onclick="event.stopPropagation()">
+        <div style="padding:4px 8px 6px;font-weight:800;font-size:11px;color:var(--subtext-color);text-transform:uppercase;letter-spacing:.05em">Тема оформления</div>
+        <button class="sound-item-btn" id="theme-light-btn" onclick="setTheme('light')">
+          <span>Светлая</span> <i data-lucide="sun" style="width:16px;height:16px"></i>
+        </button>
+        <button class="sound-item-btn" id="theme-dark-btn" onclick="setTheme('dark')">
+          <span>Тёмная</span> <i data-lucide="moon" style="width:16px;height:16px"></i>
+        </button>
+        <button class="sound-item-btn" id="theme-system-btn" onclick="setTheme('system')">
+          <span>Системная</span> <i data-lucide="laptop" style="width:16px;height:16px"></i>
+        </button>
+        <button class="sound-item-btn" id="theme-custom-btn" onclick="setTheme('custom')">
+          <span>Свой цвет / Градиент</span> <i data-lucide="palette" style="width:16px;height:16px"></i>
+        </button>
+
+        <div id="customThemePicker" class="custom-theme-picker">
+          <div class="color-picker-row">
+            <span>Цвет 1 (Фон):</span>
+            <div class="color-picker-wrap">
+              <input type="color" id="customColor1" value="#4f46e5" onchange="updateCustomColors()">
+            </div>
+          </div>
+          <div class="color-picker-row">
+            <span>Цвет 2 (Фон):</span>
+            <div class="color-picker-wrap">
+              <input type="color" id="customColor2" value="#9333ea" onchange="updateCustomColors()">
+            </div>
+          </div>
+          <div class="color-picker-row">
+            <span>Угол градиента:</span>
+            <input type="range" id="customAngle" min="0" max="360" value="135" oninput="updateCustomColors()" style="width:90px">
+          </div>
+          <div class="color-picker-row">
+            <span>Цвет кнопок:</span>
+            <div class="color-picker-wrap">
+              <input type="color" id="customBtnBg" value="#ffffff" onchange="updateCustomColors()">
+            </div>
+          </div>
+          <div class="color-picker-row">
+            <span>Текст кнопок:</span>
+            <div class="color-picker-wrap">
+              <input type="color" id="customBtnText" value="#000000" onchange="updateCustomColors()">
+            </div>
+          </div>
+        </div>
+
+        <div style="border-top:1px solid var(--border-color);margin:8px 0;padding-top:8px">
+          <div style="padding:0 8px 6px;font-weight:800;font-size:11px;color:var(--subtext-color);text-transform:uppercase;letter-spacing:.05em">Живой фон</div>
+          
+          <button class="sound-item-btn" id="blobsToggleBtn" onclick="toggleBlobs()">
+            <span>Включен</span> <i id="blobsIcon" data-lucide="check" style="width:16px;height:16px"></i>
+          </button>
+
+          <div style="padding:8px 10px;background:var(--card-bg);border:1px solid var(--border-color);border-radius:12px;margin-top:5px">
+            <div style="display:flex;justify-content:space-between;font-size:12px;font-weight:700;margin-bottom:4px">
+              <span>Скорость движения:</span>
+              <span id="speedValueLabel" style="color:var(--subtext-color)">5x</span>
+            </div>
+            <input type="range" id="blobSpeedInput" min="1" max="10" step="1" value="5" oninput="changeBlobSpeed(this.value)" style="width:100%;cursor:pointer">
+          </div>
+        </div>
+      </div>
+
+      <button id="soundToggleBtn" class="action-btn" onpointerdown="unlockAudio(event)" onclick="toggleSoundMenu(event)" title="Выбор звука">
+        <i id="soundIcon" data-lucide="volume-2" style="width:18px;height:18px"></i>
+      </button>
+      
+      <div id="soundMenu" class="dropdown-menu" style="right:48px" onclick="event.stopPropagation()">
+        <div style="padding:4px 8px 8px;font-weight:800;font-size:11px;color:var(--subtext-color);text-transform:uppercase;letter-spacing:.05em">Выберите звук</div>
+        <div id="soundListOptions" style="max-height:240px;overflow-y:auto"></div>
+      </div>
+
+      <button class="action-btn" onclick="syncNow()" title="Синхронизация">
+        <i data-lucide="refresh-cw" style="width:18px;height:18px"></i>
+      </button>
+    </div>
+  </div>
+
+  <div style="display:flex;gap:12px;margin-bottom:12px;">
+    <div style="flex:1;background:var(--stat-bg);border:1px solid var(--border-color);border-radius:18px;padding:12px 16px;backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px)">
+      <p style="font-weight:700;font-size:12px;color:var(--text-color);text-transform:uppercase;letter-spacing:.04em;opacity:.6">Файлов</p>
+      <p id="statFiles" style="font-weight:900;font-size:22px;margin-top:2px">0</p>
+    </div>
+    <div style="flex:1;background:var(--stat-bg);border:1px solid var(--border-color);border-radius:18px;padding:12px 16px;backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px)">
+      <p style="font-weight:700;font-size:12px;color:var(--text-color);text-transform:uppercase;letter-spacing:.04em;opacity:.6">Занято</p>
+      <p id="statSize" style="font-weight:900;font-size:22px;margin-top:2px">0 Б</p>
+    </div>
+  </div>
+
+  <div class="search-box" style="margin-bottom:12px">
+    <i data-lucide="search" style="position:absolute;left:14px;top:50%;transform:translateY(-50%);width:18px;height:18px;color:var(--text-color);opacity:.5"></i>
+    <input type="text" id="searchInput" placeholder="Поиск файлов..." oninput="onSearch()">
+    <button id="clearSearch" class="action-btn" style="position:absolute;right:6px;top:50%;transform:translateY(-50%);width:26px;height:26px;display:none" onclick="clearSearch()">
+      <i data-lucide="x" style="width:14px;height:14px"></i>
+    </button>
+  </div>
+
+  <div class="filters-scroll-wrap">
+    <button class="chip active" data-filter="all" onclick="setFilter('all')">Все</button>
+    <button class="chip" data-filter="photo" onclick="setFilter('photo')">
+      <i data-lucide="image" style="width:16px;height:16px"></i>
+    </button>
+    <button class="chip" data-filter="video" onclick="setFilter('video')">
+      <i data-lucide="film" style="width:16px;height:16px"></i>
+    </button>
+    <button class="chip" data-filter="audio" onclick="setFilter('audio')">
+      <i data-lucide="music" style="width:16px;height:16px"></i>
+    </button>
+    <button class="chip" data-filter="document" onclick="setFilter('document')">
+      <i data-lucide="file-text" style="width:16px;height:16px"></i>
+    </button>
+    <button class="chip" data-filter="vault" onclick="setFilter('vault')">
+      <i data-lucide="lock" style="width:16px;height:16px"></i>
+    </button>
+  </div>
+
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;position:relative;">
+    <p id="filesCount" style="font-weight:700;font-size:14px;color:var(--text-color);opacity:.6">0 файлов</p>
+    <div style="position:relative">
+      <button class="chip" id="sortToggleBtn" onclick="toggleSortMenu(event)">
+        <i data-lucide="arrow-up-down" style="width:16px;height:16px"></i>
+        <span id="sortLabel">По дате</span>
+      </button>
+      <div id="sortMenu" class="dropdown-menu" onclick="event.stopPropagation()">
+        <button class="sound-item-btn" data-sort="date-desc" onclick="setSort('date-desc')">
+          <i data-lucide="clock" style="width:16px;height:16px"></i> Сначала новые
+        </button>
+        <button class="sound-item-btn" data-sort="date-asc" onclick="setSort('date-asc')">
+          <i data-lucide="history" style="width:16px;height:16px"></i> Сначала старые
+        </button>
+        <button class="sound-item-btn" data-sort="name-asc" onclick="setSort('name-asc')">
+          <i data-lucide="arrow-down-a-z" style="width:16px;height:16px"></i> По имени (А→Я)
+        </button>
+        <button class="sound-item-btn" data-sort="name-desc" onclick="setSort('name-desc')">
+          <i data-lucide="arrow-up-z-a" style="width:16px;height:16px"></i> По имени (Я→А)
+        </button>
+        <button class="sound-item-btn" data-sort="size-desc" onclick="setSort('size-desc')">
+          <i data-lucide="arrow-down-wide-narrow" style="width:16px;height:16px"></i> Сначала большие
+        </button>
+        <button class="sound-item-btn" data-sort="size-asc" onclick="setSort('size-asc')">
+          <i data-lucide="arrow-up-narrow-wide" style="width:16px;height:16px"></i> Сначала маленькие
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <div class="drop-zone" id="dropZone" onclick="handleDropZoneClick(event)">
+    <div class="initial-state" id="initialState">
+      <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M4 14.899A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.5 8.242"/>
+        <path d="M12 12v9"/>
+        <path d="m16 16-4-4-4 4"/>
+      </svg>
+      <p style="font-weight:800;font-size:15px;color:var(--text-color)">Загрузить файлы</p>
+      <p style="font-weight:600;font-size:12px;color:var(--subtext-color)">нажмите или перетащите файлы сюда</p>
+    </div>
+
+    <div class="upload-filename" id="uploadFilename"></div>
+
+    <div class="download-progress-wrap" id="progressWrap">
+      <div class="drop-loader" id="dropLoader" onclick="handleLoaderClick(event)" title="1 клик - пауза/старт, 2 клика - отмена">
+        <svg viewBox="0 0 60 60">
+          <circle class="bg" cx="30" cy="30" r="25"></circle>
+          <circle class="bar" id="progressBar" cx="30" cy="30" r="25"></circle>
+        </svg>
+        <svg class="checkmark-svg" id="checkmark" viewBox="0 0 60 60">
+          <path d="M17 31 L26 40 L43 21" fill="none" stroke="#22c55e" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        <div class="square-stop" id="squareStop"></div>
+      </div>
+      <p class="download-text" id="downloadText">Загрузка...</p>
+    </div>
+
+    <input type="file" id="fileInput" multiple style="display:none">
+  </div>
+
+  <div class="files-container">
+    <section id="filesList" style="display:flex;flex-direction:column;gap:10px"></section>
+
+    <section id="emptyState" class="empty-state">
+      <div class="icon-wrap" style="margin:0 auto 12px;background:var(--card-bg);width:54px;height:54px;border:1px solid var(--border-color)">
+        <i data-lucide="folder-open" style="width:26px;height:26px;color:var(--text-color);opacity:.4"></i>
+      </div>
+      <p id="emptyTitle" style="font-weight:800;font-size:16px;color:var(--text-color)">Облако пусто</p>
+      <p id="emptySub" style="font-weight:600;font-size:13px;color:var(--subtext-color);margin-top:2px">Загрузите первые файлы</p>
+    </section>
+  </div>
+
+</div>
+
+<script>
+const tg = window.Telegram?.WebApp;
+if (tg) { tg.ready(); tg.expand(); }
+
+let currentTheme = localStorage.getItem('devo_theme') || 'system';
+let blobsEnabled = localStorage.getItem('devo_blobs_enabled') !== 'false';
+let blobIdleSpeed = localStorage.getItem('devo_blob_speed') || '5';
+
+function applyTheme(theme) {
+  currentTheme = theme;
+  localStorage.setItem('devo_theme', theme);
+  
+  let isDark = false;
+  if (theme === 'system') {
+    isDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+  } else {
+    isDark = theme === 'dark';
+  }
+
+  document.documentElement.setAttribute('data-theme', theme === 'custom' ? 'custom' : (isDark ? 'dark' : 'light'));
+  
+  const iconEl = document.getElementById('themeIcon');
+  if (iconEl) {
+    iconEl.setAttribute('data-lucide', theme === 'custom' ? 'palette' : (isDark ? 'moon' : 'sun'));
+    lucide.createIcons();
+  }
+
+  document.querySelectorAll('#themeMenu .sound-item-btn').forEach(btn => {
+    if (btn.id.startsWith('theme-')) {
+      btn.classList.toggle('active-sound', btn.id === `theme-${theme}-btn`);
+    }
+  });
+
+  const picker = document.getElementById('customThemePicker');
+  if (picker) picker.classList.toggle('active', theme === 'custom');
+
+  if (theme === 'custom') updateCustomColors();
+}
+
+function updateCustomColors() {
+  const c1 = document.getElementById('customColor1').value;
+  const c2 = document.getElementById('customColor2').value;
+  const angle = document.getElementById('customAngle').value;
+  const btnBg = document.getElementById('customBtnBg').value;
+  const btnText = document.getElementById('customBtnText').value;
+
+  document.documentElement.style.setProperty('--custom-bg1', c1);
+  document.documentElement.style.setProperty('--custom-bg2', c2);
+  document.documentElement.style.setProperty('--custom-angle', angle + 'deg');
+  document.documentElement.style.setProperty('--custom-btn-bg', btnBg);
+  document.documentElement.style.setProperty('--custom-btn-text', btnText);
+
+  localStorage.setItem('devo_custom_c1', c1);
+  localStorage.setItem('devo_custom_c2', c2);
+  localStorage.setItem('devo_custom_angle', angle);
+  localStorage.setItem('devo_custom_btn_bg', btnBg);
+  localStorage.setItem('devo_custom_btn_text', btnText);
+}
+
+function initCustomColors() {
+  const c1 = localStorage.getItem('devo_custom_c1') || '#4f46e5';
+  const c2 = localStorage.getItem('devo_custom_c2') || '#9333ea';
+  const angle = localStorage.getItem('devo_custom_angle') || '135';
+  const btnBg = localStorage.getItem('devo_custom_btn_bg') || '#ffffff';
+  const btnText = localStorage.getItem('devo_custom_btn_text') || '#000000';
+
+  if (document.getElementById('customColor1')) {
+    document.getElementById('customColor1').value = c1;
+    document.getElementById('customColor2').value = c2;
+    document.getElementById('customAngle').value = angle;
+    document.getElementById('customBtnBg').value = btnBg;
+    document.getElementById('customBtnText').value = btnText;
+  }
+}
+
+function toggleBlobs() {
+  blobsEnabled = !blobsEnabled;
+  localStorage.setItem('devo_blobs_enabled', blobsEnabled);
+  updateBlobsVisibility();
+}
+
+function updateBlobsVisibility() {
+  const bgBlobs = document.getElementById('bgBlobs');
+  const blobsIcon = document.getElementById('blobsIcon');
+  if (bgBlobs) bgBlobs.style.opacity = blobsEnabled ? '1' : '0';
+  if (blobsIcon) blobsIcon.style.display = blobsEnabled ? 'inline-block' : 'none';
+}
+
+let blobTimer = null;
+
+function moveBlobsRandomly() {
+  if (!blobsEnabled) return;
+  
+  const b1 = document.getElementById('blob1');
+  const b2 = document.getElementById('blob2');
+  if (!b1 || !b2) return;
+
+  const widthRange = window.innerWidth * 0.45;
+  const heightRange = window.innerHeight * 0.45;
+
+  const randX1 = (Math.random() - 0.5) * widthRange;
+  const randY1 = (Math.random() - 0.5) * heightRange;
+  const scale1 = 0.75 + Math.random() * 0.5;
+
+  const randX2 = (Math.random() - 0.5) * widthRange;
+  const randY2 = (Math.random() - 0.5) * heightRange;
+  const scale2 = 0.75 + Math.random() * 0.5;
+
+  b1.style.transform = `translate(${randX1}px, ${randY1}px) scale(${scale1})`;
+  b2.style.transform = `translate(${randX2}px, ${randY2}px) scale(${scale2})`;
+}
+
+function startBlobAnimation() {
+  if (blobTimer) clearInterval(blobTimer);
+  moveBlobsRandomly();
+  
+  const speed = parseInt(blobIdleSpeed) || 5;
+  const intervalMs = Math.max(800, 3200 - (speed * 240));
+  
+  const b1 = document.getElementById('blob1');
+  const b2 = document.getElementById('blob2');
+  if (b1) b1.style.transition = `transform ${intervalMs / 1000 * 1.25}s cubic-bezier(0.25, 1, 0.5, 1)`;
+  if (b2) b2.style.transition = `transform ${intervalMs / 1000 * 1.25}s cubic-bezier(0.25, 1, 0.5, 1)`;
+
+  blobTimer = setInterval(moveBlobsRandomly, intervalMs);
+}
+
+function changeBlobSpeed(val) {
+  blobIdleSpeed = val;
+  localStorage.setItem('devo_blob_speed', val);
+  
+  const label = document.getElementById('speedValueLabel');
+  if (label) label.textContent = val + 'x';
+
+  startBlobAnimation();
+}
+
+function closeAllMenus(except) {
+  const menus = ['themeMenu', 'soundMenu', 'sortMenu'];
+  menus.forEach(id => {
+    if (id !== except) {
+      const m = document.getElementById(id);
+      if (m) m.classList.remove('open');
+    }
+  });
+}
+
+function toggleThemeMenu(e) {
+  if (e) e.stopPropagation();
+  const menu = document.getElementById('themeMenu');
+  const willOpen = !menu.classList.contains('open');
+  closeAllMenus('themeMenu');
+  if (willOpen) menu.classList.add('open');
+  else menu.classList.remove('open');
+}
+
+function setTheme(theme) {
+  applyTheme(theme);
+  if (theme !== 'custom') {
+    document.getElementById('themeMenu').classList.remove('open');
+  }
+}
+
+window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
+  if (currentTheme === 'system') applyTheme('system');
+});
+
+/* АУДИО */
+let audioCtx = null;
+function getAudioContext() {
+  if (!audioCtx) {
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (AudioContextClass) audioCtx = new AudioContextClass();
+  }
+  if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+  return audioCtx;
+}
+
+function unlockAudio(e) {
+  if (e) e.stopPropagation();
+  const ctx = getAudioContext();
+  if (ctx && ctx.state === 'suspended') ctx.resume().catch(() => {});
+}
+
+const SOUND_PROFILES = [
+  { id: 1, name: '1. Apple Pay Double-Chime', fn: (ctx, now) => {
+      const o1 = ctx.createOscillator(), g1 = ctx.createGain();
+      const o2 = ctx.createOscillator(), g2 = ctx.createGain();
+      o1.type = 'sine'; o1.frequency.setValueAtTime(1046.50, now);
+      g1.gain.setValueAtTime(0, now); g1.gain.linearRampToValueAtTime(0.2, now + 0.02);
+      g1.gain.exponentialRampToValueAtTime(0.0001, now + 0.35);
+      o1.connect(g1); g1.connect(ctx.destination);
+      o2.type = 'sine'; o2.frequency.setValueAtTime(1567.98, now + 0.08);
+      g2.gain.setValueAtTime(0, now + 0.08); g2.gain.linearRampToValueAtTime(0.3, now + 0.1);
+      g2.gain.exponentialRampToValueAtTime(0.0001, now + 0.6);
+      o2.connect(g2); g2.connect(ctx.destination);
+      o1.start(now); o1.stop(now + 0.4); o2.start(now + 0.08); o2.stop(now + 0.65);
+  }},
+  { id: 2, name: '2. Sci-Fi Confirmation', fn: (ctx, now) => {
+      const o1 = ctx.createOscillator(), o2 = ctx.createOscillator(), g = ctx.createGain();
+      o1.type = 'sine'; o1.frequency.setValueAtTime(587.33, now);
+      o2.type = 'sine'; o2.frequency.setValueAtTime(880, now + 0.07);
+      g.gain.setValueAtTime(0.2, now); g.gain.exponentialRampToValueAtTime(0.0001, now + 0.35);
+      o1.connect(g); o2.connect(g); g.connect(ctx.destination);
+      o1.start(now); o1.stop(now + 0.35); o2.start(now + 0.07); o2.stop(now + 0.35);
+  }},
+  { id: 3, name: '3. Glassy Bell', fn: (ctx, now) => {
+      const o = ctx.createOscillator(), g = ctx.createGain();
+      o.type = 'sine'; o.frequency.setValueAtTime(2093.00, now);
+      g.gain.setValueAtTime(0.2, now); g.gain.exponentialRampToValueAtTime(0.0001, now + 0.7);
+      o.connect(g); g.connect(ctx.destination);
+      o.start(now); o.stop(now + 0.75);
+  }},
+  { id: 4, name: '4. Sci-Fi Pulse', fn: (ctx, now) => {
+      const o = ctx.createOscillator(), g = ctx.createGain();
+      o.type = 'triangle'; o.frequency.setValueAtTime(440, now);
+      o.frequency.exponentialRampToValueAtTime(880, now + 0.15);
+      g.gain.setValueAtTime(0.25, now); g.gain.exponentialRampToValueAtTime(0.0001, now + 0.3);
+      o.connect(g); g.connect(ctx.destination);
+      o.start(now); o.stop(now + 0.35);
+  }},
+  { id: 5, name: '5. Harmonic Tri-Tone', fn: (ctx, now) => {
+      [659.25, 830.61, 987.77].forEach((f, i) => {
+        const o = ctx.createOscillator(), g = ctx.createGain();
+        o.type = 'sine'; o.frequency.setValueAtTime(f, now + i * 0.05);
+        g.gain.setValueAtTime(0.15, now + i * 0.05);
+        g.gain.exponentialRampToValueAtTime(0.0001, now + i * 0.05 + 0.3);
+        o.connect(g); g.connect(ctx.destination);
+        o.start(now + i * 0.05); o.stop(now + i * 0.05 + 0.35);
+      });
+  }}
+];
+
+let selectedSoundId = parseInt(localStorage.getItem('devo_sound_id') || '1');
+
+function playSoundDirectly(id) {
+  try {
+    const ctx = getAudioContext();
+    if (!ctx) return;
+    const play = () => {
+      const now = ctx.currentTime;
+      const item = SOUND_PROFILES.find(s => s.id === Number(id)) || SOUND_PROFILES[0];
+      item.fn(ctx, now);
+    };
+    if (ctx.state === 'suspended') ctx.resume().then(play).catch(() => play());
+    else play();
+  } catch (e) { console.error(e); }
+}
+
+function renderSoundMenu() {
+  const container = document.getElementById('soundListOptions');
+  if (!container) return;
+  container.innerHTML = SOUND_PROFILES.map(s => {
+    const isSelected = Number(s.id) === Number(selectedSoundId);
+    return `
+      <button class="sound-item-btn ${isSelected ? 'active-sound' : ''}" 
+              data-sound-id="${s.id}"
+              onpointerdown="unlockAudio(event)"
+              onclick="handleSoundSelect(event, ${s.id})">
+        <span>${s.name}</span>
+        ${isSelected 
+          ? `<div class="check-circle-icon"><i data-lucide="check"></i></div>` 
+          : `<i data-lucide="volume-2" style="width:16px;height:16px;opacity:0.5"></i>`
+        }
+      </button>
+    `;
+  }).join('');
+  lucide.createIcons();
+}
+
+function toggleSoundMenu(e) {
+  if (e) { e.preventDefault(); e.stopPropagation(); }
+  getAudioContext();
+  const menu = document.getElementById('soundMenu');
+  const willOpen = !menu.classList.contains('open');
+  closeAllMenus('soundMenu');
+  if (willOpen) {
+    menu.classList.add('open');
+    renderSoundMenu();
+  } else {
+    menu.classList.remove('open');
+  }
+}
+
+function handleSoundSelect(e, id) {
+  if (e) e.stopPropagation();
+  unlockAudio();
+  selectedSoundId = Number(id);
+  localStorage.setItem('devo_sound_id', selectedSoundId);
+  renderSoundMenu();
+  playSoundDirectly(selectedSoundId);
+}
+
+/* ===== РЕАЛЬНОЕ ОБЛАКО: API БОТА (волна 22.21) =====
+   Дизайн приложения не менялся. Этот слой соединяет его с ОСНОВНОЙ базой
+   бота: список файлов — тот же, что в чате (☁️ Облако), хранилище — тот же
+   приватный канал (или СВОЙ личный канал из «🔗 Моё облако»). Загрузка идёт
+   чанками и уходит в канал КАК ДОКУМЕНТ — без сжатия, оригинал байт-в-байт. */
+const IS_TELEGRAM = !!(tg && tg.initData);
+
+function authHeaders(extra) {
+  const h = Object.assign({ 'Cache-Control': 'no-store' }, extra || {});
+  if (IS_TELEGRAM && tg.initData) h['X-Telegram-Init-Data'] = tg.initData;
+  return h;
+}
+
+async function apiJson(url, options) {
+  const r = await fetch(url, Object.assign({ headers: authHeaders() }, options || {}));
+  let data = {};
+  try { data = await r.json(); } catch (e) {}
+  if (!r.ok) {
+    const err = new Error(data.message || ('HTTP ' + r.status));
+    err.code = String(data.error || '');  // 22.24: код (unauthorized/not_registered/…)
+    err.bot = String(data.bot || '');     // 22.24: @username бота для кнопки «Открыть чат бота»
+    throw err;
+  }
+  return data;
+}
+
+/* 22.24: честный текст сбоя облака. Ошибки сервера уже конкретны и по-русски
+   (401 «откройте через Telegram», 403 «бот не админ канала», 503 «бот ещё
+   запускается») — показываем их КАК ЕСТЬ; «Failed to fetch» — вот это по-
+   настоящему «нет связи», его и называем связью. */
+var AUTH_BOT = '';
+function cloudErrText(e) {
+  const m = (e && e.message) ? String(e.message) : '';
+  if (!m || /failed to fetch|networkerror|load failed|timed? ?out/i.test(m))
+    return 'Нет связи с сервером. Сервис мог просыпаться — попробуйте ещё раз через минуту.';
+  if (e && e.bot) AUTH_BOT = e.bot;
+  return m;
+}
+function showAuthCard(text) {
+  const card = document.getElementById('authModal');
+  if (!card) return;
+  document.getElementById('authText').textContent = text || 'Нет доступа к облаку.';
+  const btn = document.getElementById('authOpenBtn');
+  if (btn) btn.style.display = AUTH_BOT ? '' : 'none';
+  card.classList.add('open');
+  document.body.classList.add('modal-open');
+}
+function closeAuthModal(e) {
+  if (e) e.stopPropagation();
+  document.getElementById('authModal').classList.remove('open');
+  document.body.classList.remove('modal-open');
+}
+function openBotChat() {
+  const url = 'https://t.me/' + (AUTH_BOT || '');
+  try {
+    if (tg && tg.openTelegramLink) tg.openTelegramLink(url);
+    else window.open(url, '_blank');
+  } catch (e) { window.open(url, '_blank'); }
+}
+
+let ALL_FILES = [];
+let listLoading = false;
+
+async function loadFiles(silent) {
+  if (listLoading) return false;
+  listLoading = true;
+  try {
+    const data = await apiJson('/api/files');
+    ALL_FILES = (data.files || []).map(f => ({
+      id: String(f.id || ''), name: String(f.name || 'файл'),
+      kind: String(f.kind || 'document'), size: +f.size || 0,
+      ts: String(f.ts || ''), vault: !!f.vault
+    }));
+    renderAll();
+    return true;
+  } catch (e) {
+    if (!silent) {
+      const t = cloudErrText(e); // 22.24: честная причина вместо слепого «нет связи»
+      showToast(t);
+      if (e && (e.code === 'unauthorized' || e.code === 'not_registered')) showAuthCard(t);
+    }
+    return false;
+  } finally {
+    listLoading = false;
+  }
+}
+
+async function syncNow() {
+  const ok = await loadFiles(true);
+  showToast(ok ? 'Синхронизировано' : 'Ошибка синхронизации');
+}
+
+let FILTER = 'all';
+let SEARCH = '';
+let SORT = 'date-desc';
+let isUploading = false;
+let isPaused = false;
+let activeEditingFileId = null;
+
+/* Движок реальной загрузки: чанки по 4 МБ, честный прогресс, пауза/отмена. */
+const CHUNK_SIZE = 4 * 1024 * 1024;
+let uploadQueue = [];
+let uploadAbortFlag = false;
+let uploadXhr = null;
+
+let pendingFiles = [];
+let pendingNames = {};
+let currentNameIndex = 0;
+let nameMode = 'each';
+
+let clickTimer = null;
+let clickCount = 0;
+
+function showToast(text) {
+  const c = document.getElementById('toastContainer');
+  const t = document.createElement('div');
+  t.className = 'toast-msg';
+  t.style.cssText = 'background:var(--btn-bg);color:var(--btn-text);font-size:14px;font-weight:700;padding:12px 20px;border-radius:9999px;box-shadow:0 10px 25px rgba(0,0,0,.25);text-align:center';
+  t.textContent = text;
+  c.appendChild(t);
+  setTimeout(() => t.remove(), 3500);
+}
+
+function flashScreen() {
+  const flash = document.getElementById('themeFlash');
+  flash.classList.remove('active');
+  void flash.offsetWidth;
+  flash.classList.add('active');
+}
+
+function fmtSize(n) {
+  n = +n || 0;
+  const u = ['Б','КБ','МБ','ГБ'];
+  let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return n.toFixed(i === 0 ? 0 : 1) + ' ' + u[i];
+}
+
+function iconFor(kind) {
+  return ({ photo:'image', video:'film', audio:'music', document:'file-text' })[kind] || 'file';
+}
+
+function applyFilters() {
+  let list = [...ALL_FILES];
+  if (FILTER === 'vault') list = list.filter(f => f.vault === true);
+  else if (FILTER !== 'all') list = list.filter(f => f.kind === FILTER && !f.vault);
+  
+  if (SEARCH.trim()) {
+    const q = SEARCH.trim().toLowerCase();
+    list = list.filter(f => (f.name || '').toLowerCase().includes(q));
+  }
+  const [key, dir] = SORT.split('-');
+  list.sort((a, b) => {
+    let va, vb;
+    if (key === 'date') { va = a.ts || ''; vb = b.ts || ''; }
+    else if (key === 'name') { va = (a.name || '').toLowerCase(); vb = (b.name || '').toLowerCase(); }
+    else if (key === 'size') { va = +a.size || 0; vb = +b.size || 0; }
+    if (va < vb) return dir === 'asc' ? -1 : 1;
+    if (va > vb) return dir === 'asc' ? 1 : -1;
+    return 0;
+  });
+  return list;
+}
+
+function renderAll() {
+  renderFiles(applyFilters());
+  renderStats();
+}
+
+function renderStats() {
+  document.getElementById('statFiles').textContent = ALL_FILES.length;
+  document.getElementById('statSize').textContent = fmtSize(ALL_FILES.reduce((s, f) => s + (+f.size || 0), 0));
+  const shown = applyFilters().length;
+  document.getElementById('filesCount').textContent = shown === ALL_FILES.length ? `${ALL_FILES.length} файлов` : `${shown} из ${ALL_FILES.length}`;
+}
+
+function renderFiles(files) {
+  const list = document.getElementById('filesList');
+  const empty = document.getElementById('emptyState');
+
+  if (!files.length) {
+    list.innerHTML = '';
+    empty.style.display = 'block';
+    return;
+  }
+
+  empty.style.display = 'none';
+  list.innerHTML = files.map(f => `
+    <article class="file-card animate-fade-in" style="display:flex;align-items:center;gap:12px" onclick="openEditModal('${f.id}')">
+      <div class="icon-wrap" style="flex-shrink:0">
+        <i data-lucide="${f.vault ? 'lock' : iconFor(f.kind)}" style="width:20px;height:20px"></i>
+      </div>
+      <div style="flex:1;min-width:0">
+        <p style="font-weight:800;font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">
+          ${escapeHtml(f.name || 'файл')}
+        </p>
+        <p style="font-weight:600;font-size:12px;color:var(--subtext-color);margin-top:2px">
+          ${fmtSize(f.size)} · ${(f.ts || '').slice(0, 10)}
+        </p>
+      </div>
+      <div style="display:flex;gap:4px;flex-shrink:0" onclick="event.stopPropagation()">
+        <button class="action-btn" onclick="openEditModal('${f.id}')" title="Редактировать">
+          <i data-lucide="more-vertical" style="width:16px;height:16px"></i>
+        </button>
+      </div>
+    </article>
+  `).join('');
+  lucide.createIcons();
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+/* СВАЙП ЗАКРЫТИЕ МОДАЛКИ */
+let touchStartY = 0;
+let touchCurrentY = 0;
+let isDraggingModal = false;
+
+const modalCard = document.getElementById('modalCard');
+
+modalCard.addEventListener('touchstart', (e) => {
+  touchStartY = e.touches[0].clientY;
+  isDraggingModal = true;
+  modalCard.style.transition = 'none';
+}, { passive: true });
+
+modalCard.addEventListener('touchmove', (e) => {
+  if (!isDraggingModal) return;
+  touchCurrentY = e.touches[0].clientY;
+  const deltaY = touchCurrentY - touchStartY;
+  if (deltaY > 0) {
+    modalCard.style.transform = `translateY(${deltaY}px)`;
+  }
+}, { passive: true });
+
+modalCard.addEventListener('touchend', () => {
+  if (!isDraggingModal) return;
+  isDraggingModal = false;
+  const deltaY = touchCurrentY - touchStartY;
+  modalCard.style.transition = 'transform 0.5s cubic-bezier(0.16, 1, 0.3, 1)';
+  
+  if (deltaY > 100) {
+    closeEditModal();
+  } else {
+    modalCard.style.transform = 'translateY(0)';
+  }
+  touchStartY = 0;
+  touchCurrentY = 0;
+});
+
+function openEditModal(id) {
+  const f = ALL_FILES.find(x => x.id === id);
+  if (!f) return;
+  activeEditingFileId = id;
+  
+  document.getElementById('modalFileName').textContent = f.name;
+  document.getElementById('modalInputName').value = f.name;
+  document.getElementById('modalVaultText').textContent = f.vault ? 'Убрать из Vault' : 'Защитить в Vault';
+  
+  modalCard.style.transform = '';
+  document.getElementById('editModal').classList.add('open');
+  document.body.classList.add('modal-open');
+}
+
+function closeEditModal(e) {
+  if (e) e.stopPropagation();
+  modalCard.style.transform = 'translateY(100%)';
+  document.getElementById('editModal').classList.remove('open');
+  document.body.classList.remove('modal-open');
+  setTimeout(() => {
+    activeEditingFileId = null;
+    modalCard.style.transform = '';
+  }, 350);
+}
+
+async function saveFileName() {
+  if (!activeEditingFileId) return;
+  const newName = document.getElementById('modalInputName').value.trim();
+  if (!newName) return;
+  try {
+    const data = await apiJson('/api/files/' + encodeURIComponent(activeEditingFileId), {
+      method: 'PATCH',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ name: newName })
+    });
+    const f = ALL_FILES.find(x => x.id === activeEditingFileId);
+    if (f) f.name = (data.file && data.file.name) || newName;
+    renderAll();
+    showToast('Имя изменено');
+  } catch (e) {
+    showToast('Не удалось: ' + e.message);
+  }
+  closeEditModal();
+}
+
+async function toggleFileVault() {
+  if (!activeEditingFileId) return;
+  const f = ALL_FILES.find(x => x.id === activeEditingFileId);
+  if (f) {
+    try {
+      const data = await apiJson('/api/files/' + encodeURIComponent(f.id), {
+        method: 'PATCH',
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ vault: !f.vault })
+      });
+      f.vault = !!(data.file && data.file.vault);
+      renderAll();
+      showToast(f.vault ? '🔐 Добавлено в Vault' : '🔓 Убрано из Vault');
+    } catch (e) {
+      showToast('Не удалось: ' + e.message);
+    }
+  }
+  closeEditModal();
+}
+
+async function downloadCurrentFile() {
+  const f = ALL_FILES.find(x => x.id === activeEditingFileId);
+  closeEditModal();
+  if (!f) return;
+  showToast('📥 Скачивание...');
+  try {
+    const r = await fetch('/api/files/' + encodeURIComponent(f.id) + '/download', { headers: authHeaders() });
+    if (!r.ok) {
+      let msg = 'HTTP ' + r.status;
+      try { msg = (await r.json()).message || msg; } catch (e) {}
+      throw new Error(msg);
+    }
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = f.name || 'file';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+    showToast('✅ Скачано: ' + fmtSize(blob.size));
+  } catch (e) {
+    showToast('Ошибка скачивания: ' + e.message);
+  }
+}
+
+async function deleteCurrentFile() {
+  if (!activeEditingFileId) return;
+  const id = activeEditingFileId;
+  try {
+    await apiJson('/api/files/' + encodeURIComponent(id), { method: 'DELETE' });
+    ALL_FILES = ALL_FILES.filter(x => x.id !== id);
+    renderAll();
+    showToast('🗑 Удалено');
+  } catch (e) {
+    showToast('Не удалось: ' + e.message);
+  }
+  closeEditModal();
+}
+
+function onSearch() {
+  SEARCH = document.getElementById('searchInput').value;
+  document.getElementById('clearSearch').style.display = SEARCH ? 'flex' : 'none';
+  renderAll();
+}
+
+function clearSearch() {
+  document.getElementById('searchInput').value = '';
+  SEARCH = '';
+  document.getElementById('clearSearch').style.display = 'none';
+  renderAll();
+}
+
+function setFilter(f) {
+  FILTER = f;
+  document.querySelectorAll('.chip[data-filter]').forEach(b => {
+    b.classList.toggle('active', b.dataset.filter === f);
+  });
+  renderAll();
+}
+
+function toggleSortMenu(e) {
+  e.stopPropagation();
+  const menu = document.getElementById('sortMenu');
+  const willOpen = !menu.classList.contains('open');
+  closeAllMenus('sortMenu');
+  if (willOpen) menu.classList.add('open');
+  else menu.classList.remove('open');
+}
+
+function setSort(s) {
+  SORT = s;
+  const labels = { 'date-desc':'По дате', 'date-asc':'Старые', 'name-asc':'А→Я', 'name-desc':'Я→А', 'size-desc':'Большие', 'size-asc':'Маленькие' };
+  document.getElementById('sortLabel').textContent = labels[s] || 'По дате';
+  document.getElementById('sortMenu').classList.remove('open');
+  renderAll();
+}
+
+document.addEventListener('pointerdown', (e) => {
+  const soundMenu = document.getElementById('soundMenu');
+  const soundBtn = document.getElementById('soundToggleBtn');
+  const sortMenu = document.getElementById('sortMenu');
+  const sortBtn = document.getElementById('sortToggleBtn');
+  const themeMenu = document.getElementById('themeMenu');
+  const themeBtn = document.getElementById('themeToggleBtn');
+
+  if (soundMenu && !soundMenu.contains(e.target) && !soundBtn.contains(e.target)) soundMenu.classList.remove('open');
+  if (sortMenu && !sortMenu.contains(e.target) && !sortBtn.contains(e.target)) sortMenu.classList.remove('open');
+  if (themeMenu && !themeMenu.contains(e.target) && !themeBtn.contains(e.target)) themeMenu.classList.remove('open');
+});
+
+function handleDropZoneClick(e) {
+  if (isUploading) return;
+  document.getElementById('fileInput').click();
+}
+
+function handleLoaderClick(e) {
+  if (e) e.stopPropagation();
+  if (!isUploading) return;
+
+  clickCount++;
+  if (clickCount === 1) {
+    clickTimer = setTimeout(() => {
+      togglePauseUpload();
+      clickCount = 0;
+    }, 260);
+  } else if (clickCount === 2) {
+    clearTimeout(clickTimer);
+    clickCount = 0;
+    cancelUpload();
+  }
+}
+
+function togglePauseUpload() {
+  isPaused = !isPaused;
+  const downloadText = document.getElementById('downloadText');
+  const squareStop = document.getElementById('squareStop');
+
+  if (isPaused) {
+    downloadText.textContent = 'Пауза (нажмите для продолжения)';
+    if (squareStop) squareStop.style.opacity = '0.4';
+  } else {
+    downloadText.textContent = 'Загрузка... (1 клик - пауза, 2 - отмена)';
+    if (squareStop) squareStop.style.opacity = '1';
+  }
+}
+
+function cancelUpload() {
+  if (!isUploading) return;
+  uploadAbortFlag = true;
+  if (uploadXhr) { try { uploadXhr.abort(); } catch (e) {} }
+  showToast('⏹ Загрузка отменена');
+}
+
+/* ОКНО ВЫБОРА РЕЖИМА ИМЕНОВАНИЯ */
+function openNameChoiceModal() {
+  document.getElementById('nameChoiceCount').textContent = pendingFiles.length;
+  const modal = document.getElementById('nameChoiceModal');
+  modal.classList.add('open');
+  document.body.classList.add('modal-open');
+}
+
+function closeNameChoiceModal(e) {
+  if (e) e.stopPropagation();
+  const modal = document.getElementById('nameChoiceModal');
+  modal.classList.remove('open');
+  document.body.classList.remove('modal-open');
+}
+
+function chooseNameMode(mode) {
+  nameMode = mode;
+  closeNameChoiceModal();
+
+  if (mode === 'skip') {
+    setTimeout(() => startActualUpload(), 400);
+  } else if (mode === 'album') {
+    setTimeout(() => openAlbumModal(), 400);
+  } else {
+    currentNameIndex = 0;
+    setTimeout(() => openNameModal(), 400);
+  }
+}
+
+/* АЛЬБОМНОЕ ИМЕНОВАНИЕ */
+function openAlbumModal() {
+  const modal = document.getElementById('albumModal');
+  const counter = document.getElementById('albumModalCounter');
+  const input = document.getElementById('albumModalInput');
+  const preview = document.getElementById('albumPreview');
+
+  counter.textContent = `${pendingFiles.length} файлов получат одно общее имя`;
+
+  input.value = '';
+  preview.innerHTML = '';
+
+  input.oninput = () => {
+    renderAlbumPreview(input.value);
+  };
+
+  renderAlbumPreview('');
+  input.focus();
+
+  modal.classList.add('open');
+  document.body.classList.add('modal-open');
+}
+
+function renderAlbumPreview(baseName) {
+  const preview = document.getElementById('albumPreview');
+  if (!baseName.trim()) {
+    preview.innerHTML = '<span style="opacity:0.6">Введите название, чтобы увидеть превью</span>';
+    return;
+  }
+
+  const items = pendingFiles.slice(0, 4).map((f, i) => {
+    const ext = f.name.includes('.') ? '.' + f.name.split('.').pop() : '';
+    return `<div style="padding:2px 0">${escapeHtml(baseName.trim())} ${i + 1}${escapeHtml(ext)}</div>`;
+  });
+
+  const more = pendingFiles.length > 4 ? `<div style="opacity:0.6;padding:2px 0">... и ещё ${pendingFiles.length - 4}</div>` : '';
+  preview.innerHTML = items.join('') + more;
+}
+
+function closeAlbumModal(e) {
+  if (e) e.stopPropagation();
+  const modal = document.getElementById('albumModal');
+  modal.classList.remove('open');
+  document.body.classList.remove('modal-open');
+}
+
+function confirmAlbumName() {
+  const baseName = document.getElementById('albumModalInput').value.trim();
+  if (!baseName) {
+    showToast('Введите название');
+    return;
+  }
+
+  pendingFiles.forEach((f, i) => {
+    const ext = f.name.includes('.') ? '.' + f.name.split('.').pop() : '';
+    pendingNames[f.id] = `${baseName} ${i + 1}${ext}`;
+  });
+
+  closeAlbumModal();
+  setTimeout(() => startActualUpload(), 400);
+}
+
+/* ИНДИВИДУАЛЬНОЕ ИМЕНОВАНИЕ */
+function openNameModal() {
+  const modal = document.getElementById('nameModal');
+  const counter = document.getElementById('nameModalCounter');
+  const input = document.getElementById('nameModalInput');
+  const original = document.getElementById('nameModalOriginal');
+
+  if (currentNameIndex >= pendingFiles.length) {
+    closeNameModal();
+    setTimeout(() => startActualUpload(), 400);
+    return;
+  }
+
+  const file = pendingFiles[currentNameIndex];
+  counter.textContent = `Файл ${currentNameIndex + 1} из ${pendingFiles.length}`;
+  input.value = '';
+  input.placeholder = 'Оставьте пустым для оригинала';
+  original.textContent = `Оригинал: ${file.name}`;
+
+  modal.classList.add('open');
+  document.body.classList.add('modal-open');
+
+  setTimeout(() => input.focus(), 300);
+}
+
+function closeNameModal(e) {
+  if (e) e.stopPropagation();
+  const modal = document.getElementById('nameModal');
+  modal.classList.remove('open');
+  document.body.classList.remove('modal-open');
+}
+
+/* ===== Хранилище («Моё облако») — волна 22.23: реальное API бота ===== */
+async function loadStorageStatus() {
+  const box = document.getElementById('storageStatus');
+  box.textContent = 'Загружаю…';
+  try {
+    renderStorage(await apiJson('/api/storage'));
+  } catch (e) {
+    const t = cloudErrText(e); // 22.24: честная причина, не «нет связи с облаком»
+    box.textContent = '⚠️ ' + t;
+    if (e && (e.code === 'unauthorized' || e.code === 'not_registered')) showAuthCard(t);
+  }
+}
+
+let STORAGE_STATE = null; // 22.25: последний статус хранилища (для togglePlain)
+
+function renderStorage(d) {
+  const box = document.getElementById('storageStatus');
+  const offBtn = document.getElementById('storageOffBtn');
+  const connLabel = document.querySelector('#storageConnectBtn span');
+  const plainBtn = document.getElementById('storagePlainBtn');
+  STORAGE_STATE = d || null;
+  if (d.connected) {
+    box.innerHTML = '✅ Ваш канал: <b style="color:var(--text-color)">' + escapeHtml(d.title || '') + '</b>'
+      + '<br><span style="font-size:11px">подключён ' + escapeHtml(d.added || '') + ' — новые загрузки уходят только в него</span>';
+    offBtn.style.display = '';
+    connLabel.textContent = 'Заменить канал';
+    // 22.25: честное состояние шифрования для личного канала.
+    if (plainBtn) {
+      plainBtn.style.display = '';
+      const pl = document.getElementById('storagePlainLabel');
+      if (pl) pl.textContent = d.plain
+        ? '🔓 Шифрование ВЫКЛ — включить шифрование'
+        : '🔒 Файлы под шифром — хранить БЕЗ шифра';
+    }
+  } else {
+    box.innerHTML = d.has_general
+      ? '☁️ Сейчас файлы уходят в общее хранилище бота. Подключите свой приватный канал — и они будут лежать только у вас.'
+      : '⚠️ Хранилище не настроено — загрузки будут неудачными. Подключите свой канал ниже.';
+    offBtn.style.display = 'none';
+    connLabel.textContent = 'Подключить канал';
+    if (plainBtn) plainBtn.style.display = 'none';
+  }
+}
+
+/* 22.25: переключатель «хранить файлы БЕЗ шифрования» — только для личного
+   канала. В общем хранилище бота незашифрованные файлы Сейфа не хранятся. */
+async function togglePlain() {
+  const btn = document.getElementById('storagePlainBtn');
+  btn.disabled = true;
+  try {
+    const cur = !!(STORAGE_STATE && STORAGE_STATE.plain);
+    const d = await apiJson('/api/storage/plain', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ plain: !cur }) });
+    renderStorage(d);
+    showToast(d.plain
+      ? '🔓 Новые файлы будут храниться БЕЗ шифра'
+      : '🔒 Шифрование включено — файлы снова под паролем');
+  } catch (e) {
+    showToast('❌ ' + cloudErrText(e));
+  } finally { btn.disabled = false; }
+}
+
+async function connectStorage() {
+  const v = document.getElementById('storageInput').value.trim();
+  if (!v) { showToast('Введите @имя или -100…id канала'); return; }
+  const btn = document.getElementById('storageConnectBtn');
+  btn.disabled = true;
+  try {
+    const d = await apiJson('/api/storage/connect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ channel: v }) });
+    document.getElementById('storageInput').value = '';
+    renderStorage(d);
+    showToast('✅ Канал «' + d.title + '» подключён');
+  } catch (e) {
+    showToast('❌ ' + e.message);
+  } finally { btn.disabled = false; }
+}
+
+async function disconnectStorage() {
+  try {
+    const d = await apiJson('/api/storage/disconnect', { method: 'POST' });
+    renderStorage(d);
+    showToast('🗑 Личный канал отключён');
+  } catch (e) {
+    showToast('❌ ' + e.message);
+  }
+}
+
+function openStorageModal() {
+  document.getElementById('storageModal').classList.add('open');
+  document.body.classList.add('modal-open');
+  loadStorageStatus();
+}
+
+function closeStorageModal(e) {
+  if (e) e.stopPropagation();
+  document.getElementById('storageModal').classList.remove('open');
+  document.body.classList.remove('modal-open');
+}
+
+function confirmNameAndNext() {
+  const file = pendingFiles[currentNameIndex];
+  const newName = document.getElementById('nameModalInput').value.trim();
+  if (newName) {
+    pendingNames[file.id] = newName;
+  }
+  currentNameIndex++;
+  closeNameModal();
+  setTimeout(() => openNameModal(), 400);
+}
+
+function skipNameAndNext() {
+  currentNameIndex++;
+  closeNameModal();
+  setTimeout(() => openNameModal(), 400);
+}
+
+function skipAllNames() {
+  closeNameModal();
+  setTimeout(() => startActualUpload(), 450);
+}
+
+function startActualUpload() {
+  if (!pendingFiles.length) return;
+
+  /* 22.21: имена применяем к САМИМ File-объектам (uploadName) — исходные
+     байты должны остаться при файле для реальной чанковой загрузки. */
+  pendingFiles.forEach(f => {
+    if (pendingNames[f.id]) {
+      const customName = pendingNames[f.id];
+      if (nameMode === 'album') {
+        f.uploadName = customName;
+      } else {
+        const ext = f.name.includes('.') ? '.' + f.name.split('.').pop() : '';
+        f.uploadName = customName + ext;
+      }
+    }
+  });
+
+  proceedUpload(pendingFiles);
+}
+
+function uploadFiles(fileList) {
+  const files = Array.from(fileList);
+  if (!files.length || isUploading) return;
+  
+  pendingFiles = files.map((f, i) => {
+    f.id = 'tmp_' + i + '_' + Math.random().toString(36).substr(2, 5);
+    return f;
+  });
+  pendingNames = {};
+  currentNameIndex = 0;
+  nameMode = 'each';
+
+  if (pendingFiles.length === 1) {
+    openNameModal();
+  } else {
+    openNameChoiceModal();
+  }
+}
+
+function proceedUpload(files) {
+  isUploading = true;
+  isPaused = false;
+  uploadAbortFlag = false;
+  uploadQueue = files.slice();
+
+  const initial = document.getElementById('initialState');
+  const filenameEl = document.getElementById('uploadFilename');
+  const wrap = document.getElementById('progressWrap');
+  const bar = document.getElementById('progressBar');
+  const checkmark = document.getElementById('checkmark');
+  const squareStop = document.getElementById('squareStop');
+
+  if (files.length === 1) {
+    filenameEl.innerHTML = `Загружается:<br><b>${escapeHtml(files[0].uploadName || files[0].name)}</b>`;
+  } else {
+    const namesPreview = files.slice(0, 2).map(f => escapeHtml(f.uploadName || f.name)).join(', ');
+    const moreText = files.length > 2 ? ` и ещё ${files.length - 2}` : '';
+    filenameEl.innerHTML = `Загружается файлов: <b>${files.length}</b><br><span style="font-size:11px;opacity:0.8">${namesPreview}${moreText}</span>`;
+  }
+  filenameEl.style.display = 'block';
+
+  initial.style.display = 'none';
+  wrap.classList.add('active');
+  
+  const circumference = 157;
+  bar.classList.remove('success');
+  bar.style.strokeDasharray = `${circumference}`;
+  bar.style.strokeDashoffset = `${circumference}`;
+  
+  if (checkmark) checkmark.classList.remove('show');
+  if (squareStop) {
+    squareStop.style.display = 'block';
+    squareStop.style.opacity = '1';
+  }
+
+  document.getElementById('downloadText').textContent = 'Загрузка... (1 клик - пауза, 2 - отмена)';
+
+  uploadEngine(bar);
+}
+
+function setUploadPct(pct, bar) {
+  const circumference = 157;
+  if (pct >= 100) pct = 100;
+  bar.style.strokeDashoffset = String(circumference - (pct / 100) * circumference);
+}
+
+function sleepMs(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+function resetUploadUI(bar, checkmark, squareStop) {
+  const initial = document.getElementById('initialState');
+  const filenameEl = document.getElementById('uploadFilename');
+  const wrap = document.getElementById('progressWrap');
+  const circumference = 157;
+
+  wrap.classList.remove('active');
+  filenameEl.style.display = 'none';
+  initial.style.display = 'flex';
+  bar.classList.remove('success');
+  bar.style.strokeDashoffset = `${circumference}`;
+  if (checkmark) checkmark.classList.remove('show');
+  if (squareStop) {
+    squareStop.style.display = 'block';
+    squareStop.style.opacity = '1';
+  }
+  isUploading = false;
+  isPaused = false;
+  uploadQueue = [];
+  uploadAbortFlag = false;
+  pendingFiles = [];
+  pendingNames = {};
+}
+
+function sendChunk(uploadId, index, blobPart, onLoaded) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    uploadXhr = xhr;
+    xhr.open('POST', '/api/upload/chunk?uploadId=' + encodeURIComponent(uploadId) + '&index=' + index);
+    const headers = authHeaders();
+    for (const k in headers) {
+      try { xhr.setRequestHeader(k, headers[k]); } catch (e) {}
+    }
+    try { xhr.setRequestHeader('Content-Type', 'application/octet-stream'); } catch (e) {}
+    xhr.upload.onprogress = (ev) => { if (ev.lengthComputable && onLoaded) onLoaded(ev.loaded); };
+    xhr.onload = () => {
+      uploadXhr = null;
+      if (xhr.status >= 200 && xhr.status < 300) return resolve();
+      let msg = 'HTTP ' + xhr.status;
+      try { msg = JSON.parse(xhr.responseText).message || msg; } catch (e) {}
+      reject(new Error(msg));
+    };
+    xhr.onerror = () => { uploadXhr = null; reject(new Error('нет связи с ботом')); };
+    xhr.onabort = () => { uploadXhr = null; reject(new Error('aborted')); };
+    xhr.send(blobPart);
+  });
+}
+
+async function uploadOneFile(file, reportBytes) {
+  const upName = String(file.uploadName || file.name || 'file.bin').slice(0, 120);
+  const initData = await apiJson('/api/upload/init', {
+    method: 'POST',
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ name: upName, size: +file.size || 0, mime: file.type || '' })
+  });
+  const uploadId = initData.uploadId;
+  let offset = 0;
+  let index = 0;
+
+  while (offset < file.size) {
+    while (isPaused && !uploadAbortFlag) await sleepMs(150);
+    if (uploadAbortFlag) {
+      apiJson('/api/upload/abort', {
+        method: 'POST',
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ uploadId })
+      }).catch(() => {});
+      throw new Error('aborted');
+    }
+    const end = Math.min(offset + CHUNK_SIZE, file.size);
+    await sendChunk(uploadId, index, file.slice(offset, end), (n) => reportBytes(offset + n));
+    offset = end;
+    index++;
+  }
+
+  const done = await apiJson('/api/upload/complete', {
+    method: 'POST',
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ uploadId })
+  });
+  return done.file;
+}
+
+async function uploadEngine(bar) {
+  const checkmark = document.getElementById('checkmark');
+  const squareStop = document.getElementById('squareStop');
+  const totalBytes = uploadQueue.reduce((s, f) => s + (+f.size || 0), 0) || 1;
+  let doneBytes = 0;
+  const added = [];
+  let failed = null;
+
+  for (const file of uploadQueue.slice()) {
+    if (uploadAbortFlag || failed) break;
+    try {
+      const rec = await uploadOneFile(file, (cur) => {
+        setUploadPct(((doneBytes + cur) / totalBytes) * 100, bar);
+      });
+      if (rec) added.push(rec);
+      doneBytes += (+file.size || 0);
+      setUploadPct((doneBytes / totalBytes) * 100, bar);
+    } catch (e) {
+      if (e.message === 'aborted' || uploadAbortFlag) break;
+      failed = e;
+      break;
+    }
+  }
+
+  if (uploadAbortFlag) {
+    /* Тост отмены уже показан в cancelUpload — здесь только тихий сброс UI. */
+    resetUploadUI(bar, checkmark, squareStop);
+    return;
+  }
+  if (failed) {
+    showToast('Ошибка загрузки: ' + failed.message + (added.length ? ' (что успело — уже сохранено)' : ''));
+    resetUploadUI(bar, checkmark, squareStop);
+    return;
+  }
+
+  setUploadPct(100, bar);
+  bar.style.strokeDashoffset = '0';
+
+  bar.classList.add('success');
+  if (squareStop) squareStop.style.display = 'none';
+  if (checkmark) checkmark.classList.add('show');
+
+  document.getElementById('downloadText').textContent = 'Успешно загружено!';
+
+  playSoundDirectly(selectedSoundId);
+  flashScreen();
+
+  added.forEach(rec => {
+    ALL_FILES.unshift({
+      id: rec.id, name: rec.name, kind: rec.kind,
+      size: +rec.size || 0, ts: rec.ts || '', vault: !!rec.vault
+    });
+  });
+  renderAll();
+
+  setTimeout(() => {
+    resetUploadUI(bar, checkmark, squareStop);
+  }, 1200);
+}
+
+document.getElementById('fileInput').addEventListener('change', (e) => {
+  if (e.target.files?.length) uploadFiles(e.target.files);
+  e.target.value = '';
+});
+
+const dz = document.getElementById('dropZone');
+['dragenter','dragover'].forEach(ev => dz.addEventListener(ev, e => e.preventDefault()));
+['dragleave','drop'].forEach(ev => dz.addEventListener(ev, e => e.preventDefault()));
+dz.addEventListener('drop', e => {
+  if (e.dataTransfer?.files?.length) uploadFiles(e.dataTransfer.files);
+});
+
+const blobSpeedInput = document.getElementById('blobSpeedInput');
+if (blobSpeedInput) blobSpeedInput.value = blobIdleSpeed;
+
+initCustomColors();
+applyTheme(currentTheme);
+updateBlobsVisibility();
+startBlobAnimation();
+renderSoundMenu();
+setSort('date-desc');
+renderAll();
+
+/* 22.21: РЕАЛЬНАЯ БАЗА — тянем файлы с сервера бота (тот же список, что в
+   чате). Вне Telegram API честно откажет: подсказываем, как открыть. */
+if (!IS_TELEGRAM) {
+  const et = document.getElementById('emptyTitle');
+  const es = document.getElementById('emptySub');
+  if (et) et.textContent = 'Откройте через Telegram';
+  if (es) es.textContent = 'Бот DEVORKS+ → кнопка меню «☁️ DEVO+» (или ☁️ Облако → 🌐 Веб-облако)';
+}
+loadFiles();
+lucide.createIcons();
+</script>
+</body>
+</html>
+"""
+# --- MINIAPP_EMBED_END ---
+
+
 async def miniapp_index(request):
-    """Отдаёт HTML мини-аппа (дизайн пользователя, без изменений)."""
-    path = _miniapp_html_path()
-    if path is None:
-        if request.path == "/":
-            # keep-alive как раньше: платформа проверяет корень на 200.
-            return web.Response(text="OK", status=200)
-        return web.Response(
-            status=503,
-            text="Мини-апп не найден: в деплое отсутствует файл miniapp/index.html",
-            content_type="text/plain", charset="utf-8")
-    try:
-        with open(path, "rb") as f:
-            body = f.read()
-    except Exception as e:
-        return web.Response(status=500, text=f"Не удалось прочитать miniapp/index.html: {e}",
-                            content_type="text/plain", charset="utf-8")
+    """Отдаёт HTML мини-аппа (дизайн пользователя, без изменений).
+    ВОЛНА 22.25: ПРИОРИТЕТ — встроенная копия MINIAPP_HTML (один источник
+    правды: веб-облако всегда той же версии, что и бот — «ничего не
+    синхронизируется» больше невозможно даже в кривом деплое из одного
+    main.py). Файл miniapp/index.html — запасной путь (кастомизация)."""
+    body = None
+    if MINIAPP_HTML:
+        body = MINIAPP_HTML.encode("utf-8")
+    else:
+        path = _miniapp_html_path()
+        if path is None:
+            if request.path == "/":
+                # keep-alive как раньше: платформа проверяет корень на 200.
+                return web.Response(text="OK", status=200)
+            return web.Response(
+                status=503,
+                text=("Мини-апп не найден: нет встроенного HTML и файла "
+                      "miniapp/index.html"),
+                content_type="text/plain", charset="utf-8")
+        try:
+            with open(path, "rb") as f:
+                body = f.read()
+        except Exception as e:
+            return web.Response(status=500, text=f"Не удалось прочитать miniapp/index.html: {e}",
+                                content_type="text/plain", charset="utf-8")
     return web.Response(body=body, content_type="text/html", charset="utf-8",
                         headers={"Cache-Control": "no-store"})
 
@@ -7946,6 +10121,42 @@ async def miniapp_storage_get(request):
         "id": int(vc[0]) if vc else None,
         "title": vc[1] if vc else "",
         "added": added,
+        # ВОЛНА 22.25: режим «файлы БЕЗ шифрования» (только с личным каналом).
+        "plain": _vault_channel_plain(user),
+        "has_general": bool(get_cloud_channel_ids()),
+    })
+
+
+async def miniapp_storage_plain(request):
+    """ВОЛНА 22.25: переключатель «хранить файлы БЕЗ шифрования» для ЛИЧНОГО
+    канала пользователя. {"plain": true/false} → новый статус хранилища.
+    Работает ТОЛЬКО при подключённом личном канале (в общий хранилище бота
+    незашифрованные файлы Сейфа не попадают никогда)."""
+    user, uid, err = await _miniapp_user_from_request(request)
+    if err:
+        return err
+    vc = getattr(user, "vault_channel", None)
+    if not isinstance(vc, dict) or not int(vc.get("id") or 0):
+        return _miniapp_err(409, "no_channel",
+                            "Сначала подключите свой канал — переключатель "
+                            "относится только к ЛИЧНОМУ каналу.")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    vc["plain"] = bool(body.get("plain"))
+    user.vault_channel = vc
+    save_user(user)
+    logger.info(f"miniapp storage: пользователь {uid} "
+                f"{'ВЫКЛЮЧИЛ' if vc['plain'] else 'включил'} шифрование Сейфа "
+                f"для своего канала {vc.get('id')}")
+    return web.json_response({
+        "ok": True,
+        "connected": True,
+        "id": int(vc.get("id") or 0),
+        "title": str(vc.get("title") or ""),
+        "added": str(vc.get("added") or ""),
+        "plain": bool(vc.get("plain")),
         "has_general": bool(get_cloud_channel_ids()),
     })
 
@@ -8018,6 +10229,7 @@ async def miniapp_storage_connect(request):
     return web.json_response({
         "ok": True, "connected": True, "id": int(tc.id),
         "title": title, "added": user.vault_channel["added"],
+        "plain": False,  # ВОЛНА 22.25: новый канал всегда НАЧИНАЕТ с шифрованием
         "has_general": bool(get_cloud_channel_ids()),
     })
 
@@ -8031,7 +10243,7 @@ async def miniapp_storage_disconnect(request):
     save_user(user)
     logger.info(f"miniapp storage: пользователь {uid} отключил личный канал")
     return web.json_response({
-        "ok": True, "connected": False,
+        "ok": True, "connected": False, "plain": False,
         "has_general": bool(get_cloud_channel_ids()),
     })
 
@@ -8053,6 +10265,8 @@ def mount_miniapp_routes(app):
     app.router.add_get("/api/storage", miniapp_storage_get)
     app.router.add_post("/api/storage/connect", miniapp_storage_connect)
     app.router.add_post("/api/storage/disconnect", miniapp_storage_disconnect)
+    # ВОЛНА 22.25: режим «файлы БЕЗ шифрования» для личного канала
+    app.router.add_post("/api/storage/plain", miniapp_storage_plain)
 
 
 async def cloud_exit_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8213,7 +10427,11 @@ async def cloud_mv_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not get_cloud_channel_ids():
         await query.answer("Хранилище отключено.", show_alert=True)
         return MAIN_MENU
-    if not _vault_kdf_available():
+    # ВОЛНА 22.25: в режиме «БЕЗ шифрования» (свой канал) cryptography не
+    # нужна — перенос работает и без неё; в обычном режиме — обязательна.
+    if (not _vault_kdf_available()
+            and not (_user_vault_channel(user) is not None
+                     and _vault_channel_plain(user))):
         await query.answer(
             "Шифрование недоступно: на сервере нет библиотеки cryptography.",
             show_alert=True,
@@ -8255,6 +10473,12 @@ async def cloud_mv_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }]
     context.user_data['vault_migrate_ids'] = [fid]
     context.user_data['vault_put_mode'] = True
+    # ВОЛНА 22.25: режим «БЕЗ шифрования» — переносим файл в личный канал КАК ЕСТЬ.
+    if _user_vault_channel(user) is not None and _vault_channel_plain(user):
+        return await _vault_plain_upload(
+            query.message, context, user,
+            note="📤 ПЕРЕНОС: файл ляжет в ваш канал БЕЗ шифра, "
+                 "старая копия будет стёрта.\n\n")
     return await _vault_prompt_password(
         query.message, user,
         note="🔐 ПЕРЕНОС В СЕЙФ: файл скачан в память (в чат не попадёт).\n\n",
@@ -11321,14 +13545,20 @@ def _vault_files_text(user):
         head = f"• {label} — " if label else f"• Файл #{idx} (без подписи) — "
         _cat = _VAULT_CAT_TITLES.get(rec.get("cat") or "", "")
         _tags = " ".join("#" + str(t) for t in (rec.get("tags") or []))
+        # ВОЛНА 22.25: файлы режима «без шифра» помечаем честно.
+        _plain_mark = " 🔓 без шифра" if rec.get("plain") else ""
         lines.append(
             f"{head}{_fmt_bytes(rec.get('size_orig', 0))} "
-            f"(в шифре {_fmt_bytes(rec.get('size_enc', 0))}), {rec.get('ts', '')}"
+            + (f", {rec.get('ts', '')}" if rec.get("plain") else
+               f"(в шифре {_fmt_bytes(rec.get('size_enc', 0))}), {rec.get('ts', '')}")
+            + _plain_mark
             + (f"  {_cat}" if _cat else "")
             + (f"\n   {_tags}" if _tags else "")
         )
     lines.append("")
-    lines.append("📥 — достать (спросит пароль) • 🔎 — полное название • "
+    # ВОЛНА 22.25: честная легенда — файлы «без шифра» отдаём сразу.
+    lines.append("📥 — достать (спросит пароль; файлы с пометкой «без шифра» "
+                 "отдаёт сразу, без пароля) • 🔎 — полное название • "
                  "🔑 — сменить пароль • ✏️ — подписать • 🗑 — удалить. "
                  "🔍 — поиск по названиям, тегам и категориям.")
     return "\n".join(lines)
@@ -11375,6 +13605,19 @@ def _vault_help_text():
         "• настоящее ИМЯ файла зашифровано; в списке видны только ваша подпись "
         "(если сами подписали), номер/размер/дата;\n"
         "• разработчик видит в канале лишь зашифрованный контейнер.\n\n"
+        "🔓 РЕЖИМ «БЕЗ ШИФРА» (только для СВОЕГО канала, волна 22.25):\n"
+        "• если хотите, шифрование можно ВЫКЛЮЧИТЬ: 🔐 Сейф → 🔗 Моё облако → "
+        "«🔓 Хранить файлы БЕЗ шифра» (или в веб-облаке: ☁️ → Хранилище);\n"
+        "• тогда НОВЫЕ загрузки будут ложиться в ваш личный канал КАК ЕСТЬ — "
+        "с исходными именами, без пароля, и доставаться кнопкой файла сразу, "
+        "без ввода пароля;\n"
+        "• ЧЕСТНОЕ предупреждение: содержимое таких файлов видно всем, у кого "
+        "есть доступ к каналу, а «восстановление по секретным вопросам» для "
+        "них не работает;\n"
+        "• уже зашифрованные файлы остаются под шифром; вернуть шифрование — "
+        "та же кнопка («🔒 Включить шифрование файлов»);\n"
+        "• в ОБЩЕЕ хранилище бота незашифрованные файлы не попадают никогда — "
+        "режим существует только вместе с вашим личным каналом.\n\n"
         "Выйти из Сейфа можно кнопкой «❌ Отмена» в ЛЮБОЙ момент — следы "
         "загруженных файлов и недописанные вопросы/ответы стираются из чата "
         "(это работает даже после перезапуска бота).\n"
@@ -11421,21 +13664,33 @@ def _vault_help_text():
 
 
 def _vault_cloud_text(user):
-    """Экран «🔗 Моё облако»: статус личного канала + честные правила."""
+    """Экран «🔗 Моё облако»: статус личного канала + честные правила.
+    ВОЛНА 22.25: добавлен честный блок про режим шифрования (вкл/выкл)."""
     _uch = _user_vault_channel(user)
     if _uch:
+        _plain = _vault_channel_plain(user)
+        _mode = (
+            "🔒 ШИФРОВАНИЕ: ВКЛЮЧЕНО — в канал уходит только шифр, открыть "
+            "его можно лишь вашим паролем Сейфа (даже мы/Telegram не видят "
+            "содержимое). Это режим по умолчанию и рекомендация."
+            if not _plain else
+            "🔓 ШИФРОВАНИЕ: ВЫКЛЮЧЕНО Вами — новые файлы Сейфа ложатся в ваш "
+            "канал КАК ЕСТЬ, без пароля: их видно любому, у кого есть доступ "
+            "к каналу, а «восстановить по секретным вопросам» для них не "
+            "работает. Уже зашифрованные файлы остаются под шифром."
+        )
         return (
             "🔗 Моё облако\n\n"
             f"✅ Подключён ВАШ личный канал: «{_uch[1]}» ({_uch[0]}).\n\n"
-            "Шифры ВАШИХ новых загрузок Сейфа уходят ТОЛЬКО в него: ни "
-            "разработчик, ни Telegram не читают канал — там только шум, "
-            "открыть который может лишь ваш пароль. Файлы, уже лежащие в "
-            "общем хранилище, остаются там и открываются как раньше — у "
-            "каждого файла свой адрес.\n\n"
+            "Новые загрузки Сейфа уходят ТОЛЬКО в него: ни разработчик, ни "
+            "Telegram не читают канал. Файлы, уже лежащие в общем хранилище, "
+            "остаются там и открываются как раньше — у каждого файла свой "
+            "адрес.\n\n"
+            f"{_mode}\n\n"
             "❗ ВАЖНО: не удаляйте бота из вашего канала. Бот — администратор "
-            "с правом публикации; без него шифры в канале станут "
-            "недоступны (их не откроет никто — включая вас). Если случайно "
-            "удалили — верните бота в канал, и всё снова заработает.\n\n"
+            "с правом публикации; без него файлы в канале станут недоступны. "
+            "Если случайно удалили — верните бота в канал, и всё снова "
+            "заработает.\n\n"
             "ℹ️ Хотите вернуть загрузки в общее хранилище — «🗑 Отключить "
             "мой канал» ниже (уже сохранённое никуда не денется)."
         )
@@ -11461,12 +13716,21 @@ def _vault_cloud_text(user):
 
 
 def get_vault_cloud_keyboard(user):
-    """Клавиатура «🔗 Моё облако»: зависит от того, подключён ли канал."""
+    """Клавиатура «🔗 Моё облако»: зависит от того, подключён ли канал.
+    ВОЛНА 22.25: кнопка-переключатель «хранить файлы БЕЗ шифрования»
+    (видна только при подключённом личном канале)."""
     _uch = _user_vault_channel(user)
     rows = []
     if _uch:
         rows.append([InlineKeyboardButton("🔄 Заменить канал",
                                           callback_data="vault_cloud_add")])
+        # ВОЛНА 22.25: честный переключатель. Подпись = ЧТО СДЕЛАЕТ нажатие.
+        if _vault_channel_plain(user):
+            rows.append([InlineKeyboardButton("🔒 Включить шифрование файлов",
+                                              callback_data="vault_plain")])
+        else:
+            rows.append([InlineKeyboardButton("🔓 Хранить файлы БЕЗ шифра",
+                                              callback_data="vault_plain")])
         rows.append([InlineKeyboardButton("🗑 Отключить мой канал",
                                           callback_data="vault_cloud_off")])
     else:
@@ -11702,6 +13966,48 @@ async def vault_cloud_off_cb(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return MAIN_MENU
 
 
+async def vault_plain_toggle_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.25: «🔓 Хранить файлы БЕЗ шифра» / «🔒 Включить шифрование» —
+    переключатель режима хранения НОВЫХ загрузок Сейфа в ЛИЧНОМ канале.
+    Уже сохранённые файлы не трогаем: зашифрованные остаются под шифром,
+    незашифрованные — как есть. Экран честно перерисовывается с новым
+    статусом. В общий хранилище бота режим не действует (там всегда шифр)."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    user = get_user(str(query.from_user.id))
+    if not user:
+        try:
+            await query.answer("Сначала зарегистрируйтесь — /start", show_alert=True)
+        except Exception:
+            pass
+        return MAIN_MENU
+    _uch = _user_vault_channel(user)
+    if not _uch:
+        try:
+            await query.answer(
+                "Сначала подключите свой канал — переключатель относится "
+                "только к личному каналу.", show_alert=True)
+        except Exception:
+            pass
+        return MAIN_MENU
+    vc = user.vault_channel
+    vc["plain"] = not bool(vc.get("plain"))
+    user.vault_channel = vc
+    save_user(user)
+    logger.info(f"vault plain: пользователь {getattr(user, 'user_id', '?')} "
+                f"{'ВЫКЛЮЧИЛ' if vc['plain'] else 'включил'} шифрование для "
+                f"канала {_uch[0]}")
+    text = _vault_cloud_text(user)
+    try:
+        await query.edit_message_text(text, reply_markup=get_vault_cloud_keyboard(user))
+    except Exception:
+        await query.message.reply_text(text, reply_markup=get_vault_cloud_keyboard(user))
+    return MAIN_MENU
+
+
 @timeout(CONVERSATION_TIMEOUT)
 async def vault_menu_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Вход в Сейф кнопкой главного меню «🔐 Сейф»."""
@@ -11799,7 +14105,10 @@ async def vault_put_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
         return MAIN_MENU
-    if not _vault_kdf_available():
+    # ВОЛНА 22.25: режим «БЕЗ шифрования» — библиотека cryptography НЕ нужна.
+    _plain = (_user_vault_channel(user) is not None
+              and _vault_channel_plain(user))
+    if not _plain and not _vault_kdf_available():
         try:
             await query.edit_message_text(
                 "❌ Шифрование недоступно: на сервере нет библиотеки "
@@ -11816,6 +14125,35 @@ async def vault_put_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop('vault_ack_mid', None)   # 22.19: новое уведомление
     context.user_data.pop('vault_ack_last', None)  # для новой сессии
     context.user_data.pop('vault_q_warned', None)  # 22.20: совет про качество — заново
+    if _plain:
+        # ВОЛНА 22.25: честные инструкции режима «без шифра».
+        try:
+            await query.edit_message_text(
+                "📥 Сохраняем файлы в ВАШ КАНАЛ (БЕЗ шифра)\n\n"
+                f"Режим «без шифрования» включён в 🔗 Моём облаке — файлы "
+                f"лягут в «{_user_vault_channel(user)[1]}» КАК ЕСТЬ, с "
+                "исходными именами, без пароля. Достать их можно в любой "
+                "момент — пароль НЕ спрашивается.\n\n"
+                "⚠️ ЧЕСТНО: содержимое таких файлов видно всем, у кого есть "
+                "доступ к каналу. Уже зашифрованные файлы остаются под "
+                "шифром — режим действует только на НОВЫЕ загрузки.\n\n"
+                "Отправьте документ, фото, видео или аудио — можно СРАЗУ "
+                "НЕСКОЛЬКО файлов ПАЧКОЙ; или НАПИШИТЕ текст — он станет "
+                "заметкой. Фото/видео присылайте «КАК ФАЙЛ» (скрепка → "
+                "«Файл»), чтобы Telegram не сжал их.\n\n"
+                "✅ ЗАКОНЧИЛИ? Кнопка «✅ Готово» ПОД сообщением (дальше — "
+                "название загрузки, пароль НЕ нужен).",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("⬅️ Назад", callback_data="vault_menu")]]),
+            )
+        except Exception:
+            pass
+        _ack = await query.message.reply_text(
+            "Жду файл или текст 👇 (закончить — кнопка «✅ Готово» ниже)",
+            reply_markup=_vault_put_kb(),
+        )
+        _vault_track_ack(context, _ack, user=user)
+        return VAULT_PUT_WAIT
     try:
         await query.edit_message_text(
             "📥 Шифруем файлы в Сейфе\n\n"
@@ -11838,7 +14176,11 @@ async def vault_put_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "reply-ответом на СВОЁ сообщение с ним.\n\n"
             "🔑 Дальше бот попросит ПАРОЛЬ СЕЙФА. Он один на весь Сейф и "
             "нигде не хранится; при первой настройке бот задаст 3 секретных "
-            "вопроса для восстановления доступа."
+            "вопроса для восстановления доступа.",
+            # ВОЛНА 22.25: «⬅️ Назад» на инструкции — выход в меню Сейфа
+            # (кнопки «✅ Готово»/«❌ Отмена» — на отдельном сообщении ниже).
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ Назад", callback_data="vault_menu")]]),
         )
     except Exception:
         pass
@@ -12111,21 +14453,33 @@ async def vault_put_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if _target is not None:
             _target["label"] = raw_text.strip()[:80]
             # ВОЛНА 22.19 (C.1): то же ОДНО редактируемое уведомление.
+            # ВОЛНА 22.25: в режиме «без шифра» честно говорим как есть.
+            _lbl_note = ("сам файл ХРАНИТСЯ КАК ЕСТЬ — режим «без шифра»"
+                         if (_user_vault_channel(user) is not None
+                             and _vault_channel_plain(user))
+                         else "сам файл по-прежнему под шифром")
             await _vault_put_ack(
                 update, context, user,
                 note=(f"✏️ Подпись сохранена: «{_target['label']}» — она будет "
-                      "видна в списке Сейфа (сам файл по-прежнему под шифром)."),
+                      f"видна в списке Сейфа ({_lbl_note})."),
                 force=True)
             return VAULT_PUT_WAIT
 
     if att is None:
-        # Текст → зашифрованная заметка (txt) в пачке.
+        # Текст → заметка (txt) в пачке (ВОЛНА 22.25: шифрованная — только
+        # в обычном режиме; «без шифра» — честно без приставки).
+        _plain_note = (_user_vault_channel(user) is not None
+                       and _vault_channel_plain(user))
         text = raw_text
         if not text:
             await msg.reply_text(
-                "🔐 Пришлите ФАЙЛ (документ/фото/видео/аудио) или НАПИШИТЕ "
-                "текст — он станет зашифрованной заметкой. Закончить пачку — "
-                "словом «готово», выйти — «отмена»."
+                ("📝 Пришлите ФАЙЛ (документ/фото/видео/аудио) или НАПИШИТЕ "
+                 "текст — он станет заметкой в вашем канале. Закончить пачку — "
+                 "словом «готово», выйти — «отмена».")
+                if _plain_note else
+                ("🔐 Пришлите ФАЙЛ (документ/фото/видео/аудио) или НАПИШИТЕ "
+                 "текст — он станет зашифрованной заметкой. Закончить пачку — "
+                 "словом «готово», выйти — «отмена».")
             )
             return VAULT_PUT_WAIT
         if len(text) > VAULT_MAX_TEXT_CHARS:
@@ -12144,7 +14498,9 @@ async def vault_put_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # ВОЛНА 22.19 (C.1): ОДНО редактируемое уведомление вместо нового
         # сообщения на каждую заметку.
         await _vault_put_ack(update, context, user,
-                             note="Текст станет зашифрованной заметкой.")
+                             note=("Текст станет заметкой в вашем канале (без шифра)."
+                                   if _plain_note else
+                                   "Текст станет зашифрованной заметкой."))
         return VAULT_PUT_WAIT
 
     # Файл.
@@ -12336,22 +14692,29 @@ class _VaultAckRef:
         self.text = text
 
 
-def _vault_put_ack_text(context, note=""):
+def _vault_put_ack_text(context, note="", user=None):
     """ВОЛНА 22.19 (C.1): текст ОДНОГО редактируемого уведомления о пачке.
     По просьбе пользователя: «не должно отправляться столько уведомлений,
-    сколько файлов — одно сообщение просто должно редактироваться»."""
+    сколько файлов — одно сообщение просто должно редактироваться».
+    ВОЛНА 22.25: в режиме «БЕЗ шифрования» текст честно говорит про заливку
+    в личный канал без пароля (user передаётся из _vault_put_ack)."""
     batch = context.user_data.get('vault_batch')
     n = len(batch) if isinstance(batch, list) else 0
+    _plain = user is not None and _user_vault_channel(user) is not None \
+        and _vault_channel_plain(user)
     lines = [
         f"📥 Принято: {n} шт.",
         "Файлы держу в памяти — в чат они не попадут; все следы сотру после "
-        "шифрования или отмены.",
+        + ("заливки" if _plain else "шифрования") + " или отмены.",
     ]
     if note:
         lines.append(note)
     lines.append(
         "Пришлите ещё файл/заметку или нажмите «✅ Готово» ниже — дальше "
-        "попросят название и пароль Сейфа. Подписать файл — ответьте (reply) "
+        + ("попросим название (пароль НЕ нужен — режим «без шифра»)."
+           if _plain else
+           "попросят название и пароль Сейфа.")
+        + " Подписать файл — ответьте (reply) "
         "на СВОЁ сообщение с ним названием."
     )
     return "\n\n".join(lines)
@@ -12368,7 +14731,7 @@ async def _vault_put_ack(update, context, user, note="", force=False):
     _VaultAckRef (для _vault_mt_precheck)."""
     msg = update.message
     mid = context.user_data.get('vault_ack_mid')
-    text = _vault_put_ack_text(context, note)
+    text = _vault_put_ack_text(context, note, user=user)
     if mid:
         now = time.monotonic()
         last = float(context.user_data.get('vault_ack_last', 0) or 0)
@@ -12436,6 +14799,8 @@ async def _vault_ask_label(msg, context, user):
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("⏭ Пропустить", callback_data="vault_labelskip"),
              InlineKeyboardButton("❌ Отмена", callback_data="vault_cancel")],
+            # ВОЛНА 22.25: «⬅️ Назад» — вернуться к добавлению файлов в пачку.
+            [InlineKeyboardButton("⬅️ Назад к файлам", callback_data="vault_put_back")],
         ]),
     )
     _vault_track_ack(context, _ack, user=user)
@@ -12531,6 +14896,8 @@ async def _vault_ask_category(msg, context, user):
     _kb = [[InlineKeyboardButton(t, callback_data=f"vault_cat_{c}")]
            for c, t in VAULT_CATEGORIES]
     _kb.append([InlineKeyboardButton("❌ Отмена", callback_data="vault_cancel")])
+    # ВОЛНА 22.25: «⬅️ Назад» — вернуться к шагу названия загрузки.
+    _kb.append([InlineKeyboardButton("⬅️ Назад", callback_data="vault_cat_back")])
     _ack = await msg.reply_text(
         "🗂 КАТЕГОРИЯ ЗАГРУЗКИ — что это? (файлов в пачке: "
         f"{len(context.user_data.get('vault_batch') or [])})\n\n"
@@ -12569,6 +14936,8 @@ async def _vault_ask_tags(msg, context, user):
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("⏭ Пропустить", callback_data="vault_tagskip"),
              InlineKeyboardButton("❌ Отмена", callback_data="vault_cancel")],
+            # ВОЛНА 22.25: «⬅️ Назад» — вернуться к шагу категории.
+            [InlineKeyboardButton("⬅️ Назад", callback_data="vault_tags_back")],
         ]),
     )
     _vault_track_ack(context, _ack, user=user)
@@ -12613,6 +14982,9 @@ async def vault_tags_receive(update: Update,
             "контрольная» — или нажмите «⏭ Пропустить».")
         return VAULT_TAGS_WAIT
     context.user_data['vault_batch_tags'] = tags
+    # ВОЛНА 22.25: режим «БЕЗ шифрования» — пароль не нужен, заливаем сразу.
+    if _user_vault_channel(user) is not None and _vault_channel_plain(user):
+        return await _vault_plain_upload(msg, context, user)
     return await _vault_prompt_password(msg, user, context=context)
 
 
@@ -12627,7 +14999,75 @@ async def vault_tagskip_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                            show_alert=True)
         return MAIN_MENU
     context.user_data['vault_batch_tags'] = []
+    # ВОЛНА 22.25: режим «БЕЗ шифрования» — пароль не нужен, заливаем сразу.
+    if _user_vault_channel(user) is not None and _vault_channel_plain(user):
+        return await _vault_plain_upload(query.message, context, user)
     return await _vault_prompt_password(query.message, user, context=context)
+
+
+# === ВОЛНА 22.25: КНОПКИ «⬅️ НАЗАД» на каждом шаге загрузки Сейфа ===
+# Пользователь просил: «везде где нужно добавь кнопку назад чтобы она делала
+# назад». Шаги загрузки идут цепочкой пачка → название → категория → теги →
+# пароль/заливка; теперь с КАЖДОГО шага можно вернуться на шаг назад, а с
+# шага названия — вообще обратно к добавлению файлов (пачка сохраняется).
+
+async def vault_put_back_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """«⬅️ Назад к файлам» с шага названия — возврат к пополнению пачки.
+    Пачка, подписи и категория сохраняются; пароль/заливка не начинались."""
+    query = update.callback_query
+    await query.answer()
+    user = get_user(str(query.from_user.id))
+    batch = context.user_data.get('vault_batch')
+    if not user or not isinstance(batch, list) or not batch:
+        await query.answer("Сессия загрузки потеряна. Начните заново.",
+                           show_alert=True)
+        return MAIN_MENU
+    try:
+        await query.edit_message_text(
+            "⬅️ Вернулся к пачке — можно добавить ещё файлы или заметки.")
+    except Exception:
+        pass
+    _ack = await query.message.reply_text(
+        "Жду файл или текст 👇 (закончить — кнопка «✅ Готово» ниже)",
+        reply_markup=_vault_put_kb(),
+    )
+    _vault_track_ack(context, _ack, user=user)
+    return VAULT_PUT_WAIT
+
+
+async def vault_cat_back_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """«⬅️ Назад» с шага категории — возврат к шагу НАЗВАНИЯ загрузки."""
+    query = update.callback_query
+    await query.answer()
+    user = get_user(str(query.from_user.id))
+    batch = context.user_data.get('vault_batch')
+    if not user or not isinstance(batch, list) or not batch:
+        await query.answer("Сессия загрузки потеряна. Начните заново.",
+                           show_alert=True)
+        return MAIN_MENU
+    try:
+        await query.edit_message_text("⬅️ Вернулись к названию загрузки.")
+    except Exception:
+        pass
+    return await _vault_ask_label(query.message, context, user)
+
+
+async def vault_tags_back_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """«⬅️ Назад» с шага тегов — возврат к шагу КАТЕГОРИИ (выбранная
+    категория сохраняется — поменяете, если нужно)."""
+    query = update.callback_query
+    await query.answer()
+    user = get_user(str(query.from_user.id))
+    batch = context.user_data.get('vault_batch')
+    if not user or not isinstance(batch, list) or not batch:
+        await query.answer("Сессия загрузки потеряна. Начните заново.",
+                           show_alert=True)
+        return MAIN_MENU
+    try:
+        await query.edit_message_text("⬅️ Вернулись к выбору категории.")
+    except Exception:
+        pass
+    return await _vault_ask_category(query.message, context, user)
 
 
 @timeout(CONVERSATION_TIMEOUT)
@@ -13080,15 +15520,28 @@ async def vault_show_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"🏷 «{label}»")
     else:
         lines.append(f"Без подписи — «Файл #{idx}». Подписать можно кнопкой ✏️ ниже.")
+    if rec.get("plain"):
+        # ВОЛНА 22.25: у файла «без шифра» имя не секрет — показываем сразу.
+        _pname = str(rec.get("name") or "").strip()
+        if _pname and _pname != label:
+            lines.append(f"📄 Имя файла: {_pname}")
     lines.append("")
     lines.append(
         f"📦 Размер: {_fmt_bytes(rec.get('size_orig', 0))} "
-        f"(в шифре {_fmt_bytes(rec.get('size_enc', 0))})")
+        + (f"• 🔓 хранится БЕЗ шифра (режим «без шифра»)"
+           if rec.get("plain") else
+           f"(в шифре {_fmt_bytes(rec.get('size_enc', 0))})"))
     lines.append(
         f"📅 Добавлено: {rec.get('ts', '')} • 🧩 тип: {_vault_kind_label(rec.get('kind'))}")
     lines.append("")
-    lines.append("🔒 Настоящее имя файла и его содержимое под шифром — "
-                 "увидите после ввода пароля (📥 Достать).")
+    # ВОЛНА 22.25: честный блок про хранение — зависит от режима файла.
+    if rec.get("plain"):
+        lines.append("🔓 Файл хранится в вашем канале КАК ЕСТЬ (режим «без "
+                     "шифра»): выдача — сразу, без пароля. Виден всем, у кого "
+                     "есть доступ к каналу.")
+    else:
+        lines.append("🔒 Настоящее имя файла и его содержимое под шифром — "
+                     "увидите после ввода пароля (📥 Достать).")
     kb = [
         [InlineKeyboardButton("⬅️ Свернуть (к списку)", callback_data="vault_files")],
         [InlineKeyboardButton("📥 Достать", callback_data=f"vault_get_{vid}"),
@@ -13737,6 +16190,602 @@ async def _vault_encrypt_batch(msg, context, user, password):
     return MAIN_MENU
 
 
+# ============================================================
+# === ВОЛНА 22.25: РЕЖИМ «ФАЙЛЫ БЕЗ ШИФРОВАНИЯ» (личный канал) ===
+# Пользователь просил: «Если пользователь захочет он может для своего канала
+# сделать чтобы файлы не шифровались». Режим включается ТОЛЬКО пользователем
+# и ТОЛЬКО для ЕГО личного канала («🔗 Моё облако» → 🔓 или мини-апп →
+# Хранилище): новые загрузки Сейфа ложатся в канал КАК ЕСТЬ, с исходными
+# именами, пароль не спрашивается ни при заливке, ни при выдаче. Файлы в
+# записи помечены "plain": True — выдача для них идёт БЕЗ пароля. Уже
+# зашифрованные файлы остаются под шифром. В ОБЩЕЕ хранилище бота
+# незашифрованные файлы Сейфа не попадают НИКОГДА (нет личного канала —
+# нет и режима).
+# ============================================================
+
+_PLAIN_CAP = "☁️ Файл Сейфа (режим «без шифра» — лежит в вашем канале как есть)."
+
+
+async def _vault_plain_item_mtproto(msg, context, user, item,
+                                    progress_msg, idx, total):
+    """ВОЛНА 22.25: ОДИН большой файл (источник — сообщение в личном чате)
+    в режиме «БЕЗ шифра»: оригинал перекачивается в личный канал КАК ЕСТЬ
+    (без DVF2-контейнера). ≤48 МБ — Bot API, больше — MTProto.
+    Возвращает запись user.vault_files; при сбое бросает исключение —
+    оригинал остаётся в чате, чтобы пользователь его не потерял."""
+    last_err = None
+    for _attempt in (1, 2):
+        try:
+            return await _vault_plain_item_mtproto_once(
+                msg, context, user, item, progress_msg, idx, total)
+        except _VaultCancelled:
+            raise  # отмену пользователя НЕ ретраим — это не сбой
+        except Exception as e:
+            last_err = e
+            # ПОЛИТИКА ПДн 1.2: имя файла пользователя в лог не попадает.
+            logger.error(f"vault plain: попытка {_attempt}/2 не удалась, "
+                         f"user_id={getattr(user, 'user_id', '?')}: {e}")
+            if _attempt == 1:
+                await asyncio.sleep(5)
+    raise last_err
+
+
+async def _vault_plain_item_mtproto_once(msg, context, user, item,
+                                         progress_msg, idx, total):
+    """ВОЛНА 22.25: одна попытка перекачки большого файла без шифрования."""
+    name = str(item.get("name") or "файл")
+    kind = str(item.get("kind") or "document")
+    mime = str(item.get("mime") or "")
+    size = int(item.get("size", 0) or 0)
+    mt = dict(item.get("mt_raw") or {})
+    raw_ch = int(mt.get("peer_id") or mt.get("channel_id") or 0)
+    raw_mid = int(mt.get("msg_id") or 0)
+    if not raw_ch or not raw_mid:
+        raise RuntimeError("источник файла потерян — пришлите файл ещё раз")
+    small = 0 < size <= VAULT_MAX_FILE_BYTES
+    client = await _mt_client()  # None — не приговор: ≤20 МБ пойдёт через Bot API
+    doc = None
+    mt_err = None
+    if client is not None:
+        try:
+            _m, doc = await _mt_fetch_document(
+                client, raw_ch, raw_mid, int(mt.get("ah") or 0))
+        except Exception as e:
+            mt_err = e
+            logger.warning(f"vault plain: MTProto-источник не открылся ({e}); "
+                           "пробую запасной путь Bot API/file_id")
+    botapi_payload = None
+    if doc is None:
+        fid = str(item.get("file_id") or "")
+        if fid and 0 < size <= VAULT_MAX_FILE_BYTES:
+            try:
+                botapi_payload = await _vault_botapi_download(context, fid)
+            except Exception as e:
+                logger.warning(f"vault plain: Bot API-скачивание не удалось: {e}")
+        if botapi_payload is None:
+            if client is None:
+                raise RuntimeError(
+                    "перекачка больших файлов сейчас недоступна на сервере: "
+                    f"{_mt_unavailable_reason()}"
+                    + ("" if small else
+                       " — файл больше 20 МБ, без потока его не взять; "
+                       "повторите позже или пришлите файл заново"))
+            if mt_err is not None:
+                raise mt_err
+            raise RuntimeError(
+                "файл исчез из чата (сообщение удалено?) — пришлите файл ещё раз")
+    _op_here = _VAULT_OPS.get(str(getattr(user, "user_id", "") or ""))
+    if _op_here is not None:
+        _op_here["phase"] = f"Файл {idx}/{total}: «{name}»"
+        if _op_here["event"].is_set():
+            raise _VaultCancelled()
+    prog = _VaultSubProg(_op_here, f"📦 [{idx}/{total}] «{name}»")
+    up = None
+    if botapi_payload is not None:
+        # Оригинал уже в памяти (Bot API) — заливаем как есть.
+        if _op_here is not None and _op_here["event"].is_set():
+            raise _VaultCancelled()
+        up = await _storage_upload_document(
+            context, botapi_payload, filename=name, caption=_PLAIN_CAP,
+            user=user)
+        botapi_payload = b""
+    else:
+        doc_size = int(getattr(doc, "size", 0) or size or 0)
+        if not _dvf2_disk_ok(doc_size):
+            raise RuntimeError("мало свободного места на диске сервера")
+        job = _dvf2_make_job_dir()
+        if _op_here is not None:
+            _op_here["temp"].append(job)  # при отмене сотрём
+        try:
+            tmp_raw = os.path.join(job, "original.bin")
+            if _op_here is not None:
+                _op_here["sub"] = f"📦 [{idx}/{total}] «{name}»: качаю…"
+            with open(tmp_raw, "wb") as fh:
+                def _sink(chunk):
+                    if _op_here is not None and _op_here["event"].is_set():
+                        raise _VaultCancelled()
+                    fh.write(chunk)
+                await _mt_download_stream(client, doc, doc_size, _sink, prog,
+                                          f"📦 [{idx}/{total}] «{name}»: качаю",
+                                          cancel_check=lambda: bool(
+                                              _op_here and _op_here["event"].is_set()))
+            raw_size = doc_size or os.path.getsize(tmp_raw)
+            if _op_here is not None:
+                _op_here["sub"] = f"📦 [{idx}/{total}] «{name}»: заливаю в канал…"
+            if raw_size <= (49 * 1024 * 1024 - 1024 * 1024):
+                with open(tmp_raw, "rb") as fh:
+                    raw_bytes = fh.read()
+                try:
+                    up = await _storage_upload_document(
+                        context, raw_bytes, filename=name, caption=_PLAIN_CAP,
+                        user=user)
+                finally:
+                    raw_bytes = b""
+                # Bot API отказал — ≤48 МБ можно залить и MTProto.
+                if up is None and _TELETHON_OK and BOT_TOKEN:
+                    if _op_here is not None and _op_here["event"].is_set():
+                        raise _VaultCancelled()
+                    up = await _mt_upload_container(
+                        client, tmp_raw, raw_size,
+                        caption=_PLAIN_CAP, filename=name,
+                        progress_cb=(lambda cur, tot: prog.sync_bar(cur, tot, "📤 Заливаю"))
+                        if _op_here is not None else None, user=user)
+            else:
+                up = await _mt_upload_container(
+                    client, tmp_raw, raw_size,
+                    caption=_PLAIN_CAP, filename=name,
+                    progress_cb=(lambda cur, tot: prog.sync_bar(cur, tot, "📤 Заливаю"))
+                    if _op_here is not None else None, user=user)
+        finally:
+            try:
+                _shutil.rmtree(job, ignore_errors=True)
+            except Exception:
+                pass
+    if up is None:
+        raise RuntimeError(
+            "файл не принят каналом — проверьте, что бот администратор "
+            "вашего канала-хранилища")
+    if _op_here is not None:
+        try:
+            _op_here["sent"].append(
+                (int(up.get("channel_id") or get_storage_channel_id() or 0),
+                 int(up.get("message_id") or 0)))
+        except (TypeError, ValueError):
+            pass
+    rec = {
+        "id": _vault_gen_id(user),
+        "kind": kind, "mime": mime,
+        "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "size_orig": size or int(up.get("size", 0) or 0),
+        "size_enc": int(up.get("size", 0) or 0),
+        "msg_id": int(up.get("message_id", 0)),
+        "file_id": up.get("file_id"),
+        "channel_id": up.get("channel_id"),
+        # ВОЛНА 22.25: исходное имя хранится В ЗАПИСИ (оно не секрет —
+        # режим «без шифра»), пометка plain — выдача без пароля.
+        "name": name[:120],
+        "plain": True,
+    }
+    _stat_bump("vault_upload")
+    # Источник (сообщение в личном чате) стираем ТОЛЬКО при успехе.
+    item.pop("mt_raw", None)
+    if raw_ch and raw_mid:
+        try:
+            await context.bot.delete_message(chat_id=raw_ch, message_id=raw_mid)
+        except Exception:
+            pass
+    return rec
+
+
+async def _vault_plain_upload(msg, context, user, note=""):
+    """ВОЛНА 22.25: заливка пачки Сейфа в ЛИЧНЫЙ канал БЕЗ шифрования.
+    Зеркало _vault_encrypt_batch (та же живая анимация, честная отмена 22.3,
+    миграция старых файлов, чистка чата), но: без пароля, без _vault_pack —
+    файлы уходят КАК ЕСТЬ с исходными именами, записи помечаются "plain".
+    Возвращает состояние для ConversationHandler."""
+    batch = context.user_data.get('vault_batch') or []
+    _batch_label = str(context.user_data.get('vault_batch_label') or "").strip()[:80]
+    _uch = _user_vault_channel(user)
+    if not _uch:
+        # Честный предохранитель: режим без личного канала невозможен.
+        context.user_data.pop('vault_put_mode', None)
+        context.user_data.pop('vault_batch', None)
+        await msg.reply_text(
+            "❌ Режим «без шифра» работает только с ВАШИМ каналом, а он не "
+            "подключён — незашифрованные файлы в общее хранилище бота я не "
+            "принимаю. Подключите канал: 🔐 Сейф → 🔗 Моё облако.",
+            reply_markup=get_main_menu_keyboard(user))
+        return MAIN_MENU
+    op = _vault_op_begin(getattr(user, "user_id", "") or "", len(batch))
+    op["phase"] = "Заливаю БЕЗ ШИФРА"
+    progress = None
+    anim = None
+    try:
+        progress = await msg.reply_text(
+            f"{note}☁️ Заливаю в ваш канал (БЕЗ шифра) 0/{len(batch)} "
+            f"{_VAULT_OP_FRAMES[0]}")
+    except Exception:
+        progress = None
+    if progress is not None:
+        anim = asyncio.create_task(_vault_animate_progress(context, progress, op))
+    files = [f for f in (getattr(user, "vault_files", []) or []) if isinstance(f, dict)]
+    ok_n, fail_n = 0, 0
+    fail_reasons = []
+    cancelled = False
+    try:
+        for i, item in enumerate(batch, 1):
+            if op["event"].is_set():
+                raise _VaultCancelled()
+            op["done"] = i - 1
+            op["sub"] = f"«{(item.get('name') or 'файл')}»: готовлю…"
+            if item.get("source") == "mtproto":
+                try:
+                    rec_mt = await _vault_plain_item_mtproto(
+                        msg, context, user, item, progress, i, len(batch))
+                except _VaultCancelled:
+                    raise
+                except Exception as e:
+                    logger.error(
+                        f"vault plain: большой файл, "
+                        f"user_id={getattr(user, 'user_id', '?')}: {e}")
+                    rec_mt = None
+                    fail_reasons.append(
+                        f"«{(item.get('name') or 'файл')}»: {_vault_fail_reason(e)}")
+                if rec_mt is None:
+                    fail_n += 1
+                    continue
+                rec_mt["label"] = _vault_item_label(item, _batch_label)
+                rec_mt["cat"] = (context.user_data.get('vault_batch_cat')
+                                 or _vault_cat_by_kind(item.get("kind"),
+                                                       item.get("mime")))
+                rec_mt["tags"] = list(context.user_data.get('vault_batch_tags') or [])
+                files.append(rec_mt)
+                ok_n += 1
+                op["done"] = i
+                op["sub"] = ""
+                item["done"] = True
+                continue
+            # Обычный файл/заметка: payload уже в памяти — заливаем как есть.
+            payload = item.get("payload") or b""
+            name = str(item.get("name") or f"file_{i}.bin")
+            if op["event"].is_set():
+                raise _VaultCancelled()
+            op["sub"] = f"«{(item.get('name') or 'файл')}»: заливаю…"
+            up = await _storage_upload_document(
+                context, payload, filename=name, caption=_PLAIN_CAP, user=user)
+            if up is None:
+                # Одна повторная попытка Bot API (одноразовые сбои бывают),
+                # затем MTProto-заливка, если поднят.
+                if op["event"].is_set():
+                    raise _VaultCancelled()
+                up = await _storage_upload_document(
+                    context, payload, filename=name, caption=_PLAIN_CAP, user=user)
+                if up is None and _TELETHON_OK and BOT_TOKEN:
+                    _mtc = await _mt_client()
+                    if _mtc is not None:
+                        _updir = _tempfile.mkdtemp(prefix="dvf1_up_")
+                        op["temp"].append(_updir)
+                        try:
+                            _uppath = os.path.join(_updir, name)
+                            with open(_uppath, "wb") as _ufh:
+                                _ufh.write(payload)
+                            up = await _mt_upload_container(
+                                _mtc, _uppath, len(payload),
+                                caption=_PLAIN_CAP, filename=name, user=user)
+                        finally:
+                            _shutil.rmtree(_updir, ignore_errors=True)
+            item["payload"] = b""  # исходник больше не нужен
+            if up is None:
+                fail_n += 1
+                fail_reasons.append(
+                    f"«{(item.get('name') or 'файл')}»: канал не принял файл — "
+                    "проверьте, что бот администратор вашего канала")
+                continue
+            try:
+                op["sent"].append((int(up.get("channel_id") or _uch[0] or 0),
+                                   int(up.get("message_id") or 0)))
+            except (TypeError, ValueError):
+                pass
+            files.append({
+                "id": _vault_gen_id(user),
+                "kind": item.get("kind", "document"),
+                "mime": item.get("mime", ""),
+                "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "size_orig": int(item.get("size", 0) or 0),
+                "size_enc": int(up.get("size", 0) or 0),
+                "msg_id": int(up.get("message_id", 0)),
+                "file_id": up.get("file_id"),
+                "channel_id": up.get("channel_id"),
+                "name": name[:120],
+                "plain": True,
+                "label": _vault_item_label(item, _batch_label),
+                "cat": (context.user_data.get('vault_batch_cat')
+                        or _vault_cat_by_kind(item.get("kind"),
+                                              item.get("mime"))),
+                "tags": list(context.user_data.get('vault_batch_tags') or []),
+            })
+            _stat_bump("vault_upload")
+            ok_n += 1
+            op["done"] = i
+            op["sub"] = ""
+            item["done"] = True
+    except _VaultCancelled:
+        cancelled = True
+    finally:
+        if anim is not None:
+            anim.cancel()
+            try:
+                await anim
+            except (asyncio.CancelledError, Exception):
+                pass
+        _vault_op_end(getattr(user, "user_id", "") or "")
+    if cancelled:
+        deleted = await _vault_cancel_cleanup(context, op)
+        if progress is not None:
+            try:
+                await context.bot.edit_message_text(
+                    "⛔ Остановлено",
+                    chat_id=progress.chat_id, message_id=progress.message_id)
+            except Exception:
+                pass
+        for key in ('vault_put_mode', 'vault_batch', 'vault_migrate_ids',
+                    'vault_attempts', 'vault_setup_pw', 'vault_qs_data',
+                    'vault_batch_label',
+                    'vault_ack_mid', 'vault_ack_last', 'vault_q_warned'):
+            context.user_data.pop(key, None)
+        await msg.reply_text(
+            "⛔ Остановлено по вашему «❌ Отмена».\n\n"
+            f"• Заливка прервана: обработано {op.get('done', 0)}/{op.get('total', 0)}.\n"
+            f"• Из канала стёрто файлов этой загрузки: {deleted}.\n"
+            "• Временные файлы стёрты с сервера.\n"
+            "• Исходные файлы ОСТАЛИСЬ в чате — ничего не потеряно.\n\n"
+            "Положить заново: 🔐 Сейф → 📥 Положить.",
+            reply_markup=get_main_menu_keyboard(user))
+        return MAIN_MENU
+    user.vault_files = files
+    migrated = 0
+    migrate_ids = context.user_data.get('vault_migrate_ids') or []
+    if migrate_ids:
+        cloud_recs = [f for f in (getattr(user, "cloud_files", []) or []) if isinstance(f, dict)]
+        for mid in migrate_ids:
+            rec = next((r for r in cloud_recs if r.get("id") == mid), None)
+            if not rec:
+                continue
+            ch = rec.get("channel_id") or get_storage_channel_id()
+            if ch and rec.get("msg_id"):
+                try:
+                    await context.bot.delete_message(chat_id=ch, message_id=int(rec["msg_id"]))
+                except Exception:
+                    pass
+            cloud_recs = [r for r in cloud_recs if r.get("id") != mid]
+            migrated += 1
+        if migrated:
+            user.cloud_files = cloud_recs
+    save_user(user)
+    _vault_flush_soon(context, reason="заливка пачки Сейфа (без шифра)")
+    for key in ('vault_put_mode', 'vault_batch', 'vault_migrate_ids',
+                'vault_attempts', 'vault_setup_pw', 'vault_qs_data',
+                'vault_batch_label',
+                'vault_ack_mid', 'vault_ack_last', 'vault_q_warned'):
+        context.user_data.pop(key, None)
+    lines = []
+    if ok_n:
+        lines.append(f"✅ СОХРАНЕНО В ВАШ КАНАЛ (БЕЗ ШИФРА): {ok_n} файл(ов).")
+    else:
+        lines.append("❌ Не удалось загрузить ни одного файла.")
+    if _batch_label and ok_n:
+        lines.append(f"🏷 Название загрузки: «{_batch_label}» — видно в «📦 Мои файлы».")
+    if fail_n:
+        lines.append(f"⚠️ Не удалось обработать: {fail_n} — попробуйте ещё раз позже.")
+        if fail_reasons:
+            lines.append("")
+            lines.append("Причины:")
+            for _fr in fail_reasons[:3]:
+                lines.append(f"• {_fr}")
+            if len(fail_reasons) > 3:
+                lines.append(f"• …и ещё {len(fail_reasons) - 3}")
+            lines.append("")
+            lines.append("Файлы, которые не ушли, ОСТАЛИСЬ в чате — ничего "
+                         "не потеряно. Попробуйте ещё раз: 🔐 Сейф → 📥 Положить.")
+    if ok_n:
+        lines.append("")
+        lines.append("• Файлы лежат в вашем канале КАК ЕСТЬ, с исходными именами — "
+                     "их видно всем, у кого есть доступ к каналу.")
+        lines.append("• Достаю их по кнопке файла в «📦 Мои файлы» — БЕЗ пароля.")
+        lines.append("• Уже зашифрованные ранее файлы остались под шифром.")
+        lines.append("")
+        lines.append("🔒 Передумали? 🔐 Сейф → 🔗 Моё облако → «🔒 Включить "
+                     "шифрование файлов» — вернёт шифрование для новых загрузок.")
+    if migrated:
+        lines.append(f"🗂 Старая незашифрованная копия в общем хранилище удалена: {migrated}.")
+    if ok_n:
+        _done_items = [it for it in batch if isinstance(it, dict) and it.get("done")]
+        _failed_ids = [it.get("chat_msg_id") for it in batch
+                       if isinstance(it, dict) and not it.get("done") and it.get("chat_msg_id")]
+        try:
+            _cleaned = await _vault_cleanup_chat(context, msg.chat_id, _done_items,
+                                                 user=user, keep_ids=_failed_ids)
+        except Exception:
+            _cleaned = 0
+        if _cleaned:
+            lines.append(f"🧹 Следов из чата стёрто: {_cleaned}.")
+    else:
+        lines.append("")
+        lines.append("🧹 Из чата ничего не стёрто — все ваши файлы и подсказки на месте.")
+    await msg.reply_text("\n".join(lines), reply_markup=get_main_menu_keyboard(user))
+    return MAIN_MENU
+
+
+async def _vault_get_plain(msg, context, user, rec):
+    """ВОЛНА 22.25: выдача файла, хранящегося БЕЗ шифра, — пароль НЕ нужен.
+    ≤20 МБ с file_id — Bot API; иначе MTProto (качаем во временник и отдаём:
+    ≤49 МБ — Bot API документом, больше — MTProto прямо в чат, как DVF2)."""
+    channel_id = rec.get("channel_id") or get_storage_channel_id()
+    mid = int(rec.get("msg_id") or 0)
+    name = str(rec.get("name") or rec.get("label") or f"vault_{rec.get('id', 'file')}.bin")
+    _lbl = str(rec.get("label") or "").strip()
+    cap = (f"🔓 {_lbl} — {name}" if _lbl
+           else f"🔓 Файл из Сейфа (хранится без шифра): {name}")
+    size = int(rec.get("size_orig") or rec.get("size_enc") or 0)
+    fid = rec.get("file_id")
+    app_bot = context.bot
+    # Путь 1: Bot API (быстрый).
+    if fid and 0 < size <= VAULT_MAX_FILE_BYTES:
+        try:
+            await app_bot.send_chat_action(chat_id=msg.chat_id, action="upload_document")
+            tg_file = await app_bot.get_file(fid)
+            buf = io.BytesIO()
+            await asyncio.wait_for(tg_file.download_to_memory(out=buf), timeout=120)
+            payload = buf.getvalue()
+            _sent_msg = await app_bot.send_document(
+                chat_id=msg.chat_id, document=InputFile(payload, filename=name),
+                caption=cap,
+            )
+            try:
+                sent_mid = int(getattr(_sent_msg, "message_id", 0) or 0)
+            except (TypeError, ValueError):
+                sent_mid = 0
+            if sent_mid:
+                await _vault_offer_wipe(
+                    context, msg.chat_id, sent_mid,
+                    wipe_enabled=bool(getattr(user, "vault_wipe_on_cancel", True)),
+                    user=user)
+            else:
+                await msg.reply_text("✅ Готово.")
+            return MAIN_MENU
+        except Exception as e:
+            logger.warning(f"vault get plain: Bot API не отдал файл ({e}); пробую MTProto")
+    # Путь 2: MTProto.
+    client = await _mt_client()
+    if client is None:
+        await msg.reply_text(
+            "❌ Файл сейчас недоступен: " + (_MT_LAST_ERR or "MTProto не подключён")
+            + ". Попробуйте позже.",
+            reply_markup=get_main_menu_keyboard(user))
+        return MAIN_MENU
+    if not channel_id or not mid:
+        await msg.reply_text(
+            "❌ Файл недоступен: он лежал в канале, который больше не "
+            "подключён, либо указатель потерян.",
+            reply_markup=get_main_menu_keyboard(user))
+        return MAIN_MENU
+    try:
+        _m, doc = await _mt_fetch_document(client, int(channel_id), mid)
+    except Exception as e:
+        logger.error(f"vault get plain: не удалось открыть файл: {e}")
+        doc = None
+    if doc is None:
+        await msg.reply_text(
+            "❌ Не смог скачать файл из канала. Возможно, сообщение в канале "
+            "удалено вручную.",
+            reply_markup=get_main_menu_keyboard(user))
+        return MAIN_MENU
+    doc_size = int(getattr(doc, "size", 0) or size or 0)
+    if not _dvf2_disk_ok(doc_size):
+        await msg.reply_text(
+            f"❌ На диске сервера сейчас меньше свободного места, чем нужно "
+            f"для файла ({_fmt_bytes(doc_size)}). Место освобождается после "
+            "перезапуска бота — попробуйте позже.",
+            reply_markup=get_main_menu_keyboard(user))
+        return MAIN_MENU
+    op = _vault_op_begin(getattr(user, "user_id", "") or "", 1, kind="get")
+    op["phase"] = "Качаю файл"
+    progress_msg = None
+    try:
+        progress_msg = await msg.reply_text(
+            "📤 Качаю файл из вашего канала… 0%\n⏳ Не прерываю — загрузка "
+            "спокойно дойдёт до конца.")
+    except Exception:
+        progress_msg = None
+    prog = _ProgressEdit(context, progress_msg, "📤 Качаю файл из вашего канала")
+    job = _dvf2_make_job_dir()
+    op["temp"].append(job)
+    err_text = None
+    cancelled = False
+    sent_mid = 0
+    try:
+        out_path = os.path.join(job, name)
+        with open(out_path, "wb") as fh:
+            def _sink(chunk):
+                if op["event"].is_set():
+                    raise _VaultCancelled()
+                fh.write(chunk)
+            await _mt_download_stream(
+                client, doc, doc_size, _sink, prog,
+                "📤 Качаю файл из вашего канала",
+                cancel_check=lambda: op["event"].is_set())
+        real_size = os.path.getsize(out_path)
+        if op["event"].is_set():
+            raise _VaultCancelled()
+        try:
+            await context.bot.send_chat_action(
+                chat_id=msg.chat_id, action="upload_document")
+        except Exception:
+            pass
+        op["phase"] = "Отправляю файл"
+        await _ProgressEdit(context, progress_msg, "").edit(
+            "📤 Отправляю файл… 0%", force=True)
+        if real_size <= (49 * 1024 * 1024 - 1024 * 1024):
+            with open(out_path, "rb") as fh:
+                _sent_msg = await context.bot.send_document(
+                    chat_id=msg.chat_id,
+                    document=InputFile(fh, filename=name),
+                    caption=cap,
+                )
+            sent_mid = int(getattr(_sent_msg, "message_id", 0) or 0)
+        else:
+            _sent = await _mt_send_file_to_user(
+                client, msg.chat_id, out_path, real_size, cap,
+                context, progress_msg or msg,
+                cancel_check=lambda: op["event"].is_set())
+            sent_mid = int(getattr(_sent, "id", 0) or 0)
+    except _VaultCancelled:
+        cancelled = True
+    except Exception as e:
+        logger.error(f"vault get plain: выдача не удалась: {e}")
+        err_text = "сбой при перекачке файла"
+    finally:
+        try:
+            _shutil.rmtree(job, ignore_errors=True)
+        except Exception:
+            pass
+        _vault_op_end(getattr(user, "user_id", "") or "")
+    if cancelled:
+        if progress_msg is not None:
+            try:
+                await context.bot.edit_message_text(
+                    "⛔ Отменено — перекачка остановлена, временные файлы "
+                    "стёрты. Файл в вашем канале цел.",
+                    chat_id=progress_msg.chat_id,
+                    message_id=progress_msg.message_id)
+            except Exception:
+                pass
+        await msg.reply_text(
+            "Отменено.", reply_markup=get_main_menu_keyboard(user))
+        return MAIN_MENU
+    if err_text is not None:
+        await msg.reply_text(
+            f"❌ Передать файл не удалось: {err_text}. Попробуйте ещё раз.",
+            reply_markup=get_main_menu_keyboard(user))
+        return MAIN_MENU
+    if progress_msg is not None:
+        try:
+            await context.bot.edit_message_text(
+                "✅ Файл отправлен ниже.",
+                chat_id=progress_msg.chat_id,
+                message_id=progress_msg.message_id)
+        except Exception:
+            pass
+    if sent_mid:
+        await _vault_offer_wipe(
+            context, msg.chat_id, sent_mid,
+            wipe_enabled=bool(getattr(user, "vault_wipe_on_cancel", True)),
+            user=user)
+    else:
+        await msg.reply_text("✅ Готово.")
+    return MAIN_MENU
+
+
 async def vault_get_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Выбор файла для скачивания: список без имён (zero-knowledge)."""
     query = update.callback_query
@@ -13765,6 +16814,10 @@ async def vault_get_password_start(update: Update, context: ContextTypes.DEFAULT
     if not rec:
         await query.answer("Файл не найден.", show_alert=True)
         return MAIN_MENU
+    # ВОЛНА 22.25: файл режима «БЕЗ шифра» — пароль не нужен и не существует:
+    # честно выдаём сразу (то же окно прогресса, что у больших файлов).
+    if rec.get("plain"):
+        return await _vault_get_plain(query.message, context, user, rec)
     context.user_data['vault_get_id'] = vid
     context.user_data['vault_attempts'] = 0
     await query.message.reply_text(
@@ -13838,6 +16891,12 @@ async def vault_get_password(update: Update, context: ContextTypes.DEFAULT_TYPE)
             context.user_data.pop(key, None)
         await msg.reply_text("Файл не найден (уже удалён?).")
         return MAIN_MENU
+    # ВОЛНА 22.25: страховка — если файл стал «без шифра», пока пользователь
+    # сидел в ожидании пароля, пароль не нужен: выдаём сразу.
+    if chp_stage != "old" and rec.get("plain"):
+        context.user_data.pop('vault_get_id', None)
+        context.user_data.pop('vault_attempts', None)
+        return await _vault_get_plain(msg, context, user, rec)
     password = (msg.text or "").strip()
     try:
         await context.bot.delete_message(chat_id=msg.chat_id, message_id=msg.message_id)
@@ -27620,6 +30679,19 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await vault_cloud_add_cb(update, context)
     elif data == "vault_cloud_off":
         return await vault_cloud_off_cb(update, context)
+    elif data == "vault_plain":
+        # ВОЛНА 22.25: переключатель «хранить файлы БЕЗ шифрования»
+        # для ЛИЧНОГО канала пользователя.
+        return await vault_plain_toggle_cb(update, context)
+    elif data == "vault_put_back":
+        # ВОЛНА 22.25: «⬅️ Назад к файлам» с шага названия загрузки.
+        return await vault_put_back_cb(update, context)
+    elif data == "vault_cat_back":
+        # ВОЛНА 22.25: «⬅️ Назад» с шага категории к шагу названия.
+        return await vault_cat_back_cb(update, context)
+    elif data == "vault_tags_back":
+        # ВОЛНА 22.25: «⬅️ Назад» с шага тегов к шагу категории.
+        return await vault_tags_back_cb(update, context)
     elif data == "vault_done":
         # ВОЛНА 13: кнопка «✅ Готово» ПОД сообщением загрузки — закончить
         # пачку без набора текста (дальше шаг названия и пароль Сейфа).
@@ -27648,8 +30720,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🔍 ПОИСК ПО СЕЙФУ\n\nПришлите запрос одним сообщением — слова из "
             "НАЗВАНИЯ, ТЕГИ или КАТЕГОРИЮ (музыка / фото / видео / файл / "
             "другое). Можно несколько слов — например «контрольная алгебра».",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("❌ Отмена", callback_data="vault_exit")]]),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("❌ Отмена", callback_data="vault_exit")],
+                # ВОЛНА 22.25: «⬅️ Назад» в меню Сейфа.
+                [InlineKeyboardButton("⬅️ Назад", callback_data="vault_menu")],
+            ]),
         )
         _vault_track_ack(context, _sack,
                          user=get_user(str(query2.from_user.id)))
