@@ -7628,7 +7628,13 @@ def _miniapp_verify_init_data(raw):
         secret = hmac.new(b"WebAppData", BOT_TOKEN.encode("utf-8"), hashlib.sha256).digest()
         calc = hmac.new(secret, check_str.encode("utf-8"), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(calc, given.lower()):
-            return None
+    logger.warning(
+        f"miniapp auth: HMAC mismatch. "
+        f"given={given[:8]}... calc={calc[:8]}... "
+        f"auth_date={dict(pairs).get('auth_date')} "
+        f"token_prefix={BOT_TOKEN[:12]}..."
+    )
+    return None
         try:
             auth_date = int(dict(pairs).get("auth_date") or 0)
         except (TypeError, ValueError):
