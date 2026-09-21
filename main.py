@@ -3336,7 +3336,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.25"
+BOT_BUILD = "22.26"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -8859,6 +8859,14 @@ function openBotChat() {
 let ALL_FILES = [];
 let listLoading = false;
 
+/* 22.26: ВИДИМОЕ доказательство связи с ботом — сервер сам присылает своё
+   имя и сборку в каждом ответе (build/bot). Показываем в окне «Хранилище»
+   и после синхронизации: пользователь всегда видит, К ЧЕМУ подключён. */
+var CONN = { bot: '', build: '' };
+var LAST_ERR = null; // 22.26: последняя ошибка облака (для честной кнопки)
+var NETERR_RE = /failed to fetch|networkerror|load failed|timed? ?out/i;
+var LAST_SYNC = 0;   // 22.26: момент последней успешной синхронизации
+
 async function loadFiles(silent) {
   if (listLoading) return false;
   listLoading = true;
@@ -8869,9 +8877,15 @@ async function loadFiles(silent) {
       kind: String(f.kind || 'document'), size: +f.size || 0,
       ts: String(f.ts || ''), vault: !!f.vault
     }));
+    // 22.26: сервер подтвердил связь — запоминаем, кем и чем отвечает
+    CONN.bot = String(data.bot || CONN.bot || '');
+    CONN.build = String(data.build || CONN.build || '');
+    LAST_ERR = null;
+    LAST_SYNC = Date.now();
     renderAll();
     return true;
   } catch (e) {
+    LAST_ERR = e;
     if (!silent) {
       const t = cloudErrText(e); // 22.24: честная причина вместо слепого «нет связи»
       showToast(t);
@@ -8883,10 +8897,43 @@ async function loadFiles(silent) {
   }
 }
 
+/* 22.26: кнопка синхронизации больше НЕ слепая. Раньше она звала loadFiles
+   в тихом режиме и показывала голое «Ошибка синхронизации» — даже честная
+   причина 22.24 до пользователя не доходила. Теперь: до 3 попыток (сервер
+   Render может просыпаться до ~30 секунд), после — причина КАК ЕСТЬ и окно
+   входа, если дело в авторизации. */
 async function syncNow() {
-  const ok = await loadFiles(true);
-  showToast(ok ? 'Синхронизировано' : 'Ошибка синхронизации');
+  const netFail = () => !!(LAST_ERR && LAST_ERR.message && NETERR_RE.test(String(LAST_ERR.message)));
+  let ok = false;
+  for (let i = 1; i <= 3; i++) {
+    if (i > 1) {
+      showToast('Подключаюсь… попытка ' + i + ' из 3');
+      await new Promise(r => setTimeout(r, 2500));
+    }
+    ok = await loadFiles(true);
+    if (ok || !netFail()) break; // серверная причина — повтор не поможет
+  }
+  if (ok) {
+    showToast('Синхронизировано' + (CONN.build ? ' • сборка ' + CONN.build : ''));
+    return;
+  }
+  const t = cloudErrText(LAST_ERR || new Error(''));
+  showToast(t);
+  if (LAST_ERR && (LAST_ERR.code === 'unauthorized' || LAST_ERR.code === 'not_registered')) showAuthCard(t);
 }
+
+/* 22.26: автосинхронизация при возврате в мини-апп — список свежий,
+   даже если пользователь не трогает кнопку синхронизации. */
+let RESYNC_TIMER = null;
+function maybeAutoResync() {
+  if (!IS_TELEGRAM || listLoading || isUploading) return;
+  if (Date.now() - LAST_SYNC < 20000) return; // не чаще раза в 20 секунд
+  loadFiles(true);
+}
+document.addEventListener('visibilitychange', function () {
+  if (!document.hidden) { clearTimeout(RESYNC_TIMER); RESYNC_TIMER = setTimeout(maybeAutoResync, 600); }
+});
+try { if (tg && tg.onEvent) tg.onEvent('activated', maybeAutoResync); } catch (e) {}
 
 let FILTER = 'all';
 let SEARCH = '';
@@ -9391,9 +9438,23 @@ function renderStorage(d) {
   const connLabel = document.querySelector('#storageConnectBtn span');
   const plainBtn = document.getElementById('storagePlainBtn');
   STORAGE_STATE = d || null;
+  // 22.26: сервер подтверждает связь — честная строка «связь с ботом».
+  // Если сборка/имя не пришли (старый сервер) — строки нет, честно.
+  if (d) {
+    CONN.bot = String(d.bot || CONN.bot || '');
+    CONN.build = String(d.build || CONN.build || '');
+  }
+  var ident = (CONN.bot || CONN.build)
+    ? '<br><span style="font-size:11px;color:var(--subtext-color)">связь с ботом: '
+      + (CONN.bot ? '<b style="color:var(--text-color)">@' + escapeHtml(CONN.bot) + '</b>' : '')
+      + (CONN.bot && CONN.build ? ' • ' : '')
+      + (CONN.build ? 'сборка ' + escapeHtml(CONN.build) : '')
+      + '</span>'
+    : '';
   if (d.connected) {
     box.innerHTML = '✅ Ваш канал: <b style="color:var(--text-color)">' + escapeHtml(d.title || '') + '</b>'
-      + '<br><span style="font-size:11px">подключён ' + escapeHtml(d.added || '') + ' — новые загрузки уходят только в него</span>';
+      + '<br><span style="font-size:11px">подключён ' + escapeHtml(d.added || '') + ' — новые загрузки уходят только в него</span>'
+      + ident;
     offBtn.style.display = '';
     connLabel.textContent = 'Заменить канал';
     // 22.25: честное состояние шифрования для личного канала.
@@ -9405,9 +9466,9 @@ function renderStorage(d) {
         : '🔒 Файлы под шифром — хранить БЕЗ шифра';
     }
   } else {
-    box.innerHTML = d.has_general
+    box.innerHTML = (d.has_general
       ? '☁️ Сейчас файлы уходят в общее хранилище бота. Подключите свой приватный канал — и они будут лежать только у вас.'
-      : '⚠️ Хранилище не настроено — загрузки будут неудачными. Подключите свой канал ниже.';
+      : '⚠️ Хранилище не настроено — загрузки будут неудачными. Подключите свой канал ниже.') + ident;
     offBtn.style.display = 'none';
     connLabel.textContent = 'Подключить канал';
     if (plainBtn) plainBtn.style.display = 'none';
@@ -9752,7 +9813,11 @@ if (!IS_TELEGRAM) {
   if (et) et.textContent = 'Откройте через Telegram';
   if (es) es.textContent = 'Бот DEVORKS+ → кнопка меню «☁️ DEVO+» (или ☁️ Облако → 🌐 Веб-облако)';
 }
-loadFiles();
+/* 22.26: первый вход — сервер Render может просыпаться (до ~30 секунд):
+   одна тихая повторная попытка через 4 секунды, честный текст остаётся. */
+loadFiles().then(function (ok) {
+  if (!ok) setTimeout(function () { loadFiles(true); }, 4000);
+});
 lucide.createIcons();
 </script>
 </body>
@@ -9802,6 +9867,9 @@ async def miniapp_files_get(request):
         "files": [_miniapp_rec_out(f) for f in files],
         "stats": {"count": len(files), "size": total},
         "limit": get_price('cloud_max_files', 50),
+        # ВОЛНА 22.26: сервер сам подтверждает связь — кем и чем отвечает.
+        "build": BOT_BUILD,
+        "bot": _miniapp_bot_username(),
     })
 
 
@@ -10124,6 +10192,9 @@ async def miniapp_storage_get(request):
         # ВОЛНА 22.25: режим «файлы БЕЗ шифрования» (только с личным каналом).
         "plain": _vault_channel_plain(user),
         "has_general": bool(get_cloud_channel_ids()),
+        # ВОЛНА 22.26: видимое подтверждение связи с ботом.
+        "build": BOT_BUILD,
+        "bot": _miniapp_bot_username(),
     })
 
 
@@ -10158,6 +10229,8 @@ async def miniapp_storage_plain(request):
         "added": str(vc.get("added") or ""),
         "plain": bool(vc.get("plain")),
         "has_general": bool(get_cloud_channel_ids()),
+        "build": BOT_BUILD,
+        "bot": _miniapp_bot_username(),
     })
 
 
@@ -10231,6 +10304,8 @@ async def miniapp_storage_connect(request):
         "title": title, "added": user.vault_channel["added"],
         "plain": False,  # ВОЛНА 22.25: новый канал всегда НАЧИНАЕТ с шифрованием
         "has_general": bool(get_cloud_channel_ids()),
+        "build": BOT_BUILD,
+        "bot": _miniapp_bot_username(),
     })
 
 
@@ -10245,6 +10320,8 @@ async def miniapp_storage_disconnect(request):
     return web.json_response({
         "ok": True, "connected": False, "plain": False,
         "has_general": bool(get_cloud_channel_ids()),
+        "build": BOT_BUILD,
+        "bot": _miniapp_bot_username(),
     })
 
 
