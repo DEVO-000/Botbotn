@@ -7,10 +7,11 @@ import json
 import logging
 import random
 import string
+import secrets  # ВОЛНА 22.29: токены веб-сессий (token_urlsafe)
 import time
 import threading
 import zipfile
-from datetime import datetime, timedelta, timezone, time as dt_time
+from datetime import datetime, timedelta, timezone, time as dt_time, date
 import asyncio
 try:
     # Python 3.9+: точные часовые пояса (IANA tzdata) без внешних сервисов.
@@ -504,6 +505,15 @@ TIMER_EDIT_TIME = 142      # «Мои напоминания» → правка 
 AGE_BLOCKED = 143          # пользователь с ДР <13 — бот закрыт для него
 DEV_BLOCK_CUSTOM = 144     # 22.28: разработчик ВПИСЫВАЕТ срок сам («2 недели», «полгода»)
 
+# ВОЛНА 22.29: веб-пароль (вход в 🌐 Веб-облако по Telegram ID + пароль
+# из обычного браузера — без Telegram и без telegram.org), «не беспокоить»
+# и «🤒 Я болел(а)».
+WEB_PW_ENTER = 150         # пользователь придумывает веб-пароль (новый/смена)
+WEB_PW_ENTER_OLD = 151     # смена веб-пароля: сначала СТАРЫЙ пароль
+DND_WAIT_TIME = 152        # «🌙 Не беспокоить»: ввод времени «со скольки»/«до скольки»
+SICK_WAIT_FROM = 153       # «🤒 Я болел(а)»: дата начала (ГГГГ-ММ-ДД)
+SICK_WAIT_TO = 154         # «🤒 Я болел(а)»: дата конца (ГГГГ-ММ-ДД)
+
 # ВОЛНА 22.4: «🎙 Пульт» удалён ПОЛНОСТЬЮ по решению пользователя — кнопки,
 # состояний (бывшие 126–131), хендлеров и хранилищ стилей больше нет.
 
@@ -527,7 +537,10 @@ _QUICK_SKIP_STATES = frozenset({VAULT_REN_WAIT, VAULT_LABEL_WAIT,
                                 PDN_CONSENT_WAIT, PARENT_CONSENT_WAIT,
                                 # ВОЛНА 22.20: тут вводят @username/-100…id
                                 # своего канала — это не команда.
-                                VAULT_MYCLOUD_WAIT})
+                                VAULT_MYCLOUD_WAIT,
+                                # ВОЛНА 22.29: пароль/время/даты — не команды.
+                                WEB_PW_ENTER, WEB_PW_ENTER_OLD,
+                                DND_WAIT_TIME, SICK_WAIT_FROM, SICK_WAIT_TO})
 
 # ==================================
 # === ВОЛНА 12: ГЛОБАЛЬНАЯ КНОПКА ОТМЕНЫ ===
@@ -2349,6 +2362,40 @@ class User:
         # True (по умолчанию) — приходит сообщение «📚 Новое решение…»;
         # тоггл: ⚙️ Настройки → «🔔 Уведомления о решениях».
         self.sol_notify = True
+        # === ВОЛНА 22.29: ВЕБ-ПАРОЛЬ (вход в 🌐 Веб-облако без Telegram) ===
+        # web_password_hash — {"salt": hex, "iters": int, "verifier": hex}.
+        # Сам пароль НИГДЕ не хранится: только PBKDF2-верификатор (см.
+        # _web_set_password). None — пароль не задан (веб-вход выключен).
+        self.web_password_hash = None
+        # Когда пароль задан/сменён ("YYYY-MM-DD HH:MM:SS").
+        self.web_password_set_at = None
+        # Неудачные попытки веб-входа ПОДРЯД (5 → блок на 10 минут).
+        self.web_login_attempts = 0
+        # ISO-момент, до которого веб-вход заблокирован (None — не заблокирован).
+        self.web_login_locked_until = None
+        # === ВОЛНА 22.29: РАССЫЛКА «ЗА ДЕНЬ ДО ДНЯ РОЖДЕНИЯ» ОДНОКЛАССНИКАМ ===
+        # True (по умолчанию) — пользователь ХОЧЕТ получать «завтра ДР у …».
+        # Тоггл: ⚙️ Настройки → 🔔 Настройки уведомлений. Отдельно от этого,
+        # сам именинник управляет рассылкой о СЕБЕ флагом show_birthday_to_class.
+        self.birthday_eve_notify = True
+        # === ВОЛНА 22.29: «🌙 НЕ БЕСПОКОИТЬ» ===
+        # В окне [dnd_from .. dnd_to] по ЛОКАЛЬНОМУ времени пользователя
+        # выбранные типы уведомлений (dnd_mute) не отправляются; после
+        # окончания окна бот их честно доставит (тикер повторяет попытки).
+        self.dnd_enabled = False
+        self.dnd_from = "23:00"
+        self.dnd_to = "07:00"
+        # Какие типы уведомлений ЗАГЛУШАТЬ в окне. Явные напоминания
+        # (таймеры) по умолчанию НЕ глушатся — их попросили сами.
+        self.dnd_mute = {
+            "morning": True,    # доброе утро
+            "evening": True,    # спокойной ночи
+            "weather": True,    # погода
+            "holiday": True,    # праздники
+            "birthday": True,   # напоминание о СВОЁМ ДР
+            "bd_eve": True,     # «завтра ДР у …» о одноклассниках
+            "timers": False,    # явные напоминания (по умолчанию приходят)
+        }
         # ВОЛНА 22.4: поле user.pult (Пульт) удалено — функция снесена целиком.
 
     def to_dict(self):
@@ -2438,6 +2485,19 @@ class User:
             'vault_kb_wipe': getattr(self, 'vault_kb_wipe', None),
             # ВОЛНА 22.12: уведомления о новых решениях класса.
             'sol_notify': getattr(self, 'sol_notify', True),
+            # ВОЛНА 22.29: веб-пароль / ДР-канун / «не беспокоить».
+            'web_password_hash': getattr(self, 'web_password_hash', None),
+            'web_password_set_at': getattr(self, 'web_password_set_at', None),
+            'web_login_attempts': getattr(self, 'web_login_attempts', 0),
+            'web_login_locked_until': getattr(self, 'web_login_locked_until', None),
+            'birthday_eve_notify': getattr(self, 'birthday_eve_notify', True),
+            'dnd_enabled': getattr(self, 'dnd_enabled', False),
+            'dnd_from': getattr(self, 'dnd_from', '23:00'),
+            'dnd_to': getattr(self, 'dnd_to', '07:00'),
+            'dnd_mute': getattr(self, 'dnd_mute', {
+                'morning': True, 'evening': True, 'weather': True,
+                'holiday': True, 'birthday': True, 'bd_eve': True,
+                'timers': False}),
             # ВОЛНА 22.4: ключ 'pult' больше не сериализуется (Пульт удалён).
         }
 
@@ -2461,6 +2521,28 @@ class User:
         # ПОЛИТИКА ПДн 1.2: флаг «ДР пропущен осознанно» у старых пользователей.
         if not hasattr(user, 'birthday_skipped'):
             user.birthday_skipped = False
+        # ВОЛНА 22.29: бэк-совместимость веб-пароля / ДР-кануна / «не беспокоить»
+        # (старые записи users.json этих полей не содержат — НЕ должны падать).
+        if not hasattr(user, 'web_password_hash') or not isinstance(user.web_password_hash, dict):
+            user.web_password_hash = None
+        if not hasattr(user, 'web_password_set_at'):
+            user.web_password_set_at = None
+        if not hasattr(user, 'web_login_attempts') or not isinstance(user.web_login_attempts, int) or user.web_login_attempts < 0:
+            user.web_login_attempts = 0
+        if not hasattr(user, 'web_login_locked_until'):
+            user.web_login_locked_until = None
+        if not hasattr(user, 'birthday_eve_notify') or user.birthday_eve_notify is None:
+            user.birthday_eve_notify = True
+        if not hasattr(user, 'dnd_enabled') or user.dnd_enabled is None:
+            user.dnd_enabled = False
+        if not hasattr(user, 'dnd_from') or not str(user.dnd_from or '').strip():
+            user.dnd_from = '23:00'
+        if not hasattr(user, 'dnd_to') or not str(user.dnd_to or '').strip():
+            user.dnd_to = '07:00'
+        if not hasattr(user, 'dnd_mute') or not isinstance(user.dnd_mute, dict):
+            user.dnd_mute = {'morning': True, 'evening': True, 'weather': True,
+                             'holiday': True, 'birthday': True, 'bd_eve': True,
+                             'timers': False}
         # Бэк-совместимость: «рассказывать ли классу о моём ДР».
         # По умолчанию — ВКЛ, чтобы старые пользователи (у которых поле
         # отсутствовало) автоматически получили эту фичу: бот объявляет
@@ -2664,6 +2746,10 @@ class Class:
         # автоудаления публикаций в часах (0 = срок выбирает отправитель).
         self.sol_auto_moder = False
         self.sol_auto_ttl_h = 0
+        # ВОЛНА 22.29: ЖУРНАЛ ОБЪЯВЛЕНИЙ КЛАССА (для «🤒 Я болел(а)»):
+        # [{"ts": "YYYY-MM-DD HH:MM", "by": user_id, "name": str, "text": str}].
+        # Пишется при каждой рассылке «📢 Написать классу»; капа 300 записей.
+        self.announcements = []
 
     def to_dict(self):
         return {
@@ -2684,6 +2770,7 @@ class Class:
             'class_buttons': self.class_buttons,
             'sol_auto_moder': bool(getattr(self, 'sol_auto_moder', False)),
             'sol_auto_ttl_h': int(getattr(self, 'sol_auto_ttl_h', 0) or 0),
+            'announcements': getattr(self, 'announcements', []),
         }
 
     @classmethod
@@ -2692,6 +2779,9 @@ class Class:
         for key, value in data.items():
             if hasattr(class_obj, key):
                 setattr(class_obj, key, value)
+        # ВОЛНА 22.29: журнал объявлений — старые классы без поля не падают.
+        if not isinstance(getattr(class_obj, 'announcements', None), list):
+            class_obj.announcements = []
         return class_obj
 
 
@@ -3408,7 +3498,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.28"
+BOT_BUILD = "22.29"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -4670,6 +4760,9 @@ def get_main_menu_keyboard(user):
         "💬 Чат поддержки",
         # ВОЛНА 22.12: общая база решений класса (для списывания честно).
         "📚 Решения",
+        # ВОЛНА 22.29: «🤒 Я болел(а)» — ДЗ и объявления класса за период
+        # болезни; «📋 Ещё» — скрытые кнопки + ДР одноклассников.
+        "🤒 Я болел(а)", "📋 Ещё",
         "📚 Инструкция", "🔑 Код класса",
     ]
     # «📨 Мои анонимные сообщения» — отдельный список, чтобы её можно было
@@ -5088,6 +5181,13 @@ def get_notification_settings_keyboard(user):
         [InlineKeyboardButton(f"📝 Текст утреннего: {user.morning_text[:20]}...", callback_data="set_morning_text")],
         [InlineKeyboardButton(f"📝 Текст вечернего: {user.evening_text[:20]}...", callback_data="set_evening_text")],
         [InlineKeyboardButton(anon_label, callback_data="toggle_anon_purge_notify")],
+        # ВОЛНА 22.29: «за день до ДР» о одноклассниках + окно тишины.
+        [InlineKeyboardButton(
+            f"{'🔕 Не присылать ДР одноклассников за день' if getattr(user, 'birthday_eve_notify', True) else '🔔 Присылать ДР одноклассников за день'}",
+            callback_data="bd_eve_toggle")],
+        [InlineKeyboardButton(
+            f"🌙 Не беспокоить: {'вкл' if getattr(user, 'dnd_enabled', False) else 'выкл'}",
+            callback_data="dnd_menu")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="back_to_settings")],
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -7042,6 +7142,9 @@ def get_cloud_menu_keyboard(user=None):
         [InlineKeyboardButton("📤 Загрузить в Сейф", callback_data="vault_put")],
         # ВОЛНА 22.20: своя настройка облака — личный канал пользователя.
         [InlineKeyboardButton("🔗 Моё облако", callback_data="vault_cloud")],
+        # ВОЛНА 22.29: веб-пароль — вход в Веб-облако из обычного браузера
+        # по Telegram ID + паролю (без Telegram/VPN).
+        [InlineKeyboardButton("🔑 Веб-пароль", callback_data="web_password_menu")],
     ]
     if legacy:
         rows.append([InlineKeyboardButton(
@@ -7672,6 +7775,28 @@ async def _miniapp_user_from_request(request):
             "Сначала зарегистрируйтесь в боте: откройте чат и отправьте /start.",
             extra={"bot": _miniapp_bot_username()})
     return user, uid, None
+
+
+async def _api_get_user_any(request):
+    """ВОЛНА 22.29: УНИВЕРСАЛЬНАЯ авторизация API мини-аппа.
+
+    Путь 1 (новый): заголовок Authorization: Bearer <токен веб-сессии> —
+    вход по Telegram ID + веб-паролю из обычного браузера (без Telegram).
+    Путь 2 (старый, не тронут): подпись Telegram X-Telegram-Init-Data —
+    всё работает как раньше, когда initData доходит.
+
+    Возвращает (user, uid, None) или (None, "", Response) — как
+    _miniapp_user_from_request. Токена нет/он битый → падение запрещено,
+    идём старым путём."""
+    auth = request.headers.get("Authorization") or ""
+    if auth.startswith("Bearer "):
+        token = auth[7:].strip()
+        uid = _web_check_session(token)
+        if uid:
+            user = get_user(uid)
+            if user:
+                return user, uid, None
+    return await _miniapp_user_from_request(request)
 
 
 def _miniapp_rec_out(rec):
@@ -8473,6 +8598,11 @@ body.modal-open {
         <i data-lucide="cloud" style="width:18px;height:18px"></i>
       </button>
 
+      <!-- 22.29: мультивыбор файлов (галочки + «В ZIP»/«Распаковать»/«Удалить») -->
+      <button class="action-btn" id="selectModeBtn" onclick="toggleSelectMode()" title="Выбрать файлы">
+        <i data-lucide="check-square" style="width:18px;height:18px"></i>
+      </button>
+
       <button class="action-btn" id="themeToggleBtn" onclick="toggleThemeMenu(event)" title="Тема оформления">
         <i id="themeIcon" data-lucide="sun" style="width:18px;height:18px"></i>
       </button>
@@ -8976,8 +9106,13 @@ function handleSoundSelect(e, id) {
    чанками и уходит в канал КАК ДОКУМЕНТ — без сжатия, оригинал байт-в-байт. */
 const IS_TELEGRAM = !!(tg && tg.initData);
 
+/* 22.29: ВЕБ-СЕССИЯ — токен входа по Telegram ID + паролю (обычный браузер).
+   Хранится в localStorage; при IS_TELEGRAM остаётся старый путь initData. */
+var WEB_TOKEN = localStorage.getItem('devo_web_token') || '';
+
 function authHeaders(extra) {
   const h = Object.assign({ 'Cache-Control': 'no-store' }, extra || {});
+  if (WEB_TOKEN) h['Authorization'] = 'Bearer ' + WEB_TOKEN;
   if (IS_TELEGRAM && tg.initData) h['X-Telegram-Init-Data'] = tg.initData;
   return h;
 }
@@ -8990,6 +9125,9 @@ async function apiJson(url, options) {
     const err = new Error(data.message || ('HTTP ' + r.status));
     err.code = String(data.error || '');  // 22.24: код (unauthorized/not_registered/…)
     err.bot = String(data.bot || '');     // 22.24: @username бота для кнопки «Открыть чат бота»
+    // 22.29: сессия истекла/битый токен — предлагаем войти по паролю заново.
+    // В Telegram остаётся прежняя карточка (initData-вход не через токен).
+    if (r.status === 401 && !IS_TELEGRAM) openLoginModal();
     throw err;
   }
   return data;
@@ -9027,6 +9165,149 @@ function openBotChat() {
     if (tg && tg.openTelegramLink) tg.openTelegramLink(url);
     else window.open(url, '_blank');
   } catch (e) { window.open(url, '_blank'); }
+}
+
+/* ===== 22.29: ВХОД ПО TELEGRAM ID + ВЕБ-ПАРОЛЮ (обычный браузер) =====
+   Старый вход через Telegram НЕ ТРОНУТ: когда initData доходит — он
+   работает как раньше. Это ДОПОЛНИТЕЛЬНЫЙ путь для VPN/школьных сетей,
+   где telegram.org недоступен. Никакой панели разработчика тут нет. */
+function openLoginModal() {
+  const m = document.getElementById('loginModal');
+  if (!m) return;
+  m.classList.add('open');
+  document.body.classList.add('modal-open');
+}
+
+function closeLoginModal(e) {
+  if (e) e.stopPropagation();
+  const m = document.getElementById('loginModal');
+  if (m) m.classList.remove('open');
+  document.body.classList.remove('modal-open');
+}
+
+async function webLogin() {
+  const uid = (document.getElementById('loginUserId')?.value || '').trim();
+  const pw = document.getElementById('loginPassword')?.value || '';
+  if (!uid || !pw) { showToast('Введите ID и пароль'); return; }
+  const btn = document.getElementById('loginSubmitBtn');
+  if (btn) btn.disabled = true;
+  try {
+    const r = await fetch('/api/web_login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
+      body: JSON.stringify({ user_id: uid, password: pw })
+    });
+    let data = {};
+    try { data = await r.json(); } catch (e) {}
+    if (r.ok && data.token) {
+      WEB_TOKEN = String(data.token);
+      localStorage.setItem('devo_web_token', WEB_TOKEN);
+      document.getElementById('loginPassword').value = '';
+      closeLoginModal();
+      showToast('Вход выполнен');
+      loadFiles();
+    } else {
+      showToast(data.message || ('Не удалось войти (HTTP ' + r.status + ')'));
+    }
+  } catch (e) {
+    showToast('Нет связи с сервером. Сервис мог просыпаться — попробуйте через минуту.');
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+/* ===== 22.29: МУЛЬТИВЫБОР ФАЙЛОВ (галочки + ZIP/распаковать/удалить) ===== */
+let selectMode = false;
+let selectedIds = new Set();
+
+function toggleSelectMode() {
+  selectMode = !selectMode;
+  if (!selectMode) selectedIds.clear();
+  const bar = document.getElementById('selectionBar');
+  if (bar) bar.style.display = selectMode ? '' : 'none';
+  updateSelCount();
+  renderAll();
+}
+
+function updateSelCount() {
+  const el = document.getElementById('selCount');
+  if (el) el.textContent = 'Выбрано: ' + selectedIds.size;
+  const unzipBtn = document.getElementById('unzipBtn');
+  if (unzipBtn) {
+    const only = (selectedIds.size === 1);
+    const f = only ? ALL_FILES.find(x => x.id === [...selectedIds][0]) : null;
+    unzipBtn.style.display = (f && /\.zip$/i.test(f.name || '')) ? '' : 'none';
+  }
+}
+
+function toggleFileSelection(e, id) {
+  if (e) e.stopPropagation();
+  if (selectedIds.has(id)) selectedIds.delete(id);
+  else selectedIds.add(id);
+  updateSelCount();
+  renderFiles(applyFilters());
+}
+
+async function zipSelected() {
+  if (!selectedIds.size) { showToast('Сначала выберите файлы'); return; }
+  showToast('📦 Собираю архив…');
+  try {
+    const data = await apiJson('/api/files/zip_selected', {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ ids: [...selectedIds] })
+    });
+    if (data.file) {
+      ALL_FILES.unshift({
+        id: data.file.id, name: data.file.name, kind: data.file.kind,
+        size: +data.file.size || 0, ts: data.file.ts || '', vault: !!data.file.vault
+      });
+      renderAll();
+      showToast('✅ Архив создан: ' + data.file.name);
+    }
+  } catch (e) { showToast(cloudErrText(e)); }
+}
+
+async function unzipSelected() {
+  if (selectedIds.size !== 1) { showToast('Выберите ОДИН ZIP-архив'); return; }
+  const id = [...selectedIds][0];
+  const f = ALL_FILES.find(x => x.id === id);
+  if (!f || !/\.zip$/i.test(f.name || '')) { showToast('Это не ZIP-архив'); return; }
+  showToast('🗂 Распаковываю…');
+  try {
+    const data = await apiJson('/api/files/unzip', {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ id: id })
+    });
+    (data.files || []).forEach(rec => {
+      ALL_FILES.unshift({
+        id: rec.id, name: rec.name, kind: rec.kind,
+        size: +rec.size || 0, ts: rec.ts || '', vault: !!rec.vault
+      });
+    });
+    renderAll();
+    showToast('✅ Файлов получено: ' + (data.files || []).length +
+      (data.skipped ? ' · пропущено: ' + data.skipped : ''));
+  } catch (e) { showToast(cloudErrText(e)); }
+}
+
+async function deleteSelected() {
+  if (!selectedIds.size) { showToast('Сначала выберите файлы'); return; }
+  const ids = [...selectedIds];
+  showToast('🗑 Удаляю ' + ids.length + '…');
+  let ok = 0;
+  for (const id of ids) {
+    try {
+      await apiJson('/api/files/' + encodeURIComponent(id), { method: 'DELETE' });
+      ALL_FILES = ALL_FILES.filter(x => x.id !== id);
+      ok++;
+    } catch (e) { /* не смогли — остаётся в списке */ }
+  }
+  selectedIds.clear();
+  updateSelCount();
+  renderAll();
+  showToast(ok === ids.length ? '✅ Удалено: ' + ok : 'Удалено ' + ok + ' из ' + ids.length);
 }
 
 let ALL_FILES = [];
@@ -9203,8 +9484,18 @@ function renderFiles(files) {
   }
 
   empty.style.display = 'none';
-  list.innerHTML = files.map(f => `
-    <article class="file-card animate-fade-in" style="display:flex;align-items:center;gap:12px" onclick="openEditModal('${f.id}')">
+  list.innerHTML = files.map(f => {
+    const sel = selectMode && selectedIds.has(f.id);
+    const cardAction = selectMode
+      ? `toggleFileSelection(event,'${f.id}')`
+      : `openEditModal('${f.id}')`;
+    const checkHtml = selectMode ? `
+      <div onclick="toggleFileSelection(event,'${f.id}')" style="flex-shrink:0;width:24px;height:24px;border-radius:8px;display:flex;align-items:center;justify-content:center;border:2px solid ${sel ? 'var(--btn-text)' : 'var(--border-color)'};background:${sel ? 'var(--btn-text)' : 'transparent'};transition:all .15s">
+        ${sel ? '<i data-lucide="check" style="width:14px;height:14px;stroke:var(--card-bg)"></i>' : ''}
+      </div>` : '';
+    return `
+    <article class="file-card animate-fade-in" style="display:flex;align-items:center;gap:12px;${sel ? 'outline:2px solid var(--btn-text);outline-offset:-2px' : ''}" onclick="${cardAction}">
+      ${checkHtml}
       <div class="icon-wrap" style="flex-shrink:0">
         <i data-lucide="${f.vault ? 'lock' : iconFor(f.kind)}" style="width:20px;height:20px"></i>
       </div>
@@ -9222,7 +9513,8 @@ function renderFiles(files) {
         </button>
       </div>
     </article>
-  `).join('');
+  `;
+  }).join('');
   safeIcons();
 }
 
@@ -9978,21 +10270,73 @@ renderSoundMenu();
 setSort('date-desc');
 renderAll();
 
-/* 22.21: РЕАЛЬНАЯ БАЗА — тянем файлы с сервера бота (тот же список, что в
-   чате). Вне Telegram API честно откажет: подсказываем, как открыть. */
+/* 22.29: СТАРТ. В Telegram — как раньше: initData → loadFiles (22.26 тихий
+   ретрай, если сервер Render просыпается). Вне Telegram: есть веб-токен —
+   проверяем GET /api/web_me (200 → грузим файлы; 401 → стираем токен и
+   открываем вход); токена нет — сразу окно входа по ID + паролю. */
 if (!IS_TELEGRAM) {
-  const et = document.getElementById('emptyTitle');
-  const es = document.getElementById('emptySub');
-  if (et) et.textContent = 'Откройте через Telegram';
-  if (es) es.textContent = 'Бот DEVORKS+ → кнопка меню «☁️ DEVO+» (или ☁️ Облако → 🌐 Веб-облако)';
+  if (WEB_TOKEN) {
+    fetch('/api/web_me', { headers: authHeaders() }).then(function (r) {
+      if (r.ok) {
+        loadFiles();
+      } else {
+        localStorage.removeItem('devo_web_token');
+        WEB_TOKEN = '';
+        openLoginModal();
+      }
+    }).catch(function () { openLoginModal(); });
+  } else {
+    openLoginModal();
+  }
+} else {
+  loadFiles().then(function (ok) {
+    if (!ok) setTimeout(function () { loadFiles(true); }, 4000);
+  });
 }
-/* 22.26: первый вход — сервер Render может просыпаться (до ~30 секунд):
-   одна тихая повторная попытка через 4 секунды, честный текст остаётся. */
-loadFiles().then(function (ok) {
-  if (!ok) setTimeout(function () { loadFiles(true); }, 4000);
-});
 safeIcons();
 </script>
+
+<!-- 22.29: панель действий мультивыбора (видна в режиме выбора) -->
+<div id="selectionBar" style="display:none;position:fixed;left:0;right:0;bottom:0;z-index:60;padding:10px 14px calc(10px + env(safe-area-inset-bottom));background:var(--card-bg);border-top:1px solid var(--border-color);box-shadow:0 -8px 24px rgba(0,0,0,.12)">
+  <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+    <span id="selCount" style="font-weight:800;font-size:13px">Выбрано: 0</span>
+    <span style="flex:1"></span>
+    <button class="sound-item-btn" onclick="zipSelected()" style="padding:8px 10px"><span>📦 В ZIP</span></button>
+    <button class="sound-item-btn" id="unzipBtn" onclick="unzipSelected()" style="padding:8px 10px;display:none"><span>🗂 Распаковать</span></button>
+    <button class="sound-item-btn" onclick="deleteSelected()" style="padding:8px 10px;color:#ef4444"><span>🗑 Удалить</span></button>
+    <button class="sound-item-btn" onclick="toggleSelectMode()" style="padding:8px 10px;background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)"><span>Готово</span></button>
+  </div>
+</div>
+
+<!-- 22.29: вход по Telegram ID + веб-паролю — обычный браузер, без Telegram
+     (для тех, у кого VPN/школьная сеть не пускает telegram.org и initData
+     не доходит). Пароль задаётся в чате бота: ☁️ Облако → «🔑 Веб-пароль». -->
+<div id="loginModal" class="modal-overlay">
+  <div class="modal-card" onclick="event.stopPropagation()">
+    <div class="sheet-handle-area">
+      <div class="sheet-handle"></div>
+    </div>
+    <h3 style="font-weight:900;font-size:20px;margin-bottom:4px">Вход в DEVO+ Облако</h3>
+    <p style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:14px">Открыто вне Telegram, войдите по ID и паролю, заданному в боте</p>
+
+    <div style="margin-bottom:12px">
+      <label for="loginUserId" style="font-size:11px;font-weight:800;color:var(--subtext-color);text-transform:uppercase;letter-spacing:0.04em">Telegram ID</label>
+      <input type="text" id="loginUserId" inputmode="numeric" autocomplete="username" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;margin-top:4px;outline:none;font-size:15px" placeholder="Например: 123456789">
+    </div>
+    <div style="margin-bottom:14px">
+      <label for="loginPassword" style="font-size:11px;font-weight:800;color:var(--subtext-color);text-transform:uppercase;letter-spacing:0.04em">Пароль</label>
+      <input type="password" id="loginPassword" autocomplete="current-password" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;margin-top:4px;outline:none;font-size:15px" placeholder="Веб-пароль из бота">
+    </div>
+
+    <div style="display:flex;flex-direction:column;gap:8px">
+      <button class="sound-item-btn" id="loginSubmitBtn" onclick="webLogin()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
+        <span>Войти</span> <i data-lucide="log-in" style="width:18px;height:18px"></i>
+      </button>
+    </div>
+
+    <p style="font-size:11px;font-weight:600;color:var(--subtext-color);margin-top:12px;line-height:1.5">Пароль задаётся в боте через ☁️ Облако → «🔑 Веб-пароль». Логин — ваш Telegram ID (бот показывает его при создании пароля). 5 неверных попыток — пауза 10 минут.</p>
+  </div>
+</div>
 </body>
 </html>
 """
@@ -10031,7 +10375,7 @@ async def miniapp_index(request):
 
 async def miniapp_files_get(request):
     """Список файлов ОСНОВНОГО облака пользователя (та же база, что в чате)."""
-    user, _uid, err = await _miniapp_user_from_request(request)
+    user, _uid, err = await _api_get_user_any(request)
     if err is not None:
         return err
     files = [f for f in (getattr(user, "cloud_files", []) or []) if isinstance(f, dict)]
@@ -10048,7 +10392,7 @@ async def miniapp_files_get(request):
 
 async def miniapp_files_patch(request):
     """Переименование и галочка Vault — прямо в записи ОСНОВНОЙ базы."""
-    user, _uid, err = await _miniapp_user_from_request(request)
+    user, _uid, err = await _api_get_user_any(request)
     if err is not None:
         return err
     rec = _cloud_find_record(user, request.match_info["fid"])
@@ -10072,7 +10416,7 @@ async def miniapp_files_patch(request):
 async def miniapp_files_delete(request):
     """Удаление файла: стирает сообщение из канала (как cloud_del_yes_cb,
     best-effort) и запись из ОСНОВНОЙ базы."""
-    user, _uid, err = await _miniapp_user_from_request(request)
+    user, _uid, err = await _api_get_user_any(request)
     if err is not None:
         return err
     rec = _cloud_find_record(user, request.match_info["fid"])
@@ -10097,7 +10441,7 @@ async def miniapp_files_download(request):
     """Оригинал байт-в-байт. Путь 1: Bot API (≤20 МБ, есть file_id) — быстрый.
     Путь 2: Telethon/MTProto по (channel_id, msg_id) — до 2 ГБ (большие
     файлы, залитые через веб, лежат в канале без file_id Bot API)."""
-    user, _uid, err = await _miniapp_user_from_request(request)
+    user, _uid, err = await _api_get_user_any(request)
     if err is not None:
         return err
     rec = _cloud_find_record(user, request.match_info["fid"])
@@ -10178,7 +10522,7 @@ async def miniapp_files_download(request):
 
 async def miniapp_upload_init(request):
     """Старт загрузки: проверяем лимиты, создаём сессию + временный файл."""
-    user, uid, err = await _miniapp_user_from_request(request)
+    user, uid, err = await _api_get_user_any(request)
     if err is not None:
         return err
     try:
@@ -10218,7 +10562,7 @@ async def miniapp_upload_init(request):
 
 async def miniapp_upload_chunk(request):
     """Кусок файла (≤4 МБ, application/octet-stream): дописываем на диск."""
-    user, uid, err = await _miniapp_user_from_request(request)
+    user, uid, err = await _api_get_user_any(request)
     if err is not None:
         return err
     s = _MINIAPP_UPLOADS.get(request.query.get("uploadId", ""))
@@ -10240,7 +10584,7 @@ async def miniapp_upload_chunk(request):
 
 async def miniapp_upload_abort(request):
     """Отмена загрузки: сессия и временный файл стираются (идемпотентно)."""
-    user, uid, err = await _miniapp_user_from_request(request)
+    user, uid, err = await _api_get_user_any(request)
     if err is not None:
         return err
     try:
@@ -10261,7 +10605,7 @@ async def miniapp_upload_complete(request):
     дописываем запись в ОСНОВНУЮ базу пользователя.
     ≤49 МБ — Bot API (_storage_upload_document, личный канал приоритетнее),
     больше — MTProto (_mt_upload_container, до 2 ГБ)."""
-    user, uid, err = await _miniapp_user_from_request(request)
+    user, uid, err = await _api_get_user_any(request)
     if err is not None:
         return err
     try:
@@ -10347,7 +10691,7 @@ async def miniapp_upload_complete(request):
 
 async def miniapp_storage_get(request):
     """Статус хранилища пользователя для мини-аппа (честно: куда уйдут файлы)."""
-    user, uid, err = await _miniapp_user_from_request(request)
+    user, uid, err = await _api_get_user_any(request)
     if err:
         return err
     vc = _user_vault_channel(user)
@@ -10376,7 +10720,7 @@ async def miniapp_storage_plain(request):
     канала пользователя. {"plain": true/false} → новый статус хранилища.
     Работает ТОЛЬКО при подключённом личном канале (в общий хранилище бота
     незашифрованные файлы Сейфа не попадают никогда)."""
-    user, uid, err = await _miniapp_user_from_request(request)
+    user, uid, err = await _api_get_user_any(request)
     if err:
         return err
     vc = getattr(user, "vault_channel", None)
@@ -10409,7 +10753,7 @@ async def miniapp_storage_plain(request):
 
 async def miniapp_storage_connect(request):
     """Подключение ЛИЧНОГО канала из мини-аппа — та же проверка, что в чате."""
-    user, uid, err = await _miniapp_user_from_request(request)
+    user, uid, err = await _api_get_user_any(request)
     if err:
         return err
     _app = _MINIAPP_PTB_APP
@@ -10484,7 +10828,7 @@ async def miniapp_storage_connect(request):
 
 async def miniapp_storage_disconnect(request):
     """Отключение личного канала из мини-аппа (как «🗑 Отключить» в чате)."""
-    user, uid, err = await _miniapp_user_from_request(request)
+    user, uid, err = await _api_get_user_any(request)
     if err:
         return err
     user.vault_channel = None
@@ -10496,6 +10840,392 @@ async def miniapp_storage_disconnect(request):
         "build": BOT_BUILD,
         "bot": _miniapp_bot_username(),
     })
+
+
+# --- ВОЛНА 22.29: ВХОД В ВЕБ-ОБЛАКО ПО TELEGRAM ID + ПАРОЛЮ ---
+# Обычный браузер, без Telegram и без telegram.org: пользователи с VPN
+# не могут загрузить telegram-web-app.js, initData не доходит и старая
+# авторизация честно отвечает 401. Пароль задаётся В ЧАТЕ БОТА
+# (☁️ Облако/Сейф → 🔑 Веб-пароль). Сессии — в _WEB_SESSIONS (30 дней).
+
+_WEB_LOGIN_MAX_ATTEMPTS = 5
+_WEB_LOGIN_LOCK_MINUTES = 10
+
+
+def _web_lock_remaining_minutes(user) -> int:
+    """Сколько минут ещё действует блокировка веб-входа (0 — не заблокирован)."""
+    lu = getattr(user, "web_login_locked_until", None)
+    if not lu:
+        return 0
+    try:
+        until = datetime.fromisoformat(str(lu))
+    except (TypeError, ValueError):
+        return 0
+    secs = (until - datetime.now()).total_seconds()
+    if secs <= 0:
+        return 0
+    return int(secs // 60) + (1 if secs % 60 else 0)
+
+
+async def miniapp_web_login(request):
+    """POST /api/web_login {"user_id", "password"} → {"token","user_id",
+    "expires_in","build","bot"}. Неверный ID/пароль — ОДИНАКОВОЕ 401
+    (не раскрываем, существует ли пользователь). 5 промахов подряд —
+    блокировка на 10 минут (429 с количеством минут)."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    user_id = str(body.get("user_id") or "").strip()
+    password = str(body.get("password") or "")
+    if not user_id or not password:
+        return _miniapp_err(400, "bad_request", "Укажите ID и пароль.")
+    user = get_user(user_id)
+    # ЧЕСТНАЯ БЕЗОПАСНОСТЬ: «нет пользователя» и «нет пароля» неразличимы.
+    if not user or not isinstance(getattr(user, "web_password_hash", None), dict):
+        return _miniapp_err(401, "unauthorized", "Неверный ID или пароль.")
+    mins_left = _web_lock_remaining_minutes(user)
+    if mins_left > 0:
+        return _miniapp_err(
+            429, "locked",
+            f"Слишком много попыток. Подождите {mins_left} мин.")
+    if not _web_check_password(user, password):
+        user.web_login_attempts = int(getattr(user, "web_login_attempts", 0) or 0) + 1
+        if user.web_login_attempts >= _WEB_LOGIN_MAX_ATTEMPTS:
+            user.web_login_locked_until = (
+                datetime.now() + timedelta(minutes=_WEB_LOGIN_LOCK_MINUTES)
+            ).isoformat()
+            user.web_login_attempts = 0
+        save_user(user)
+        return _miniapp_err(401, "unauthorized", "Неверный ID или пароль.")
+    user.web_login_attempts = 0
+    user.web_login_locked_until = None
+    save_user(user)
+    token = _web_create_session(user.user_id)
+    logger.info(f"web_login: пользователь {user.user_id} вошёл в веб-облако по паролю")
+    return web.json_response({
+        "token": token,
+        "user_id": str(user.user_id),
+        "expires_in": WEB_SESSION_TTL,
+        "build": BOT_BUILD,
+        "bot": _miniapp_bot_username(),
+    })
+
+
+async def miniapp_web_me(request):
+    """GET /api/web_me (Authorization: Bearer) → {"user_id","first_name",
+    "build","bot"}; провал — 401 (фронт удаляет токен и открывает вход)."""
+    auth = request.headers.get("Authorization") or ""
+    if not auth.startswith("Bearer "):
+        return _miniapp_err(401, "unauthorized", "Войдите по ID и паролю.")
+    uid = _web_check_session(auth[7:].strip())
+    if not uid:
+        return _miniapp_err(401, "unauthorized", "Сессия истекла — войдите заново.")
+    user = get_user(uid)
+    if not user:
+        return _miniapp_err(401, "unauthorized", "Пользователь не найден.")
+    return web.json_response({
+        "user_id": str(user.user_id),
+        "first_name": str(user.first_name or ""),
+        "build": BOT_BUILD,
+        "bot": _miniapp_bot_username(),
+    })
+
+
+async def miniapp_web_logout(request):
+    """POST /api/web_logout (Authorization: Bearer) — удаляет сессию."""
+    auth = request.headers.get("Authorization") or ""
+    if auth.startswith("Bearer "):
+        _WEB_SESSIONS.pop(auth[7:].strip(), None)
+    return web.json_response({"ok": True})
+
+
+# --- ВОЛНА 22.29: МУЛЬТИВЫБОР В ОБЛАКЕ — «В ZIP» И «РАСПАКОВАТЬ» ---
+# Фронт выделяет галочками несколько файлов (или один ZIP-архив), сервер
+# скачивает оригиналы из канала (Bot API ≤20 МБ / MTProto больше), собирает
+# ZIP или распаковывает его и заливает результат в ТОТ ЖЕ канал. Лимиты
+# честные и свободные для школьного облака.
+
+_WEBZIP_MAX_FILES = 20                    # файлов в одном архиве
+_WEBZIP_MAX_FILE_BYTES = 20 * 1024 * 1024  # каждый ≤20 МБ (Bot API download)
+_WEBZIP_MAX_TOTAL = 100 * 1024 * 1024      # суммарно ≤100 МБ
+_UNZIP_MAX_ARCHIVE = 30 * 1024 * 1024      # сам ZIP ≤30 МБ
+_UNZIP_MAX_ENTRIES = 100                   # не больше 100 файлов внутри
+_UNZIP_MAX_TOTAL = 150 * 1024 * 1024       # суммарно после распаковки
+_UNZIP_MAX_ENTRY = 45 * 1024 * 1024        # один файл внутри ZIP
+
+
+async def _miniapp_fetch_file_bytes(rec, max_bytes: int) -> "bytes | None":
+    """Скачивает файл облака в память: Bot API (≤20 МБ), иначе MTProto.
+    Больше max_bytes → None (честно)."""
+    app = _MINIAPP_PTB_APP
+    size = int(rec.get("size") or 0)
+    fid = rec.get("file_id")
+    if app is not None and fid and size <= 20 * 1024 * 1024:
+        try:
+            tg_file = await app.bot.get_file(fid)
+            buf = await tg_file.download_as_bytearray()
+            data = bytes(buf)
+            if len(data) > max_bytes:
+                return None
+            return data
+        except Exception as e:
+            logger.warning(f"miniapp fetch: Bot API не отдал файл ({e}); пробую MTProto")
+    client = await _mt_client()
+    if client is None:
+        return None
+    channel_id = rec.get("channel_id") or get_storage_channel_id()
+    if not channel_id or not rec.get("msg_id"):
+        return None
+    try:
+        _msg, doc = await _mt_fetch_document(client, int(channel_id), int(rec["msg_id"]))
+        if doc is None:
+            return None
+        doc_size = int(getattr(doc, "size", 0) or size or 0)
+        if doc_size and doc_size > max_bytes:
+            return None
+        chunks = []
+        await _mt_download_stream(client, doc, doc_size, lambda c: chunks.append(c))
+        data = b"".join(chunks)
+        return data if len(data) <= max_bytes else None
+    except Exception as e:
+        logger.error(f"miniapp fetch MTProto: {e}")
+        return None
+
+
+async def _miniapp_upload_bytes(user, data: bytes, name: str, mime: str):
+    """Заливает байты В КАНАЛ КАК ДОКУМЕНТ (≤49 МБ Bot API, больше — MTProto)
+    и возвращает НОВУЮ запись cloud_files (или None — Telegram не принял)."""
+    app = _MINIAPP_PTB_APP
+    sent = None
+    if len(data) <= STORAGE_MAX_FILE_BYTES:
+        if app is None:
+            return None
+        sent = await _storage_upload_document(
+            _MiniappCtx(app.bot), data, filename=name,
+            caption=name[:100], user=user)
+    else:
+        client = await _mt_client()
+        if client is None:
+            return None
+        tmppath = os.path.join(_miniapp_tmpdir(), f"up_{secrets.token_hex(6)}.bin")
+        with open(tmppath, "wb") as f:
+            f.write(data)
+        try:
+            sent = await _mt_upload_container(
+                client, tmppath, len(data), name[:100], filename=name, user=user)
+        finally:
+            try:
+                os.remove(tmppath)
+            except Exception:
+                pass
+    if not sent:
+        return None
+    return {
+        "id": _cloud_gen_file_id(user),
+        "name": name[:120],
+        "kind": _miniapp_kind_from(mime, name),
+        "msg_id": int(sent.get("message_id") or 0),
+        "file_id": sent.get("file_id"),
+        "size": len(data),
+        "mime": mime,
+        "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "channel_id": sent.get("channel_id"),
+        "src": "web",
+    }
+
+
+def _cloud_unique_name(user, name: str) -> str:
+    """«file.txt» → «file (2).txt» при совпадении с существующими именами."""
+    files = [f for f in (getattr(user, "cloud_files", []) or []) if isinstance(f, dict)]
+    taken = {str(f.get("name") or "").lower() for f in files}
+    if name.lower() not in taken:
+        return name
+    stem, dot, ext = name.rpartition(".")
+    if not dot:
+        stem, ext = name, ""
+    for i in range(2, 1000):
+        cand = f"{stem} ({i}).{ext}" if ext else f"{stem} ({i})"
+        if cand.lower() not in taken:
+            return cand
+    return f"{name} ({secrets.token_hex(3)})"
+
+
+async def miniapp_files_zip_selected(request):
+    """POST /api/files/zip_selected {"ids": [...]} — собирает выбранные файлы
+    в ОДИН ZIP-архив и сохраняет его в облако как новый файл."""
+    user, uid, err = await _api_get_user_any(request)
+    if err is not None:
+        return err
+    try:
+        body = await request.json()
+    except Exception:
+        return _miniapp_err(400, "bad_json", "Ожидался JSON.")
+    ids = (body or {}).get("ids") or []
+    if not isinstance(ids, list):
+        return _miniapp_err(400, "bad_ids", "Ожидался список ids.")
+    ids = [str(i) for i in ids if str(i).strip()][: _WEBZIP_MAX_FILES + 1]
+    if not ids:
+        return _miniapp_err(400, "empty", "Файлы не выбраны.")
+    if len(ids) > _WEBZIP_MAX_FILES:
+        return _miniapp_err(
+            413, "too_many",
+            f"В один архив можно завернуть максимум {_WEBZIP_MAX_FILES} файлов.")
+    recs = []
+    total = 0
+    for fid in ids:
+        rec = _cloud_find_record(user, fid)
+        if not rec:
+            return _miniapp_err(404, "not_found", f"Файл не найден: {fid}.")
+        if int(rec.get("size") or 0) > _WEBZIP_MAX_FILE_BYTES:
+            return _miniapp_err(
+                413, "too_big",
+                f"«{rec.get('name')}» больше 20 МБ — Telegram не даёт ботам "
+                "скачивать такие файлы. Заверните его в ZIP в чате "
+                "(☁️ Облако → 📦 ZIP) и выберите архив.")
+        total += int(rec.get("size") or 0)
+        recs.append(rec)
+    if total > _WEBZIP_MAX_TOTAL:
+        return _miniapp_err(413, "too_big_total",
+                            "Суммарный размер выбранных файлов больше 100 МБ.")
+    await asyncio.sleep(0)  # отдаём управление циклу до тяжёлой работы
+    stamp = datetime.now().strftime("%d.%m.%Y %H-%M")
+    zip_name = _cloud_unique_name(user, f"Архив {stamp} ({len(recs)}).zip")
+    buf = io.BytesIO()
+    try:
+        with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            used_names = set()
+            for rec in recs:
+                data = await _miniapp_fetch_file_bytes(rec, _WEBZIP_MAX_FILE_BYTES)
+                if data is None:
+                    return _miniapp_err(
+                        502, "download_failed",
+                        f"Не удалось скачать «{rec.get('name')}» из хранилища. "
+                        "Попробуйте ещё раз или позже.")
+                iname = str(rec.get("name") or "file")
+                iname = iname if iname not in used_names else \
+                    f"{iname} ({secrets.token_hex(2)})"
+                used_names.add(iname)
+                zf.writestr(zipfile.ZipInfo(iname), data)
+                await asyncio.sleep(0)
+    except Exception as e:
+        logger.error(f"zip_selected: {e}")
+        return _miniapp_err(500, "zip_failed", f"Не удалось собрать архив: {e}")
+    archive = buf.getvalue()
+    new_rec = await _miniapp_upload_bytes(user, archive, zip_name, "application/zip")
+    if not new_rec:
+        return _miniapp_err(502, "upload_failed",
+                            "Telegram не принял архив в хранилище. Попробуйте позже.")
+    user.cloud_files = [f for f in (getattr(user, "cloud_files", []) or [])
+                        if isinstance(f, dict)]
+    user.cloud_files.append(new_rec)
+    save_user(user)
+    logger.info(f"zip_selected: {uid} собрал архив из {len(recs)} файлов "
+                f"({len(archive)} байт)")
+    return web.json_response({"file": _miniapp_rec_out(new_rec)})
+
+
+def _zip_entry_base_name(info_name: str) -> "str | None":
+    """Безопасное ИМЯ файла из записи архива: только база пути, без
+    «..» и абсолютных путей (защита от zip-slip)."""
+    n = (info_name or "").replace("\\", "/")
+    parts = [p for p in n.split("/") if p and p not in (".", "..")]
+    if not parts:
+        return None
+    base = parts[-1].strip()
+    if not base:
+        return None
+    return base[:120]
+
+
+async def miniapp_files_unzip(request):
+    """POST /api/files/unzip {"id": fid} — распаковывает ZIP из облака:
+    каждый файл внутри заливается в канал как отдельный файл облака."""
+    user, uid, err = await _api_get_user_any(request)
+    if err is not None:
+        return err
+    try:
+        body = await request.json()
+    except Exception:
+        return _miniapp_err(400, "bad_json", "Ожидался JSON.")
+    rec = _cloud_find_record(user, str((body or {}).get("id") or ""))
+    if not rec:
+        return _miniapp_err(404, "not_found", "Файл не найден (возможно, уже удалён).")
+    if not str(rec.get("name") or "").lower().endswith(".zip"):
+        return _miniapp_err(400, "not_zip", "Распаковать можно только ZIP-архив.")
+    if int(rec.get("size") or 0) > _UNZIP_MAX_ARCHIVE:
+        return _miniapp_err(
+            413, "too_big",
+            "Архив больше 30 МБ — школьному серверу его не распаковать. "
+            "Загрузите содержимое частями.")
+    data = await _miniapp_fetch_file_bytes(rec, _UNZIP_MAX_ARCHIVE)
+    if data is None:
+        return _miniapp_err(502, "download_failed",
+                            "Не удалось скачать архив из хранилища. Попробуйте позже.")
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(data))
+    except Exception:
+        return _miniapp_err(400, "bad_zip", "Файл повреждён или это не ZIP.")
+    entries = [i for i in zf.infolist() if not i.is_dir()]
+    if not entries:
+        return _miniapp_err(400, "empty_zip", "В архиве нет файлов.")
+    if len(entries) > _UNZIP_MAX_ENTRIES:
+        return _miniapp_err(
+            413, "too_many",
+            f"В архиве {len(entries)} файлов — максимум {_UNZIP_MAX_ENTRIES}.")
+    if sum(i.file_size for i in entries) > _UNZIP_MAX_TOTAL:
+        return _miniapp_err(413, "too_big_total",
+                            "Распакованное содержимое больше 150 МБ.")
+    created = []
+    skipped = 0
+    for info in entries:
+        if int(info.file_size) > _UNZIP_MAX_ENTRY:
+            skipped += 1
+            continue
+        base = _zip_entry_base_name(info.filename)
+        if not base:
+            skipped += 1
+            continue
+        try:
+            entry_data = zf.read(info)
+        except RuntimeError:
+            skipped += 1  # зашифрованный ZIP — пароля у нас нет
+            continue
+        except Exception:
+            skipped += 1
+            continue
+        await asyncio.sleep(0)
+        mime = "application/octet-stream"
+        try:
+            import mimetypes as _mt_mime
+            guessed, _ = _mt_mime.guess_type(base)
+            if guessed:
+                mime = guessed
+        except Exception:
+            pass
+        new_rec = await _miniapp_upload_bytes(
+            user, entry_data, _cloud_unique_name(user, base), mime)
+        if not new_rec:
+            skipped += 1
+            continue
+        user.cloud_files = [f for f in (getattr(user, "cloud_files", []) or [])
+                            if isinstance(f, dict)]
+        user.cloud_files.append(new_rec)
+        created.append(_miniapp_rec_out(new_rec))
+    try:
+        zf.close()
+    except Exception:
+        pass
+    if not created and skipped:
+        return _miniapp_err(502, "nothing_uploaded",
+                            "Ни один файл из архива загрузить не удалось "
+                            "(Telegram не принял). Попробуйте позже.")
+    save_user(user)
+    logger.info(f"unzip: {uid} распаковал «{rec.get('name')}»: "
+                f"{len(created)} файлов, пропущено {skipped}")
+    return web.json_response({"files": created, "skipped": skipped})
 
 
 def mount_miniapp_routes(app):
@@ -10517,6 +11247,13 @@ def mount_miniapp_routes(app):
     app.router.add_post("/api/storage/disconnect", miniapp_storage_disconnect)
     # ВОЛНА 22.25: режим «файлы БЕЗ шифрования» для личного канала
     app.router.add_post("/api/storage/plain", miniapp_storage_plain)
+    # ВОЛНА 22.29: вход по Telegram ID + веб-паролю (обычный браузер)
+    app.router.add_post("/api/web_login", miniapp_web_login)
+    app.router.add_get("/api/web_me", miniapp_web_me)
+    app.router.add_post("/api/web_logout", miniapp_web_logout)
+    # ВОЛНА 22.29: мультивыбор — собранный ZIP из выбранных + распаковка ZIP
+    app.router.add_post("/api/files/zip_selected", miniapp_files_zip_selected)
+    app.router.add_post("/api/files/unzip", miniapp_files_unzip)
 
 
 async def cloud_exit_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -11728,6 +12465,108 @@ def _vault_check_password(user, rec, password: str) -> bool:
         return hmac.compare_digest(_vault_verifier(key), bytes.fromhex(rec.get("verifier", "")))
     except Exception:
         return False
+
+
+# ==================================
+# === ВОЛНА 22.29: ВЕБ-ПАРОЛЬ ===
+# Вход в 🌐 Веб-облако по Telegram ID + паролю из ОБЫЧНОГО браузера
+# (без Telegram, без telegram.org, без VPN — по просьбе пользователей
+# с VPN, у которых скрипт Telegram не загружается и initData не доходит).
+# Пароль нигде не хранится: PBKDF2-HMAC-SHA256 (200 000 итераций) → ключ
+# → HMAC-верификатор «DEVORKS-WEB-VERIFY». Проверка — сравнение верификаторов.
+# ==================================
+
+WEB_PW_KDF_ITERS = 200000
+
+
+def _web_hash_password(password: str, salt: bytes, iters: int = WEB_PW_KDF_ITERS) -> bytes:
+    """Ключ из веб-пароля: PBKDF2-HMAC-SHA256, 32 байта."""
+    return hashlib.pbkdf2_hmac(
+        "sha256", (password or "").encode("utf-8"), salt, int(iters), dklen=32,
+    )
+
+
+def _web_make_verifier(key: bytes) -> bytes:
+    """«Отпечаток» ключа веб-пароля: HMAC-SHA256(b"DEVORKS-WEB-VERIFY", key),
+    первые 16 байт. По верификатору пароль восстановить нельзя."""
+    return hmac.new(b"DEVORKS-WEB-VERIFY", key, hashlib.sha256).digest()[:16]
+
+
+def _web_set_password(user, password: str) -> None:
+    """Задаёт/меняет веб-пароль пользователя: свежая соль os.urandom(16),
+    ключ → верификатор → user.web_password_hash; сохраняет юзера."""
+    salt = os.urandom(16)
+    key = _web_hash_password(password, salt, WEB_PW_KDF_ITERS)
+    verifier = _web_make_verifier(key)
+    user.web_password_hash = {
+        "salt": salt.hex(),
+        "iters": int(WEB_PW_KDF_ITERS),
+        "verifier": verifier.hex(),
+    }
+    user.web_password_set_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # Новый пароль — старые блокировки и счётчики попыток не имеют смысла.
+    user.web_login_attempts = 0
+    user.web_login_locked_until = None
+    save_user(user)
+
+
+def _web_check_password(user, password: str) -> bool:
+    """Проверяет веб-пароль по верификатору (hmac.compare_digest)."""
+    rec = getattr(user, "web_password_hash", None)
+    if not isinstance(rec, dict):
+        return False
+    try:
+        salt = bytes.fromhex(str(rec.get("salt", "")))
+        iters = int(rec.get("iters") or WEB_PW_KDF_ITERS)
+        key = _web_hash_password(password, salt, iters)
+        return hmac.compare_digest(
+            _web_make_verifier(key), bytes.fromhex(str(rec.get("verifier", ""))))
+    except Exception:
+        return False
+
+
+# === ВОЛНА 22.29: ВЕБ-СЕССИИ (Bearer-токены для /api/*) ===
+# Живут В ПАМЯТИ процесса: рестарт сервера сбрасывает сессии — пользователю
+# нужно просто войти заново (пароль остаётся). TTL — 30 дней.
+_WEB_SESSIONS = {}
+WEB_SESSION_TTL = 30 * 24 * 3600   # 30 дней, сек
+WEB_SESSIONS_MAX = 10000           # капа словаря (при превышении чистим просрочку)
+
+
+def _web_create_session(user_id) -> str:
+    """Создаёт веб-сессию: secrets.token_urlsafe(32) → {user_id, expires, created}."""
+    # Капа: если записей стало слишком много — сначала чистим просроченные.
+    if len(_WEB_SESSIONS) >= WEB_SESSIONS_MAX:
+        _now = time.time()
+        for _k in [k for k, v in _WEB_SESSIONS.items() if v.get("expires", 0) <= _now]:
+            _WEB_SESSIONS.pop(_k, None)
+        # Всё ещё тесно — срезаем самые старые.
+        if len(_WEB_SESSIONS) >= WEB_SESSIONS_MAX:
+            _oldest = sorted(_WEB_SESSIONS, key=lambda k: _WEB_SESSIONS[k].get("created", 0))
+            for _k in _oldest[: len(_WEB_SESSIONS) - WEB_SESSIONS_MAX + 1]:
+                _WEB_SESSIONS.pop(_k, None)
+    token = secrets.token_urlsafe(32)
+    _now = time.time()
+    _WEB_SESSIONS[token] = {
+        "user_id": str(user_id),
+        "expires": _now + WEB_SESSION_TTL,
+        "created": _now,
+    }
+    return token
+
+
+def _web_check_session(token) -> "str | None":
+    """Возвращает user_id живой сессии; просроченную удаляет; None — нет/битая."""
+    if not token:
+        return None
+    rec = _WEB_SESSIONS.get(token)
+    if not rec:
+        return None
+    if float(rec.get("expires", 0)) <= time.time():
+        _WEB_SESSIONS.pop(token, None)
+        return None
+    uid = str(rec.get("user_id") or "")
+    return uid or None
 
 
 # ВОЛНА 17: ТЕКСТЫ секретных вопросов шифруются в файле базы ключом бота
@@ -13730,6 +14569,8 @@ def get_vault_menu_keyboard():
         # ВОЛНА 22.20: «🔗 Моё облако» — НАСТРОЙКА САМОГО ПОЛЬЗОВАТЕЛЯ:
         # свой приватный канал как личное хранилище (без панели разработчика).
         [InlineKeyboardButton("🔗 Моё облако", callback_data="vault_cloud")],
+        # ВОЛНА 22.29: веб-пароль для входа в Веб-облако без Telegram.
+        [InlineKeyboardButton("🔑 Веб-пароль", callback_data="web_password_menu")],
         # ВОЛНА 9: восстановление и управление вопросами — прямо в меню Сейфа.
         [InlineKeyboardButton("🔑 Забыл пароль (восстановить)", callback_data="vault_rec")],
         [InlineKeyboardButton("❓ Сменить секретные вопросы", callback_data="vault_qs")],
@@ -14047,6 +14888,670 @@ async def vault_cloud_add_cb(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except Exception:
         pass
     return VAULT_MYCLOUD_WAIT
+
+
+# ==================================
+# === ВОЛНА 22.29: ВЕБ-ПАРОЛЬ В ЧАТЕ ===
+# Экран и флоу управления входом в 🌐 Веб-облако по ID+паролю:
+# ☁️ Облако / 🔐 Сейф → «🔑 Веб-пароль» → Задать / Сменить / Удалить.
+# ==================================
+
+def _web_password_text(user) -> str:
+    has_pw = isinstance(getattr(user, "web_password_hash", None), dict)
+    when = str(getattr(user, "web_password_set_at", "") or "")
+    if has_pw:
+        status = f"✅ Пароль задан{f' ({when[:16]})' if when else ''}.\n" \
+                 f"🆔 Ваш логин — Telegram ID: <code>{user.user_id}</code>"
+    else:
+        status = ("❌ Пароль не задан — вход в веб-облако по паролю "
+                  "пока закрыт.")
+    return (
+        "🔑 <b>Веб-пароль</b>\n\n"
+        "Вход в 🌐 Веб-облако из обычного браузера — без Telegram и без VPN.\n\n"
+        f"{status}\n\n"
+        "Требования к паролю: минимум 8 символов, хотя бы одна буква и одна "
+        "цифра. Сам пароль нигде не хранится — только его «отпечаток» "
+        "(PBKDF2, 200 000 раундов). 5 неверных попыток подряд — пауза на "
+        "10 минут.\n\n"
+        "Вход: откройте веб-облако и введите свой Telegram ID (виден выше) "
+        "и этот пароль."
+    )
+
+
+def _web_password_kb(user):
+    has_pw = isinstance(getattr(user, "web_password_hash", None), dict)
+    rows = []
+    if has_pw:
+        rows.append([InlineKeyboardButton("🔁 Сменить пароль", callback_data="web_pw_change")])
+        rows.append([InlineKeyboardButton("🗑 Удалить пароль", callback_data="web_pw_delete")])
+    else:
+        rows.append([InlineKeyboardButton("➕ Задать пароль", callback_data="web_pw_set")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="cloud_menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _web_pw_validate(password: str) -> "str | None":
+    """None — пароль годен; иначе текст ошибки (для пользователя)."""
+    if not password or len(password) < 8:
+        return "Пароль слишком короткий — минимум 8 символов. Придумайте другой:"
+    if not re.search(r"[A-Za-zА-Яа-яЁё]", password):
+        return "В пароле должна быть хотя бы одна буква. Придумайте другой:"
+    if not re.search(r"\d", password):
+        return "В пароле должна быть хотя бы одна цифра. Придумайте другой:"
+    return None
+
+
+async def web_password_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Экран «🔑 Веб-пароль»: статус + Задать/Сменить/Удалить."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    user = get_user(str(query.from_user.id))
+    if not user:
+        try:
+            await query.answer("Сначала зарегистрируйтесь — /start", show_alert=True)
+        except Exception:
+            pass
+        return MAIN_MENU
+    if not MINIAPP_URL:
+        # Честно: без адреса веб-облака пароль задавать некуда.
+        try:
+            await query.edit_message_text(
+                "🌐 Разработчик не настроил адрес веб-облака, задать пароль нельзя.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("⬅️ Назад", callback_data="cloud_menu")]]),
+            )
+        except Exception:
+            try:
+                await query.message.reply_text(
+                    "🌐 Разработчик не настроил адрес веб-облака, задать пароль нельзя.")
+            except Exception:
+                pass
+        return MAIN_MENU
+    try:
+        await query.edit_message_text(
+            _web_password_text(user),
+            reply_markup=_web_password_kb(user),
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        await query.message.reply_text(
+            _web_password_text(user),
+            reply_markup=_web_password_kb(user),
+            parse_mode=ParseMode.HTML,
+        )
+    return MAIN_MENU
+
+
+async def web_pw_set_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """«➕ Задать пароль» — просим придумать пароль (состояние WEB_PW_ENTER)."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    user = get_user(str(query.from_user.id))
+    if not user:
+        return MAIN_MENU
+    if not MINIAPP_URL:
+        try:
+            await query.edit_message_text(
+                "🌐 Разработчик не настроил адрес веб-облака, задать пароль нельзя.")
+        except Exception:
+            pass
+        return MAIN_MENU
+    context.user_data["web_pw_mode"] = "set"
+    try:
+        await query.edit_message_text(
+            "🔐 Придумайте веб-пароль и пришлите его следующим сообщением.\n\n"
+            "Требования: минимум 8 символов, хотя бы одна буква и одна цифра.\n"
+            "Сообщение с паролем я удалю из чата после сохранения.\n\n"
+            "«отмена» — выйти без изменений.")
+    except Exception:
+        pass
+    return WEB_PW_ENTER
+
+
+async def web_pw_change_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """«🔁 Сменить пароль» — сначала СТАРЫЙ пароль (WEB_PW_ENTER_OLD)."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    user = get_user(str(query.from_user.id))
+    if not user:
+        return MAIN_MENU
+    if not MINIAPP_URL:
+        try:
+            await query.edit_message_text(
+                "🌐 Разработчик не настроил адрес веб-облака, задать пароль нельзя.")
+        except Exception:
+            pass
+        return MAIN_MENU
+    if not isinstance(getattr(user, "web_password_hash", None), dict):
+        # Пароля нет — это просто установка нового.
+        context.user_data["web_pw_mode"] = "set"
+        try:
+            await query.edit_message_text(
+                "🔐 Пароль ещё не задан. Пришлите новый пароль одним "
+                "сообщением (минимум 8 символов, буква и цифра).")
+        except Exception:
+            pass
+        return WEB_PW_ENTER
+    context.user_data["web_pw_mode"] = "change"
+    try:
+        await query.edit_message_text(
+            "🔐 Смена веб-пароля.\n\nШаг 1 из 2: пришлите ТЕКУЩИЙ "
+            "(старый) пароль одним сообщением.\n\n"
+            "«отмена» — выйти без изменений.")
+    except Exception:
+        pass
+    return WEB_PW_ENTER_OLD
+
+
+async def web_pw_delete_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """«🗑 Удалить пароль» — веб-вход по паролю выключается."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    user = get_user(str(query.from_user.id))
+    if not user:
+        return MAIN_MENU
+    user.web_password_hash = None
+    user.web_password_set_at = None
+    user.web_login_attempts = 0
+    user.web_login_locked_until = None
+    save_user(user)
+    logger.info(f"web_password: пользователь {user.user_id} удалил веб-пароль")
+    try:
+        await query.edit_message_text(
+            "🗑 Веб-пароль удалён. Вход в веб-облако по паролю больше "
+            "не работает (в Telegram облако открывается как раньше).",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ Назад", callback_data="cloud_menu")]]),
+        )
+    except Exception:
+        pass
+    return MAIN_MENU
+
+
+async def web_pw_old_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Шаг 1 смены пароля: проверяем СТАРЫЙ пароль (состояние WEB_PW_ENTER_OLD)."""
+    user = get_user(str(update.effective_user.id))
+    if not user:
+        return MAIN_MENU
+    text = (update.message.text or "").strip()
+    if text.lower() in ("отмена", "cancel"):
+        context.user_data.pop("web_pw_mode", None)
+        await update.message.reply_text("Смена веб-пароля отменена.")
+        return await global_cancel_handler(update, context)
+    # Сообщение со старым паролем сразу стираем — паролям нечего делать в чате.
+    try:
+        await context.bot.delete_message(
+            chat_id=update.effective_chat.id,
+            message_id=update.message.message_id)
+    except Exception:
+        pass
+    if not _web_check_password(user, text):
+        await update.message.reply_text(
+            "❌ Старый пароль не подошёл. Попробуйте ещё раз — пришлите "
+            "текущий пароль одним сообщением, или напишите «отмена».")
+        return WEB_PW_ENTER_OLD
+    context.user_data["web_pw_mode"] = "change"
+    await update.message.reply_text(
+        "✅ Старый пароль верный.\n\nШаг 2 из 2: пришлите НОВЫЙ пароль "
+        "(минимум 8 символов, хотя бы одна буква и одна цифра). "
+        "Сообщение я удалю из чата.")
+    return WEB_PW_ENTER
+
+
+async def web_pw_enter_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Сохранение нового веб-пароля (состояние WEB_PW_ENTER).
+    Валидации: ≥8 символов, буква и цифра. Сообщение пользователя удаляется."""
+    user = get_user(str(update.effective_user.id))
+    if not user:
+        return MAIN_MENU
+    password = (update.message.text or "").strip()
+    if password.lower() in ("отмена", "cancel"):
+        context.user_data.pop("web_pw_mode", None)
+        await update.message.reply_text("Настройка веб-пароля отменена.")
+        return await global_cancel_handler(update, context)
+    # Сообщение с паролем стираем ДО любых проверок — оно не должно висеть в чате.
+    try:
+        await context.bot.delete_message(
+            chat_id=update.effective_chat.id,
+            message_id=update.message.message_id)
+    except Exception:
+        pass
+    err = _web_pw_validate(password)
+    if err:
+        await update.message.reply_text(f"⚠️ {err}")
+        return WEB_PW_ENTER
+    _mode = context.user_data.get("web_pw_mode")
+    _web_set_password(user, password)
+    context.user_data.pop("web_pw_mode", None)
+    logger.info(f"web_password: пользователь {user.user_id} "
+                f"{'сменил' if _mode == 'change' else 'задал'} веб-пароль")
+    await update.message.reply_text(
+        "✅ Веб-пароль сохранён. Войдите в веб-облако:\n"
+        f"{MINIAPP_URL}\n\n"
+        f"🆔 Логин — ваш Telegram ID: <code>{user.user_id}</code>\n"
+        "Пункт «🔑 Веб-пароль» живёт в ☁️ Облако и 🔐 Сейфе.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🌐 Открыть веб-облако", url=MINIAPP_URL)]])
+        if MINIAPP_URL else None,
+    )
+    return MAIN_MENU
+
+
+# ==================================
+# === ВОЛНА 22.29: «🌙 НЕ БЕСПОКОИТЬ» ===
+# Окно тишины [со скольки .. до скольки] по ЛОКАЛЬНОМУ времени пользователя +
+# выбор того, КАКИЕ уведомления в этом окне не приходить. Пропущенные в окне
+# уведомления НЕ ТЕРЯЮТСЯ: тикер повторяет попытки и доставит их после
+# окончания окна (журнал «уже отправлено» помечается только при реальной
+# отправке). Явные напоминания (таймеры) по умолчанию приходят всегда.
+# ==================================
+
+_DND_KIND_LABELS = {
+    "morning": "☀️ Доброе утро",
+    "evening": "🌙 Спокойной ночи",
+    "weather": "🌦 Погода",
+    "holiday": "🎉 Праздники",
+    "birthday": "🎂 Напоминание о моём ДР",
+    "bd_eve": "🎁 «Завтра ДР у …»",
+    "timers": "⏰ Напоминания-таймеры",
+}
+
+
+def _parse_hhmm_minutes(text) -> "int | None":
+    """«ЧЧ:ММ» → минуты от полуночи (0..1439); None — не время."""
+    m = re.fullmatch(r"\s*(\d{1,2})\s*[:.]\s*(\d{2})\s*", str(text or ""))
+    if not m:
+        return None
+    h, mi = int(m.group(1)), int(m.group(2))
+    if h > 23 or mi > 59:
+        return None
+    return h * 60 + mi
+
+
+def _dnd_blocks(user, kind: str, local_now=None) -> bool:
+    """True — сейчас у пользователя окно тишины и тип `kind` в нём заглушён."""
+    if not user or not getattr(user, "dnd_enabled", False):
+        return False
+    mute = getattr(user, "dnd_mute", None)
+    if not isinstance(mute, dict) or not mute.get(kind):
+        return False
+    start = _parse_hhmm_minutes(getattr(user, "dnd_from", "23:00"))
+    end = _parse_hhmm_minutes(getattr(user, "dnd_to", "07:00"))
+    if start is None or end is None:
+        return False
+    if local_now is None:
+        local_now = _user_local_now(user)
+    cur = local_now.hour * 60 + local_now.minute
+    if start == end:
+        return True  # окно «с X до X» считаем круглосуточным (честно пишем в меню)
+    if start < end:
+        return start <= cur < end
+    return cur >= start or cur < end  # окно через полночь
+
+
+def _dnd_menu_text(user) -> str:
+    on = bool(getattr(user, "dnd_enabled", False))
+    mute = getattr(user, "dnd_mute", None) or {}
+    fr = getattr(user, "dnd_from", "23:00")
+    to = getattr(user, "dnd_to", "07:00")
+    lines = [
+        "🌙 <b>Не беспокоить</b>\n",
+        f"Режим: {'✅ включён' if on else '❌ выключен'}",
+        f"Окно тишины: с <b>{fr}</b> до <b>{to}</b> (ваше местное время)."
+        + (" Круглосуточно — время совпадают." if fr == to else ""),
+        "",
+        "В окне тишины НЕ приходят заглушенные уведомления. Всё, что бот "
+        "пропустил из-за тишины, он доставит сразу после её окончания — "
+        "ничего не теряется.",
+        "",
+        "<b>Что заглушено в окне:</b>",
+    ]
+    for key, label in _DND_KIND_LABELS.items():
+        lines.append(("🔇 " if mute.get(key) else "🔔 ") + label)
+    lines.append("")
+    lines.append("Нажмите на тип, чтобы заглушить/вернуть его.")
+    return "\n".join(lines)
+
+
+def _dnd_menu_kb(user):
+    mute = getattr(user, "dnd_mute", None) or {}
+    rows = [
+        [InlineKeyboardButton(
+            f"{'🔕 Выключить режим' if getattr(user, 'dnd_enabled', False) else '🔔 Включить режим'}",
+            callback_data="dnd_toggle")],
+        [InlineKeyboardButton(
+            f"⏰ С: {getattr(user, 'dnd_from', '23:00')}", callback_data="dnd_set_from"),
+         InlineKeyboardButton(
+            f"⏰ До: {getattr(user, 'dnd_to', '07:00')}", callback_data="dnd_set_to")],
+    ]
+    for key, label in _DND_KIND_LABELS.items():
+        rows.append([InlineKeyboardButton(
+            ("🔇 " if mute.get(key) else "🔔 ") + label,
+            callback_data=f"dnd_kind_{key}")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_to_settings")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def dnd_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Экран «🌙 Не беспокоить»."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    user = get_user(str(query.from_user.id))
+    if not user:
+        return MAIN_MENU
+    try:
+        await query.edit_message_text(
+            _dnd_menu_text(user), reply_markup=_dnd_menu_kb(user),
+            parse_mode=ParseMode.HTML)
+    except Exception:
+        await query.message.reply_text(
+            _dnd_menu_text(user), reply_markup=_dnd_menu_kb(user),
+            parse_mode=ParseMode.HTML)
+    return MAIN_MENU
+
+
+async def dnd_toggle_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Вкл/выкл режима «не беспокоить»."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    user = get_user(str(query.from_user.id))
+    if not user:
+        return MAIN_MENU
+    user.dnd_enabled = not bool(getattr(user, "dnd_enabled", False))
+    save_user(user)
+    logger.info(f"dnd: пользователь {user.user_id} "
+                f"{'ВКЛЮЧИЛ' if user.dnd_enabled else 'выключил'} режим")
+    try:
+        await query.edit_message_text(
+            _dnd_menu_text(user), reply_markup=_dnd_menu_kb(user),
+            parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
+    return MAIN_MENU
+
+
+async def dnd_set_time_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопки «⏰ С» / «⏰ До» — просим ввести время (состояние DND_WAIT_TIME)."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    user = get_user(str(query.from_user.id))
+    if not user:
+        return MAIN_MENU
+    which = "from" if query.data == "dnd_set_from" else "to"
+    context.user_data["dnd_time_which"] = which
+    label = "СО СКОЛЬКИ" if which == "from" else "ДО СКОЛЬКИ"
+    try:
+        await query.edit_message_text(
+            f"🌙 Время {label} начала окна тишины.\n\n"
+            "Пришлите время в формате ЧЧ:ММ (например, 23:00 или 7:30).\n"
+            "Если время совпадут — окно считается круглосуточным.\n\n"
+            "«отмена» — выйти без изменений.")
+    except Exception:
+        pass
+    return DND_WAIT_TIME
+
+
+async def dnd_time_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Сохранение времени окна тишины (состояние DND_WAIT_TIME)."""
+    user = get_user(str(update.effective_user.id))
+    if not user:
+        return MAIN_MENU
+    text = (update.message.text or "").strip()
+    if text.lower() in ("отмена", "cancel"):
+        context.user_data.pop("dnd_time_which", None)
+        await update.message.reply_text("Настройка «Не беспокоить» отменена.")
+        return await global_cancel_handler(update, context)
+    minutes = _parse_hhmm_minutes(text)
+    if minutes is None:
+        await update.message.reply_text(
+            "Не похоже на время. Пришлите ЧЧ:ММ, например 23:00 "
+            "(или «отмена» — выйти).")
+        return DND_WAIT_TIME
+    hhmm = f"{minutes // 60:02d}:{minutes % 60:02d}"
+    which = context.user_data.get("dnd_time_which") or "from"
+    if which == "from":
+        user.dnd_from = hhmm
+    else:
+        user.dnd_to = hhmm
+    save_user(user)
+    context.user_data.pop("dnd_time_which", None)
+    await update.message.reply_text(
+        f"✅ Готово: окно тишины теперь с {user.dnd_from} до {user.dnd_to}.",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🌙 Открыть «Не беспокоить»", callback_data="dnd_menu")]]),
+    )
+    return MAIN_MENU
+
+
+async def dnd_kind_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Тоггл типа уведомления в окне тишины (dnd_kind_<key>)."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    user = get_user(str(query.from_user.id))
+    if not user:
+        return MAIN_MENU
+    key = query.data.replace("dnd_kind_", "", 1)
+    if key not in _DND_KIND_LABELS:
+        return MAIN_MENU
+    mute = getattr(user, "dnd_mute", None)
+    if not isinstance(mute, dict):
+        mute = {"morning": True, "evening": True, "weather": True,
+                "holiday": True, "birthday": True, "bd_eve": True,
+                "timers": False}
+    mute[key] = not bool(mute.get(key))
+    user.dnd_mute = mute
+    save_user(user)
+    try:
+        await query.edit_message_text(
+            _dnd_menu_text(user), reply_markup=_dnd_menu_kb(user),
+            parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
+    return MAIN_MENU
+
+
+async def bd_eve_toggle_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Тоггл «присылать ли "завтра ДР у …" об одноклассниках»."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    user = get_user(str(query.from_user.id))
+    if not user:
+        return MAIN_MENU
+    user.birthday_eve_notify = not bool(getattr(user, "birthday_eve_notify", True))
+    save_user(user)
+    state = "включены" if user.birthday_eve_notify else "выключены"
+    try:
+        await query.answer(f"Уведомления о ДР одноклассников за день: {state}")
+    except Exception:
+        pass
+    try:
+        await query.edit_message_reply_markup(
+            reply_markup=get_notification_settings_keyboard(user))
+    except Exception:
+        pass
+    return MAIN_MENU
+
+
+# ==================================
+# === ВОЛНА 22.29: «🤒 Я БОЛЕЛ(А)» ===
+# Пользователь выбирает период болезни (с … по …), бот собирает:
+#   1) ВСЁ домашнее задание класса за эти даты;
+#   2) ВСЕ объявления администратора класса за это время (журнал
+#      class_obj.announcements — пишется при «📢 Написать классу»).
+# ==================================
+
+SICK_MAX_DAYS = 60  # честный потолок периода (защита от «с 1 года до н.э.»)
+
+
+def _sick_parse_date(text: str) -> "date | None":
+    """Понимает ГГГГ-ММ-ДД и ДД.ММ.ГГГГ (любой лексикон дат)."""
+    t = (text or "").strip()
+    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d.%m.%y"):
+        try:
+            return datetime.strptime(t, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+async def sick_from_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Шаг 1: дата НАЧАЛА болезни (состояние SICK_WAIT_FROM)."""
+    user = get_user(str(update.effective_user.id))
+    if not user:
+        return MAIN_MENU
+    text = (update.message.text or "").strip()
+    if text.lower() in ("отмена", "cancel"):
+        context.user_data.pop("sick_from", None)
+        await update.message.reply_text("Выход. Выздоравливайте!")
+        return await global_cancel_handler(update, context)
+    d = _sick_parse_date(text)
+    if d is None:
+        await update.message.reply_text(
+            "Не похоже на дату. Пришлите ГГГГ-ММ-ДД (например, 2026-02-10) "
+            "или ДД.ММ.ГГГГ.\n\n«отмена» — выйти.")
+        return SICK_WAIT_FROM
+    context.user_data["sick_from"] = d.strftime("%Y-%m-%d")
+    await update.message.reply_text(
+        f"✅ С {d.strftime('%d.%m.%Y')}.\n\n"
+        "📅 ПО КАКОЕ число вы болели? Тот же формат даты.\n\n"
+        "«отмена» — выйти.")
+    return SICK_WAIT_TO
+
+
+async def sick_to_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Шаг 2: дата КОНЦА + сборка отчёта (ДЗ + объявления за период)."""
+    user = get_user(str(update.effective_user.id))
+    if not user:
+        return MAIN_MENU
+    text = (update.message.text or "").strip()
+    if text.lower() in ("отмена", "cancel"):
+        context.user_data.pop("sick_from", None)
+        await update.message.reply_text("Выход. Выздоравливайте!")
+        return await global_cancel_handler(update, context)
+    d_to = _sick_parse_date(text)
+    if d_to is None:
+        await update.message.reply_text(
+            "Не похоже на дату. Пришлите ГГГГ-ММ-ДД (например, 2026-02-14) "
+            "или ДД.ММ.ГГГГ.\n\n«отмена» — выйти.")
+        return SICK_WAIT_TO
+    from_raw = context.user_data.pop("sick_from", None)
+    if not from_raw:
+        await update.message.reply_text(
+            "Сначала пришлите дату НАЧАЛА болезни. Нажмите «🤒 Я болел(а)» заново.")
+        return MAIN_MENU
+    try:
+        d_from = datetime.strptime(from_raw, "%Y-%m-%d").date()
+    except Exception:
+        await update.message.reply_text("Ошибка диапазона — начните заново.")
+        return MAIN_MENU
+    if d_to < d_from:
+        await update.message.reply_text(
+            "Дата конца раньше даты начала. Пришлите дату КОНЦА болезни "
+            f"не раньше {d_from.strftime('%d.%m.%Y')}:\n\n«отмена» — выйти.")
+        context.user_data["sick_from"] = from_raw
+        return SICK_WAIT_TO
+    if (d_to - d_from).days + 1 > SICK_MAX_DAYS:
+        await update.message.reply_text(
+            f"Период больше {SICK_MAX_DAYS} дней — слишком длинный. "
+            "Разбейте его на части (например, по месяцам).")
+        context.user_data["sick_from"] = from_raw
+        return SICK_WAIT_TO
+
+    class_obj = get_class_by_user(user.user_id)
+    if not class_obj:
+        await update.message.reply_text("Вы не состоите в классе.")
+        return MAIN_MENU
+
+    # --- 1) Домашнее задание по дням ---
+    # format_homework возвращает Markdown (**жирный**) — для честного HTML
+    # снимаем звёздочки и экранируем пользовательский текст.
+    hw_parts = []
+    cur = d_from
+    hw_days = 0
+    while cur <= d_to:
+        ds = cur.strftime("%Y-%m-%d")
+        hw = get_homework_for_date(class_obj, ds)
+        if hw:
+            hw_days += 1
+            hw_text = format_homework(hw, ds).replace("**", "")
+            hw_parts.append(f"📅 {cur.strftime('%d.%m.%Y')}:\n{escape_html(hw_text)}")
+        cur += timedelta(days=1)
+
+    # --- 2) Объявления админов за период ---
+    ann_parts = []
+    for rec in (getattr(class_obj, 'announcements', []) or []):
+        if not isinstance(rec, dict):
+            continue
+        ts = str(rec.get('ts') or '')
+        if not ts or not (from_raw <= ts[:10] <= d_to.strftime("%Y-%m-%d")):
+            continue
+        name = str(rec.get('name') or 'админ')
+        body = str(rec.get('text') or '')[:1500]
+        ann_parts.append(f"📢 {ts} — {escape_html(name)}:\n{escape_html(body)}")
+
+    header = (f"🤒 <b>Ваши пропуски: {d_from.strftime('%d.%m.%Y')} — "
+              f"{d_to.strftime('%d.%m.%Y')}</b> ({escape_html(class_obj.class_name)})\n"
+              "Выздоравливайте! Вот что произошло за это время:")
+
+    sections = []
+    if hw_days:
+        sections.append("📚 <b>ДОМАШНЕЕ ЗАДАНИЕ</b>\n\n" + "\n\n".join(hw_parts))
+    else:
+        sections.append("📚 <b>ДОМАШНЕЕ ЗАДАНИЕ</b>\n\nЗа эти дни ДЗ не задано "
+                        "(или админ не вносил его с датами).")
+    if ann_parts:
+        sections.append("📢 <b>ОБЪЯВЛЕНИЯ КЛАССА</b>\n\n" + "\n\n".join(ann_parts))
+    else:
+        sections.append("📢 <b>ОБЪЯВЛЕНИЯ КЛАССА</b>\n\nЗа этот период "
+                        "объявлений от админа не было (журнал ведётся "
+                        "с волны 22.29 — раньше объявления не записывались).")
+
+    full = header + "\n\n" + "\n\n".join(sections)
+    MAX_LEN = 3800
+    if len(full) <= MAX_LEN:
+        await update.message.reply_text(full, parse_mode=ParseMode.HTML)
+    else:
+        chunk = ""
+        for para in full.split("\n\n"):
+            if len(chunk) + len(para) + 2 > MAX_LEN:
+                if chunk:
+                    await update.message.reply_text(chunk, parse_mode=ParseMode.HTML)
+                chunk = para
+            else:
+                chunk = f"{chunk}\n\n{para}" if chunk else para
+        if chunk:
+            await update.message.reply_text(chunk, parse_mode=ParseMode.HTML)
+    logger.info(f"sick: {user.user_id} запросил пропуски {from_raw}..{d_to} "
+                f"(ДЗ-дней: {hw_days}, объявлений: {len(ann_parts)})")
+    return MAIN_MENU
 
 
 async def vault_cloud_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -23509,6 +25014,30 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(holidays_info)
         return MAIN_MENU
 
+    elif message_text == "📋 Ещё":
+        # ВОЛНА 22.29: скрытые кнопки (перемещённые через настройки)
+        # + список ДР одноклассников.
+        await more_menu_msg(update, context, user)
+        return MAIN_MENU
+
+    elif message_text == "🤒 Я болел(а)":
+        # ВОЛНА 22.29: запрос диапазона болезни — потом ДЗ + объявления.
+        if not class_obj:
+            await update.message.reply_text(
+                "Вы не состоите в классе — ДЗ и объявления берутся из класса.\n"
+                "Вступите в класс через «🎓 Управление классами».")
+            return MAIN_MENU
+        if is_user_class_blocked(user_id, class_obj.class_code):
+            await update.message.reply_text("Вы заблокированы в этом классе.")
+            return MAIN_MENU
+        await update.message.reply_text(
+            "🤒 Поправляйтесь!\n\n"
+            "📅 С КАКОГО числа вы болели? Пришлите дату в формате "
+            "ГГГГ-ММ-ДД (например, 2026-02-10).\n\n"
+            "«отмена» — выйти.",
+            reply_markup=get_cancel_keyboard())
+        return SICK_WAIT_FROM
+
     elif message_text == "💬 Написать админу":
         if class_obj:
             if is_user_class_blocked(user_id, class_obj.class_code):
@@ -23560,7 +25089,9 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # === ГЛОБАЛЬНАЯ АВТОМАТИЗАЦИЯ И АЛИАСЫ КНОПОК (текст И голос) ===
     # Нераспознанный текст в главном меню больше не игнорируется молча:
     # 1) совпал с алиасом кнопки («домашка», «учителя») → открываем кнопку;
-    # 2) иначе — свободный запрос уходит в автоматизацию DeepSeek одним
+    # 2) ВОЛНА 22.29: похожая фраза / «покажи расписание на неделю» →
+    #    фуззи-подбор кнопки (любой лексикон, работает БЕЗ AI-ключа);
+    # 3) иначе — свободный запрос уходит в автоматизацию DeepSeek одним
     #    действием (голосовые сообщения уже превращены в текст middleware'ом).
     if message_text and not message_text.startswith("/"):
         _low = message_text.strip().lower()
@@ -23575,11 +25106,316 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return await handle_main_menu(_fake_update, context)
             except Exception as e:
                 logger.error(f"menu alias routing ({_low} -> {_alias_target}): {e}")
+        # ВОЛНА 22.29: «распознавай любой лексикон» — подбор кнопки по
+        # опечаткам/похожим словам/вхождению в фразу. Только если точный
+        # алиас не сработал и цель отличается от нажатой кнопки.
+        _fuzzy_target = _fuzzy_menu_target(_low)
+        if _fuzzy_target and _fuzzy_target != message_text:
+            import copy as _copy_fz
+            try:
+                _fake_update = _copy_fz.copy(update)
+                _fake_msg = _copy_fz.copy(update.message)
+                object.__setattr__(_fake_msg, "text", _fuzzy_target)
+                _fake_update.message = _fake_msg
+                return await handle_main_menu(_fake_update, context)
+            except Exception as e:
+                logger.error(f"menu fuzzy routing ({_low} -> {_fuzzy_target}): {e}")
         result_state = await _run_automation_oneshot(update, context, user, class_obj, message_text)
         if result_state is not None:
             return result_state
 
     return MAIN_MENU
+
+
+# ==================================
+# === ВОЛНА 22.29: КНОПКА «📋 Ещё» ===
+# 1) В «Ещё» попадают кнопки, скрытые из главного меню (перемещение кнопок
+#    через ⚙️ Настройки → «👁 Скрыть/показать кнопки» — скрыл кнопку, и она
+#    автоматически живёт в «Ещё»; вернул — снова в меню).
+# 2) «🎂 ДР одноклассников»: все одноклассники СПИСКОМ от ближайшего ДР к
+#    самому позднему; тап по человеку — подробная карточка.
+# ==================================
+
+def _fuzzy_menu_target(low: str) -> "str | None":
+    """ВОЛНА 22.29: подбор кнопки меню под ЛЮБУЮ формулировку.
+
+    1) Похожее слово (опечатки, падежи) — difflib по алиасам, порог 0.75.
+    2) Вхождение основы алиаса во фразу: «покажи мне расписание» содержит
+       «расписани…» → открываем 📅 Расписание. Сначала проверяем ДЛИННЫЕ
+       алиасы («чат поддержки» ценнее «чат»).
+    Возвращает ПОЛНОЕ название кнопки меню (или None)."""
+    if not low or len(low) < 2:
+        return None
+    try:
+        import difflib
+        close = difflib.get_close_matches(low, list(_MENU_TEXT_ALIASES.keys()),
+                                          n=1, cutoff=0.75)
+        if close:
+            return _MENU_TEXT_ALIASES[close[0]]
+    except Exception:
+        pass
+    # Вхождение основы (алиас без последней буквы — ловит падежи:
+    # «расписанию/расписания», «таймером», «училок»).
+    best_key = None
+    for key in _MENU_TEXT_ALIASES:
+        if len(key) < 5:
+            continue  # короткие («дз», «ai», «сейф») — слишком много ложных
+        stem_full = key if len(key) < 6 else key[:-1]
+        # 5-символьное начало ловит формы с беглой гласной:
+        # «настройки» → «настроек», «окно настроек».
+        stem5 = key[:5]
+        if ((stem_full in low) or (stem5 in low)) and \
+                (best_key is None or len(key) > len(best_key)):
+            best_key = key
+    if best_key:
+        return _MENU_TEXT_ALIASES[best_key]
+    return None
+
+
+def _more_menu_kb(user, context):
+    """Клавиатура «📋 Ещё»: скрытые кнопки (перемещённые через настройки)
+    + «🎂 ДР одноклассников». Соответствие «номер → кнопка» живёт в
+    context.user_data['more_map'] (callback_data ограничен 64 байтами)."""
+    hidden = [b for b in (getattr(user, 'hidden_buttons', []) or [])
+              if isinstance(b, str) and b]
+    more_map = {}
+    rows = []
+    if hidden:
+        for i, name in enumerate(hidden[:40]):
+            more_map[str(i)] = name
+            rows.append([InlineKeyboardButton(name, callback_data=f"more_run_{i}")])
+    rows.append([InlineKeyboardButton("🎂 ДР одноклассников", callback_data="bd_list")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_to_main")])
+    context.user_data["more_map"] = more_map
+    return InlineKeyboardMarkup(rows), len(hidden)
+
+
+def _more_menu_text(hidden_count: int) -> str:
+    text = "📋 <b>Ещё</b>\n\n"
+    if hidden_count:
+        text += (
+            "Здесь кнопки, которые вы скрыли из главного меню. Вернуть или "
+            "спрятать другие: ⚙️ Настройки → «👁 Скрыть/показать кнопки» — "
+            "скрытая кнопка автоматически переезжает сюда.\n\n"
+        )
+    else:
+        text += (
+            "Сюда можно переместить любую кнопку главного меню: ⚙️ Настройки "
+            "→ «👁 Скрыть/показать кнопки» — скрытая кнопка переедет сюда, "
+            "меню станет чище.\n\n"
+        )
+    text += "🎂 ДР одноклассников — все дни рождения от ближайшего к позднему."
+    return text
+
+
+async def more_menu_msg(update: Update, context: ContextTypes.DEFAULT_TYPE, user):
+    """Отправляет сообщение «📋 Ещё» (используется из handle_main_menu)."""
+    kb, hidden_count = _more_menu_kb(user, context)
+    await update.message.reply_text(
+        _more_menu_text(hidden_count), reply_markup=kb, parse_mode=ParseMode.HTML)
+
+
+async def more_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Повторное открытие «📋 Ещё» из колбэка (кнопка «⬅️» из карточек)."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    user = get_user(str(query.from_user.id))
+    if not user:
+        return MAIN_MENU
+    kb, hidden_count = _more_menu_kb(user, context)
+    try:
+        await query.edit_message_text(
+            _more_menu_text(hidden_count), reply_markup=kb, parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
+    return MAIN_MENU
+
+
+async def more_run_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Нажали скрытую кнопку внутри «📋 Ещё» — выполняем её КАК БУДТО
+    пользователь нажал кнопку главного меню (переиспользуется весь
+    dispatch handle_main_menu: права, класс, блокировки — всё то же)."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    user = get_user(str(query.from_user.id))
+    if not user:
+        return MAIN_MENU
+    more_map = context.user_data.get("more_map") or {}
+    name = more_map.get(query.data.replace("more_run_", "", 1))
+    if not name:
+        kb, hidden_count = _more_menu_kb(user, context)
+        try:
+            await query.edit_message_text(
+                "Список кнопок обновился — открываю заново.",
+                reply_markup=kb, parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+        return MAIN_MENU
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+    import copy as _copy_more
+    _fake_msg = await query.message.chat.send_message(f"Открываю «{name}»…")
+    _fake_update = _copy_more.copy(update)
+    object.__setattr__(_fake_msg, "text", name)
+    _fake_update.message = _fake_msg
+    return await handle_main_menu(_fake_update, context)
+
+
+def _next_birthday_date(bd, today):
+    """Ближайший следующий день рождения (дата). 29 февраля → 28.02 в
+    невисокосные годы (честно и без падений)."""
+    try:
+        nxt = date(today.year, bd.month, bd.day)
+    except ValueError:
+        nxt = date(today.year, 2, 28) if (bd.month, bd.day) == (2, 29) else None
+        if nxt is None:
+            raise
+    if nxt < today:
+        try:
+            nxt = date(today.year + 1, bd.month, bd.day)
+        except ValueError:
+            nxt = date(today.year + 1, 2, 28)
+    return nxt
+
+
+async def bd_list_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """«🎂 ДР одноклассников»: список от ближайшего к позднему."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    user = get_user(str(query.from_user.id))
+    if not user:
+        return MAIN_MENU
+    class_obj = get_class_by_user(user.user_id)
+    if not class_obj:
+        try:
+            await query.edit_message_text(
+                "🎂 Вы не состоите в классе — некому показывать дни рождения.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("⬅️ Назад", callback_data="more_menu")]]))
+        except Exception:
+            pass
+        return MAIN_MENU
+    today = get_local_time(user).date()
+    entries = []
+    no_bday = []
+    members = list(set(
+        (getattr(class_obj, 'students', []) or [])
+        + (getattr(class_obj, 'admins', []) or [])))
+    for member_id in members:
+        if str(member_id) == str(user.user_id):
+            continue
+        member = get_user(str(member_id))
+        if not member:
+            continue
+        b = getattr(member, 'birthday', None)
+        if not b:
+            no_bday.append(member.first_name or str(member_id))
+            continue
+        try:
+            bd = datetime.strptime(b, "%Y-%m-%d").date()
+        except Exception:
+            no_bday.append(member.first_name or str(member_id))
+            continue
+        try:
+            nxt = _next_birthday_date(bd, today)
+        except Exception:
+            continue
+        days = (nxt - today).days
+        entries.append((days, member, bd, nxt))
+    entries.sort(key=lambda x: x[0])
+    lines = [f"🎂 <b>Дни рождения — {class_obj.class_name}</b>\n"]
+    kb_rows = []
+    context.user_data["bd_map"] = {}
+    if entries:
+        lines.append("От ближайшего к позднему:\n")
+        for i, (days, member, bd, nxt) in enumerate(entries):
+            when = (f"сегодня! 🎉" if days == 0 else
+                    f"завтра!" if days == 1 else
+                    f"через {days} дн.")
+            lines.append(
+                f"{i + 1}. <b>{escape_html(member.first_name or member.user_id)}</b> — "
+                f"{nxt.strftime('%d.%m')} ({when})")
+            context.user_data["bd_map"][str(i)] = str(member.user_id)
+            kb_rows.append([InlineKeyboardButton(
+                f"🎂 {member.first_name or member.user_id} — {nxt.strftime('%d.%m')}",
+                callback_data=f"bd_who_{i}")])
+    else:
+        lines.append("Дни рождения одноклассников пока не указаны.")
+    if no_bday:
+        lines.append("")
+        lines.append("Дата не указана: " + ", ".join(escape_html(n) for n in no_bday[:20]))
+    kb_rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="more_menu")])
+    try:
+        await query.edit_message_text(
+            "\n".join(lines), reply_markup=InlineKeyboardMarkup(kb_rows),
+            parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
+    return MAIN_MENU
+
+
+async def bd_who_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Карточка одноклассника: точная дата, сколько исполняется, через сколько."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    user = get_user(str(query.from_user.id))
+    if not user:
+        return MAIN_MENU
+    bd_map = context.user_data.get("bd_map") or {}
+    mid = bd_map.get(query.data.replace("bd_who_", "", 1))
+    member = get_user(mid) if mid else None
+    if not member or not getattr(member, "birthday", None):
+        return await bd_list_cb(update, context)
+    today = get_local_time(user).date()
+    try:
+        bd = datetime.strptime(member.birthday, "%Y-%m-%d").date()
+        nxt = _next_birthday_date(bd, today)
+    except Exception:
+        return await bd_list_cb(update, context)
+    days = (nxt - today).days
+    turning = nxt.year - bd.year
+    when = ("СЕГОДНИ! 🎉" if days == 0 else
+            "Завтра!" if days == 1 else
+            f"Через {days} дн.")
+    username = (getattr(member, 'username', '') or '').lstrip('@')
+    lines = [
+        f"🎂 <b>{escape_html(member.first_name or member.user_id)}</b>",
+        "",
+        f"📅 Дата рождения: <b>{bd.strftime('%d.%m.%Y')}</b>",
+        f"🎉 Исполняется: <b>{turning}</b>",
+        f"⏳ {when}",
+    ]
+    if username:
+        lines.append(f"🔗 @{username}")
+    try:
+        await query.edit_message_text(
+            "\n".join(lines),
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ К списку ДР", callback_data="bd_list")]]),
+            parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
+    return MAIN_MENU
+
+
+def escape_html(text: str) -> str:
+    """HTML-экранирование имён в сообщениях (волна 22.29)."""
+    return (str(text or "").replace("&", "&amp;")
+            .replace("<", "&lt;").replace(">", "&gt;"))
 
 
 # ==================================
@@ -26158,6 +27994,24 @@ async def send_class_message_handler(update: Update, context: ContextTypes.DEFAU
     # ВОЛНА 22.27: журнал действий админов — доказуемая авторство рассылки.
     _log_admin_action(user_id, class_code, "Рассылка классу",
                       message_text[:200])
+
+    # ВОЛНА 22.29: журнал ОБЪЯВЛЕНИЙ класса — по нему «🤒 Я болел(а)»
+    # показывает «что писал админ за время болезни». Хранится В КЛАССЕ
+    # (classes.json → канал-БД), капа 300 записей.
+    try:
+        log_ann = getattr(class_obj, 'announcements', None)
+        if not isinstance(log_ann, list):
+            log_ann = []
+        log_ann.append({
+            "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "by": str(user_id),
+            "name": str(getattr(user, 'first_name', '') or ''),
+            "text": str(message_text)[:1000],
+        })
+        class_obj.announcements = log_ann[-300:]
+        save_class(class_obj)
+    except Exception as e:
+        logger.error(f"send_class_message: не удалось записать объявление в журнал: {e}")
 
     await update.message.reply_text(success_text)
     return await admin_panel(update, context)
@@ -32591,6 +34445,35 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # ВОЛНА 22.20: «🔗 Моё облако» — личный канал-хранилище пользователя
         # (своя настройка в облаке; панель разработчика тут ни при чём).
         return await vault_cloud_cb(update, context)
+    elif data == "web_password_menu":
+        # ВОЛНА 22.29: экран «🔑 Веб-пароль» (вход в веб-облако без Telegram).
+        return await web_password_menu_cb(update, context)
+    elif data == "web_pw_set":
+        return await web_pw_set_cb(update, context)
+    elif data == "web_pw_change":
+        return await web_pw_change_cb(update, context)
+    elif data == "web_pw_delete":
+        return await web_pw_delete_cb(update, context)
+    elif data == "dnd_menu":
+        # ВОЛНА 22.29: «🌙 Не беспокоить» — окно тишины и типы уведомлений.
+        return await dnd_menu_cb(update, context)
+    elif data == "dnd_toggle":
+        return await dnd_toggle_cb(update, context)
+    elif data in ("dnd_set_from", "dnd_set_to"):
+        return await dnd_set_time_cb(update, context)
+    elif data.startswith("dnd_kind_"):
+        return await dnd_kind_cb(update, context)
+    elif data == "bd_eve_toggle":
+        return await bd_eve_toggle_cb(update, context)
+    elif data == "more_menu":
+        # ВОЛНА 22.29: «📋 Ещё» — скрытые кнопки + ДР одноклассников.
+        return await more_menu_cb(update, context)
+    elif data.startswith("more_run_"):
+        return await more_run_cb(update, context)
+    elif data == "bd_list":
+        return await bd_list_cb(update, context)
+    elif data.startswith("bd_who_"):
+        return await bd_who_cb(update, context)
     elif data == "vault_cloud_add":
         return await vault_cloud_add_cb(update, context)
     elif data == "vault_cloud_off":
@@ -37333,6 +39216,12 @@ async def _tick_send_timers(bot):
                 continue
             user = get_user(user_id)
             tz = getattr(user, 'timezone', 3) if user else 3
+            # ВОЛНА 22.29: окно тишины «не беспокоить» для явных напоминаний.
+            # По умолчанию таймеры НЕ глушатся (dnd_mute['timers']=False) —
+            # но если пользователь сам их заглушил, напоминание просто
+            # подождёт окончания окна (не помечается отправленным).
+            if _dnd_blocks(user, 'timers'):
+                continue
             target_utc = target_local - timedelta(hours=tz)
             if (now_utc - target_utc).total_seconds() < 0:
                 continue  # ещё не время
@@ -37448,6 +39337,79 @@ async def _tick_broadcast_birthday_to_class(bot, user):
                 )
     except Exception as e:
         logger.error(f"birthday_class_broadcast: top-level error: {e}")
+
+
+async def _tick_birthday_eve_for_user(bot, user, tomorrow_str: str) -> bool:
+    """ВОЛНА 22.29: «🎁 Завтра день рождения у …» — сообщение ОДНОКЛАССНИКУ
+    за день до ДР его одноклассников. Управление:
+      • именинник: show_birthday_to_class («видимость для класса» — скрыл
+        ДР от класса → о нём не объявляем ни в день ДР, ни за день);
+      • получатель: birthday_eve_notify (тоггл в 🔔 Настройках уведомлений);
+      • окно тишины получателя проверяет ВЫЗЫВАЮЩИЙ код (тип bd_eve):
+        пока тишина — вызова нет, сообщение уйдёт после её окончания.
+
+    Возвращает True, если хотя бы одно сообщение реально отправлено
+    (вызывающий код помечает слот журнала только при True — иначе
+    попытка повторится на следующем тике, как у утренних уведомлений)."""
+    try:
+        try:
+            tm_date = datetime.strptime(tomorrow_str, "%Y-%m-%d").date()
+        except Exception:
+            return False
+        try:
+            class_obj = get_class_by_user(user.user_id)
+        except Exception as e:
+            logger.error(f"birthday_eve: get_class_by_user failed: {e}")
+            return False
+        if not class_obj:
+            return False
+        members = list(set(
+            (getattr(class_obj, 'students', []) or [])
+            + (getattr(class_obj, 'admins', []) or [])
+        ))
+        candidates = []
+        for member_id in members:
+            if str(member_id) == str(user.user_id):
+                continue  # о своём ДР пользователь узнаёт из личного уведомления
+            member = get_user(str(member_id))
+            if not member:
+                continue
+            b = getattr(member, 'birthday', None)
+            if not b:
+                continue  # одноклассник не указал ДР — о нём нечего объявлять
+            try:
+                bd = datetime.strptime(b, "%Y-%m-%d").date()
+            except Exception:
+                continue
+            if (bd.month, bd.day) == (tm_date.month, tm_date.day):
+                # Гейт ИМЕНИННИКА: скрыл ДР от класса → не объявляем.
+                if not getattr(member, 'show_birthday_to_class', True):
+                    continue
+                candidates.append((member, bd))
+        if not candidates:
+            return False
+        sent_any = False
+        for member, bd in candidates:
+            display_name = member.first_name or 'одноклассник(а)'
+            username = (getattr(member, 'username', '') or '').lstrip('@')
+            mention = f"@{username}" if username else display_name
+            text = (
+                f"🎁 Завтра, {tm_date.strftime('%d.%m')}, день рождения "
+                f"у {display_name} ({mention})!\n\n"
+                f"Не забудьте подготовиться 😉"
+            )
+            try:
+                await bot.send_message(chat_id=int(user.user_id), text=text)
+                sent_any = True
+            except Exception as e:
+                logger.error(f"birthday_eve: send to {user.user_id} failed: {e}")
+        if sent_any:
+            logger.info(f"birthday_eve: {user.user_id} уведомлён о ДР "
+                        f"одноклассников на {tomorrow_str}")
+        return sent_any
+    except Exception as e:
+        logger.error(f"birthday_eve: top-level error: {e}")
+        return False
 
 
 async def _tick_send_birthday_for_user(
@@ -37683,7 +39645,9 @@ async def _unified_notification_tick_locked(context):
                         _mark_notification_sent(log, uid, 'morning', local_today_str)
                         log_changed = True
                 elif morn_occ and not _notification_already_sent(log, uid, 'morning', morn_occ):
-                    if due:
+                    # ВОЛНА 22.29: окно тишины — утро доставим после его окончания
+                    # (не помечаем «отправлено» — тикер повторит попытку).
+                    if due and not _dnd_blocks(user, 'morning', local_now):
                         try:
                             await bot.send_message(
                                 chat_id=int(uid),
@@ -37720,7 +39684,8 @@ async def _unified_notification_tick_locked(context):
                         _mark_notification_sent(log, uid, 'evening', local_today_str)
                         log_changed = True
                 elif eve_occ and not _notification_already_sent(log, uid, 'evening', eve_occ):
-                    if due:
+                    # ВОЛНА 22.29: окно тишины — вечер доставим после его окончания.
+                    if due and not _dnd_blocks(user, 'evening', local_now):
                         try:
                             await bot.send_message(
                                 chat_id=int(uid),
@@ -37757,7 +39722,8 @@ async def _unified_notification_tick_locked(context):
                     local_now, weather_t, max_late_minutes=14 * 60
                 )
                 if w_occ and not _notification_already_sent(log, uid, 'weather', w_occ):
-                    if due_w:
+                    # ВОЛНА 22.29: окно тишины — погода доставится после его окончания.
+                    if due_w and not _dnd_blocks(user, 'weather', local_now):
                         try:
                             wtext = await weather_current_text(user.city)
                             wkb = InlineKeyboardMarkup([
@@ -37797,7 +39763,8 @@ async def _unified_notification_tick_locked(context):
                     local_now, holiday_t, max_late_minutes=23 * 60
                 )
                 if hol_occ and not _notification_already_sent(log, uid, 'holiday', hol_occ):
-                    if due:
+                    # ВОЛНА 22.29: окно тишины — праздник доставится после его окончания.
+                    if due and not _dnd_blocks(user, 'holiday', local_now):
                         try:
                             occ_date = datetime.strptime(hol_occ, "%Y-%m-%d").date()
                             day_key = occ_date.strftime("%d-%m")
@@ -37837,7 +39804,9 @@ async def _unified_notification_tick_locked(context):
                 local_now, bday_t, max_late_minutes=24 * 60
             )
             if bday_occ and not _notification_already_sent(log, uid, 'birthday', bday_occ):
-                if due:
+                # ВОЛНА 22.29: окно тишины — ДР-напоминание доставится после окончания
+                # (окно догона 24 ч — хватит даже при круглой ночи тишины).
+                if due and not _dnd_blocks(user, 'birthday', local_now):
                     await _tick_send_birthday_for_user(
                         bot, user, log, local_today_str, bday_occ
                     )
@@ -37845,6 +39814,31 @@ async def _unified_notification_tick_locked(context):
                 elif too_late:
                     _mark_notification_sent(log, uid, 'birthday', bday_occ)
                     log_changed = True
+
+            # 2f) ВОЛНА 22.29: «🎁 Завтра день рождения у …» — одноклассникам
+            # за день до ДР. Идёт ПО ВРЕМЕНИ ПОЛУЧАТЕЛЯ (его
+            # birthday_notification_time), со своим слотом журнала
+            # (kind='bd_eve', слот = завтрашняя дата) и его окном тишины.
+            if getattr(user, 'birthday_eve_notify', True):
+                tmrw_str = (local_now + timedelta(days=1)).strftime("%Y-%m-%d")
+                if not _notification_already_sent(log, uid, 'bd_eve', tmrw_str):
+                    due_e, too_late_e, eve_occ = _is_daily_time_due(
+                        local_now, bday_t, max_late_minutes=14 * 60
+                    )
+                    if eve_occ:
+                        if due_e and not _dnd_blocks(user, 'bd_eve', local_now):
+                            if await _tick_birthday_eve_for_user(bot, user, tmrw_str):
+                                _mark_notification_sent(log, uid, 'bd_eve', tmrw_str)
+                                try:
+                                    _save_notification_log(log)
+                                except Exception as save_err:
+                                    logger.error(f"unified_tick: log save (bd_eve) {uid}: {save_err}")
+                                log_changed = False
+                        elif too_late_e:
+                            # За целый день так и не смогли доставить (бот
+                            # спал) — помечаем, чтобы не гонять впустую.
+                            _mark_notification_sent(log, uid, 'bd_eve', tmrw_str)
+                            log_changed = True
         except Exception as e:
             logger.error(f"unified_tick: пользователь {uid}: {e}")
 
@@ -39009,6 +41003,29 @@ def main():
             # («2 недели», «полгода», «45 минут»…) — _parse_duration_to_hours.
             DEV_BLOCK_CUSTOM: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, dev_block_custom_handler),
+                CallbackQueryHandler(handle_callback),
+            ],
+            # ВОЛНА 22.29: веб-пароль (ввод нового / подтверждение старого).
+            WEB_PW_ENTER: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, web_pw_enter_save),
+                CallbackQueryHandler(handle_callback),
+            ],
+            WEB_PW_ENTER_OLD: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, web_pw_old_save),
+                CallbackQueryHandler(handle_callback),
+            ],
+            # ВОЛНА 22.29: «🌙 Не беспокоить» — ввод времени окна.
+            DND_WAIT_TIME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, dnd_time_save),
+                CallbackQueryHandler(handle_callback),
+            ],
+            # ВОЛНА 22.29: «🤒 Я болел(а)» — ввод диапазона дат.
+            SICK_WAIT_FROM: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, sick_from_save),
+                CallbackQueryHandler(handle_callback),
+            ],
+            SICK_WAIT_TO: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, sick_to_save),
                 CallbackQueryHandler(handle_callback),
             ],
             # ВОЛНА 22.27: правка напоминаний из «📋 Мои напоминания».
