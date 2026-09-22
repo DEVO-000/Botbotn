@@ -237,6 +237,10 @@ def _data_file(filename: str) -> str:
 USERS_FILE = _data_file("users.json")
 CLASSES_FILE = _data_file("classes.json")
 TIMERS_FILE = _data_file("timers.json")
+# ВОЛНА 22.28: активные помодоро-сессии («в таймере добавь помодоро таймер»).
+# Хранится на диске и в канале-БД — сессия переживает рестарт и тикер сам
+# продолжит фазы (работа/перерыв) даже после падения сервера.
+POMODORO_FILE = _data_file("pomodoro.json")
 ANONYMOUS_MESSAGES_FILE = _data_file("anonymous_messages.json")
 SUGGESTIONS_FILE = _data_file("suggestions.json")
 HOMEWORK_FILE = _data_file("homework.json")
@@ -498,6 +502,7 @@ DEV_BLOCK_DURATION = 140   # разработчик выбирает, НА СК�
 TIMER_EDIT_TEXT = 141      # «Мои напоминания» → правка текста напоминания
 TIMER_EDIT_TIME = 142      # «Мои напоминания» → правка времени напоминания
 AGE_BLOCKED = 143          # пользователь с ДР <13 — бот закрыт для него
+DEV_BLOCK_CUSTOM = 144     # 22.28: разработчик ВПИСЫВАЕТ срок сам («2 недели», «полгода»)
 
 # ВОЛНА 22.4: «🎙 Пульт» удалён ПОЛНОСТЬЮ по решению пользователя — кнопки,
 # состояний (бывшие 126–131), хендлеров и хранилищ стилей больше нет.
@@ -1184,6 +1189,7 @@ _SANITIZE_TARGET_FILES = [
     GLOBAL_BUTTONS_FILE,
     REPORTS_FILE,
     ADMIN_LOG_FILE,
+    POMODORO_FILE,
 ]
 
 
@@ -2087,6 +2093,9 @@ STORAGE_BACKUP_FILES = (
     # ВОЛНА 22.27: жалобы и журнал действий админов тоже переживают рестарт
     # и живут в канале-БД (без них доказательства терялись бы при деплое).
     REPORTS_FILE, ADMIN_LOG_FILE,
+    # ВОЛНА 22.28: активные помодоро-сессии переживают рестарт — тикер
+    # продолжит прерванные фазы (работа/перерыв) автоматически.
+    POMODORO_FILE,
 )
 
 PRICES = load_prices()
@@ -2175,10 +2184,9 @@ class User:
         self.created_classes = []
         self.setup_completed = False
         self.birthday = None
-        # ПОЛИТИКА ПДн 1.2 (минимизация данных): пользователь мог ОСОЗНАННО
-        # пропустить ввод даты рождения («⏭ Пропустить» при регистрации).
-        # Флаг нужен, чтобы /start не спрашивал ДР у такого пользователя снова
-        # и снова: гейт выглядит как «нет ДР И не пропущено».
+        # ВОЛНА 22.28: пропустить ввод ДР больше нельзя — дата обязательна.
+        # Флаг остался только для совместимости старых JSON-записей; при
+        # отсутствии даты бот теперь ВСЕГДА просит её ввести при входе.
         self.birthday_skipped = False
         self.show_birthday_countdown = True
         self.show_birthday_to_class = True
@@ -3400,7 +3408,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.27"
+BOT_BUILD = "22.28"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -4157,14 +4165,12 @@ def get_cancel_keyboard():
     return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel_action")]])
 
 
-# ПОЛИТИКА ПДн 1.2 (минимизация данных): шаги регистрации, где данные
-# НЕОБЯЗАТЕЛЬНЫ, получают кнопку «⏭ Пропустить». Пользователь сам решает,
-# указывать ли город и дату рождения; оба шага можно заполнить позже
-# в ⚙️ Настройках. Появлены по требованию пользователя: «если пользователь
-# не хочет указывать город — он не будет указывать, также с датой рождения».
+# ВОЛНА 22.28: дату рождения ПРОПУСТИТЬ БОЛЬШЕ НЕЛЬЗЯ («дату рождения нельзя
+# пропустить») — на шаге ДР остаётся только «❌ Отмена». Город остаётся
+# необязательным («⏭ Пропустить» — get_skip_city_keyboard). Имя функции
+# оставлено старым для совместимости вызовов — текст подсказки обновлён.
 def get_skip_birthday_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⏭ Пропустить", callback_data="skip_birthday")],
         [InlineKeyboardButton("❌ Отмена", callback_data="cancel_action")],
     ])
 
@@ -4204,6 +4210,8 @@ def get_quick_timer_keyboard():
         # ВОЛНА 22.27: «все таймеры должны быть указаны» — список всех
         # напоминаний с управлением (выключить/удалить/изменить).
         [InlineKeyboardButton("📋 Мои напоминания", callback_data="timer_list")],
+        # ВОЛНА 22.28: «в таймере добавь помодоро таймер» — сессии работа/перерыв.
+        [InlineKeyboardButton("🍅 Помодоро", callback_data="pomo_menu")],
         [InlineKeyboardButton("❌ Отмена", callback_data="cancel_action")],
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -7628,13 +7636,7 @@ def _miniapp_verify_init_data(raw):
         secret = hmac.new(b"WebAppData", BOT_TOKEN.encode("utf-8"), hashlib.sha256).digest()
         calc = hmac.new(secret, check_str.encode("utf-8"), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(calc, given.lower()):
-    logger.warning(
-        f"miniapp auth: HMAC mismatch. "
-        f"given={given[:8]}... calc={calc[:8]}... "
-        f"auth_date={dict(pairs).get('auth_date')} "
-        f"token_prefix={BOT_TOKEN[:12]}..."
-    )
-    return None
+            return None
         try:
             auth_date = int(dict(pairs).get("auth_date") or 0)
         except (TypeError, ValueError):
@@ -7741,6 +7743,62 @@ MINIAPP_HTML = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
 <title>DEVO+ Облако</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
+<script>
+/* ===== ВОЛНА 22.28: ФОЛБЭК, ЕСЛИ telegram.org НЕДОСТУПЕН =====
+   Официальный скрипт грузится с telegram.org, который в ряде сетей
+   (особенно школьных/российских) заблокирован. Без него window.Telegram
+   пуст, initData не передаётся — и КАЖДЫЙ запрос к /api/* отвечал 401
+   («нет связи с облаком»), хотя бот работал. Telegram всегда передаёт
+   initData в URL-хэше (tgWebAppData=...) — собираем минимальный WebApp-шим
+   прямо из него. Если официальный скрипт загрузился — ничего не делаем. */
+(function () {
+  try {
+    if (window.Telegram && window.Telegram.WebApp && window.Telegram.WebApp.initData) return;
+    var _h = location.hash || '';
+    function _hashVal(name) {
+      var m = _h.match(new RegExp(name + '=([^&]+)'));
+      if (!m) return '';
+      try { return decodeURIComponent(m[1]); } catch (e) { return m[1]; }
+    }
+    var initData = _hashVal('tgWebAppData');
+    var themeParams = {};
+    try { themeParams = JSON.parse(_hashVal('tgWebAppThemeParams') || '{}') || {}; } catch (e) {}
+    var unsafe = {};
+    try {
+      initData.split('&').forEach(function (p) {
+        var i = p.indexOf('=');
+        if (i > 0) unsafe[p.slice(0, i)] = decodeURIComponent(p.slice(i + 1));
+      });
+      if (unsafe.user) unsafe.user = JSON.parse(unsafe.user);
+    } catch (e) {}
+    function _noop() {}
+    var _hf = { impactOccurred: _noop, notificationOccurred: _noop, selectionChanged: _noop };
+    window.Telegram = window.Telegram || {};
+    window.Telegram.WebApp = {
+      initData: initData,
+      initDataUnsafe: unsafe,
+      version: '6.9', platform: 'unknown',
+      colorScheme: (themeParams.bg_color && /^#([0-9a-f]{6})$/i.test(themeParams.bg_color)
+        ? (parseInt(themeParams.bg_color.slice(1), 16) < 0x800000 ? 'dark' : 'light') : 'light'),
+      themeParams: themeParams,
+      isExpanded: true, viewportStableHeight: window.innerHeight,
+      ready: _noop, expand: _noop, close: _noop,
+      onEvent: _noop, offEvent: _noop,
+      enableClosingConfirmation: _noop, disableClosingConfirmation: _noop,
+      setHeaderColor: _noop, setBackgroundColor: _noop,
+      HapticFeedback: _hf,
+      MainButton: { hide: _noop, show: _noop, setText: _noop, onClick: _noop, offClick: _noop },
+      BackButton: { hide: _noop, show: _noop, onClick: _noop, offClick: _noop },
+      openTelegramLink: function (u) { window.open(u, '_blank'); },
+      openLink: function (u) { window.open(u, '_blank'); },
+      showAlert: function (m) { try { alert(m); } catch (e) {} },
+      showConfirm: function (m, cb) { try { cb(!!confirm(m)); } catch (e) {} },
+      showToast: function (m) { try { console.log(String(m)); } catch (e) {} },
+      sendData: _noop
+    };
+  } catch (e) {}
+})();
+</script>
 <link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;800;900&display=swap" rel="stylesheet">
 <script src="https://unpkg.com/lucide@latest"></script>
 <style>
@@ -8610,6 +8668,15 @@ body.modal-open {
 </div>
 
 <script>
+/* 22.28: безопасная отрисовка иконок — unpkg.com тоже бывает недоступен
+   (школьные сети). Без guard'а вызов lucide падал с ReferenceError
+   ВНУТРИ applyTheme на старте — и весь скрипт приложения умирал:
+   не было ни списка файлов, ни авторизации («мини апп не работает»). */
+function safeIcons() {
+  try {
+    if (window.lucide && typeof lucide.createIcons === 'function') lucide.createIcons();
+  } catch (e) {}
+}
 const tg = window.Telegram?.WebApp;
 if (tg) { tg.ready(); tg.expand(); }
 
@@ -8633,7 +8700,7 @@ function applyTheme(theme) {
   const iconEl = document.getElementById('themeIcon');
   if (iconEl) {
     iconEl.setAttribute('data-lucide', theme === 'custom' ? 'palette' : (isDark ? 'moon' : 'sun'));
-    lucide.createIcons();
+    safeIcons();
   }
 
   document.querySelectorAll('#themeMenu .sound-item-btn').forEach(btn => {
@@ -8876,7 +8943,7 @@ function renderSoundMenu() {
       </button>
     `;
   }).join('');
-  lucide.createIcons();
+  safeIcons();
 }
 
 function toggleSoundMenu(e) {
@@ -9156,7 +9223,7 @@ function renderFiles(files) {
       </div>
     </article>
   `).join('');
-  lucide.createIcons();
+  safeIcons();
 }
 
 function escapeHtml(s) {
@@ -9924,7 +9991,7 @@ if (!IS_TELEGRAM) {
 loadFiles().then(function (ok) {
   if (!ok) setTimeout(function () { loadFiles(true); }, 4000);
 });
-lucide.createIcons();
+safeIcons();
 </script>
 </body>
 </html>
@@ -21661,12 +21728,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return AGE_BLOCKED
 
     # Если инструкция уже прочитана — продолжаем как раньше.
-    # ПОЛИТИКА ПДн 1.2: если ДР осознанно пропущен (birthday_skipped) —
-    # больше НЕ спрашиваем: минимизация данных.
-    if not user.birthday and not getattr(user, "birthday_skipped", False):
+    # ВОЛНА 22.28: ДР ОБЯЗАТЕЛЕН («дату рождения нельзя пропустить») —
+    # просим у ВСЕХ без даты, включая тех, кто раньше нажимал «Пропустить».
+    if not user.birthday:
         await update.message.reply_text(
             "🎂 Пожалуйста, введите вашу реальную дату рождения в формате ГГГГ-ММ-ДД (например, 2005-04-15):\n\n"
-            "Указывать необязательно: нажмите «⏭ Пропустить», если не хотите.",
+            "Дата рождения обязательна: по ней проверяется возраст 13+.\n"
+            "Бот будет напоминать вам о дне рождения и может поздравить вас в классе!",
             reply_markup=get_skip_birthday_keyboard()
         )
         return ENTER_BIRTHDAY
@@ -21689,14 +21757,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ENTER_CITY
     else:
-        # ВОЛНА 22.27: ДР пропущен — порог 13+ проверить нельзя. При каждом
-        # входе предлагаем указать дату (отказ возможен — минимизация данных).
-        if not user.birthday:
-            try:
-                await update.message.reply_text(
-                    _AGE_ASK_TEXT, reply_markup=_AGE_ASK_KB)
-            except Exception:
-                pass
+        # ВОЛНА 22.28: ветка «ДР пропущен» исчезла — дата теперь обязательна
+        # (блок выше отправляет всех без ДР на ввод), здесь остаётся только
+        # обычный путь: pending share → главное меню.
         # ВОЛНА 22.12: pending share-ссылка — сначала выдаём файлы, потом меню.
         _ptok = context.user_data.pop('pending_share_tok', None)
         if _ptok:
@@ -21913,11 +21976,15 @@ async def enter_birthday_handler(update: Update, context: ContextTypes.DEFAULT_T
                 for c in orphan:
                     del codes[c]
                 save_user_codes(codes)
+            # ВОЛНА 22.28: «есть кнопка старт чтобы перезапустить и кнопка
+            # поддержки» — при опечатке в дате можно начать заново одной
+            # кнопкой, либо написать в поддержку.
             await update.message.reply_text(
                 "🚫 Бот не предназначен для детей младше 13 лет.\n\n"
-                "Регистрация не может быть продолжена. Если вы считаете, "
-                "что это ошибка — проверьте введённую дату или напишите "
-                "в «💬 Чат поддержки»."
+                "Регистрация не может быть продолжена. Если вы ошиблись в "
+                "дате — нажмите «🔄 Старт» и начните заново, или напишите "
+                "в «💬 Чат поддержки».",
+                reply_markup=_AGE_RESTART_KB
             )
             return ConversationHandler.END
 
@@ -22435,13 +22502,13 @@ async def instructions_read_handler(update: Update, context: ContextTypes.DEFAUL
     save_user(user)
 
     # Дальше — регистрация как раньше.
-    # ПОЛИТИКА ПДн 1.2: пропущенный ранее ДР (birthday_skipped) повторно не спрашиваем.
-    if not user.birthday and not getattr(user, "birthday_skipped", False):
+    # ВОЛНА 22.28: ДР обязателен — просим у всех без даты рождения.
+    if not user.birthday:
         await query.edit_message_text(
             "👋 Добро пожаловать в DEVORKS+! Давайте настроим ваш профиль.\n\n"
             "🎂 Введите вашу реальную дату рождения в формате ГГГГ-ММ-ДД (например, 2005-04-15):\n\n"
-            "Бот будет напоминать вам о дне рождения и может поздравить вас в классе!\n\n"
-            "Указывать необязательно: нажмите «⏭ Пропустить», если не хотите.",
+            "Дата рождения обязательна: по ней проверяется возраст 13+.\n"
+            "Бот будет напоминать вам о дне рождения и может поздравить вас в классе!",
             reply_markup=get_skip_birthday_keyboard()
         )
         return ENTER_BIRTHDAY
@@ -22942,6 +23009,16 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _age_gate_violation(user):
         await _send_age_block(update, context)
         return AGE_BLOCKED
+    # ВОЛНА 22.28: «дату рождения нельзя пропустить» — у пользователей
+    # без ДР (в т.ч. нажимавших «⏭ Пропустить» раньше) меню не открывается,
+    # пока дата не введена. Ровно та же проверка, что и на /start.
+    if not getattr(user, "birthday", None):
+        await update.message.reply_text(
+            "🎂 Введите вашу реальную дату рождения в формате ГГГГ-ММ-ДД "
+            "(например, 2005-04-15):\n\n"
+            "Дата рождения обязательна: по ней проверяется возраст 13+.",
+            reply_markup=get_skip_birthday_keyboard())
+        return ENTER_BIRTHDAY
     # ВОЛНА 22.13: отметка дневной активности (для DAU/WAU/MAU статистики).
     _touch_activity(user_id)
     message_text = update.message.text
@@ -27842,7 +27919,8 @@ async def dev_block_user_handler(update: Update, context: ContextTypes.DEFAULT_T
 
 
 def _render_block_duration_kb():
-    """ВОЛНА 22.27: «на сколько заблокировать» — разработчик выбирает срок."""
+    """ВОЛНА 22.27/22.28: «на сколько заблокировать» — разработчик выбирает
+    срок кнопкой ИЛИ вписывает свой («2 недели», «полгода») — 22.28."""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("⏱ 2 часа", callback_data="dev_blockdur_h_2")],
         [InlineKeyboardButton("🕐 1 день", callback_data="dev_blockdur_h_24")],
@@ -27850,6 +27928,9 @@ def _render_block_duration_kb():
         [InlineKeyboardButton("📅 7 дней", callback_data="dev_blockdur_h_168")],
         [InlineKeyboardButton("🗓 30 дней", callback_data="dev_blockdur_h_720")],
         [InlineKeyboardButton("♾ Навсегда", callback_data="dev_blockdur_inf")],
+        # 22.28: «разработчик может сам писать, на сколько заблокировать» —
+        # свободный ввод разбирает _parse_duration_to_hours.
+        [InlineKeyboardButton("✍️ Свой срок", callback_data="dev_blockdur_custom")],
         [InlineKeyboardButton("❌ Отмена", callback_data="cancel_action")],
     ])
 
@@ -27904,6 +27985,28 @@ async def dev_block_duration_cb(update: Update, context: ContextTypes.DEFAULT_TY
     if data == "dev_blockdur_inf":
         context.user_data['block_until_hours'] = None
         _dur_label = "навсегда"
+    elif data == "dev_blockdur_custom":
+        # ВОЛНА 22.28: «разработчик может сам писать, на сколько заблокировать».
+        # ВАЖНО: query.answer() уже вызван выше (строка после def) — второй
+        # answer падал бы «Query is already answered» и убивал ветку.
+        _txt = (
+            "✍️ Свой срок блокировки\n\n"
+            "Напишите срок одним сообщением. Понимаю:\n"
+            "• минуты: «45 минут», «90 мин»\n"
+            "• часы: «2 часа», «полчаса», «1.5 часа»\n"
+            "• дни/сутки: «3 дня», «сутки»\n"
+            "• недели: «2 недели»\n"
+            "• месяцы: «2 месяца», «полгода»\n"
+            "• годы: «1 год», «полтора года»\n"
+            "• или «навсегда»"
+        )
+        try:
+            await query.edit_message_text(_txt, reply_markup=get_cancel_keyboard())
+        except Exception:
+            await context.bot.send_message(
+                chat_id=int(query.from_user.id), text=_txt,
+                reply_markup=get_cancel_keyboard())
+        return DEV_BLOCK_CUSTOM
     else:
         try:
             _h = int(data.split("_")[3])
@@ -28013,6 +28116,131 @@ async def dev_block_user_price_handler(update: Update, context: ContextTypes.DEF
     except ValueError:
         await update.message.reply_text("Введите число (цена в звёздах, 0 — бесплатно):")
         return DEV_BLOCK_USER_PRICE
+
+
+# === ВОЛНА 22.28: свой срок блокировки — разработчик вписывает его сам ===
+_BLOCKDUR_MAX_HOURS = 87600  # потолок парсера: 10 лет — дальше не блокируем
+
+_BLOCKDUR_UNITS = (
+    # (регэксп единицы, часов в единице)
+    (r"мин|минут\S*|m|min", 1.0 / 60),
+    (r"ч|час\S*|h|hour\S*", 1.0),
+    (r"д|день|дня|дней|сутки|суток|d|day\S*", 24.0),
+    (r"недел\S*|w|week\S*", 168.0),
+    (r"месяц\S*|mo|month\S*", 720.0),
+    (r"год\S*|лет|г|y|year\S*", 8760.0),
+)
+
+_BLOCKDUR_WORDY = (
+    ("полчаса", 0.5), ("пол-часа", 0.5),
+    ("полдня", 12.0), ("пол-дня", 12.0),
+    ("полтора года", 13140.0), ("пол-тора года", 13140.0),
+    ("полтора часа", 1.5),
+    ("полторы недели", 252.0),
+    ("полгода", 4380.0), ("пол-года", 4380.0),
+    ("сутки", 24.0),
+)
+
+
+def _parse_duration_to_hours(text):
+    """ВОЛНА 22.28: русская длительность → (часы: float, метка: str) или
+    (None, сообщение об ошибке). Особый случай «навсегда» → (None, "навсегда").
+    Понимает «45 минут», «2 часа», «полчаса», «1.5 часа», «3 дня», «сутки»,
+    «2 недели», «2 месяца», «полгода», «1 год», «полтора года», «навсегда»."""
+    s = str(text or "").strip().lower().replace(",", ".")
+    if not s:
+        return None, "Пустой срок. Напишите, например: «2 недели» или «навсегда»."
+    if any(w in s for w in ("навсегда", "бессрочно", "forever", "permanent")):
+        return None, "навсегда"
+    # словесные исключения ДО числового разбора (пол-года раньше цифр)
+    for w, h in _BLOCKDUR_WORDY:
+        if w in s:
+            if h > _BLOCKDUR_MAX_HOURS:
+                return None, "Слишком большой срок (максимум — 10 лет)."
+            return h, _blockdur_hours_label(h)
+    m = re.search(r"(\d+(?:\.\d+)?)\s*([a-zа-яё]+)", s)
+    if not m:
+        return None, ("Не понял срок. Напишите, например: «45 минут», "
+                      "«2 недели», «полгода» или «навсегда».")
+    try:
+        num = float(m.group(1))
+    except ValueError:
+        return None, "Не понял число в сроке. Например: «2 недели»."
+    unit = m.group(2)
+    for pat, k in _BLOCKDUR_UNITS:
+        if re.fullmatch(pat, unit):
+            hours = num * k
+            if hours <= 0:
+                return None, "Срок должен быть больше нуля."
+            if hours > _BLOCKDUR_MAX_HOURS:
+                return None, "Слишком большой срок (максимум — 10 лет)."
+            return hours, _blockdur_hours_label(hours)
+    return None, (f"Не знаю единицу «{unit}». Понимаю минуты, часы, дни/сутки, "
+                  "недели, месяцы, годы — или «навсегда».")
+
+
+def _blockdur_hours_label(hours):
+    """Человекочитаемая метка длительности: «2 нед.», «90 мин», «≈1.5 г.»."""
+    h = float(hours)
+    if h >= 8760:
+        _y = h / 8760
+        if _y == int(_y):
+            return f"{int(_y)} г." if _y > 1 else "1 год"
+        return f"≈{_y:.1f} г."
+    if h >= 720:
+        _m = h / 720
+        if _m == int(_m):
+            return f"{int(_m)} мес."
+        return f"≈{_m:.1f} мес."
+    if h >= 168:
+        _w = h / 168
+        if _w == int(_w):
+            return f"{int(_w)} нед."
+        return f"≈{_w:.1f} нед."
+    if h >= 24:
+        _d = h / 24
+        if _d == int(_d):
+            return f"{int(_d)} дн."
+        return f"≈{_d:.1f} дн."
+    if h >= 1 and h == int(h):
+        return f"{int(h)} ч."
+    if h * 60 == int(h * 60):
+        return f"{int(h * 60)} мин"
+    return f"≈{h:.2f} ч."
+
+
+@timeout(CONVERSATION_TIMEOUT)
+async def dev_block_custom_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.28: разработчик вписал срок свободным текстом. Разбираем и
+    переходим к цене разблокировки (тем же путём, что и кнопки срока)."""
+    user_id = str(update.effective_user.id)
+    if user_id != DEVELOPER_ID:
+        await update.message.reply_text("Доступ запрещён.")
+        return await developer_panel(update, context)
+
+    hours, label = _parse_duration_to_hours(update.message.text)
+    # «навсегда» приходит как (None, "навсегда") — легальный вариант.
+    if hours is None and label != "навсегда":
+        await update.message.reply_text(str(label))
+        return DEV_BLOCK_CUSTOM
+
+    context.user_data['block_until_hours'] = hours
+
+    blocking_user_id = context.user_data.get('blocking_user_id')
+    if not blocking_user_id:
+        await update.message.reply_text("Пользователь не выбран.")
+        return await developer_panel(update, context)
+
+    user = get_user(blocking_user_id)
+    user_name = user.first_name if user else f"User {blocking_user_id}"
+    username_str = f" (@{user.username})" if user and getattr(user, 'username', None) else ""
+
+    await update.message.reply_text(
+        f"🚫 Блокировка пользователя {user_name}{username_str}\n"
+        f"⏳ Срок: {label}\n\n"
+        "Введите цену разблокировки (в звёздах). "
+        "Можно 0 — тогда разблокировка будет бесплатной:")
+    return DEV_BLOCK_USER_PRICE
 
 async def dev_unblock_user_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -31196,32 +31424,380 @@ async def timer_edit_time_save(update: Update, context: ContextTypes.DEFAULT_TYP
     return TIMER_SET_DATE
 
 
-# === ВОЛНА 22.27: возрастной гейт 13+ ===
+# ==================================
+# === ВОЛНА 22.28: ПОМОДОРО-ТАЙМЕР («в таймере добавь помодоро таймер») ===
+# ==================================
+# Сессия = цепочка фаз «работа → короткий перерыв → … → длинный перерыв →
+# 🎉 конец сессии». Хранится в POMODORO_FILE (в канале-БД — переживает
+# рестарт: тикер сам продолжает прерванные фазы). Управление — колбэки
+# pomo_* БЕЗ ConversationHandler: кнопки помодоро не ломают текущий FSM,
+# из handle_callback возвращается None (остаться в текущем состоянии).
+
+_POMO_DEFAULTS = {"work": 25, "brk": 5, "long": 15, "cycles": 4}
+_POMO_CHOICES = {
+    "work":   [15, 20, 25, 30, 45, 50, 60],
+    "brk":    [3, 5, 10, 15],
+    "long":   [10, 15, 20, 30],
+    "cycles": [1, 2, 3, 4, 6, 8],
+}
+
+
+def _pomo_cfg_from_user_data(context):
+    """Настройки помодоро из user_data (или дефолт 25/5/15/4)."""
+    cfg = context.user_data.get('pomo_cfg')
+    if not isinstance(cfg, dict):
+        cfg = {}
+    out = dict(_POMO_DEFAULTS)
+    for k in out:
+        try:
+            v = int(cfg.get(k, out[k]))
+            if v > 0:
+                out[k] = v
+        except (TypeError, ValueError):
+            pass
+    return out
+
+
+def _pomo_load_sessions():
+    return load_data(POMODORO_FILE, {})
+
+
+def _pomo_get_session(uid, sessions=None):
+    sessions = sessions if sessions is not None else _pomo_load_sessions()
+    s = sessions.get(str(uid))
+    return s if isinstance(s, dict) and s.get('is_active') else None
+
+
+def _pomo_phase_kb():
+    """Кнопки под КАЖДЫМ помодоро-уведомлением и в меню активной сессии."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⏭ Пропустить этап", callback_data="pomo_skip"),
+         InlineKeyboardButton("⏹ Остановить", callback_data="pomo_stop")],
+    ])
+
+
+def _pomo_menu_text(sess, cfg, tz=3):
+    if sess:
+        try:
+            _ends = datetime.strptime(str(sess.get('ends')), "%Y-%m-%d %H:%M")
+            # ВАЖНО: ends — в ЛОКАЛЬНОМ времени пользователя, datetime.now() —
+            # в локальном времени СЕРВЕРА (на Render это UTC). Сравниваем
+            # через _utcnow() + сдвиг часового пояса, иначе «осталось» врёт.
+            _now_local = _utcnow() + timedelta(hours=(tz or 3))
+            _left = max(0, int((_ends - _now_local).total_seconds() // 60))
+        except (TypeError, ValueError):
+            _left = None
+        _ph = {'work': '▶️ работа', 'break': '☕️ короткий перерыв',
+               'long': '🛌 длинный перерыв'}.get(sess.get('phase'), sess.get('phase'))
+        _left_line = f" · осталось ≈{_left} мин" if _left is not None else ""
+        return (f"🍅 Помодоро\n\n"
+                f"Сессия ИДЁТ: {_ph}{_left_line}\n"
+                f"🔁 Цикл: {sess.get('cycle_done', 0)}/{sess.get('cycles', 4)}\n"
+                f"⚙️ {sess.get('work')}/{sess.get('brk')}/{sess.get('long')} мин\n\n"
+                "Фазы сменяются сами — бот пришлёт уведомление.")
+    return (f"🍅 Помодоро\n\n"
+            f"Настройка: ▶️ работа {cfg['work']} мин → ☕️ перерыв {cfg['brk']} мин; "
+            f"после {cfg['cycles']} циклов — 🛌 длинный перерыв {cfg['long']} мин.\n\n"
+            "Классическая схема: 25 минут работы, 5 минут перерыва, "
+            "длинный перерыв после 4 циклов.")
+
+
+def _pomo_menu_kb(sess, cfg):
+    rows = []
+    if sess:
+        rows.append([InlineKeyboardButton("⏭ Пропустить этап", callback_data="pomo_skip"),
+                     InlineKeyboardButton("⏹ Остановить", callback_data="pomo_stop")])
+    else:
+        rows.append([InlineKeyboardButton(
+            f"▶️ Старт ({cfg['work']}/{cfg['brk']} · {cfg['cycles']} цикла)",
+            callback_data="pomo_start_def")])
+        rows.append([InlineKeyboardButton("⚙️ Настроить", callback_data="pomo_setup")])
+    rows.append([InlineKeyboardButton("⬅️ Назад к таймерам", callback_data="pomo_back")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def pomo_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """«🍅 Помодоро» в меню таймеров: статус сессии или настройка+старт."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    uid = str(query.from_user.id)
+    cfg = _pomo_cfg_from_user_data(context)
+    sess = _pomo_get_session(uid)
+    _u = get_user(uid)
+    _tz = getattr(_u, 'timezone', 3) if _u else 3
+    _txt = _pomo_menu_text(sess, cfg, tz=_tz)
+    _kb = _pomo_menu_kb(sess, cfg)
+    try:
+        await query.edit_message_text(_txt, reply_markup=_kb)
+    except Exception:
+        await context.bot.send_message(chat_id=int(uid), text=_txt, reply_markup=_kb)
+    return None  # не трогаем текущее состояние FSM
+
+
+def _pomo_setup_kb(cfg):
+    _names = {"work": "▶️ Работа", "brk": "☕️ Перерыв",
+              "long": "🛌 Длинный", "cycles": "🔁 Циклов"}
+    rows = []
+    for key in ("work", "brk", "long", "cycles"):
+        rows.append([InlineKeyboardButton(
+            f"{_names[key]}: {v}{'✅' if int(cfg[key]) == v else ''}",
+            callback_data=f"pomo_{key[0] if key != 'cycles' else 'c'}_{v}")
+            for v in _POMO_CHOICES[key]])
+    rows.append([InlineKeyboardButton("▶️ Старт с этими настройками",
+                                      callback_data="pomo_start_cfg")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="pomo_menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def pomo_setup_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    cfg = _pomo_cfg_from_user_data(context)
+    _txt = ("⚙️ Настройка помодоро\n\nВыберите длительности и число циклов "
+            "(✅ — текущий выбор):")
+    try:
+        await query.edit_message_text(_txt, reply_markup=_pomo_setup_kb(cfg))
+    except Exception:
+        await context.bot.send_message(chat_id=int(query.from_user.id),
+                                       text=_txt, reply_markup=_pomo_setup_kb(cfg))
+    return None
+
+
+async def pomo_pick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выбор длительности: pomo_w_25 / pomo_b_5 / pomo_l_15 / pomo_c_4."""
+    query = update.callback_query
+    await query.answer()
+    try:
+        _kind, _val = query.data.split("_")[1], int(query.data.split("_")[2])
+    except (IndexError, ValueError):
+        return None
+    _kmap = {"w": "work", "b": "brk", "l": "long", "c": "cycles"}
+    key = _kmap.get(_kind)
+    if key is None or _val not in _POMO_CHOICES.get(key, []):
+        return None
+    cfg = _pomo_cfg_from_user_data(context)
+    cfg[key] = _val
+    context.user_data['pomo_cfg'] = cfg
+    _txt = ("⚙️ Настройка помодоро\n\nВыберите длительности и число циклов "
+            "(✅ — текущий выбор):")
+    try:
+        await query.edit_message_text(_txt, reply_markup=_pomo_setup_kb(cfg))
+    except Exception:
+        pass
+    return None
+
+
+async def pomo_start_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Старт помодоро-сессии: одна активная сессия на пользователя."""
+    query = update.callback_query
+    uid = str(query.from_user.id)
+    user = get_user(uid)
+    if not user:
+        user = User(uid)
+    sessions = _pomo_load_sessions()
+    if _pomo_get_session(uid, sessions):
+        # СЕССИЯ УЖЕ ИДЁТ: именно этот answer показит алерт (двойного нет).
+        try:
+            await query.answer("Сессия уже идёт — остановите её кнопкой «⏹».",
+                               show_alert=True)
+        except Exception:
+            pass
+        return None
+    await query.answer()
+    cfg = (_pomo_cfg_from_user_data(context)
+           if query.data == "pomo_start_cfg" else dict(_POMO_DEFAULTS))
+    tz_offset = getattr(user, 'timezone', 3) or 3
+    now_local = _utcnow() + timedelta(hours=tz_offset)
+    sess = {
+        'user_id': uid,
+        'work': int(cfg['work']), 'brk': int(cfg['brk']),
+        'long': int(cfg['long']), 'cycles': int(cfg['cycles']),
+        'cycle_done': 0, 'phase': 'work',
+        'ends': (now_local + timedelta(minutes=int(cfg['work']))
+                 ).strftime("%Y-%m-%d %H:%M"),
+        'is_active': True,
+        'created': now_local.strftime("%Y-%m-%d %H:%M"),
+    }
+    sessions[uid] = sess
+    save_data(POMODORO_FILE, sessions)
+    _txt = (f"🍅 Помодоро запущен!\n\n"
+            f"▶️ Работа: {sess['work']} мин → ☕️ перерыв: {sess['brk']} мин\n"
+            f"🔁 Циклов: {sess['cycles']} · потом 🛌 длинный перерыв {sess['long']} мин\n"
+            f"⏰ Фаза закончится в {sess['ends'][11:]}\n\n"
+            f"Удачной работы! Фазы сменяются сами.")
+    try:
+        await query.edit_message_text(_txt, reply_markup=_pomo_phase_kb())
+    except Exception:
+        await context.bot.send_message(chat_id=int(uid), text=_txt,
+                                       reply_markup=_pomo_phase_kb())
+    return None
+
+
+async def pomo_stop_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """⏹ Полностью остановить помодоро-сессию (из меню или уведомления)."""
+    query = update.callback_query
+    await query.answer()
+    uid = str(query.from_user.id)
+    sessions = _pomo_load_sessions()
+    sess = sessions.get(uid)
+    _kb = None
+    if isinstance(sess, dict) and sess.get('is_active'):
+        sess['is_active'] = False
+        sess['stopped_at'] = datetime.now().strftime("%Y-%m-%d %H:%M")
+        sessions[uid] = sess
+        save_data(POMODORO_FILE, sessions)
+        _n_done = int(sess.get('cycle_done', 0) or 0)
+        _txt = (f"⏹ Помодоро остановлен.\nЗавершено помодоро: {_n_done} из "
+                f"{sess.get('cycles', 4)}.")
+        _kb = InlineKeyboardMarkup([[InlineKeyboardButton(
+            "▶️ Запустить заново", callback_data="pomo_menu")]])
+    else:
+        _txt = "Активной помодоро-сессии нет."
+    try:
+        await query.edit_message_text(_txt, reply_markup=_kb)
+    except Exception:
+        await context.bot.send_message(chat_id=int(uid), text=_txt,
+                                       reply_markup=_kb)
+    return None
+
+
+async def pomo_skip_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """⏭ Досрочно завершить текущую фазу — тикер переключит её в течение 30 с."""
+    query = update.callback_query
+    uid = str(query.from_user.id)
+    sessions = _pomo_load_sessions()
+    sess = _pomo_get_session(uid, sessions)
+    if not sess:
+        try:
+            await query.answer("Активной сессии нет.", show_alert=True)
+        except Exception:
+            pass
+        return None
+    sess['ends'] = datetime.now().strftime("%Y-%m-%d %H:%M")
+    sessions[uid] = sess
+    save_data(POMODORO_FILE, sessions)
+    try:
+        await query.answer("Этап будет закрыт в течение полминуты.")
+    except Exception:
+        pass
+    return None
+
+
+async def _tick_send_pomodoro(bot):
+    """Часть тикера (22.28): закрывает созревшие фазы помодоро и запускает
+    следующие. Переживает рестарт — сессии лежат в POMODORO_FILE."""
+    try:
+        sessions = _pomo_load_sessions()
+    except Exception as e:
+        logger.error(f"tick/pomodoro: load error: {e}")
+        return
+    if not sessions:
+        return
+    now_utc = _utcnow()
+    changed = False
+    for uid, s in list(sessions.items()):
+        try:
+            if not isinstance(s, dict) or not s.get('is_active'):
+                continue
+            try:
+                ends_local = datetime.strptime(str(s.get('ends')), "%Y-%m-%d %H:%M")
+            except (TypeError, ValueError):
+                sessions.pop(uid, None)
+                changed = True
+                continue
+            user = get_user(uid)
+            tz = getattr(user, 'timezone', 3) if user else 3
+            if (now_utc - (ends_local - timedelta(hours=tz))).total_seconds() < 0:
+                continue  # фаза ещё не закончилась
+            phase = s.get('phase')
+            if phase == 'work':
+                s['cycle_done'] = int(s.get('cycle_done', 0) or 0) + 1
+                if s['cycle_done'] >= int(s.get('cycles', 4) or 4):
+                    nxt, dur = 'long', int(s.get('long', 15) or 15)
+                else:
+                    nxt, dur = 'break', int(s.get('brk', 5) or 5)
+            elif phase == 'break':
+                nxt, dur = 'work', int(s.get('work', 25) or 25)
+            elif phase == 'long':
+                # длинный перерыв закончился — сессия завершена
+                sessions.pop(uid, None)
+                changed = True
+                try:
+                    await bot.send_message(
+                        chat_id=int(uid),
+                        text=(f"🎉 Помодоро-сессия завершена! Отличная работа: "
+                              f"{s.get('cycle_done', 0)} помодоро.\n\n"
+                              f"Запустить новую — «⏰ Таймер» → «🍅 Помодоро»."),
+                        reply_markup=InlineKeyboardMarkup([[
+                            InlineKeyboardButton("🍅 Помодоро",
+                                                 callback_data="pomo_menu")]]))
+                except Exception as e:
+                    logger.error(f"tick/pomodoro: завершение {uid}: {e}")
+                continue
+            else:
+                sessions.pop(uid, None)
+                changed = True
+                continue
+            now_local = now_utc + timedelta(hours=tz)
+            s['phase'] = nxt
+            s['ends'] = (now_local + timedelta(minutes=dur)).strftime("%Y-%m-%d %H:%M")
+            sessions[uid] = s
+            changed = True
+            if nxt == 'break':
+                _msg = (f"🍅 Помодоро {s['cycle_done']}/{s.get('cycles', 4)} готов!\n\n"
+                        f"☕️ Перерыв {dur} мин — отойдите от учёбы.")
+            elif nxt == 'long':
+                _msg = (f"🛌 Длинный перерыв {dur} мин — все "
+                        f"{s['cycle_done']}/{s.get('cycles', 4)} помодоро сделаны!")
+            else:
+                _msg = (f"☕️ Перерыв окончен — за работу!\n\n"
+                        f"▶️ Помодоро {s['cycle_done'] + 1}/{s.get('cycles', 4)} "
+                        f"на {dur} мин.")
+            _msg += f"\n⏰ до {s['ends'][11:]}"
+            try:
+                await bot.send_message(chat_id=int(uid), text=_msg,
+                                       reply_markup=_pomo_phase_kb())
+                logger.info(f"tick/pomodoro: {uid} -> {nxt} ({dur} мин)")
+            except Exception as e:
+                logger.error(f"tick/pomodoro: send failed {uid}: {e}")
+        except Exception as e:
+            logger.error(f"tick/pomodoro: error on {uid}: {e}")
+    if changed:
+        try:
+            save_data(POMODORO_FILE, sessions)
+        except Exception as e:
+            logger.error(f"tick/pomodoro: final save failed: {e}")
+
+
+# === ВОЛНА 22.27/22.28: возрастной гейт 13+ ===
+# 22.28: ДР ОБЯЗАТЕЛЕН — экрана «можно продолжить без даты» (_AGE_ASK_*)
+# больше нет; все без ДР направляются на ввод даты. Экран отказа получил
+# кнопки «🔄 Ввести дату заново» (перезапуск) и «💬 Чат поддержки».
 _AGE_BLOCK_TEXT = (
     "🚫 Бот не предназначен для детей младше 13 лет.\n\n"
     "По указанной дате рождения вам меньше 13 — доступ к боту закрыт "
     "(проверяется при каждом входе).\n\n"
-    "Если дата указана неверно — напишите нам, разберёмся."
+    "Если дата указана неверно — нажмите «🔄 Ввести дату заново» и пришлите "
+    "правильную дату (ГГГГ-ММ-ДД), доступ откроется сразу."
 )
 
-# 22.27: для тех, кто ДР ПРОПУСТИЛ: порог проверить нельзя — при каждом
-# входе предлагаем указать дату (отказаться можно, данные минимизируются).
-_AGE_ASK_TEXT = (
-    "🎂 Подтвердите возраст (13+)\n\n"
-    "Вы не указали дату рождения, поэтому возраст проверить нельзя. "
-    "Бот предназначен для пользователей от 13 лет.\n\n"
-    "Указать дату? Это необязательно — можно продолжить без неё."
-)
-_AGE_ASK_KB = InlineKeyboardMarkup([
-    [InlineKeyboardButton("🎂 Указать дату рождения", callback_data="age_set_birthday")],
-    [InlineKeyboardButton("⏭ Продолжить без даты", callback_data="age_continue")],
+_AGE_RESTART_KB = InlineKeyboardMarkup([
+    [InlineKeyboardButton("🔄 Ввести дату заново", callback_data="age_restart")],
+    [InlineKeyboardButton("💬 Чат поддержки", callback_data="open_support_chat")],
 ])
 
 
 async def _send_age_block(update, context):
-    """Единый текст возрастного отказа + путь в поддержку (если ошибка)."""
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("💬 Чат поддержки", callback_data="open_support_chat")]])
+    """Единый текст возрастного отказа + кнопки: перезапуск (исправить дату)
+    и поддержка (если ошибка). Требование 22.28: «кнопка старт чтобы
+    перезапустить и кнопка поддержки»."""
+    kb = _AGE_RESTART_KB
     if hasattr(update, 'message') and update.message:
         await update.message.reply_text(_AGE_BLOCK_TEXT, reply_markup=kb)
     elif hasattr(update, 'callback_query') and update.callback_query:
@@ -31239,9 +31815,97 @@ async def _send_age_block(update, context):
 
 
 async def age_blocked_echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Любое сообщение из «закрытого» состояния — снова честный отказ."""
+    """Любое сообщение из «закрытого» состояния.
+
+    ВОЛНА 22.28: если пользователь прислал ДАТУ (ГГГГ-ММ-ДД) — это попытка
+    исправить ошибочный ДР: 13+ → дата сохраняется, гейт снимается, бот
+    открывается; снова <13 → отказ остаётся. Остальной текст — прежний
+    честный отказ (кнопки перезапуска и поддержки остаются доступными)."""
+    _txt = (update.message.text or "").strip() if update.message else ""
+    # 22.28: строго ГГГГ-ММ-ДД и разумный год — случайный текст вида
+    # «0101-01-01» не должен становиться датой рождения.
+    _age = (_user_age_years(_txt)
+            if (re.fullmatch(r"\d{4}-\d{2}-\d{2}", _txt)
+                and _txt[:4] >= "1900") else None)
+    if _age is not None:
+        uid = str(update.effective_user.id)
+        user = get_user(uid)
+        if _age < 13:
+            await update.message.reply_text(
+                "🚫 По этой дате всё ещё меньше 13 — доступ закрыт.\n\n"
+                "Если дата неверна, пришлите правильную (ГГГГ-ММ-ДД) или "
+                "нажмите «💬 Чат поддержки».",
+                reply_markup=_AGE_RESTART_KB)
+            return AGE_BLOCKED
+        if user is not None:
+            user.birthday = _txt[:10]
+            save_user(user)
+        else:
+            # записи нет (удалена при регистрации) — создаём заготовку и
+            # ведём по ОБЫЧНОМУ пути регистрации (дисклеймер → ПДн → город),
+            # сразу в меню с готовой датой не пускаем: согласие обязательны.
+            user = User(uid, update.effective_user.username,
+                        update.effective_user.first_name)
+            user.user_code = generate_user_code()
+            save_user_code(user.user_code, uid)
+            user.birthday = _txt[:10]
+            save_user(user)
+            await update.message.reply_text(
+                f"✅ Дата рождения принята: {_txt[:10]}. Продолжим настройку!")
+            await show_disclaimer(update, context)
+            return SHOW_INSTRUCTIONS
+        await update.message.reply_text(
+            f"✅ Дата рождения обновлена: {_txt[:10]}. Доступ открыт!")
+        return await show_main_menu(update, context, user)
     await _send_age_block(update, context)
     return AGE_BLOCKED
+
+
+async def age_restart_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.28: кнопка «🔄 Старт/Ввести дату заново» на экране 13+.
+
+    • Есть профиль → просим прислать правильную дату (state AGE_BLOCKED
+      разбирает её в age_blocked_echo: 13+ открывает бота, <13 — отказ).
+    • Профиля нет (в регистрации дата <13, запись удалена по политике ПДн)
+      → перезапускаем регистрацию с чистого листа, как /start: инструкция →
+      ввод даты (обязательно) → дальше по обычному пути."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    uid = str(query.from_user.id)
+    user = get_user(uid)
+    if user is not None:
+        try:
+            await query.edit_message_text(
+                "🔄 Введите вашу реальную дату рождения заново — одним "
+                "сообщением в формате ГГГГ-ММ-ДД (например, 2005-04-15).\n\n"
+                "Если по новой дате вам 13+, доступ откроется сразу.")
+        except Exception:
+            await context.bot.send_message(
+                chat_id=int(uid),
+                text=("🔄 Введите вашу реальную дату рождения заново — одним "
+                      "сообщением в формате ГГГГ-ММ-ДД (например, 2005-04-15).\n\n"
+                      "Если по новой дате вам 13+, доступ откроется сразу."))
+        return AGE_BLOCKED
+    # профиля нет — перезапуск регистрации (эквивалент /start для удалённой записи)
+    user = User(uid, query.from_user.username, query.from_user.first_name)
+    user.user_code = generate_user_code()
+    save_user_code(user.user_code, uid)
+    save_user(user)
+    try:
+        await notify_developer_about_new_user(context, user)
+    except Exception as e:
+        logger.error(f"age_restart: notify_developer: {e}")
+    try:
+        await query.edit_message_text(
+            "🔄 Начинаем заново! Прочитайте инструкцию — дальше вернёмся "
+            "к дате рождения.")
+    except Exception:
+        pass
+    await show_instructions(update, context)
+    return SHOW_INSTRUCTIONS
 
 
 def _age_gate_violation(user):
@@ -31503,22 +32167,32 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "dev_adminlog":
         return await dev_adminlog_cb(update, context)
     elif data == "age_set_birthday":
-        # Пропустивший ДР пользователь решил указать дату (порог 13+).
+        # ВОЛНА 22.28: ДР обязателен — текст без «необязательно».
         await update.callback_query.answer()
         await context.bot.send_message(
             chat_id=update.effective_user.id,
             text=("🎂 Введите вашу реальную дату рождения в формате "
                   "ГГГГ-ММ-ДД (например, 2005-04-15):\n\n"
-                  "Указывать необязательно: нажмите «⏭ Пропустить», если "
-                  "не хотите."),
+                  "Дата рождения обязательна: по ней проверяется возраст 13+."),
             reply_markup=get_skip_birthday_keyboard())
         return ENTER_BIRTHDAY
+    elif data == "age_restart":
+        # ВОЛНА 22.28: «🔄 Старт» на экране 13+ — исправить дату или
+        # перезапустить регистрацию (если записи нет).
+        return await age_restart_cb(update, context)
     elif data == "age_continue":
+        # ВОЛНА 22.28: кнопки «Продолжить без даты» больше нет — дата
+        # обязательна. Если колбэк пришёл из старого сообщения — честно
+        # отправляем вводить дату, а не в меню.
         await update.callback_query.answer()
-        user = get_user(str(update.effective_user.id))
-        if user is not None:
-            await show_main_menu(update, context, user)
-        return MAIN_MENU
+        await context.bot.send_message(
+            chat_id=update.effective_user.id,
+            text=("🎂 Продолжить без даты рождения нельзя — она обязательна "
+                  "(по ней проверяется возраст 13+).\n\n"
+                  "Введите вашу реальную дату рождения в формате ГГГГ-ММ-ДД "
+                  "(например, 2005-04-15):"),
+            reply_markup=get_skip_birthday_keyboard())
+        return ENTER_BIRTHDAY
 
     if data.startswith("quick_timer_"):
         return await quick_timer_handler(update, context)
@@ -31556,6 +32230,24 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=get_quick_timer_keyboard(),
             )
         return TIMER_SET_DATE
+
+    # === ВОЛНА 22.28: ПОМОДОРО (pomo_*) — без смены FSM-состояния ===
+    # None = остаться в текущем состоянии: кнопки помодоро не должны
+    # выкидывать пользователя из флоу, в котором он находился.
+    if data == "pomo_menu":
+        return await pomo_menu_cb(update, context)
+    elif data == "pomo_setup":
+        return await pomo_setup_cb(update, context)
+    elif data.startswith(("pomo_w_", "pomo_b_", "pomo_l_", "pomo_c_")):
+        return await pomo_pick_cb(update, context)
+    elif data in ("pomo_start_def", "pomo_start_cfg"):
+        return await pomo_start_cb(update, context)
+    elif data == "pomo_stop":
+        return await pomo_stop_cb(update, context)
+    elif data == "pomo_skip":
+        return await pomo_skip_cb(update, context)
+    elif data == "pomo_back":
+        return await timer_back_cb(update, context)
 
     if data == "change_time":
         return await change_time_start(update, context)
@@ -33416,12 +34108,10 @@ async def enter_city_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def skip_birthday_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """ПОЛИТИКА ПДн 1.2 (минимизация данных): «⏭ Пропустить» на шаге ДР.
-
-    Пользователь не обязан указывать дату рождения: тогда напоминания и
-    поздравления с ДР просто не работают, а гейт /start больше не спрашивает
-    ДР (ставится флаг birthday_skipped). Регистрация продолжается обычным
-    путём — с экрана условий."""
+    """ВОЛНА 22.28: «⏭ Пропустить» на шаге ДР УДАЛЕНА — дата рождения
+    обязательна (порог 13+ проверяется по ней). Кнопки больше нет; если
+    колбэк пришёл из старого сообщения — честно просим ввести дату.
+    Раньше здесь ставился флаг birthday_skipped — теперь не ставится."""
     query = update.callback_query
     try:
         await query.answer()
@@ -33432,8 +34122,13 @@ async def skip_birthday_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Профиль не найден. Начните с /start")
         return ConversationHandler.END
     if not user.birthday:
-        user.birthday_skipped = True
-        save_user(user)
+        await query.edit_message_text(
+            "🎂 Пропустить дату рождения больше нельзя — она обязательна "
+            "(по ней проверяется возраст 13+).\n\n"
+            "Введите вашу реальную дату рождения в формате ГГГГ-ММ-ДД "
+            "(например, 2005-04-15):",
+            reply_markup=get_skip_birthday_keyboard())
+        return ENTER_BIRTHDAY
     await show_disclaimer(update, context)
     return SHOW_INSTRUCTIONS
 
@@ -36886,6 +37581,13 @@ async def _unified_notification_tick_locked(context):
         logger.error(f"unified_tick: timers crashed: {e}")
         await _notify_dev_error(bot, "Тикер: блок таймеров", e)
 
+    # 1+) ВОЛНА 22.28: помодоро-сессии (работа/перерыв/длинный перерыв).
+    try:
+        await _tick_send_pomodoro(bot)
+    except Exception as e:
+        logger.error(f"unified_tick: pomodoro crashed: {e}")
+        await _notify_dev_error(bot, "Тикер: блок помодоро", e)
+
     # 1-минус) ВОЛНА 20: фоновый догрев MTProto (не блокирует тик — задача
     # в фоне; если клиент уже поднят или Telethon нет — мгновенный выход).
     try:
@@ -38301,6 +39003,12 @@ def main():
             ],
             # ВОЛНА 22.27: выбор срока блокировки (только inline-кнопки).
             DEV_BLOCK_DURATION: [
+                CallbackQueryHandler(handle_callback),
+            ],
+            # ВОЛНА 22.28: свой срок блокировки — разработчик вписывает сам
+            # («2 недели», «полгода», «45 минут»…) — _parse_duration_to_hours.
+            DEV_BLOCK_CUSTOM: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, dev_block_custom_handler),
                 CallbackQueryHandler(handle_callback),
             ],
             # ВОЛНА 22.27: правка напоминаний из «📋 Мои напоминания».
