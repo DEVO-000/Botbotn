@@ -735,6 +735,11 @@ body.modal-open {
         <i data-lucide="cloud" style="width:18px;height:18px"></i>
       </button>
 
+      <!-- 22.29: мультивыбор файлов (галочки + «В ZIP»/«Распаковать»/«Удалить») -->
+      <button class="action-btn" id="selectModeBtn" onclick="toggleSelectMode()" title="Выбрать файлы">
+        <i data-lucide="check-square" style="width:18px;height:18px"></i>
+      </button>
+
       <button class="action-btn" id="themeToggleBtn" onclick="toggleThemeMenu(event)" title="Тема оформления">
         <i id="themeIcon" data-lucide="sun" style="width:18px;height:18px"></i>
       </button>
@@ -1238,8 +1243,13 @@ function handleSoundSelect(e, id) {
    чанками и уходит в канал КАК ДОКУМЕНТ — без сжатия, оригинал байт-в-байт. */
 const IS_TELEGRAM = !!(tg && tg.initData);
 
+/* 22.29: ВЕБ-СЕССИЯ — токен входа по Telegram ID + паролю (обычный браузер).
+   Хранится в localStorage; при IS_TELEGRAM остаётся старый путь initData. */
+var WEB_TOKEN = localStorage.getItem('devo_web_token') || '';
+
 function authHeaders(extra) {
   const h = Object.assign({ 'Cache-Control': 'no-store' }, extra || {});
+  if (WEB_TOKEN) h['Authorization'] = 'Bearer ' + WEB_TOKEN;
   if (IS_TELEGRAM && tg.initData) h['X-Telegram-Init-Data'] = tg.initData;
   return h;
 }
@@ -1252,6 +1262,9 @@ async function apiJson(url, options) {
     const err = new Error(data.message || ('HTTP ' + r.status));
     err.code = String(data.error || '');  // 22.24: код (unauthorized/not_registered/…)
     err.bot = String(data.bot || '');     // 22.24: @username бота для кнопки «Открыть чат бота»
+    // 22.29: сессия истекла/битый токен — предлагаем войти по паролю заново.
+    // В Telegram остаётся прежняя карточка (initData-вход не через токен).
+    if (r.status === 401 && !IS_TELEGRAM) openLoginModal();
     throw err;
   }
   return data;
@@ -1289,6 +1302,149 @@ function openBotChat() {
     if (tg && tg.openTelegramLink) tg.openTelegramLink(url);
     else window.open(url, '_blank');
   } catch (e) { window.open(url, '_blank'); }
+}
+
+/* ===== 22.29: ВХОД ПО TELEGRAM ID + ВЕБ-ПАРОЛЮ (обычный браузер) =====
+   Старый вход через Telegram НЕ ТРОНУТ: когда initData доходит — он
+   работает как раньше. Это ДОПОЛНИТЕЛЬНЫЙ путь для VPN/школьных сетей,
+   где telegram.org недоступен. Никакой панели разработчика тут нет. */
+function openLoginModal() {
+  const m = document.getElementById('loginModal');
+  if (!m) return;
+  m.classList.add('open');
+  document.body.classList.add('modal-open');
+}
+
+function closeLoginModal(e) {
+  if (e) e.stopPropagation();
+  const m = document.getElementById('loginModal');
+  if (m) m.classList.remove('open');
+  document.body.classList.remove('modal-open');
+}
+
+async function webLogin() {
+  const uid = (document.getElementById('loginUserId')?.value || '').trim();
+  const pw = document.getElementById('loginPassword')?.value || '';
+  if (!uid || !pw) { showToast('Введите ID и пароль'); return; }
+  const btn = document.getElementById('loginSubmitBtn');
+  if (btn) btn.disabled = true;
+  try {
+    const r = await fetch('/api/web_login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
+      body: JSON.stringify({ user_id: uid, password: pw })
+    });
+    let data = {};
+    try { data = await r.json(); } catch (e) {}
+    if (r.ok && data.token) {
+      WEB_TOKEN = String(data.token);
+      localStorage.setItem('devo_web_token', WEB_TOKEN);
+      document.getElementById('loginPassword').value = '';
+      closeLoginModal();
+      showToast('Вход выполнен');
+      loadFiles();
+    } else {
+      showToast(data.message || ('Не удалось войти (HTTP ' + r.status + ')'));
+    }
+  } catch (e) {
+    showToast('Нет связи с сервером. Сервис мог просыпаться — попробуйте через минуту.');
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+/* ===== 22.29: МУЛЬТИВЫБОР ФАЙЛОВ (галочки + ZIP/распаковать/удалить) ===== */
+let selectMode = false;
+let selectedIds = new Set();
+
+function toggleSelectMode() {
+  selectMode = !selectMode;
+  if (!selectMode) selectedIds.clear();
+  const bar = document.getElementById('selectionBar');
+  if (bar) bar.style.display = selectMode ? '' : 'none';
+  updateSelCount();
+  renderAll();
+}
+
+function updateSelCount() {
+  const el = document.getElementById('selCount');
+  if (el) el.textContent = 'Выбрано: ' + selectedIds.size;
+  const unzipBtn = document.getElementById('unzipBtn');
+  if (unzipBtn) {
+    const only = (selectedIds.size === 1);
+    const f = only ? ALL_FILES.find(x => x.id === [...selectedIds][0]) : null;
+    unzipBtn.style.display = (f && /\.zip$/i.test(f.name || '')) ? '' : 'none';
+  }
+}
+
+function toggleFileSelection(e, id) {
+  if (e) e.stopPropagation();
+  if (selectedIds.has(id)) selectedIds.delete(id);
+  else selectedIds.add(id);
+  updateSelCount();
+  renderFiles(applyFilters());
+}
+
+async function zipSelected() {
+  if (!selectedIds.size) { showToast('Сначала выберите файлы'); return; }
+  showToast('📦 Собираю архив…');
+  try {
+    const data = await apiJson('/api/files/zip_selected', {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ ids: [...selectedIds] })
+    });
+    if (data.file) {
+      ALL_FILES.unshift({
+        id: data.file.id, name: data.file.name, kind: data.file.kind,
+        size: +data.file.size || 0, ts: data.file.ts || '', vault: !!data.file.vault
+      });
+      renderAll();
+      showToast('✅ Архив создан: ' + data.file.name);
+    }
+  } catch (e) { showToast(cloudErrText(e)); }
+}
+
+async function unzipSelected() {
+  if (selectedIds.size !== 1) { showToast('Выберите ОДИН ZIP-архив'); return; }
+  const id = [...selectedIds][0];
+  const f = ALL_FILES.find(x => x.id === id);
+  if (!f || !/\.zip$/i.test(f.name || '')) { showToast('Это не ZIP-архив'); return; }
+  showToast('🗂 Распаковываю…');
+  try {
+    const data = await apiJson('/api/files/unzip', {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ id: id })
+    });
+    (data.files || []).forEach(rec => {
+      ALL_FILES.unshift({
+        id: rec.id, name: rec.name, kind: rec.kind,
+        size: +rec.size || 0, ts: rec.ts || '', vault: !!rec.vault
+      });
+    });
+    renderAll();
+    showToast('✅ Файлов получено: ' + (data.files || []).length +
+      (data.skipped ? ' · пропущено: ' + data.skipped : ''));
+  } catch (e) { showToast(cloudErrText(e)); }
+}
+
+async function deleteSelected() {
+  if (!selectedIds.size) { showToast('Сначала выберите файлы'); return; }
+  const ids = [...selectedIds];
+  showToast('🗑 Удаляю ' + ids.length + '…');
+  let ok = 0;
+  for (const id of ids) {
+    try {
+      await apiJson('/api/files/' + encodeURIComponent(id), { method: 'DELETE' });
+      ALL_FILES = ALL_FILES.filter(x => x.id !== id);
+      ok++;
+    } catch (e) { /* не смогли — остаётся в списке */ }
+  }
+  selectedIds.clear();
+  updateSelCount();
+  renderAll();
+  showToast(ok === ids.length ? '✅ Удалено: ' + ok : 'Удалено ' + ok + ' из ' + ids.length);
 }
 
 let ALL_FILES = [];
@@ -1465,8 +1621,18 @@ function renderFiles(files) {
   }
 
   empty.style.display = 'none';
-  list.innerHTML = files.map(f => `
-    <article class="file-card animate-fade-in" style="display:flex;align-items:center;gap:12px" onclick="openEditModal('${f.id}')">
+  list.innerHTML = files.map(f => {
+    const sel = selectMode && selectedIds.has(f.id);
+    const cardAction = selectMode
+      ? `toggleFileSelection(event,'${f.id}')`
+      : `openEditModal('${f.id}')`;
+    const checkHtml = selectMode ? `
+      <div onclick="toggleFileSelection(event,'${f.id}')" style="flex-shrink:0;width:24px;height:24px;border-radius:8px;display:flex;align-items:center;justify-content:center;border:2px solid ${sel ? 'var(--btn-text)' : 'var(--border-color)'};background:${sel ? 'var(--btn-text)' : 'transparent'};transition:all .15s">
+        ${sel ? '<i data-lucide="check" style="width:14px;height:14px;stroke:var(--card-bg)"></i>' : ''}
+      </div>` : '';
+    return `
+    <article class="file-card animate-fade-in" style="display:flex;align-items:center;gap:12px;${sel ? 'outline:2px solid var(--btn-text);outline-offset:-2px' : ''}" onclick="${cardAction}">
+      ${checkHtml}
       <div class="icon-wrap" style="flex-shrink:0">
         <i data-lucide="${f.vault ? 'lock' : iconFor(f.kind)}" style="width:20px;height:20px"></i>
       </div>
@@ -1484,7 +1650,8 @@ function renderFiles(files) {
         </button>
       </div>
     </article>
-  `).join('');
+  `;
+  }).join('');
   safeIcons();
 }
 
@@ -2240,20 +2407,72 @@ renderSoundMenu();
 setSort('date-desc');
 renderAll();
 
-/* 22.21: РЕАЛЬНАЯ БАЗА — тянем файлы с сервера бота (тот же список, что в
-   чате). Вне Telegram API честно откажет: подсказываем, как открыть. */
+/* 22.29: СТАРТ. В Telegram — как раньше: initData → loadFiles (22.26 тихий
+   ретрай, если сервер Render просыпается). Вне Telegram: есть веб-токен —
+   проверяем GET /api/web_me (200 → грузим файлы; 401 → стираем токен и
+   открываем вход); токена нет — сразу окно входа по ID + паролю. */
 if (!IS_TELEGRAM) {
-  const et = document.getElementById('emptyTitle');
-  const es = document.getElementById('emptySub');
-  if (et) et.textContent = 'Откройте через Telegram';
-  if (es) es.textContent = 'Бот DEVORKS+ → кнопка меню «☁️ DEVO+» (или ☁️ Облако → 🌐 Веб-облако)';
+  if (WEB_TOKEN) {
+    fetch('/api/web_me', { headers: authHeaders() }).then(function (r) {
+      if (r.ok) {
+        loadFiles();
+      } else {
+        localStorage.removeItem('devo_web_token');
+        WEB_TOKEN = '';
+        openLoginModal();
+      }
+    }).catch(function () { openLoginModal(); });
+  } else {
+    openLoginModal();
+  }
+} else {
+  loadFiles().then(function (ok) {
+    if (!ok) setTimeout(function () { loadFiles(true); }, 4000);
+  });
 }
-/* 22.26: первый вход — сервер Render может просыпаться (до ~30 секунд):
-   одна тихая повторная попытка через 4 секунды, честный текст остаётся. */
-loadFiles().then(function (ok) {
-  if (!ok) setTimeout(function () { loadFiles(true); }, 4000);
-});
 safeIcons();
 </script>
+
+<!-- 22.29: панель действий мультивыбора (видна в режиме выбора) -->
+<div id="selectionBar" style="display:none;position:fixed;left:0;right:0;bottom:0;z-index:60;padding:10px 14px calc(10px + env(safe-area-inset-bottom));background:var(--card-bg);border-top:1px solid var(--border-color);box-shadow:0 -8px 24px rgba(0,0,0,.12)">
+  <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+    <span id="selCount" style="font-weight:800;font-size:13px">Выбрано: 0</span>
+    <span style="flex:1"></span>
+    <button class="sound-item-btn" onclick="zipSelected()" style="padding:8px 10px"><span>📦 В ZIP</span></button>
+    <button class="sound-item-btn" id="unzipBtn" onclick="unzipSelected()" style="padding:8px 10px;display:none"><span>🗂 Распаковать</span></button>
+    <button class="sound-item-btn" onclick="deleteSelected()" style="padding:8px 10px;color:#ef4444"><span>🗑 Удалить</span></button>
+    <button class="sound-item-btn" onclick="toggleSelectMode()" style="padding:8px 10px;background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)"><span>Готово</span></button>
+  </div>
+</div>
+
+<!-- 22.29: вход по Telegram ID + веб-паролю — обычный браузер, без Telegram
+     (для тех, у кого VPN/школьная сеть не пускает telegram.org и initData
+     не доходит). Пароль задаётся в чате бота: ☁️ Облако → «🔑 Веб-пароль». -->
+<div id="loginModal" class="modal-overlay">
+  <div class="modal-card" onclick="event.stopPropagation()">
+    <div class="sheet-handle-area">
+      <div class="sheet-handle"></div>
+    </div>
+    <h3 style="font-weight:900;font-size:20px;margin-bottom:4px">Вход в DEVO+ Облако</h3>
+    <p style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:14px">Открыто вне Telegram, войдите по ID и паролю, заданному в боте</p>
+
+    <div style="margin-bottom:12px">
+      <label for="loginUserId" style="font-size:11px;font-weight:800;color:var(--subtext-color);text-transform:uppercase;letter-spacing:0.04em">Telegram ID</label>
+      <input type="text" id="loginUserId" inputmode="numeric" autocomplete="username" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;margin-top:4px;outline:none;font-size:15px" placeholder="Например: 123456789">
+    </div>
+    <div style="margin-bottom:14px">
+      <label for="loginPassword" style="font-size:11px;font-weight:800;color:var(--subtext-color);text-transform:uppercase;letter-spacing:0.04em">Пароль</label>
+      <input type="password" id="loginPassword" autocomplete="current-password" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;margin-top:4px;outline:none;font-size:15px" placeholder="Веб-пароль из бота">
+    </div>
+
+    <div style="display:flex;flex-direction:column;gap:8px">
+      <button class="sound-item-btn" id="loginSubmitBtn" onclick="webLogin()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
+        <span>Войти</span> <i data-lucide="log-in" style="width:18px;height:18px"></i>
+      </button>
+    </div>
+
+    <p style="font-size:11px;font-weight:600;color:var(--subtext-color);margin-top:12px;line-height:1.5">Пароль задаётся в боте через ☁️ Облако → «🔑 Веб-пароль». Логин — ваш Telegram ID (бот показывает его при создании пароля). 5 неверных попыток — пауза 10 минут.</p>
+  </div>
+</div>
 </body>
 </html>
