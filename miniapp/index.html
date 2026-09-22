@@ -5,6 +5,62 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
 <title>DEVO+ Облако</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
+<script>
+/* ===== ВОЛНА 22.28: ФОЛБЭК, ЕСЛИ telegram.org НЕДОСТУПЕН =====
+   Официальный скрипт грузится с telegram.org, который в ряде сетей
+   (особенно школьных/российских) заблокирован. Без него window.Telegram
+   пуст, initData не передаётся — и КАЖДЫЙ запрос к /api/* отвечал 401
+   («нет связи с облаком»), хотя бот работал. Telegram всегда передаёт
+   initData в URL-хэше (tgWebAppData=...) — собираем минимальный WebApp-шим
+   прямо из него. Если официальный скрипт загрузился — ничего не делаем. */
+(function () {
+  try {
+    if (window.Telegram && window.Telegram.WebApp && window.Telegram.WebApp.initData) return;
+    var _h = location.hash || '';
+    function _hashVal(name) {
+      var m = _h.match(new RegExp(name + '=([^&]+)'));
+      if (!m) return '';
+      try { return decodeURIComponent(m[1]); } catch (e) { return m[1]; }
+    }
+    var initData = _hashVal('tgWebAppData');
+    var themeParams = {};
+    try { themeParams = JSON.parse(_hashVal('tgWebAppThemeParams') || '{}') || {}; } catch (e) {}
+    var unsafe = {};
+    try {
+      initData.split('&').forEach(function (p) {
+        var i = p.indexOf('=');
+        if (i > 0) unsafe[p.slice(0, i)] = decodeURIComponent(p.slice(i + 1));
+      });
+      if (unsafe.user) unsafe.user = JSON.parse(unsafe.user);
+    } catch (e) {}
+    function _noop() {}
+    var _hf = { impactOccurred: _noop, notificationOccurred: _noop, selectionChanged: _noop };
+    window.Telegram = window.Telegram || {};
+    window.Telegram.WebApp = {
+      initData: initData,
+      initDataUnsafe: unsafe,
+      version: '6.9', platform: 'unknown',
+      colorScheme: (themeParams.bg_color && /^#([0-9a-f]{6})$/i.test(themeParams.bg_color)
+        ? (parseInt(themeParams.bg_color.slice(1), 16) < 0x800000 ? 'dark' : 'light') : 'light'),
+      themeParams: themeParams,
+      isExpanded: true, viewportStableHeight: window.innerHeight,
+      ready: _noop, expand: _noop, close: _noop,
+      onEvent: _noop, offEvent: _noop,
+      enableClosingConfirmation: _noop, disableClosingConfirmation: _noop,
+      setHeaderColor: _noop, setBackgroundColor: _noop,
+      HapticFeedback: _hf,
+      MainButton: { hide: _noop, show: _noop, setText: _noop, onClick: _noop, offClick: _noop },
+      BackButton: { hide: _noop, show: _noop, onClick: _noop, offClick: _noop },
+      openTelegramLink: function (u) { window.open(u, '_blank'); },
+      openLink: function (u) { window.open(u, '_blank'); },
+      showAlert: function (m) { try { alert(m); } catch (e) {} },
+      showConfirm: function (m, cb) { try { cb(!!confirm(m)); } catch (e) {} },
+      showToast: function (m) { try { console.log(String(m)); } catch (e) {} },
+      sendData: _noop
+    };
+  } catch (e) {}
+})();
+</script>
 <link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;800;900&display=swap" rel="stylesheet">
 <script src="https://unpkg.com/lucide@latest"></script>
 <style>
@@ -874,6 +930,15 @@ body.modal-open {
 </div>
 
 <script>
+/* 22.28: безопасная отрисовка иконок — unpkg.com тоже бывает недоступен
+   (школьные сети). Без guard'а вызов lucide падал с ReferenceError
+   ВНУТРИ applyTheme на старте — и весь скрипт приложения умирал:
+   не было ни списка файлов, ни авторизации («мини апп не работает»). */
+function safeIcons() {
+  try {
+    if (window.lucide && typeof lucide.createIcons === 'function') lucide.createIcons();
+  } catch (e) {}
+}
 const tg = window.Telegram?.WebApp;
 if (tg) { tg.ready(); tg.expand(); }
 
@@ -897,7 +962,7 @@ function applyTheme(theme) {
   const iconEl = document.getElementById('themeIcon');
   if (iconEl) {
     iconEl.setAttribute('data-lucide', theme === 'custom' ? 'palette' : (isDark ? 'moon' : 'sun'));
-    lucide.createIcons();
+    safeIcons();
   }
 
   document.querySelectorAll('#themeMenu .sound-item-btn').forEach(btn => {
@@ -1140,7 +1205,7 @@ function renderSoundMenu() {
       </button>
     `;
   }).join('');
-  lucide.createIcons();
+  safeIcons();
 }
 
 function toggleSoundMenu(e) {
@@ -1420,7 +1485,7 @@ function renderFiles(files) {
       </div>
     </article>
   `).join('');
-  lucide.createIcons();
+  safeIcons();
 }
 
 function escapeHtml(s) {
@@ -2188,7 +2253,7 @@ if (!IS_TELEGRAM) {
 loadFiles().then(function (ok) {
   if (!ok) setTimeout(function () { loadFiles(true); }, 4000);
 });
-lucide.createIcons();
+safeIcons();
 </script>
 </body>
 </html>
