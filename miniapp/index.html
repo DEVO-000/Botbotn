@@ -564,8 +564,13 @@ body.modal-open {
       <button class="sound-item-btn" onclick="saveFileName()">
         <span>Сохранить имя</span> <i data-lucide="check" style="width:18px;height:18px"></i>
       </button>
-      <button class="sound-item-btn" id="modalVaultBtn" onclick="toggleFileVault()">
-        <span id="modalVaultText">Защитить в Vault</span> <i data-lucide="lock" style="width:18px;height:18px"></i>
+      <!-- 22.30: НАСТОЯЩИЙ Сейф — перенос туда-обратно вместо косметической галочки.
+           Для файла в Сейфе показываем «Достать из Сейфа», для обычного — «В Сейф». -->
+      <button class="sound-item-btn" id="modalToSafeBtn" onclick="toSafeCurrentFile()">
+        <span>🔐 Переместить в Сейф</span> <i data-lucide="lock" style="width:18px;height:18px"></i>
+      </button>
+      <button class="sound-item-btn" id="modalFromSafeBtn" onclick="fromSafeCurrentFile()" style="display:none">
+        <span>🔓 Достать из Сейфа</span> <i data-lucide="lock-open" style="width:18px;height:18px"></i>
       </button>
       <button class="sound-item-btn" onclick="downloadCurrentFile()">
         <span>Скачать файл</span> <i data-lucide="download" style="width:18px;height:18px"></i>
@@ -574,6 +579,35 @@ body.modal-open {
         <span>Удалить файл</span> <i data-lucide="trash-2" style="width:18px;height:18px;stroke:#ef4444"></i>
       </button>
     </div>
+  </div>
+</div>
+
+<!-- 22.30: модальное окно Сейфа (разблокировка паролем) -->
+<div id="safeModal" class="modal-overlay" onclick="closeSafeModal(event)">
+  <div class="modal-card" onclick="event.stopPropagation()">
+    <div class="sheet-handle-area">
+      <div class="sheet-handle"></div>
+    </div>
+    <h3 style="font-weight:900;font-size:20px;margin-bottom:4px">🔒 Сейф</h3>
+    <p id="safeStatusLine" style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:14px;line-height:1.5">Загружаю…</p>
+
+    <div style="margin-bottom:14px">
+      <label style="font-size:11px;font-weight:800;color:var(--subtext-color);text-transform:uppercase;letter-spacing:0.04em">Пароль Сейфа (тот же, что в чате)</label>
+      <input type="password" id="safePassword" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;margin-top:4px;outline:none;font-size:15px" placeholder="Пароль">
+    </div>
+
+    <div style="display:flex;flex-direction:column;gap:8px">
+      <button class="sound-item-btn" onclick="unlockSafe()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
+        <span>Разблокировать</span> <i data-lucide="unlock" style="width:18px;height:18px"></i>
+      </button>
+      <button class="sound-item-btn" onclick="lockSafe()">
+        <span>Заблокировать снова</span> <i data-lucide="lock" style="width:18px;height:18px"></i>
+      </button>
+      <button class="sound-item-btn" onclick="closeSafeModal()">
+        <span>Закрыть</span> <i data-lucide="x" style="width:18px;height:18px"></i>
+      </button>
+    </div>
+    <p style="font-size:11px;font-weight:600;color:var(--subtext-color);margin-top:12px;line-height:1.5">Пароль Сейфа нужен, чтобы скачать зашифрованный файл или переместить файл в Сейф из веб-облака. Пароль держится только в памяти страницы и никогда не сохраняется.</p>
   </div>
 </div>
 
@@ -702,7 +736,7 @@ body.modal-open {
       </button>
     </div>
 
-    <p style="font-size:11px;font-weight:600;color:var(--subtext-color);margin-top:12px;line-height:1.5">Бот должен быть админом канала с правом «Публикация сообщений». Приватный канал без @username: перешлите любое сообщение из него боту в чат (Сейф → 🔗 Моё облако).</p>
+    <p style="font-size:11px;font-weight:600;color:var(--subtext-color);margin-top:12px;line-height:1.5">Бот должен быть админом канала с правом «Публикация сообщений». Приватный канал без @username: перешлите любое сообщение из него боту в чат (Сейф → 🔗 Моё облако). Канал общий для чата и веб-облака: подключите/смените здесь — и в боте он тот же, и наоборот.</p>
   </div>
 </div>
 
@@ -730,6 +764,11 @@ body.modal-open {
   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
     <h1 class="logo-font">DEVO+</h1>
     <div style="display:flex;gap:8px;position:relative">
+
+      <!-- 22.30: 🔒 Сейф — разблокировка паролем для скачивания/переносов -->
+      <button class="action-btn" onclick="openSafeModal()" title="Сейф (разблокировать)">
+        <i data-lucide="lock" style="width:18px;height:18px"></i>
+      </button>
 
       <button class="action-btn" onclick="openStorageModal()" title="Хранилище (Моё облако)">
         <i data-lucide="cloud" style="width:18px;height:18px"></i>
@@ -1700,11 +1739,15 @@ function openEditModal(id) {
   const f = ALL_FILES.find(x => x.id === id);
   if (!f) return;
   activeEditingFileId = id;
-  
+
   document.getElementById('modalFileName').textContent = f.name;
   document.getElementById('modalInputName').value = f.name;
-  document.getElementById('modalVaultText').textContent = f.vault ? 'Убрать из Vault' : 'Защитить в Vault';
-  
+  // 22.30: НАСТОЯЩИЙ Сейф вместо косметической галочки Vault:
+  // обычный файл → «Переместить в Сейф»; файл Сейфа → «Достать из Сейфа».
+  const inSafe = !!f.vault;
+  document.getElementById('modalToSafeBtn').style.display = inSafe ? 'none' : '';
+  document.getElementById('modalFromSafeBtn').style.display = inSafe ? '' : 'none';
+
   modalCard.style.transform = '';
   document.getElementById('editModal').classList.add('open');
   document.body.classList.add('modal-open');
@@ -1741,50 +1784,162 @@ async function saveFileName() {
   closeEditModal();
 }
 
-async function toggleFileVault() {
-  if (!activeEditingFileId) return;
-  const f = ALL_FILES.find(x => x.id === activeEditingFileId);
-  if (f) {
-    try {
-      const data = await apiJson('/api/files/' + encodeURIComponent(f.id), {
-        method: 'PATCH',
-        headers: authHeaders({ 'Content-Type': 'application/json' }),
-        body: JSON.stringify({ vault: !f.vault })
-      });
-      f.vault = !!(data.file && data.file.vault);
-      renderAll();
-      showToast(f.vault ? '🔐 Добавлено в Vault' : '🔓 Убрано из Vault');
-    } catch (e) {
-      showToast('Не удалось: ' + e.message);
+/* ===== 22.30: НАСТОЯЩИЙ СЕЙФ — перенос в Сейф и обратно =====
+   Раньше галочка «Vault» была лишь пометкой в списке. Теперь «🔐 В Сейф»
+   реально шифрует файл паролем Сейфа (как кнопка 🔐 в чате бота), а
+   «🔓 Достать» расшифровывает и возвращает в облако. Пароль — тот же,
+   что в чате; он живёт ТОЛЬКО в памяти страницы. */
+var VAULT_PW = '';  // пароль, введённый на этой странице (RAM; не localStorage)
+var VAULT_SERVER_UNLOCKED = false;  // серверная веб-сессия уже разблокирована
+
+function vaultHeaders(extra) {
+  const h = authHeaders(extra);
+  // Пароль в заголовок — только если пользователь ВВОДИЛ его здесь.
+  // Если Сейф разблокирован через веб-сессию (кнопка 🔒 в браузере), пароль
+  // уже лежит в RAM-сессии сервера — туда отправлять ничего не нужно.
+  if (VAULT_PW) h['X-Vault-Password'] = VAULT_PW;
+  return h;
+}
+
+function openSafeModal() {
+  const m = document.getElementById('safeModal');
+  if (!m) return;
+  loadSafeStatus();
+  m.classList.add('open');
+  document.body.classList.add('modal-open');
+}
+
+function closeSafeModal(e) {
+  if (e) e.stopPropagation();
+  const m = document.getElementById('safeModal');
+  if (m) m.classList.remove('open');
+  document.body.classList.remove('modal-open');
+}
+
+async function loadSafeStatus() {
+  const line = document.getElementById('safeStatusLine');
+  try {
+    const s = await apiJson('/api/safe/status', { headers: vaultHeaders() });
+    if (s.unlocked) {
+      VAULT_SERVER_UNLOCKED = true;
+      line.textContent = 'Сейф разблокирован. Файлов в Сейфе: ' + (s.count || 0) + '.';
+    } else {
+      line.textContent = 'Сейф заблокирован. Введите пароль Сейфа, чтобы ' +
+        'скачивать зашифрованные файлы и переносить файлы в Сейф. Файлов: ' + (s.count || 0) + '.';
     }
+  } catch (e) {
+    line.textContent = cloudErrText(e);
   }
+}
+
+async function unlockSafe() {
+  const input = document.getElementById('safePassword');
+  const pw = (input && input.value) || '';
+  if (!pw) { showToast('Введите пароль Сейфа'); return; }
+  try {
+    await apiJson('/api/safe/unlock', {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ password: pw })
+    });
+    VAULT_PW = pw;
+    if (input) input.value = '';
+    showToast('🔒 Сейф разблокирован');
+    closeSafeModal();
+    loadFiles(true);
+  } catch (e) {
+    showToast(cloudErrText(e));
+  }
+}
+
+async function lockSafe() {
+  try {
+    await apiJson('/api/safe/lock', { method: 'POST', headers: authHeaders() });
+  } catch (e) {}
+  VAULT_PW = '';
+  VAULT_SERVER_UNLOCKED = false;
+  showToast('Сейф заблокирован');
+  closeSafeModal();
+}
+
+function ensureSafeUnlocked() {
+  if (VAULT_PW || VAULT_SERVER_UNLOCKED) return true;
+  showToast('Сначала введите пароль Сейфа (🔒 в шапке)');
+  openSafeModal();
+  return false;
+}
+
+async function toSafeCurrentFile() {
+  const f = ALL_FILES.find(x => x.id === activeEditingFileId);
   closeEditModal();
+  if (!f) return;
+  if (!ensureSafeUnlocked()) return;
+  showToast('🔐 Шифрую и переношу в Сейф…');
+  try {
+    await apiJson('/api/files/' + encodeURIComponent(f.id) + '/to_safe', {
+      method: 'POST',
+      headers: vaultHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({})
+    });
+    showToast('Файл в Сейфе — теперь он и в чате, и здесь');
+    loadFiles(true);
+  } catch (e) {
+    if (e.code === 'safe_locked') { VAULT_PW = ''; VAULT_SERVER_UNLOCKED = false; openSafeModal(); }
+    showToast(cloudErrText(e));
+  }
+}
+
+async function fromSafeCurrentFile() {
+  const f = ALL_FILES.find(x => x.id === activeEditingFileId);
+  closeEditModal();
+  if (!f) return;
+  if (!ensureSafeUnlocked()) return;
+  showToast('🔓 Расшифровываю и возвращаю в облако…');
+  try {
+    await apiJson('/api/files/' + encodeURIComponent(f.id) + '/from_safe', {
+      method: 'POST',
+      headers: vaultHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({})
+    });
+    showToast('Файл достан из Сейфа в обычное облако');
+    loadFiles(true);
+  } catch (e) {
+    if (e.code === 'safe_locked') { VAULT_PW = ''; VAULT_SERVER_UNLOCKED = false; openSafeModal(); }
+    showToast(cloudErrText(e));
+  }
 }
 
 async function downloadCurrentFile() {
   const f = ALL_FILES.find(x => x.id === activeEditingFileId);
   closeEditModal();
   if (!f) return;
-  showToast('📥 Скачивание...');
+  if (f.vault && !VAULT_PW && !ensureSafeUnlocked()) return;
+  /* 22.30: ССЫЛКА ВМЕСТО BLOB. Раньше файл целиком собирался в память
+     страницы и сохранялся кликом по виртуальной ссылке — WebView Telegram
+     такие загрузки часто блокирует («скачивание не работает»), а 2 ГБ
+     в память телефона вообще не собрать. Теперь сервер выдаёт одноразовую
+     ссылку, файл качает сам системный браузер ПОТОКОМ. */
+  showToast('📥 Готовлю скачивание…');
   try {
-    const r = await fetch('/api/files/' + encodeURIComponent(f.id) + '/download', { headers: authHeaders() });
-    if (!r.ok) {
-      let msg = 'HTTP ' + r.status;
-      try { msg = (await r.json()).message || msg; } catch (e) {}
-      throw new Error(msg);
+    const data = await apiJson('/api/files/' + encodeURIComponent(f.id) + '/link', {
+      headers: vaultHeaders()
+    });
+    const abs = new URL(data.url, location.origin).href;
+    if (IS_TELEGRAM && tg && tg.openLink) {
+      tg.openLink(abs);  // открывает системный обработчик — файл качается
+    } else {
+      const a = document.createElement('a');
+      a.href = abs;
+      a.download = f.name || 'file';
+      a.rel = 'noopener';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
     }
-    const blob = await r.blob();
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = f.name || 'file';
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 10000);
-    showToast('✅ Скачано: ' + fmtSize(blob.size));
+    showToast('Скачивание началось');
   } catch (e) {
-    showToast('Ошибка скачивания: ' + e.message);
+    if (e.code === 'safe_locked') { VAULT_PW = ''; VAULT_SERVER_UNLOCKED = false; openSafeModal(); }
+    showToast('Ошибка скачивания: ' + cloudErrText(e));
   }
 }
 
@@ -2104,6 +2259,8 @@ async function connectStorage() {
     document.getElementById('storageInput').value = '';
     renderStorage(d);
     showToast('✅ Канал «' + d.title + '» подключён');
+    /* 22.30: сразу обновляем список — файлы теперь лягут в новый канал и в чате */
+    loadFiles(true);
   } catch (e) {
     showToast('❌ ' + e.message);
   } finally { btn.disabled = false; }
@@ -2114,6 +2271,7 @@ async function disconnectStorage() {
     const d = await apiJson('/api/storage/disconnect', { method: 'POST' });
     renderStorage(d);
     showToast('🗑 Личный канал отключён');
+    loadFiles(true);
   } catch (e) {
     showToast('❌ ' + e.message);
   }
@@ -2311,7 +2469,21 @@ async function uploadOneFile(file, reportBytes) {
       throw new Error('aborted');
     }
     const end = Math.min(offset + CHUNK_SIZE, file.size);
-    await sendChunk(uploadId, index, file.slice(offset, end), (n) => reportBytes(offset + n));
+    /* 22.30: повтор куска при сбое сети (2 доп. попытки). Сервер теперь
+       идемпотентен: пересланный кусок не задваивается, файл не портится. */
+    let lastErr = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        await sendChunk(uploadId, index, file.slice(offset, end), (n) => reportBytes(offset + n));
+        lastErr = null;
+        break;
+      } catch (err) {
+        if (err && err.message === 'aborted') throw err;
+        lastErr = err;
+        if (attempt < 2) await sleepMs(1200 * (attempt + 1));
+      }
+    }
+    if (lastErr) throw lastErr;
     offset = end;
     index++;
   }
