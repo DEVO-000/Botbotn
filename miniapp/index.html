@@ -567,6 +567,10 @@ body.modal-open {
       <button class="sound-item-btn" id="modalVaultBtn" onclick="toggleFileVault()">
         <span id="modalVaultText">Защитить в Vault</span> <i data-lucide="lock" style="width:18px;height:18px"></i>
       </button>
+      <!-- 22.30: перенос обычного файла В Сейф (шифрование паролем Сейфа) -->
+      <button class="sound-item-btn" id="modalToVaultBtn" onclick="openToVaultPw()">
+        <span>🔐 Перенести в Сейф</span> <i data-lucide="shield" style="width:18px;height:18px"></i>
+      </button>
       <button class="sound-item-btn" onclick="downloadCurrentFile()">
         <span>Скачать файл</span> <i data-lucide="download" style="width:18px;height:18px"></i>
       </button>
@@ -574,6 +578,46 @@ body.modal-open {
         <span>Удалить файл</span> <i data-lucide="trash-2" style="width:18px;height:18px;stroke:#ef4444"></i>
       </button>
     </div>
+  </div>
+</div>
+
+<!-- 22.30: СЕЙФ в мини-аппе — список зашифрованных файлов -->
+<div id="vaultModal" class="modal-overlay" onclick="closeVaultModal(event)">
+  <div class="modal-card" onclick="event.stopPropagation()">
+    <div class="sheet-handle-area">
+      <div class="sheet-handle"></div>
+    </div>
+    <h3 style="font-weight:900;font-size:20px;margin-bottom:4px">🔐 Сейф</h3>
+    <p style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:12px">Файлы под шифром AES-256. Для скачивания — пароль Сейфа.</p>
+
+    <div id="vaultStatus" style="padding:10px 12px;background:var(--card-bg);border:1px solid var(--border-color);border-radius:14px;margin-bottom:12px;font-size:12px;font-weight:700;color:var(--subtext-color);line-height:1.5">Загружаю…</div>
+
+    <div id="vaultList" style="display:flex;flex-direction:column;gap:8px;max-height:40vh;overflow:auto"></div>
+
+    <button class="sound-item-btn" onclick="closeVaultModal()" style="margin-top:12px">
+      <span>Закрыть</span> <i data-lucide="x" style="width:18px;height:18px"></i>
+    </button>
+  </div>
+</div>
+
+<!-- 22.30: пароль Сейфа для скачивания/переноса (нигде не сохраняется) -->
+<div id="vaultPwModal" class="modal-overlay">
+  <div class="modal-card" onclick="event.stopPropagation()">
+    <div class="sheet-handle-area">
+      <div class="sheet-handle"></div>
+    </div>
+    <h3 id="vaultPwTitle" style="font-weight:900;font-size:20px;margin-bottom:4px">Пароль Сейфа</h3>
+    <p id="vaultPwSub" style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:12px">Введите пароль Сейфа</p>
+    <input type="password" id="vaultPwInput" autocomplete="off" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;margin-bottom:14px;outline:none;font-size:15px" placeholder="Пароль Сейфа">
+    <div style="display:flex;flex-direction:column;gap:8px">
+      <button class="sound-item-btn" id="vaultPwGoBtn" onclick="vaultPwConfirm()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
+        <span id="vaultPwGoText">Скачать</span> <i data-lucide="unlock" style="width:18px;height:18px"></i>
+      </button>
+      <button class="sound-item-btn" onclick="closeVaultPwModal()">
+        <span>Отмена</span> <i data-lucide="x" style="width:18px;height:18px"></i>
+      </button>
+    </div>
+    <p style="font-size:11px;font-weight:600;color:var(--subtext-color);margin-top:12px;line-height:1.5">Пароль не сохраняется и никуда не записывается: сервер расшифрует файл в памяти и сразу забудет пароль.</p>
   </div>
 </div>
 
@@ -735,9 +779,14 @@ body.modal-open {
         <i data-lucide="cloud" style="width:18px;height:18px"></i>
       </button>
 
-      <!-- 22.29: мультивыбор файлов (галочки + «В ZIP»/«Распаковать»/«Удалить») -->
+      <!-- 22.30: мультивыбор файлов (галочки + «В ZIP»/«Распаковать»/«Удалить») -->
       <button class="action-btn" id="selectModeBtn" onclick="toggleSelectMode()" title="Выбрать файлы">
         <i data-lucide="check-square" style="width:18px;height:18px"></i>
+      </button>
+
+      <!-- 22.30: Сейф — список зашифрованных файлов и скачивание по паролю -->
+      <button class="action-btn" id="vaultBtn" onclick="openVaultModal()" title="🔐 Сейф (зашифрованные файлы)">
+        <i data-lucide="shield" style="width:18px;height:18px"></i>
       </button>
 
       <button class="action-btn" id="themeToggleBtn" onclick="toggleThemeMenu(event)" title="Тема оформления">
@@ -1362,6 +1411,9 @@ function toggleSelectMode() {
   if (!selectMode) selectedIds.clear();
   const bar = document.getElementById('selectionBar');
   if (bar) bar.style.display = selectMode ? '' : 'none';
+  /* 22.30: панель внизу НЕ перекрывает последний файл — отступ снизу */
+  const wrap = document.querySelector('.main-wrapper');
+  if (wrap) wrap.style.paddingBottom = selectMode ? '96px' : '';
   updateSelCount();
   renderAll();
 }
@@ -1447,6 +1499,183 @@ async function deleteSelected() {
   showToast(ok === ids.length ? '✅ Удалено: ' + ok : 'Удалено ' + ok + ' из ' + ids.length);
 }
 
+/* 22.30: СКАЧИВАНИЕ ВЫБРАННОГО: один файл — как есть, несколько — одним ZIP */
+function _saveBlob(blob, name) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = name || 'file';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+}
+
+async function _fetchDownload(id, fallbackName) {
+  const r = await fetch('/api/files/' + encodeURIComponent(id) + '/download', { headers: authHeaders() });
+  if (!r.ok) {
+    let msg = 'HTTP ' + r.status;
+    try { msg = (await r.json()).message || msg; } catch (e) {}
+    throw new Error(msg);
+  }
+  const blob = await r.blob();
+  let name = fallbackName;
+  if (!name) {
+    const cd = r.headers.get('Content-Disposition') || '';
+    const m = cd.match(/filename\*=UTF-8''([^;]+)/);
+    if (m) { try { name = decodeURIComponent(m[1]); } catch (e) {} }
+  }
+  _saveBlob(blob, name || 'file');
+}
+
+async function downloadSelected() {
+  if (!selectedIds.size) { showToast('Сначала выберите файлы'); return; }
+  const ids = [...selectedIds];
+  if (ids.length === 1) {
+    const f = ALL_FILES.find(x => x.id === ids[0]);
+    showToast('📥 Скачиваю…');
+    try {
+      await _fetchDownload(ids[0], f ? f.name : null);
+      showToast('✅ Скачано');
+    } catch (e) { showToast(cloudErrText(e)); }
+    return;
+  }
+  showToast('📦 Собираю ZIP из ' + ids.length + '…');
+  try {
+    const data = await apiJson('/api/files/zip_selected', {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ ids: ids })
+    });
+    if (data.file) {
+      await _fetchDownload(data.file.id, data.file.name);
+      showToast('✅ ZIP скачан');
+    }
+  } catch (e) { showToast(cloudErrText(e)); }
+}
+
+/* ============ 22.30: СЕЙФ В МИНИ-АППЕ ============ */
+let VAULT_ITEMS = [];
+let pendingVaultAction = null; // {mode:'download', id, label} | {mode:'toVault', id, name}
+
+async function openVaultModal() {
+  document.getElementById('vaultModal').classList.add('open');
+  document.body.classList.add('modal-open');
+  await loadVaultList();
+}
+
+function closeVaultModal(e) {
+  if (e) e.stopPropagation();
+  document.getElementById('vaultModal').classList.remove('open');
+  document.body.classList.remove('modal-open');
+}
+
+async function loadVaultList() {
+  const st = document.getElementById('vaultStatus');
+  const lst = document.getElementById('vaultList');
+  st.textContent = 'Загружаю…';
+  lst.innerHTML = '';
+  try {
+    const d = await apiJson('/api/vault/list');
+    VAULT_ITEMS = (d.files || []);
+    if (CONN.bot || d.bot) CONN.bot = String(d.bot || CONN.bot || '');
+    if (d.build) CONN.build = String(d.build);
+    if (!d.crypto) {
+      st.textContent = '⚠️ На сервере нет библиотеки шифрования — скачивание через чат Сейфа.';
+    } else if (!d.safe_set) {
+      st.textContent = '🔐 Сейф ещё не настроен: задайте пароль и 3 вопроса в боте (☁️ Облако → 📤 Загрузить в Сейф).';
+    } else {
+      st.textContent = '✅ Сейф готов · файлов: ' + VAULT_ITEMS.length + ' · сборка ' + (d.build || '?');
+    }
+    if (!VAULT_ITEMS.length) {
+      lst.innerHTML = '<div style="font-size:12px;font-weight:700;color:var(--subtext-color);padding:8px 4px">Пока пусто. Загружайте файлы через ☁️ Облако → 📤 Загрузить в Сейф (или переносите кнопкой «🔐 В Сейф» у файла).</div>';
+      return;
+    }
+    lst.innerHTML = VAULT_ITEMS.map(v => `
+      <button class="sound-item-btn" onclick="askVaultDownload('${escapeHtml(v.id)}')">
+        <span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">🔐 ${escapeHtml(v.label || 'без подписи')} · ${fmtSize(+v.size || 0)}</span>
+        <i data-lucide="download" style="width:16px;height:16px;flex-shrink:0"></i>
+      </button>
+    `).join('');
+    safeIcons();
+  } catch (e) {
+    st.textContent = '⚠️ ' + cloudErrText(e);
+  }
+}
+
+function openVaultPwModal(mode, id, label) {
+  pendingVaultAction = { mode: mode, id: id, label: label };
+  document.getElementById('vaultPwInput').value = '';
+  document.getElementById('vaultPwGoText').textContent = mode === 'toVault' ? '🔐 Зашифровать в Сейф' : '📥 Скачать';
+  document.getElementById('vaultPwTitle').textContent = mode === 'toVault' ? 'Перенести в Сейф' : 'Пароль Сейфа';
+  document.getElementById('vaultPwSub').textContent = mode === 'toVault'
+    ? ('«' + (label || 'файл') + '» будет зашифрован паролем Сейфа, оригинал удалён')
+    : 'Файл расшифруется только с вашим паролем Сейфа';
+  document.getElementById('vaultPwModal').classList.add('open');
+  document.body.classList.add('modal-open');
+}
+
+function closeVaultPwModal() {
+  document.getElementById('vaultPwModal').classList.remove('open');
+  document.body.classList.remove('modal-open');
+  pendingVaultAction = null;
+}
+
+function askVaultDownload(id) {
+  const v = VAULT_ITEMS.find(x => String(x.id) === String(id));
+  openVaultPwModal('download', id, v ? v.label : '');
+}
+
+function openToVaultPw() {
+  if (!activeEditingFileId) return;
+  const f = ALL_FILES.find(x => x.id === activeEditingFileId);
+  closeEditModal();
+  openVaultPwModal('toVault', activeEditingFileId, f ? f.name : '');
+}
+
+async function vaultPwConfirm() {
+  if (!pendingVaultAction) return;
+  const pw = document.getElementById('vaultPwInput').value;
+  if (!pw) { showToast('Введите пароль Сейфа'); return; }
+  const btn = document.getElementById('vaultPwGoBtn');
+  btn.disabled = true;
+  const act = pendingVaultAction;
+  try {
+    if (act.mode === 'toVault') {
+      const d = await apiJson('/api/files/to_vault', {
+        method: 'POST',
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ id: act.id, password: pw })
+      });
+      ALL_FILES = ALL_FILES.filter(x => x.id !== act.id);
+      closeVaultPwModal();
+      renderAll();
+      showToast('🔐 Перенесено в Сейф: ' + (d.vault && d.vault.label ? d.vault.label : 'файл'));
+    } else {
+      const r = await fetch('/api/vault/download', {
+        method: 'POST',
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ id: act.id, password: pw })
+      });
+      if (!r.ok) {
+        let msg = 'HTTP ' + r.status;
+        try { msg = (await r.json()).message || msg; } catch (e) {}
+        throw new Error(msg);
+      }
+      const blob = await r.blob();
+      let name = act.label || 'vault_file';
+      const cd = r.headers.get('Content-Disposition') || '';
+      const m = cd.match(/filename\*=UTF-8''([^;]+)/);
+      if (m) { try { name = decodeURIComponent(m[1]); } catch (e) {} }
+      _saveBlob(blob, name);
+      closeVaultPwModal();
+      showToast('✅ Файл Сейфа скачан');
+    }
+  } catch (e) {
+    showToast('❌ ' + cloudErrText(e));
+  } finally { btn.disabled = false; }
+}
+
 let ALL_FILES = [];
 let listLoading = false;
 
@@ -1466,7 +1695,7 @@ async function loadFiles(silent) {
     ALL_FILES = (data.files || []).map(f => ({
       id: String(f.id || ''), name: String(f.name || 'файл'),
       kind: String(f.kind || 'document'), size: +f.size || 0,
-      ts: String(f.ts || ''), vault: !!f.vault
+      ts: String(f.ts || ''), vault: !!f.vault, own: !!f.own
     }));
     // 22.26: сервер подтвердил связь — запоминаем, кем и чем отвечает
     CONN.bot = String(data.bot || CONN.bot || '');
@@ -1642,6 +1871,7 @@ function renderFiles(files) {
         </p>
         <p style="font-weight:600;font-size:12px;color:var(--subtext-color);margin-top:2px">
           ${fmtSize(f.size)} · ${(f.ts || '').slice(0, 10)}
+          <span title="${f.own ? 'лежит в ВАШЕМ канале' : 'лежит в канале бота'}"> · ${f.own ? '🏢 ваш канал' : '☁️ канал бота'}</span>
         </p>
       </div>
       <div style="display:flex;gap:4px;flex-shrink:0" onclick="event.stopPropagation()">
@@ -2054,8 +2284,13 @@ function renderStorage(d) {
       + '</span>'
     : '';
   if (d.connected) {
+    // 22.30: «ПО ПОЛОЧКАМ» — честно: куда идут файлы и сколько их.
+    const _cnt = (d.counts || {});
     box.innerHTML = '✅ Ваш канал: <b style="color:var(--text-color)">' + escapeHtml(d.title || '') + '</b>'
       + '<br><span style="font-size:11px">подключён ' + escapeHtml(d.added || '') + ' — новые загрузки уходят только в него</span>'
+      + '<br><span style="font-size:11px">📦 Обычных файлов: ' + (_cnt.cloud != null ? _cnt.cloud : '…')
+      + ' • 🔐 В Сейфе: ' + (_cnt.vault != null ? _cnt.vault : '…') + '\u00b7 '
+      + (d.plain ? 'шифрование ВЫКЛ' : 'файлы Сейфа под шифром') + '</span>'
       + ident;
     offBtn.style.display = '';
     connLabel.textContent = 'Заменить канал';
@@ -2070,7 +2305,11 @@ function renderStorage(d) {
   } else {
     box.innerHTML = (d.has_general
       ? '☁️ Сейчас файлы уходят в общее хранилище бота. Подключите свой приватный канал — и они будут лежать только у вас.'
-      : '⚠️ Хранилище не настроено — загрузки будут неудачными. Подключите свой канал ниже.') + ident;
+      : '⚠️ Хранилище не настроено — загрузки будут неудачными. Подключите свой канал ниже.')
+      + '<br><span style="font-size:11px">📦 Обычных файлов: ' + ((d.counts || {}).cloud != null ? d.counts.cloud : '…')
+      + ' • 🔐 В Сейфе: ' + ((d.counts || {}).vault != null ? d.counts.vault : '…') + '</span>'
+      + '<br><span style="font-size:11px;color:#f59e0b">💡 Надёжнее всего СВОЙ частный канал: создайте его, добавьте бота админом с правом «Публикация сообщений» и подключите ниже — данные будут только в вашем хранилище.</span>'
+      + ident;
     offBtn.style.display = 'none';
     connLabel.textContent = 'Подключить канал';
     if (plainBtn) plainBtn.style.display = 'none';
@@ -2438,6 +2677,8 @@ safeIcons();
   <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
     <span id="selCount" style="font-weight:800;font-size:13px">Выбрано: 0</span>
     <span style="flex:1"></span>
+    <!-- 22.30: «Скачать» — скачивание выбранного (одного) или архивом (нескольких) -->
+    <button class="sound-item-btn" onclick="downloadSelected()" style="padding:8px 10px"><span>📥 Скачать</span></button>
     <button class="sound-item-btn" onclick="zipSelected()" style="padding:8px 10px"><span>📦 В ZIP</span></button>
     <button class="sound-item-btn" id="unzipBtn" onclick="unzipSelected()" style="padding:8px 10px;display:none"><span>🗂 Распаковать</span></button>
     <button class="sound-item-btn" onclick="deleteSelected()" style="padding:8px 10px;color:#ef4444"><span>🗑 Удалить</span></button>
@@ -2445,16 +2686,16 @@ safeIcons();
   </div>
 </div>
 
-<!-- 22.29: вход по Telegram ID + веб-паролю — обычный браузер, без Telegram
-     (для тех, у кого VPN/школьная сеть не пускает telegram.org и initData
-     не доходит). Пароль задаётся в чате бота: ☁️ Облако → «🔑 Веб-пароль». -->
+<!-- 22.29/22.30: вход по Telegram ID + паролю Сейфа — обычный браузер,
+     без Telegram (для тех, у кого VPN/школьная сеть не пускает telegram.org).
+     Пароль = пароль Сейфа (задаётся в боте: ☁️ Облако → 🔐 Сейф). -->
 <div id="loginModal" class="modal-overlay">
   <div class="modal-card" onclick="event.stopPropagation()">
     <div class="sheet-handle-area">
       <div class="sheet-handle"></div>
     </div>
     <h3 style="font-weight:900;font-size:20px;margin-bottom:4px">Вход в DEVO+ Облако</h3>
-    <p style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:14px">Открыто вне Telegram, войдите по ID и паролю, заданному в боте</p>
+    <p style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:14px">Открыто вне Telegram: войдите по ID и паролю Сейфа</p>
 
     <div style="margin-bottom:12px">
       <label for="loginUserId" style="font-size:11px;font-weight:800;color:var(--subtext-color);text-transform:uppercase;letter-spacing:0.04em">Telegram ID</label>
@@ -2462,7 +2703,7 @@ safeIcons();
     </div>
     <div style="margin-bottom:14px">
       <label for="loginPassword" style="font-size:11px;font-weight:800;color:var(--subtext-color);text-transform:uppercase;letter-spacing:0.04em">Пароль</label>
-      <input type="password" id="loginPassword" autocomplete="current-password" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;margin-top:4px;outline:none;font-size:15px" placeholder="Веб-пароль из бота">
+      <input type="password" id="loginPassword" autocomplete="current-password" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;margin-top:4px;outline:none;font-size:15px" placeholder="Пароль Сейфа">
     </div>
 
     <div style="display:flex;flex-direction:column;gap:8px">
@@ -2471,7 +2712,7 @@ safeIcons();
       </button>
     </div>
 
-    <p style="font-size:11px;font-weight:600;color:var(--subtext-color);margin-top:12px;line-height:1.5">Пароль задаётся в боте через ☁️ Облако → «🔑 Веб-пароль». Логин — ваш Telegram ID (бот показывает его при создании пароля). 5 неверных попыток — пауза 10 минут.</p>
+    <p style="font-size:11px;font-weight:600;color:var(--subtext-color);margin-top:12px;line-height:1.5">Пароль — тот же, что открывает ваш 🔐 Сейф (задаётся в боте: ☁️ Облако → 🔐 Сейф; смена — там же или по 3 секретным вопросам). Логин — ваш Telegram ID. 5 неверных попыток — пауза 10 минут.</p>
   </div>
 </div>
 </body>
