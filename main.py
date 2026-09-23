@@ -3538,7 +3538,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.30"
+BOT_BUILD = "22.31"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -7974,27 +7974,28 @@ MINIAPP_HTML = r"""<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
 <title>DEVO+ Облако</title>
+
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <script>
-/* ===== ВОЛНА 22.28: ФОЛБЭК, ЕСЛИ telegram.org НЕДОСТУПЕН =====
-   Официальный скрипт грузится с telegram.org, который в ряде сетей
-   (особенно школьных/российских) заблокирован. Без него window.Telegram
-   пуст, initData не передаётся — и КАЖДЫЙ запрос к /api/* отвечал 401
-   («нет связи с облаком»), хотя бот работал. Telegram всегда передаёт
-   initData в URL-хэше (tgWebAppData=...) — собираем минимальный WebApp-шим
-   прямо из него. Если официальный скрипт загрузился — ничего не делаем. */
 (function () {
   try {
     if (window.Telegram && window.Telegram.WebApp && window.Telegram.WebApp.initData) return;
+
     var _h = location.hash || '';
+
     function _hashVal(name) {
       var m = _h.match(new RegExp(name + '=([^&]+)'));
       if (!m) return '';
       try { return decodeURIComponent(m[1]); } catch (e) { return m[1]; }
     }
+
     var initData = _hashVal('tgWebAppData');
+
     var themeParams = {};
-    try { themeParams = JSON.parse(_hashVal('tgWebAppThemeParams') || '{}') || {}; } catch (e) {}
+    try {
+      themeParams = JSON.parse(_hashVal('tgWebAppThemeParams') || '{}') || {};
+    } catch (e) {}
+
     var unsafe = {};
     try {
       initData.split('&').forEach(function (p) {
@@ -8003,36 +8004,74 @@ MINIAPP_HTML = r"""<!DOCTYPE html>
       });
       if (unsafe.user) unsafe.user = JSON.parse(unsafe.user);
     } catch (e) {}
+
     function _noop() {}
-    var _hf = { impactOccurred: _noop, notificationOccurred: _noop, selectionChanged: _noop };
+
+    var _hf = {
+      impactOccurred: _noop,
+      notificationOccurred: _noop,
+      selectionChanged: _noop
+    };
+
     window.Telegram = window.Telegram || {};
     window.Telegram.WebApp = {
       initData: initData,
       initDataUnsafe: unsafe,
-      version: '6.9', platform: 'unknown',
+      version: '6.9',
+      platform: 'unknown',
       colorScheme: (themeParams.bg_color && /^#([0-9a-f]{6})$/i.test(themeParams.bg_color)
-        ? (parseInt(themeParams.bg_color.slice(1), 16) < 0x800000 ? 'dark' : 'light') : 'light'),
+        ? (parseInt(themeParams.bg_color.slice(1), 16) < 0x800000 ? 'dark' : 'light')
+        : 'light'),
       themeParams: themeParams,
-      isExpanded: true, viewportStableHeight: window.innerHeight,
-      ready: _noop, expand: _noop, close: _noop,
-      onEvent: _noop, offEvent: _noop,
-      enableClosingConfirmation: _noop, disableClosingConfirmation: _noop,
-      setHeaderColor: _noop, setBackgroundColor: _noop,
+      isExpanded: true,
+      viewportStableHeight: window.innerHeight,
+      ready: _noop,
+      expand: _noop,
+      close: _noop,
+      onEvent: _noop,
+      offEvent: _noop,
+      enableClosingConfirmation: _noop,
+      disableClosingConfirmation: _noop,
+      setHeaderColor: _noop,
+      setBackgroundColor: _noop,
       HapticFeedback: _hf,
-      MainButton: { hide: _noop, show: _noop, setText: _noop, onClick: _noop, offClick: _noop },
-      BackButton: { hide: _noop, show: _noop, onClick: _noop, offClick: _noop },
-      openTelegramLink: function (u) { window.open(u, '_blank'); },
-      openLink: function (u) { window.open(u, '_blank'); },
-      showAlert: function (m) { try { alert(m); } catch (e) {} },
-      showConfirm: function (m, cb) { try { cb(!!confirm(m)); } catch (e) {} },
-      showToast: function (m) { try { console.log(String(m)); } catch (e) {} },
+      MainButton: {
+        hide: _noop,
+        show: _noop,
+        setText: _noop,
+        onClick: _noop,
+        offClick: _noop
+      },
+      BackButton: {
+        hide: _noop,
+        show: _noop,
+        onClick: _noop,
+        offClick: _noop
+      },
+      openTelegramLink: function (u) {
+        window.open(u, '_blank');
+      },
+      openLink: function (u) {
+        window.open(u, '_blank');
+      },
+      showAlert: function (m) {
+        try { alert(m); } catch (e) {}
+      },
+      showConfirm: function (m, cb) {
+        try { cb(!!confirm(m)); } catch (e) {}
+      },
+      showToast: function (m) {
+        try { console.log(String(m)); } catch (e) {}
+      },
       sendData: _noop
     };
   } catch (e) {}
 })();
 </script>
+
 <link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;800;900&display=swap" rel="stylesheet">
 <script src="https://unpkg.com/lucide@latest"></script>
+
 <style>
 :root {
   --bg-color: #f8f9fa;
@@ -8094,21 +8133,40 @@ MINIAPP_HTML = r"""<!DOCTYPE html>
   --blob-2: var(--custom-bg2, #9333ea);
 }
 
-*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent;user-select:none}
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+  -webkit-tap-highlight-color: transparent;
+  user-select: none;
+}
 
-html, body {
+input,
+textarea {
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+html,
+body {
   min-height: 100%;
   overflow-x: hidden;
   overflow-y: auto;
 }
 
-body{
-  font-family:'Nunito',sans-serif;
+body {
+  font-family: 'Nunito', sans-serif;
   background: var(--bg-gradient, var(--bg-color));
   background-color: var(--bg-color);
-  color:var(--text-color);
-  transition: background 1.2s cubic-bezier(0.25, 1, 0.5, 1), color 1.2s cubic-bezier(0.25, 1, 0.5, 1);
+  color: var(--text-color);
+  transition: background-color 0.35s cubic-bezier(0.25, 1, 0.5, 1), color 0.35s cubic-bezier(0.25, 1, 0.5, 1);
   position: relative;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+button {
+  touch-action: manipulation;
 }
 
 body.modal-open {
@@ -8116,7 +8174,6 @@ body.modal-open {
   touch-action: none;
 }
 
-/* ВСПЫШКА В ЦВЕТАХ ТЕМЫ */
 .theme-flash {
   position: fixed;
   inset: 0;
@@ -8124,15 +8181,18 @@ body.modal-open {
   pointer-events: none;
   opacity: 0;
   mix-blend-mode: screen;
+  will-change: opacity;
 }
+
 .theme-flash.active {
   animation: themeFlash 1.1s cubic-bezier(0.16, 1, 0.3, 1) forwards;
 }
+
 @keyframes themeFlash {
-  0%   { opacity: 0; filter: brightness(1); }
-  15%  { opacity: 0.55; filter: brightness(1.4); }
-  40%  { opacity: 0.35; filter: brightness(1.2); }
-  70%  { opacity: 0.45; filter: brightness(1.3); }
+  0% { opacity: 0; filter: brightness(1); }
+  15% { opacity: 0.55; filter: brightness(1.4); }
+  40% { opacity: 0.35; filter: brightness(1.2); }
+  70% { opacity: 0.45; filter: brightness(1.3); }
   100% { opacity: 0; filter: brightness(1); }
 }
 
@@ -8142,37 +8202,50 @@ body.modal-open {
   position: absolute;
   border-radius: 50%;
   filter: blur(80px);
+  will-change: transform;
 }
+
 .theme-flash::before {
-  width: 70vw; height: 70vw;
+  width: 70vw;
+  height: 70vw;
   background: var(--blob-1);
-  top: 10%; left: -10%;
+  top: 10%;
+  left: -10%;
   animation: flashMove1 1.1s ease-out forwards;
 }
+
 .theme-flash::after {
-  width: 75vw; height: 75vw;
+  width: 75vw;
+  height: 75vw;
   background: var(--blob-2);
-  bottom: 10%; right: -10%;
+  bottom: 10%;
+  right: -10%;
   animation: flashMove2 1.1s ease-out forwards;
 }
+
 @keyframes flashMove1 {
-  0%   { transform: scale(0.6); opacity: 0; }
-  30%  { transform: scale(1.15); opacity: 0.8; }
+  0% { transform: scale(0.6); opacity: 0; }
+  30% { transform: scale(1.15); opacity: 0.8; }
   100% { transform: scale(1.4); opacity: 0; }
 }
+
 @keyframes flashMove2 {
-  0%   { transform: scale(0.6); opacity: 0; }
-  30%  { transform: scale(1.15); opacity: 0.8; }
+  0% { transform: scale(0.6); opacity: 0; }
+  30% { transform: scale(1.15); opacity: 0.8; }
   100% { transform: scale(1.4); opacity: 0; }
 }
 
 .bg-blobs-container {
   position: fixed;
-  top: 0; left: 0; width: 100vw; height: 100vh;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
   z-index: 0;
   pointer-events: none;
   overflow: hidden;
-  transition: opacity 1.5s ease;
+  transition: opacity 0.5s ease;
+  will-change: opacity;
 }
 
 .blob {
@@ -8181,19 +8254,24 @@ body.modal-open {
   filter: blur(90px);
   opacity: 0.65;
   will-change: transform;
+  transform: translateZ(0);
   transition: transform 3s cubic-bezier(0.25, 1, 0.5, 1);
 }
 
 .blob-1 {
-  width: 320px; height: 320px;
+  width: 320px;
+  height: 320px;
   background: var(--blob-1);
-  top: 20%; left: 10%;
+  top: 20%;
+  left: 10%;
 }
 
 .blob-2 {
-  width: 360px; height: 360px;
+  width: 360px;
+  height: 360px;
   background: var(--blob-2);
-  bottom: 20%; right: 10%;
+  bottom: 20%;
+  right: 10%;
 }
 
 .main-wrapper {
@@ -8208,167 +8286,251 @@ body.modal-open {
   flex-direction: column;
 }
 
-.logo-font{font-weight:900;letter-spacing:-.04em;color:var(--text-color);font-size:32px;line-height:1}
+.logo-font {
+  font-weight: 900;
+  letter-spacing: -0.04em;
+  color: var(--text-color);
+  font-size: 32px;
+  line-height: 1;
+  transition: color 0.35s ease;
+}
 
-.animate-fade-in{
-  animation: smoothInsert 0.8s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+.toast-msg {
+  animation: fadeInOut 3.5s cubic-bezier(0.16, 1, 0.3, 1) forwards;
   will-change: transform, opacity;
-  opacity: 0;
-  transform: translateY(20px) scale(0.98);
 }
 
-@keyframes smoothInsert {
-  0% { opacity: 0; transform: translateY(20px) scale(0.98); }
-  100% { opacity: 1; transform: translateY(0) scale(1); }
+@keyframes fadeInOut {
+  0% { opacity: 0; transform: translateY(15px); }
+  15% { opacity: 1; transform: translateY(0); }
+  85% { opacity: 1; transform: translateY(0); }
+  100% { opacity: 0; transform: translateY(10px); }
 }
 
-.toast-msg{animation:fadeInOut 3.5s cubic-bezier(.16,1,.3,1) forwards}
-@keyframes fadeInOut{
-  0%{opacity:0;transform:translateY(15px)}
-  15%{opacity:1;transform:translateY(0)}
-  85%{opacity:1;transform:translateY(0)}
-  100%{opacity:0;transform:translateY(10px)}
-}
-
-.file-card{
-  background:var(--card-bg);
+.file-card {
+  background: var(--card-bg);
   border: 1px solid var(--border-color);
-  border-radius:20px;
+  border-radius: 20px;
   cursor: pointer;
   backdrop-filter: blur(14px);
   -webkit-backdrop-filter: blur(14px);
   padding: 12px 14px;
-  transition: transform 0.4s cubic-bezier(0.2, 0.8, 0.2, 1), background 0.6s ease;
-}
-.file-card:active{transform:scale(.98);background:var(--card-active)}
-
-.icon-wrap{
-  width:46px;height:46px;border-radius:14px;
-  background:var(--btn-bg);
-  color:var(--btn-text);
-  display:flex;align-items:center;justify-content:center;
-  transition: background 0.6s ease, color 0.6s ease;
+  transition: transform 0.18s cubic-bezier(0.2, 0.8, 0.2, 1), background 0.35s ease, border-color 0.35s ease;
+  will-change: transform;
+  transform: translateZ(0);
 }
 
-.action-btn{
-  width:40px;height:40px;border-radius:9999px;
-  background:var(--btn-bg);
-  display:flex;align-items:center;justify-content:center;
-  color:var(--btn-text);border:none;cursor:pointer;
-  transition: transform 0.35s cubic-bezier(0.2, 0.8, 0.2, 1), opacity 0.5s ease, background 0.6s ease, color 0.6s ease;
+.file-card:active {
+  transform: scale(0.98) translateZ(0);
+  background: var(--card-active);
 }
-.action-btn:active{transform:scale(.92);opacity:.8}
 
-.chip{
-  padding:8px 10px;border-radius:9999px;
-  background:var(--card-bg);color:var(--text-color);font-weight:700;font-size:14px;
-  border: 1px solid var(--border-color);cursor:pointer;
+.icon-wrap {
+  width: 46px;
+  height: 46px;
+  border-radius: 14px;
+  background: var(--btn-bg);
+  color: var(--btn-text);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.35s ease, color 0.35s ease;
+  will-change: background-color, color;
+}
+
+.action-btn {
+  width: 40px;
+  height: 40px;
+  border-radius: 9999px;
+  background: var(--btn-bg);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--btn-text);
+  border: none;
+  cursor: pointer;
+  transition: transform 0.16s cubic-bezier(0.2, 0.8, 0.2, 1), background 0.35s ease, color 0.35s ease;
+  will-change: transform;
+  transform: translateZ(0);
+}
+
+.action-btn:active {
+  transform: scale(0.92) translateZ(0);
+  opacity: 0.8;
+}
+
+.chip {
+  padding: 8px 10px;
+  border-radius: 9999px;
+  background: var(--card-bg);
+  color: var(--text-color);
+  font-weight: 700;
+  font-size: 14px;
+  border: 1px solid var(--border-color);
+  cursor: pointer;
   backdrop-filter: blur(10px);
   -webkit-backdrop-filter: blur(10px);
-  transition: transform 0.4s cubic-bezier(0.2, 0.8, 0.2, 1), background 0.6s ease, color 0.6s ease;
-  white-space:nowrap;
-  display:inline-flex;align-items:center;justify-content:center;gap:6px;
-  flex-shrink:0;
+  transition: transform 0.16s cubic-bezier(0.2, 0.8, 0.2, 1), background 0.35s ease, color 0.35s ease, border-color 0.35s ease;
+  white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  flex-shrink: 0;
+  will-change: transform;
+  transform: translateZ(0);
 }
-.chip:active{transform:scale(.95)}
-.chip.active{background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)}
 
-.filters-scroll-wrap{
-  display:flex;gap:6px;padding-bottom:6px;margin-bottom:12px;
+.chip:active {
+  transform: scale(0.95) translateZ(0);
+}
+
+.chip.active {
+  background: var(--btn-bg);
+  color: var(--btn-text);
+  border-color: var(--btn-bg);
+}
+
+.filters-scroll-wrap {
+  display: flex;
+  gap: 6px;
+  padding-bottom: 6px;
+  margin-bottom: 12px;
   justify-content: space-between;
   width: 100%;
 }
+
 .filters-scroll-wrap .chip {
   flex: 1 1 0;
   min-width: 0;
   padding: 8px 4px;
 }
 
-.search-box{
-  position:relative;border:1.5px solid var(--border-color);
+.search-box {
+  position: relative;
+  border: 1.5px solid var(--border-color);
   background: var(--card-bg);
   backdrop-filter: blur(10px);
   -webkit-backdrop-filter: blur(10px);
-  border-radius:9999px;
-  padding:8px 16px 8px 40px;
-  transition: border-color 0.6s ease;
+  border-radius: 9999px;
+  padding: 8px 16px 8px 40px;
+  transition: border-color 0.35s ease, background 0.35s ease;
 }
-.search-box input{
-  width:100%;background:transparent;border:none;outline:none;
-  font-family:'Nunito',sans-serif;font-weight:700;font-size:15px;color:var(--text-color);
-}
-.search-box input::placeholder{color:var(--subtext-color);font-weight:600}
 
-.drop-zone{
-  background:var(--drop-bg);
+.search-box input {
+  width: 100%;
+  background: transparent;
+  border: none;
+  outline: none;
+  font-family: 'Nunito', sans-serif;
+  font-weight: 700;
+  font-size: 15px;
+  color: var(--text-color);
+}
+
+.search-box input::placeholder {
+  color: var(--subtext-color);
+  font-weight: 600;
+}
+
+.drop-zone {
+  background: var(--drop-bg);
   border: 1.5px dashed var(--border-color);
-  border-radius:24px;
-  padding:16px;
-  text-align:center;
-  cursor:pointer;
-  display:flex;
-  flex-direction:column;
-  align-items:center;
-  justify-content:center;
-  min-height:110px;
-  position:relative;
+  border-radius: 24px;
+  padding: 16px;
+  text-align: center;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: 110px;
+  position: relative;
   backdrop-filter: blur(10px);
   -webkit-backdrop-filter: blur(10px);
-  transition: transform 0.4s cubic-bezier(0.2, 0.8, 0.2, 1), background 0.6s ease;
+  transition: transform 0.18s cubic-bezier(0.2, 0.8, 0.2, 1), background 0.35s ease;
   margin-bottom: 12px;
-}
-.drop-zone:active{transform:scale(.99);background:var(--drop-active)}
-
-.initial-state{
-  display:flex;
-  flex-direction:column;
-  align-items:center;
-  gap:4px;
+  will-change: transform;
+  transform: translateZ(0);
 }
 
-.upload-filename{
-  font-weight:800;
-  font-size:13px;
-  color:var(--text-color);
-  margin-bottom:6px;
-  max-width:300px;
-  text-align:center;
-  display:none;
+.drop-zone:active {
+  transform: scale(0.99) translateZ(0);
+  background: var(--drop-active);
+}
+
+.initial-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+}
+
+.upload-filename {
+  font-weight: 800;
+  font-size: 13px;
+  color: var(--text-color);
+  margin-bottom: 6px;
+  max-width: 300px;
+  text-align: center;
+  display: none;
   word-break: break-word;
 }
 
-.download-progress-wrap{
-  display:none;
-  flex-direction:column;
-  align-items:center;
-  justify-content:center;
-  gap:8px;
-  opacity:0;
-  transition: opacity 0.6s ease;
-}
-.download-progress-wrap.active{
-  display:flex;
-  opacity:1;
+.download-progress-wrap {
+  display: none;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  opacity: 0;
+  transition: opacity 0.35s ease;
 }
 
-.drop-loader{
-  width:58px;height:58px;position:relative;
-  display:flex;align-items:center;justify-content:center;
+.download-progress-wrap.active {
+  display: flex;
+  opacity: 1;
+}
+
+.drop-loader {
+  width: 58px;
+  height: 58px;
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   cursor: pointer;
 }
-.drop-loader svg{width:58px;height:58px}
-.drop-loader > svg:first-child{transform:rotate(-90deg)}
-.drop-loader circle.bg{stroke:var(--loader-bg);stroke-width:6;fill:none}
-.drop-loader circle.bar{
-  stroke:var(--loader-bar);stroke-width:6;fill:none;
-  stroke-dasharray:157;stroke-dashoffset:157;stroke-linecap:round;
-  transition: stroke-dashoffset 0.3s linear, stroke 0.6s ease;
+
+.drop-loader svg {
+  width: 58px;
+  height: 58px;
 }
+
+.drop-loader > svg:first-child {
+  transform: rotate(-90deg);
+}
+
+.drop-loader circle.bg {
+  stroke: var(--loader-bg);
+  stroke-width: 6;
+  fill: none;
+}
+
+.drop-loader circle.bar {
+  stroke: var(--loader-bar);
+  stroke-width: 6;
+  fill: none;
+  stroke-dasharray: 157;
+  stroke-dashoffset: 157;
+  stroke-linecap: round;
+  transition: stroke-dashoffset 0.2s linear, stroke 0.35s ease;
+}
+
 .drop-loader circle.bar.success {
   stroke: #22c55e !important;
 }
 
-/* === ПРАВИЛЬНАЯ ГАЛОЧКА (SVG) === */
 .checkmark-svg {
   position: absolute;
   width: 58px;
@@ -8377,58 +8539,106 @@ body.modal-open {
   left: 0;
   pointer-events: none;
   opacity: 0;
-  transition: opacity 0.3s ease;
+  transition: opacity 0.25s ease;
 }
+
 .checkmark-svg path {
   stroke-dasharray: 60;
   stroke-dashoffset: 60;
-  transition: stroke-dashoffset 0.6s cubic-bezier(0.65, 0, 0.35, 1);
+  transition: stroke-dashoffset 0.5s cubic-bezier(0.65, 0, 0.35, 1);
 }
+
 .checkmark-svg.show {
   opacity: 1;
 }
+
 .checkmark-svg.show path {
   stroke-dashoffset: 0;
 }
 
-.square-stop{
-  width:16px;height:16px;background:var(--btn-bg);border-radius:4px;
-  position:absolute; transition: transform 0.4s ease, opacity 0.4s ease;
+.square-stop {
+  width: 16px;
+  height: 16px;
+  background: var(--btn-bg);
+  border-radius: 4px;
+  position: absolute;
+  transition: transform 0.3s ease, opacity 0.3s ease;
 }
 
-.download-text{font-weight:800;font-size:13px;color:var(--subtext-color);}
+.download-text {
+  font-weight: 800;
+  font-size: 13px;
+  color: var(--subtext-color);
+}
 
 .files-container {
   width: 100%;
   margin-top: 6px;
 }
 
-.empty-state{padding:40px 20px;text-align:center;display:none}
+.empty-state {
+  padding: 40px 20px;
+  text-align: center;
+  display: none;
+}
 
-.dropdown-menu{
-  position:absolute;top:calc(100% + 10px);right:0;
-  background:var(--card-bg);border:1px solid var(--border-color);border-radius:20px;
-  box-shadow:0 15px 35px rgba(0,0,0,.18);
-  padding:10px;min-width:260px;z-index:30;
-  opacity:0;pointer-events:none;
-  transform:translateY(-8px) scale(0.96);
-  transition: transform 0.4s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.3s ease, background 0.6s ease;
-  transform-origin:top right;
+.dropdown-menu {
+  position: absolute;
+  top: calc(100% + 10px);
+  right: 0;
+  background: var(--card-bg);
+  border: 1px solid var(--border-color);
+  border-radius: 20px;
+  box-shadow: 0 15px 35px rgba(0, 0, 0, 0.18);
+  padding: 10px;
+  min-width: 260px;
+  z-index: 30;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(-8px) scale(0.96) translateZ(0);
+  transition: transform 0.22s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.18s ease, background 0.35s ease;
+  transform-origin: top right;
   backdrop-filter: blur(14px);
   -webkit-backdrop-filter: blur(14px);
   will-change: transform, opacity;
 }
-.dropdown-menu.open{opacity:1;pointer-events:auto;transform:translateY(0) scale(1)}
+
+.dropdown-menu.open {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateY(0) scale(1) translateZ(0);
+}
 
 .sound-item-btn {
-  width: 100%;text-align: left;padding: 10px 12px;border-radius: 14px;
-  background: var(--card-bg);border: 1px solid var(--border-color);cursor: pointer;
-  font-family: 'Nunito', sans-serif;font-weight: 700;font-size: 14px;
-  color: var(--text-color);display: flex;align-items: center;justify-content: space-between;
-  gap: 10px;margin-bottom: 6px;transition: transform 0.3s ease, background-color 0.6s ease, color 0.6s ease;
+  width: 100%;
+  text-align: left;
+  padding: 10px 12px;
+  border-radius: 14px;
+  background: var(--card-bg);
+  border: 1px solid var(--border-color);
+  cursor: pointer;
+  font-family: 'Nunito', sans-serif;
+  font-weight: 700;
+  font-size: 14px;
+  color: var(--text-color);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 6px;
+  transition: transform 0.16s ease, background-color 0.35s ease, color 0.35s ease, border-color 0.35s ease;
+  will-change: transform;
+  transform: translateZ(0);
 }
-.sound-item-btn:last-child { margin-bottom: 0; }
-.sound-item-btn:active { transform: scale(0.98); }
+
+.sound-item-btn:last-child {
+  margin-bottom: 0;
+}
+
+.sound-item-btn:active {
+  transform: scale(0.98) translateZ(0);
+}
+
 .sound-item-btn.active-sound {
   background: var(--btn-bg) !important;
   color: var(--btn-text) !important;
@@ -8436,10 +8646,21 @@ body.modal-open {
 }
 
 .check-circle-icon {
-  width: 22px;height: 22px;border-radius: 50%;background: #34c759;
-  display: flex;align-items: center;justify-content: center;flex-shrink: 0;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: #34c759;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
 }
-.check-circle-icon svg { stroke: #fff !important; width: 13px; height: 13px; }
+
+.check-circle-icon svg {
+  stroke: #fff !important;
+  width: 13px;
+  height: 13px;
+}
 
 .custom-theme-picker {
   display: none;
@@ -8451,46 +8672,88 @@ body.modal-open {
   border-radius: 14px;
   margin-top: 8px;
 }
-.custom-theme-picker.active { display: flex; }
-.color-picker-row { display: flex; align-items: center; justify-content: space-between; font-size: 13px; font-weight: 700; }
-.color-picker-wrap {
-  position: relative; width: 32px; height: 32px; border-radius: 50%;
-  border: 2px solid var(--border-color); overflow: hidden; cursor: pointer;
+
+.custom-theme-picker.active {
+  display: flex;
 }
+
+.color-picker-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.color-picker-wrap {
+  position: relative;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  border: 2px solid var(--border-color);
+  overflow: hidden;
+  cursor: pointer;
+}
+
 .color-picker-wrap input[type="color"] {
-  position: absolute; top: -10px; left: -10px; width: 50px; height: 50px;
-  border: none; cursor: pointer; background: none;
+  position: absolute;
+  top: -10px;
+  left: -10px;
+  width: 50px;
+  height: 50px;
+  border: none;
+  cursor: pointer;
+  background: none;
 }
 
 .modal-overlay {
-  position: fixed; top: 0; left: 0; right: 0; bottom: 0;
-  background: rgba(0,0,0,0.5);
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.5);
   backdrop-filter: blur(8px);
   -webkit-backdrop-filter: blur(8px);
-  z-index: 100; display: flex; align-items: flex-end; justify-content: center;
-  opacity: 0; pointer-events: none;
-  transition: opacity 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+  z-index: 100;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.22s cubic-bezier(0.16, 1, 0.3, 1);
   overscroll-behavior: contain;
   touch-action: none;
+  will-change: opacity;
 }
-.modal-overlay.open { opacity: 1; pointer-events: auto; }
+
+.modal-overlay.open {
+  opacity: 1;
+  pointer-events: auto;
+}
 
 .modal-card {
   background: var(--card-bg);
   border: 1px solid var(--border-color);
   border-bottom: none;
-  border-top-left-radius: 32px; border-top-right-radius: 32px;
-  padding: 14px 22px 32px 22px; width: 100%; max-width: 560px;
-  box-shadow: 0 -10px 40px rgba(0,0,0,0.25);
-  transform: translateY(100%);
-  transition: transform 0.5s cubic-bezier(0.16, 1, 0.3, 1);
+  border-top-left-radius: 32px;
+  border-top-right-radius: 32px;
+  padding: 14px 22px 32px 22px;
+  width: 100%;
+  max-width: 560px;
+  box-shadow: 0 -10px 40px rgba(0, 0, 0, 0.25);
+  transform: translateY(100%) translateZ(0);
+  transition: transform 0.28s cubic-bezier(0.16, 1, 0.3, 1);
   will-change: transform;
   backdrop-filter: blur(20px);
   -webkit-backdrop-filter: blur(20px);
   overscroll-behavior: contain;
   touch-action: pan-y;
 }
-.modal-overlay.open .modal-card { transform: translateY(0); }
+
+.modal-overlay.open .modal-card {
+  transform: translateY(0) translateZ(0);
+}
 
 .sheet-handle-area {
   width: 100%;
@@ -8499,9 +8762,301 @@ body.modal-open {
   display: flex;
   justify-content: center;
 }
+
 .sheet-handle {
-  width: 48px; height: 5px; background: var(--border-color);
-  border-radius: 999px; opacity: 0.8;
+  width: 48px;
+  height: 5px;
+  background: var(--border-color);
+  border-radius: 999px;
+  opacity: 0.8;
+}
+
+.settings-btn {
+  width: 44px;
+  height: 44px;
+  border-radius: 9999px;
+  background: var(--btn-bg);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--btn-text);
+  border: none;
+  cursor: pointer;
+  transition: transform 0.18s cubic-bezier(0.2, 0.8, 0.2, 1), background 0.35s ease, color 0.35s ease;
+  will-change: transform;
+  position: relative;
+  z-index: 35;
+  transform: translateZ(0);
+}
+
+.settings-btn:active {
+  transform: scale(0.9) rotate(30deg) translateZ(0);
+}
+
+.settings-panel {
+  position: absolute;
+  top: calc(100% + 12px);
+  right: 0;
+  width: 280px;
+  max-height: 70vh;
+  overflow-y: auto;
+  overflow-x: hidden;
+  background: var(--card-bg);
+  border: 1px solid var(--border-color);
+  border-radius: 24px;
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.22);
+  padding: 14px;
+  z-index: 34;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(-12px) scale(0.92) translateZ(0);
+  transition: transform 0.24s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+  transform-origin: top right;
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  will-change: transform, opacity;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+}
+
+.settings-panel.open {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateY(0) scale(1) translateZ(0);
+}
+
+.settings-panel-title {
+  font-weight: 900;
+  font-size: 16px;
+  padding: 4px 8px 10px;
+  color: var(--text-color);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.settings-item {
+  width: 100%;
+  text-align: left;
+  padding: 12px 14px;
+  border-radius: 16px;
+  background: transparent;
+  border: 1px solid transparent;
+  cursor: pointer;
+  font-family: 'Nunito', sans-serif;
+  font-weight: 700;
+  font-size: 14px;
+  color: var(--text-color);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 4px;
+  transition: transform 0.16s cubic-bezier(0.2, 0.8, 0.2, 1), background 0.25s ease, border-color 0.25s ease;
+  will-change: transform;
+  transform: translateZ(0);
+}
+
+.settings-item:last-child {
+  margin-bottom: 0;
+}
+
+.settings-item:active {
+  transform: scale(0.96) translateZ(0);
+  background: var(--card-active);
+}
+
+.settings-item-icon {
+  width: 38px;
+  height: 38px;
+  border-radius: 12px;
+  background: var(--btn-bg);
+  color: var(--btn-text);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: background 0.35s ease, color 0.35s ease;
+}
+
+.settings-item-label {
+  flex: 1;
+  min-width: 0;
+}
+
+.settings-item-label small {
+  display: block;
+  font-weight: 600;
+  font-size: 11px;
+  color: var(--subtext-color);
+  margin-top: 2px;
+}
+
+.settings-divider {
+  height: 1px;
+  background: var(--border-color);
+  margin: 8px 4px;
+  border: none;
+}
+
+.settings-submenu {
+  overflow: hidden;
+  max-height: 0;
+  opacity: 0;
+  transition: max-height 0.28s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+  will-change: max-height, opacity;
+}
+
+.settings-submenu.open {
+  max-height: 700px;
+  opacity: 1;
+}
+
+.settings-submenu-inner {
+  padding: 6px 0 4px;
+}
+
+.settings-panel .settings-item,
+.settings-panel .settings-submenu {
+  transform: translateX(12px) translateZ(0);
+  opacity: 0;
+  transition: transform 0.22s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.18s ease;
+}
+
+.settings-panel.open .settings-item,
+.settings-panel.open .settings-submenu {
+  transform: translateX(0) translateZ(0);
+  opacity: 1;
+}
+
+.settings-panel.open .settings-item:nth-child(1) { transition-delay: 0.02s; }
+.settings-panel.open .settings-item:nth-child(2) { transition-delay: 0.04s; }
+.settings-panel.open .settings-item:nth-child(3) { transition-delay: 0.06s; }
+.settings-panel.open .settings-item:nth-child(4) { transition-delay: 0.08s; }
+.settings-panel.open .settings-item:nth-child(5) { transition-delay: 0.10s; }
+.settings-panel.open .settings-item:nth-child(6) { transition-delay: 0.12s; }
+.settings-panel.open .settings-item:nth-child(7) { transition-delay: 0.14s; }
+.settings-panel.open .settings-item:nth-child(8) { transition-delay: 0.16s; }
+.settings-panel.open .settings-item:nth-child(9) { transition-delay: 0.18s; }
+
+.settings-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 33;
+  background: transparent;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.2s ease;
+}
+
+.settings-overlay.active {
+  pointer-events: auto;
+  opacity: 1;
+}
+
+#selectionBar {
+  position: fixed;
+  bottom: calc(20px + env(safe-area-inset-bottom));
+  left: 50%;
+  z-index: 60;
+  display: flex;
+  width: clamp(300px, 88%, 440px);
+  padding: 6px 6px 6px 12px;
+  background: var(--card-bg);
+  border: 1px solid var(--border-color);
+  border-radius: 9999px;
+  box-shadow: 0 14px 40px rgba(0, 0, 0, 0.22), 0 4px 12px rgba(0, 0, 0, 0.08);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+  opacity: 0;
+  pointer-events: none;
+  transform: translateX(-50%) translateY(140%) scale(0.96) translateZ(0);
+  transition: transform 0.28s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.22s ease;
+  will-change: transform, opacity;
+  overscroll-behavior: contain;
+}
+
+#selectionBar.visible {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateX(-50%) translateY(0) scale(1) translateZ(0);
+}
+
+#selectionBar .sel-inner {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+}
+
+#selectionBar .sel-count {
+  flex: 0 0 auto;
+  padding: 6px 10px;
+  border-radius: 9999px;
+  background: var(--btn-bg);
+  color: var(--btn-text);
+  font-weight: 800;
+  font-size: 13px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+  min-height: 36px;
+  transition: transform 0.16s cubic-bezier(0.2, 0.8, 0.2, 1);
+  will-change: transform;
+  transform: translateZ(0);
+}
+
+#selectionBar .sel-count.pulse {
+  animation: countPulse 0.25s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+@keyframes countPulse {
+  0% { transform: scale(1) translateZ(0); }
+  50% { transform: scale(1.12) translateZ(0); }
+  100% { transform: scale(1) translateZ(0); }
+}
+
+#selectionBar .sel-btn {
+  flex: 0 0 auto;
+  width: 38px;
+  height: 38px;
+  border-radius: 9999px;
+  border: 1px solid var(--border-color);
+  background: var(--card-bg);
+  color: var(--text-color);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  font-size: 15px;
+  transition: transform 0.12s cubic-bezier(0.2, 0.8, 0.2, 1), background 0.25s ease, border-color 0.25s ease;
+  will-change: transform;
+  -webkit-tap-highlight-color: transparent;
+  transform: translateZ(0);
+}
+
+#selectionBar .sel-btn:active {
+  transform: scale(0.88) translateZ(0);
+}
+
+#selectionBar .sel-btn.danger {
+  color: #ef4444;
+  border-color: rgba(239, 68, 68, 0.3);
+}
+
+#selectionBar .sel-btn.done {
+  background: var(--btn-bg);
+  color: var(--btn-text);
+  border-color: var(--btn-bg);
+  font-weight: 800;
+  font-size: 12px;
+  width: auto;
+  padding: 0 14px;
+  margin-left: auto;
+}
+
+#selectionBar .sel-btn.hidden {
+  display: none;
 }
 </style>
 </head>
@@ -8516,15 +9071,15 @@ body.modal-open {
 
 <div id="toastContainer" style="position:fixed;bottom:24px;left:50%;transform:translateX(-50%);z-index:150;display:flex;flex-direction:column;align-items:center;gap:8px;pointer-events:none;width:100%;max-width:400px;padding:0 16px"></div>
 
-<!-- Модальное окно действий с файлом -->
 <div id="editModal" class="modal-overlay" onclick="closeEditModal(event)">
   <div class="modal-card" id="modalCard" onclick="event.stopPropagation()">
     <div class="sheet-handle-area" id="modalHandle">
       <div class="sheet-handle"></div>
     </div>
+
     <h3 style="font-weight:900;font-size:20px;margin-bottom:4px">Действия с файлом</h3>
     <p id="modalFileName" style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:14px;word-break:break-all"></p>
-    
+
     <div style="margin-bottom:14px">
       <label style="font-size:11px;font-weight:800;color:var(--subtext-color);text-transform:uppercase;letter-spacing:0.04em">Название файла</label>
       <input type="text" id="modalInputName" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;margin-top:4px;outline:none;font-size:15px">
@@ -8532,63 +9087,84 @@ body.modal-open {
 
     <div style="display:flex;flex-direction:column;gap:8px">
       <button class="sound-item-btn" onclick="saveFileName()">
-        <span>Сохранить имя</span> <i data-lucide="check" style="width:18px;height:18px"></i>
+        <span>Сохранить имя</span>
+        <i data-lucide="check" style="width:18px;height:18px"></i>
       </button>
-      <!-- 22.30: НАСТОЯЩИЙ Сейф — перенос туда-обратно вместо косметической галочки.
-           Для файла в Сейфе показываем «Достать из Сейфа», для обычного — «В Сейф». -->
+
       <button class="sound-item-btn" id="modalToSafeBtn" onclick="toSafeCurrentFile()">
-        <span>🔐 Переместить в Сейф</span> <i data-lucide="lock" style="width:18px;height:18px"></i>
+        <span>🔐 Переместить в Сейф</span>
+        <i data-lucide="lock" style="width:18px;height:18px"></i>
       </button>
+
       <button class="sound-item-btn" id="modalFromSafeBtn" onclick="fromSafeCurrentFile()" style="display:none">
-        <span>🔓 Достать из Сейфа</span> <i data-lucide="lock-open" style="width:18px;height:18px"></i>
+        <span>🔓 Достать из Сейфа</span>
+        <i data-lucide="lock-open" style="width:18px;height:18px"></i>
       </button>
+
       <button class="sound-item-btn" onclick="downloadCurrentFile()">
-        <span>Скачать файл</span> <i data-lucide="download" style="width:18px;height:18px"></i>
+        <span>Скачать файл</span>
+        <i data-lucide="download" style="width:18px;height:18px"></i>
       </button>
+
       <button class="sound-item-btn" style="color:#ef4444" onclick="deleteCurrentFile()">
-        <span>Удалить файл</span> <i data-lucide="trash-2" style="width:18px;height:18px;stroke:#ef4444"></i>
+        <span>Удалить файл</span>
+        <i data-lucide="trash-2" style="width:18px;height:18px;stroke:#ef4444"></i>
       </button>
     </div>
   </div>
 </div>
 
-<!-- 22.30: модальное окно Сейфа (разблокировка паролем) -->
 <div id="safeModal" class="modal-overlay" onclick="closeSafeModal(event)">
   <div class="modal-card" onclick="event.stopPropagation()">
     <div class="sheet-handle-area">
       <div class="sheet-handle"></div>
     </div>
+
     <h3 style="font-weight:900;font-size:20px;margin-bottom:4px">🔒 Сейф</h3>
     <p id="safeStatusLine" style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:14px;line-height:1.5">Загружаю…</p>
 
     <div style="margin-bottom:14px">
-      <label style="font-size:11px;font-weight:800;color:var(--subtext-color);text-transform:uppercase;letter-spacing:0.04em">Пароль Сейфа (тот же, что в чате)</label>
+      <label style="font-size:11px;font-weight:800;color:var(--subtext-color);text-transform:uppercase;letter-spacing:0.04em">Пароль Сейфа</label>
       <input type="password" id="safePassword" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;margin-top:4px;outline:none;font-size:15px" placeholder="Пароль">
     </div>
 
     <div style="display:flex;flex-direction:column;gap:8px">
       <button class="sound-item-btn" onclick="unlockSafe()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
-        <span>Разблокировать</span> <i data-lucide="unlock" style="width:18px;height:18px"></i>
+        <span>Разблокировать</span>
+        <i data-lucide="unlock" style="width:18px;height:18px"></i>
       </button>
+
       <button class="sound-item-btn" onclick="lockSafe()">
-        <span>Заблокировать снова</span> <i data-lucide="lock" style="width:18px;height:18px"></i>
+        <span>Заблокировать снова</span>
+        <i data-lucide="lock" style="width:18px;height:18px"></i>
       </button>
+
       <button class="sound-item-btn" onclick="closeSafeModal()">
-        <span>Закрыть</span> <i data-lucide="x" style="width:18px;height:18px"></i>
+        <span>Закрыть</span>
+        <i data-lucide="x" style="width:18px;height:18px"></i>
       </button>
     </div>
-    <p style="font-size:11px;font-weight:600;color:var(--subtext-color);margin-top:12px;line-height:1.5">Пароль Сейфа нужен, чтобы скачать зашифрованный файл или переместить файл в Сейф из веб-облака. Пароль держится только в памяти страницы и никогда не сохраняется.</p>
+
+    <p style="font-size:11px;font-weight:600;color:var(--subtext-color);margin-top:12px;line-height:1.5">
+      Пароль Сейфа нужен, чтобы скачать зашифрованный файл или переместить файл в Сейф из веб-облака.
+      Пароль держится только в памяти страницы и никогда не сохраняется.
+    </p>
   </div>
 </div>
 
-<!-- Модальное окно выбора режима именования -->
 <div id="nameChoiceModal" class="modal-overlay" onclick="closeNameChoiceModal(event)">
   <div class="modal-card" onclick="event.stopPropagation()">
     <div class="sheet-handle-area">
       <div class="sheet-handle"></div>
     </div>
-    <h3 style="font-weight:900;font-size:20px;margin-bottom:4px">Выбрано файлов: <span id="nameChoiceCount">0</span></h3>
-    <p style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:16px">Как назвать эти файлы?</p>
+
+    <h3 style="font-weight:900;font-size:20px;margin-bottom:4px">
+      Выбрано файлов: <span id="nameChoiceCount">0</span>
+    </h3>
+
+    <p style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:16px">
+      Как назвать эти файлы?
+    </p>
 
     <div style="display:flex;flex-direction:column;gap:8px">
       <button class="sound-item-btn" onclick="chooseNameMode('album')" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
@@ -8598,6 +9174,7 @@ body.modal-open {
         </div>
         <i data-lucide="layers" style="width:18px;height:18px"></i>
       </button>
+
       <button class="sound-item-btn" onclick="chooseNameMode('each')">
         <div style="text-align:left">
           <div style="font-weight:800">Назвать по одному</div>
@@ -8605,6 +9182,7 @@ body.modal-open {
         </div>
         <i data-lucide="list" style="width:18px;height:18px"></i>
       </button>
+
       <button class="sound-item-btn" onclick="chooseNameMode('skip')">
         <div style="text-align:left">
           <div style="font-weight:800">Пропустить всё</div>
@@ -8616,15 +9194,15 @@ body.modal-open {
   </div>
 </div>
 
-<!-- Модальное окно именования одного файла -->
 <div id="nameModal" class="modal-overlay" onclick="closeNameModal(event)">
   <div class="modal-card" onclick="event.stopPropagation()">
     <div class="sheet-handle-area">
       <div class="sheet-handle"></div>
     </div>
+
     <h3 style="font-weight:900;font-size:20px;margin-bottom:4px">Назовите файл</h3>
     <p id="nameModalCounter" style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:14px"></p>
-    
+
     <div style="margin-bottom:14px">
       <label style="font-size:11px;font-weight:800;color:var(--subtext-color);text-transform:uppercase;letter-spacing:0.04em">Новое название</label>
       <input type="text" id="nameModalInput" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;margin-top:4px;outline:none;font-size:15px" placeholder="Оставьте пустым для оригинала">
@@ -8634,30 +9212,35 @@ body.modal-open {
 
     <div style="display:flex;flex-direction:column;gap:8px">
       <button class="sound-item-btn" onclick="confirmNameAndNext()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
-        <span>Сохранить и продолжить</span> <i data-lucide="arrow-right" style="width:18px;height:18px"></i>
+        <span>Сохранить и продолжить</span>
+        <i data-lucide="arrow-right" style="width:18px;height:18px"></i>
       </button>
+
       <button class="sound-item-btn" onclick="skipNameAndNext()">
-        <span>Пропустить</span> <i data-lucide="skip-forward" style="width:18px;height:18px"></i>
+        <span>Пропустить</span>
+        <i data-lucide="skip-forward" style="width:18px;height:18px"></i>
       </button>
+
       <button class="sound-item-btn" onclick="skipAllNames()">
-        <span>Пропустить все</span> <i data-lucide="fast-forward" style="width:18px;height:18px"></i>
+        <span>Пропустить все</span>
+        <i data-lucide="fast-forward" style="width:18px;height:18px"></i>
       </button>
     </div>
   </div>
 </div>
 
-<!-- Модальное окно альбомного именования -->
 <div id="albumModal" class="modal-overlay" onclick="closeAlbumModal(event)">
   <div class="modal-card" onclick="event.stopPropagation()">
     <div class="sheet-handle-area">
       <div class="sheet-handle"></div>
     </div>
+
     <h3 style="font-weight:900;font-size:20px;margin-bottom:4px">Название альбома</h3>
     <p id="albumModalCounter" style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:14px"></p>
-    
+
     <div style="margin-bottom:14px">
       <label style="font-size:11px;font-weight:800;color:var(--subtext-color);text-transform:uppercase;letter-spacing:0.04em">Общее название</label>
-      <input type="text" id="albumModalInput" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;margin-top:4px;outline:none;font-size:15px" placeholder="Например: Отпуск 2026">
+      <input type="text" id="albumModalInput" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;margin-top:4px;outline:none;font-size:15px" placeholder="Например: Отпуск 2026" oninput="renderAlbumPreview(this.value)">
     </div>
 
     <div style="padding:12px;background:var(--card-bg);border:1px solid var(--border-color);border-radius:14px;margin-bottom:16px;font-size:12px;font-weight:600;color:var(--subtext-color)">
@@ -8667,29 +9250,34 @@ body.modal-open {
 
     <div style="display:flex;flex-direction:column;gap:8px">
       <button class="sound-item-btn" onclick="confirmAlbumName()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
-        <span>Применить ко всем</span> <i data-lucide="check" style="width:18px;height:18px"></i>
+        <span>Применить ко всем</span>
+        <i data-lucide="check" style="width:18px;height:18px"></i>
       </button>
+
       <button class="sound-item-btn" onclick="closeAlbumModal()">
-        <span>Отмена</span> <i data-lucide="x" style="width:18px;height:18px"></i>
+        <span>Отмена</span>
+        <i data-lucide="x" style="width:18px;height:18px"></i>
       </button>
     </div>
   </div>
 </div>
 
-<!-- Модальное окно хранилища («Моё облако» — волна 22.23) -->
 <div id="storageModal" class="modal-overlay" onclick="closeStorageModal(event)">
   <div class="modal-card" onclick="event.stopPropagation()">
     <div class="sheet-handle-area">
       <div class="sheet-handle"></div>
     </div>
+
     <h3 style="font-weight:900;font-size:20px;margin-bottom:4px">Хранилище</h3>
     <p style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:12px">Куда попадают ваши файлы</p>
 
-    <div id="storageStatus" style="padding:12px;background:var(--card-bg);border:1px solid var(--border-color);border-radius:14px;margin-bottom:14px;font-size:13px;font-weight:700;color:var(--subtext-color);line-height:1.5">Загружаю…</div>
+    <div id="storageStatus" style="padding:12px;background:var(--card-bg);border:1px solid var(--border-color);border-radius:14px;margin-bottom:14px;font-size:13px;font-weight:700;color:var(--subtext-color);line-height:1.5">
+      Загружаю…
+    </div>
 
-    <!-- 22.25: переключатель «хранить файлы БЕЗ шифрования» (виден при подключённом канале) -->
     <button class="sound-item-btn" id="storagePlainBtn" onclick="togglePlain()" style="display:none;margin-bottom:14px">
-      <span id="storagePlainLabel">Шифрование файлов</span> <i data-lucide="lock" style="width:18px;height:18px"></i>
+      <span id="storagePlainLabel">Шифрование файлов</span>
+      <i data-lucide="lock" style="width:18px;height:18px"></i>
     </button>
 
     <div style="margin-bottom:14px">
@@ -8699,33 +9287,85 @@ body.modal-open {
 
     <div style="display:flex;flex-direction:column;gap:8px">
       <button class="sound-item-btn" id="storageConnectBtn" onclick="connectStorage()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
-        <span>Подключить канал</span> <i data-lucide="link" style="width:18px;height:18px"></i>
+        <span>Подключить канал</span>
+        <i data-lucide="link" style="width:18px;height:18px"></i>
       </button>
+
       <button class="sound-item-btn" id="storageOffBtn" onclick="disconnectStorage()" style="color:#ef4444;display:none">
-        <span>Отключить мой канал</span> <i data-lucide="unlink" style="width:18px;height:18px;stroke:#ef4444"></i>
+        <span>Отключить мой канал</span>
+        <i data-lucide="unlink" style="width:18px;height:18px;stroke:#ef4444"></i>
       </button>
     </div>
 
-    <p style="font-size:11px;font-weight:600;color:var(--subtext-color);margin-top:12px;line-height:1.5">Бот должен быть админом канала с правом «Публикация сообщений». Приватный канал без @username: перешлите любое сообщение из него боту в чат (Сейф → 🔗 Моё облако). Канал общий для чата и веб-облака: подключите/смените здесь — и в боте он тот же, и наоборот.</p>
+    <p style="font-size:11px;font-weight:600;color:var(--subtext-color);margin-top:12px;line-height:1.5">
+      Бот должен быть админом канала с правом «Публикация сообщений».
+      Приватный канал без @username: перешлите любое сообщение из него боту в чат.
+      Канал общий для чата и веб-облака.
+    </p>
   </div>
 </div>
 
-<!-- 22.24: честное окно «нет доступа» (открыто вне Telegram / не зарегистрирован) -->
 <div id="authModal" class="modal-overlay" onclick="closeAuthModal(event)">
   <div class="modal-card" onclick="event.stopPropagation()">
     <div class="sheet-handle-area">
       <div class="sheet-handle"></div>
     </div>
+
     <h3 style="font-weight:900;font-size:20px;margin-bottom:4px">Нет доступа к облаку</h3>
     <p id="authText" style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:14px;line-height:1.5">Проверяем…</p>
+
     <div style="display:flex;flex-direction:column;gap:8px">
       <button class="sound-item-btn" id="authOpenBtn" onclick="openBotChat()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg);display:none">
-        <span>Открыть чат бота</span> <i data-lucide="send" style="width:18px;height:18px"></i>
+        <span>Открыть чат бота</span>
+        <i data-lucide="send" style="width:18px;height:18px"></i>
       </button>
+
       <button class="sound-item-btn" onclick="closeAuthModal()">
-        <span>Понятно</span> <i data-lucide="x" style="width:18px;height:18px"></i>
+        <span>Понятно</span>
+        <i data-lucide="x" style="width:18px;height:18px"></i>
       </button>
     </div>
+  </div>
+</div>
+
+<div id="loginModal" class="modal-overlay" onclick="closeLoginModal(event)">
+  <div class="modal-card" onclick="event.stopPropagation()">
+    <div class="sheet-handle-area">
+      <div class="sheet-handle"></div>
+    </div>
+
+    <h3 style="font-weight:900;font-size:20px;margin-bottom:4px">Вход в DEVO+ Облако</h3>
+    <p style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:14px">
+      Открыто вне Telegram, войдите по ID и паролю, заданному в боте
+    </p>
+
+    <div style="margin-bottom:12px">
+      <label for="loginUserId" style="font-size:11px;font-weight:800;color:var(--subtext-color);text-transform:uppercase;letter-spacing:0.04em">Telegram ID</label>
+      <input type="text" id="loginUserId" inputmode="numeric" autocomplete="username" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;margin-top:4px;outline:none;font-size:15px" placeholder="Например: 123456789">
+    </div>
+
+    <div style="margin-bottom:14px">
+      <label for="loginPassword" style="font-size:11px;font-weight:800;color:var(--subtext-color);text-transform:uppercase;letter-spacing:0.04em">Пароль</label>
+      <input type="password" id="loginPassword" autocomplete="current-password" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;margin-top:4px;outline:none;font-size:15px" placeholder="Веб-пароль из бота">
+    </div>
+
+    <div style="display:flex;flex-direction:column;gap:8px">
+      <button class="sound-item-btn" id="loginSubmitBtn" onclick="webLogin()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
+        <span>Войти</span>
+        <i data-lucide="log-in" style="width:18px;height:18px"></i>
+      </button>
+
+      <button class="sound-item-btn" onclick="closeLoginModal()">
+        <span>Закрыть</span>
+        <i data-lucide="x" style="width:18px;height:18px"></i>
+      </button>
+    </div>
+
+    <p style="font-size:11px;font-weight:600;color:var(--subtext-color);margin-top:12px;line-height:1.5">
+      Пароль задаётся в боте через ☁️ Облако → «🔑 Веб-пароль».
+      Логин — ваш Telegram ID.
+      5 неверных попыток — пауза 10 минут.
+    </p>
   </div>
 </div>
 
@@ -8733,110 +9373,178 @@ body.modal-open {
 
   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
     <h1 class="logo-font">DEVO+</h1>
-    <div style="display:flex;gap:8px;position:relative">
 
-      <!-- 22.30: 🔒 Сейф — разблокировка паролем для скачивания/переносов -->
-      <button class="action-btn" onclick="openSafeModal()" title="Сейф (разблокировать)">
-        <i data-lucide="lock" style="width:18px;height:18px"></i>
+    <div style="position:relative">
+      <button class="settings-btn" id="settingsToggleBtn" onclick="toggleSettingsPanel(event)" title="Настройки">
+        <i data-lucide="settings" style="width:20px;height:20px"></i>
       </button>
 
-      <button class="action-btn" onclick="openStorageModal()" title="Хранилище (Моё облако)">
-        <i data-lucide="cloud" style="width:18px;height:18px"></i>
-      </button>
+      <div class="settings-overlay" id="settingsOverlay" onclick="closeSettingsPanel()"></div>
 
-      <!-- 22.29: мультивыбор файлов (галочки + «В ZIP»/«Распаковать»/«Удалить») -->
-      <button class="action-btn" id="selectModeBtn" onclick="toggleSelectMode()" title="Выбрать файлы">
-        <i data-lucide="check-square" style="width:18px;height:18px"></i>
-      </button>
+      <div class="settings-panel" id="settingsPanel" onclick="event.stopPropagation()">
+        <div class="settings-panel-title">
+          <i data-lucide="settings" style="width:18px;height:18px"></i>
+          Настройки
+        </div>
 
-      <button class="action-btn" id="themeToggleBtn" onclick="toggleThemeMenu(event)" title="Тема оформления">
-        <i id="themeIcon" data-lucide="sun" style="width:18px;height:18px"></i>
-      </button>
-
-      <div id="themeMenu" class="dropdown-menu" style="right:96px" onclick="event.stopPropagation()">
-        <div style="padding:4px 8px 6px;font-weight:800;font-size:11px;color:var(--subtext-color);text-transform:uppercase;letter-spacing:.05em">Тема оформления</div>
-        <button class="sound-item-btn" id="theme-light-btn" onclick="setTheme('light')">
-          <span>Светлая</span> <i data-lucide="sun" style="width:16px;height:16px"></i>
-        </button>
-        <button class="sound-item-btn" id="theme-dark-btn" onclick="setTheme('dark')">
-          <span>Тёмная</span> <i data-lucide="moon" style="width:16px;height:16px"></i>
-        </button>
-        <button class="sound-item-btn" id="theme-system-btn" onclick="setTheme('system')">
-          <span>Системная</span> <i data-lucide="laptop" style="width:16px;height:16px"></i>
-        </button>
-        <button class="sound-item-btn" id="theme-custom-btn" onclick="setTheme('custom')">
-          <span>Свой цвет / Градиент</span> <i data-lucide="palette" style="width:16px;height:16px"></i>
+        <button class="settings-item" onclick="closeSettingsAndDo(openSafeModal)">
+          <div class="settings-item-icon">
+            <i data-lucide="lock" style="width:18px;height:18px"></i>
+          </div>
+          <div class="settings-item-label">
+            Сейф
+            <small>Разблокировка паролем</small>
+          </div>
         </button>
 
-        <div id="customThemePicker" class="custom-theme-picker">
-          <div class="color-picker-row">
-            <span>Цвет 1 (Фон):</span>
-            <div class="color-picker-wrap">
-              <input type="color" id="customColor1" value="#4f46e5" onchange="updateCustomColors()">
+        <button class="settings-item" onclick="closeSettingsAndDo(openStorageModal)">
+          <div class="settings-item-icon">
+            <i data-lucide="cloud" style="width:18px;height:18px"></i>
+          </div>
+          <div class="settings-item-label">
+            Хранилище
+            <small>Моё облако / канал</small>
+          </div>
+        </button>
+
+        <button class="settings-item" onclick="closeSettingsAndDo(toggleSelectMode)">
+          <div class="settings-item-icon">
+            <i data-lucide="check-square" style="width:18px;height:18px"></i>
+          </div>
+          <div class="settings-item-label">
+            Выбор файлов
+            <small>ZIP, удаление, распаковка</small>
+          </div>
+        </button>
+
+        <button class="settings-item" onclick="toggleSettingsSubmenu('themeSubmenu')">
+          <div class="settings-item-icon">
+            <i id="themeIcon" data-lucide="sun" style="width:18px;height:18px"></i>
+          </div>
+          <div class="settings-item-label">
+            Тема оформления
+            <small id="themeCurrentLabel">Системная</small>
+          </div>
+          <i data-lucide="chevron-right" style="width:16px;height:16px;color:var(--subtext-color);flex-shrink:0"></i>
+        </button>
+
+        <div class="settings-submenu" id="themeSubmenu">
+          <div class="settings-submenu-inner">
+            <button class="sound-item-btn" id="theme-light-btn" onclick="setTheme('light')">
+              <span>Светлая</span>
+              <i data-lucide="sun" style="width:16px;height:16px"></i>
+            </button>
+
+            <button class="sound-item-btn" id="theme-dark-btn" onclick="setTheme('dark')">
+              <span>Тёмная</span>
+              <i data-lucide="moon" style="width:16px;height:16px"></i>
+            </button>
+
+            <button class="sound-item-btn" id="theme-system-btn" onclick="setTheme('system')">
+              <span>Системная</span>
+              <i data-lucide="laptop" style="width:16px;height:16px"></i>
+            </button>
+
+            <button class="sound-item-btn" id="theme-custom-btn" onclick="setTheme('custom')">
+              <span>Свой цвет / Градиент</span>
+              <i data-lucide="palette" style="width:16px;height:16px"></i>
+            </button>
+
+            <div id="customThemePicker" class="custom-theme-picker">
+              <div class="color-picker-row">
+                <span>Цвет 1 (Фон):</span>
+                <div class="color-picker-wrap">
+                  <input type="color" id="customColor1" value="#4f46e5" onchange="updateCustomColors()">
+                </div>
+              </div>
+
+              <div class="color-picker-row">
+                <span>Цвет 2 (Фон):</span>
+                <div class="color-picker-wrap">
+                  <input type="color" id="customColor2" value="#9333ea" onchange="updateCustomColors()">
+                </div>
+              </div>
+
+              <div class="color-picker-row">
+                <span>Угол градиента:</span>
+                <input type="range" id="customAngle" min="0" max="360" value="135" oninput="updateCustomColors()" style="width:90px">
+              </div>
+
+              <div class="color-picker-row">
+                <span>Цвет кнопок:</span>
+                <div class="color-picker-wrap">
+                  <input type="color" id="customBtnBg" value="#ffffff" onchange="updateCustomColors()">
+                </div>
+              </div>
+
+              <div class="color-picker-row">
+                <span>Текст кнопок:</span>
+                <div class="color-picker-wrap">
+                  <input type="color" id="customBtnText" value="#000000" onchange="updateCustomColors()">
+                </div>
+              </div>
             </div>
-          </div>
-          <div class="color-picker-row">
-            <span>Цвет 2 (Фон):</span>
-            <div class="color-picker-wrap">
-              <input type="color" id="customColor2" value="#9333ea" onchange="updateCustomColors()">
-            </div>
-          </div>
-          <div class="color-picker-row">
-            <span>Угол градиента:</span>
-            <input type="range" id="customAngle" min="0" max="360" value="135" oninput="updateCustomColors()" style="width:90px">
-          </div>
-          <div class="color-picker-row">
-            <span>Цвет кнопок:</span>
-            <div class="color-picker-wrap">
-              <input type="color" id="customBtnBg" value="#ffffff" onchange="updateCustomColors()">
-            </div>
-          </div>
-          <div class="color-picker-row">
-            <span>Текст кнопок:</span>
-            <div class="color-picker-wrap">
-              <input type="color" id="customBtnText" value="#000000" onchange="updateCustomColors()">
+
+            <div style="border-top:1px solid var(--border-color);margin:8px 0;padding-top:8px">
+              <div style="padding:0 8px 6px;font-weight:800;font-size:11px;color:var(--subtext-color);text-transform:uppercase;letter-spacing:.05em">
+                Живой фон
+              </div>
+
+              <button class="sound-item-btn" id="blobsToggleBtn" onclick="toggleBlobs()">
+                <span id="blobsToggleLabel">Включен</span>
+                <i id="blobsIcon" data-lucide="check" style="width:16px;height:16px"></i>
+              </button>
+
+              <div style="padding:8px 10px;background:var(--card-bg);border:1px solid var(--border-color);border-radius:12px;margin-top:5px">
+                <div style="display:flex;justify-content:space-between;font-size:12px;font-weight:700;margin-bottom:4px">
+                  <span>Скорость движения:</span>
+                  <span id="speedValueLabel" style="color:var(--subtext-color)">5x</span>
+                </div>
+                <input type="range" id="blobSpeedInput" min="1" max="10" step="1" value="5" oninput="changeBlobSpeed(this.value)" style="width:100%;cursor:pointer">
+              </div>
             </div>
           </div>
         </div>
 
-        <div style="border-top:1px solid var(--border-color);margin:8px 0;padding-top:8px">
-          <div style="padding:0 8px 6px;font-weight:800;font-size:11px;color:var(--subtext-color);text-transform:uppercase;letter-spacing:.05em">Живой фон</div>
-          
-          <button class="sound-item-btn" id="blobsToggleBtn" onclick="toggleBlobs()">
-            <span>Включен</span> <i id="blobsIcon" data-lucide="check" style="width:16px;height:16px"></i>
-          </button>
+        <hr class="settings-divider">
 
-          <div style="padding:8px 10px;background:var(--card-bg);border:1px solid var(--border-color);border-radius:12px;margin-top:5px">
-            <div style="display:flex;justify-content:space-between;font-size:12px;font-weight:700;margin-bottom:4px">
-              <span>Скорость движения:</span>
-              <span id="speedValueLabel" style="color:var(--subtext-color)">5x</span>
-            </div>
-            <input type="range" id="blobSpeedInput" min="1" max="10" step="1" value="5" oninput="changeBlobSpeed(this.value)" style="width:100%;cursor:pointer">
+        <button class="settings-item" onpointerdown="unlockAudio(event)" onclick="toggleSettingsSubmenu('soundSubmenu')">
+          <div class="settings-item-icon">
+            <i id="soundIcon" data-lucide="volume-2" style="width:18px;height:18px"></i>
           </div>
+          <div class="settings-item-label">
+            Звук уведомления
+            <small id="soundCurrentLabel">Apple Pay Double-Chime</small>
+          </div>
+          <i data-lucide="chevron-right" style="width:16px;height:16px;color:var(--subtext-color);flex-shrink:0"></i>
+        </button>
+
+        <div class="settings-submenu" id="soundSubmenu">
+          <div class="settings-submenu-inner" id="soundListOptions"></div>
         </div>
-      </div>
 
-      <button id="soundToggleBtn" class="action-btn" onpointerdown="unlockAudio(event)" onclick="toggleSoundMenu(event)" title="Выбор звука">
-        <i id="soundIcon" data-lucide="volume-2" style="width:18px;height:18px"></i>
-      </button>
-      
-      <div id="soundMenu" class="dropdown-menu" style="right:48px" onclick="event.stopPropagation()">
-        <div style="padding:4px 8px 8px;font-weight:800;font-size:11px;color:var(--subtext-color);text-transform:uppercase;letter-spacing:.05em">Выберите звук</div>
-        <div id="soundListOptions" style="max-height:240px;overflow-y:auto"></div>
-      </div>
+        <hr class="settings-divider">
 
-      <button class="action-btn" onclick="syncNow()" title="Синхронизация">
-        <i data-lucide="refresh-cw" style="width:18px;height:18px"></i>
-      </button>
+        <button class="settings-item" onclick="closeSettingsAndDo(syncNow)">
+          <div class="settings-item-icon">
+            <i data-lucide="refresh-cw" style="width:18px;height:18px"></i>
+          </div>
+          <div class="settings-item-label">
+            Синхронизация
+            <small>Обновить список файлов</small>
+          </div>
+        </button>
+      </div>
     </div>
   </div>
 
   <div style="display:flex;gap:12px;margin-bottom:12px;">
-    <div style="flex:1;background:var(--stat-bg);border:1px solid var(--border-color);border-radius:18px;padding:12px 16px;backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px)">
+    <div style="flex:1;background:var(--stat-bg);border:1px solid var(--border-color);border-radius:18px;padding:12px 16px;backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);transition:background 0.35s ease,border-color 0.35s ease">
       <p style="font-weight:700;font-size:12px;color:var(--text-color);text-transform:uppercase;letter-spacing:.04em;opacity:.6">Файлов</p>
       <p id="statFiles" style="font-weight:900;font-size:22px;margin-top:2px">0</p>
     </div>
-    <div style="flex:1;background:var(--stat-bg);border:1px solid var(--border-color);border-radius:18px;padding:12px 16px;backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px)">
+
+    <div style="flex:1;background:var(--stat-bg);border:1px solid var(--border-color);border-radius:18px;padding:12px 16px;backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);transition:background 0.35s ease,border-color 0.35s ease">
       <p style="font-weight:700;font-size:12px;color:var(--text-color);text-transform:uppercase;letter-spacing:.04em;opacity:.6">Занято</p>
       <p id="statSize" style="font-weight:900;font-size:22px;margin-top:2px">0 Б</p>
     </div>
@@ -8871,29 +9579,42 @@ body.modal-open {
 
   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;position:relative;">
     <p id="filesCount" style="font-weight:700;font-size:14px;color:var(--text-color);opacity:.6">0 файлов</p>
+
     <div style="position:relative">
       <button class="chip" id="sortToggleBtn" onclick="toggleSortMenu(event)">
         <i data-lucide="arrow-up-down" style="width:16px;height:16px"></i>
         <span id="sortLabel">По дате</span>
       </button>
+
       <div id="sortMenu" class="dropdown-menu" onclick="event.stopPropagation()">
-        <button class="sound-item-btn" data-sort="date-desc" onclick="setSort('date-desc')">
-          <i data-lucide="clock" style="width:16px;height:16px"></i> Сначала новые
+        <button class="sound-item-btn" onclick="setSort('date-desc')">
+          <i data-lucide="clock" style="width:16px;height:16px"></i>
+          Сначала новые
         </button>
-        <button class="sound-item-btn" data-sort="date-asc" onclick="setSort('date-asc')">
-          <i data-lucide="history" style="width:16px;height:16px"></i> Сначала старые
+
+        <button class="sound-item-btn" onclick="setSort('date-asc')">
+          <i data-lucide="history" style="width:16px;height:16px"></i>
+          Сначала старые
         </button>
-        <button class="sound-item-btn" data-sort="name-asc" onclick="setSort('name-asc')">
-          <i data-lucide="arrow-down-a-z" style="width:16px;height:16px"></i> По имени (А→Я)
+
+        <button class="sound-item-btn" onclick="setSort('name-asc')">
+          <i data-lucide="arrow-down-a-z" style="width:16px;height:16px"></i>
+          По имени (А→Я)
         </button>
-        <button class="sound-item-btn" data-sort="name-desc" onclick="setSort('name-desc')">
-          <i data-lucide="arrow-up-z-a" style="width:16px;height:16px"></i> По имени (Я→А)
+
+        <button class="sound-item-btn" onclick="setSort('name-desc')">
+          <i data-lucide="arrow-up-z-a" style="width:16px;height:16px"></i>
+          По имени (Я→А)
         </button>
-        <button class="sound-item-btn" data-sort="size-desc" onclick="setSort('size-desc')">
-          <i data-lucide="arrow-down-wide-narrow" style="width:16px;height:16px"></i> Сначала большие
+
+        <button class="sound-item-btn" onclick="setSort('size-desc')">
+          <i data-lucide="arrow-down-wide-narrow" style="width:16px;height:16px"></i>
+          Сначала большие
         </button>
-        <button class="sound-item-btn" data-sort="size-asc" onclick="setSort('size-asc')">
-          <i data-lucide="arrow-up-narrow-wide" style="width:16px;height:16px"></i> Сначала маленькие
+
+        <button class="sound-item-btn" onclick="setSort('size-asc')">
+          <i data-lucide="arrow-up-narrow-wide" style="width:16px;height:16px"></i>
+          Сначала маленькие
         </button>
       </div>
     </div>
@@ -8906,6 +9627,7 @@ body.modal-open {
         <path d="M12 12v9"/>
         <path d="m16 16-4-4-4 4"/>
       </svg>
+
       <p style="font-weight:800;font-size:15px;color:var(--text-color)">Загрузить файлы</p>
       <p style="font-weight:600;font-size:12px;color:var(--subtext-color)">нажмите или перетащите файлы сюда</p>
     </div>
@@ -8918,11 +9640,14 @@ body.modal-open {
           <circle class="bg" cx="30" cy="30" r="25"></circle>
           <circle class="bar" id="progressBar" cx="30" cy="30" r="25"></circle>
         </svg>
+
         <svg class="checkmark-svg" id="checkmark" viewBox="0 0 60 60">
           <path d="M17 31 L26 40 L43 21" fill="none" stroke="#22c55e" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
         </svg>
+
         <div class="square-stop" id="squareStop"></div>
       </div>
+
       <p class="download-text" id="downloadText">Загрузка...</p>
     </div>
 
@@ -8936,6 +9661,7 @@ body.modal-open {
       <div class="icon-wrap" style="margin:0 auto 12px;background:var(--card-bg);width:54px;height:54px;border:1px solid var(--border-color)">
         <i data-lucide="folder-open" style="width:26px;height:26px;color:var(--text-color);opacity:.4"></i>
       </div>
+
       <p id="emptyTitle" style="font-weight:800;font-size:16px;color:var(--text-color)">Облако пусто</p>
       <p id="emptySub" style="font-weight:600;font-size:13px;color:var(--subtext-color);margin-top:2px">Загрузите первые файлы</p>
     </section>
@@ -8943,43 +9669,128 @@ body.modal-open {
 
 </div>
 
+<div id="selectionBar">
+  <div class="sel-inner">
+    <div class="sel-count" id="selCount">
+      <i data-lucide="check" style="width:12px;height:12px"></i>
+      <span id="selCountNum">0</span>
+    </div>
+
+    <button class="sel-btn" onclick="zipSelected()" title="В ZIP">📦</button>
+    <button class="sel-btn hidden" id="unzipBtn" onclick="unzipSelected()" title="Распаковать">🗂</button>
+    <button class="sel-btn danger" onclick="deleteSelected()" title="Удалить">🗑</button>
+    <button class="sel-btn done" onclick="toggleSelectMode()">Готово</button>
+  </div>
+</div>
+
 <script>
-/* 22.28: безопасная отрисовка иконок — unpkg.com тоже бывает недоступен
-   (школьные сети). Без guard'а вызов lucide падал с ReferenceError
-   ВНУТРИ applyTheme на старте — и весь скрипт приложения умирал:
-   не было ни списка файлов, ни авторизации («мини апп не работает»). */
 function safeIcons() {
   try {
-    if (window.lucide && typeof lucide.createIcons === 'function') lucide.createIcons();
+    if (window.lucide && typeof lucide.createIcons === 'function') {
+      lucide.createIcons();
+    }
   } catch (e) {}
 }
+
 const tg = window.Telegram?.WebApp;
-if (tg) { tg.ready(); tg.expand(); }
+if (tg) {
+  tg.ready();
+  tg.expand();
+}
 
 let currentTheme = localStorage.getItem('devo_theme') || 'system';
 let blobsEnabled = localStorage.getItem('devo_blobs_enabled') !== 'false';
 let blobIdleSpeed = localStorage.getItem('devo_blob_speed') || '5';
 
+function toggleSettingsPanel(e) {
+  if (e) e.stopPropagation();
+
+  const panel = document.getElementById('settingsPanel');
+  const overlay = document.getElementById('settingsOverlay');
+
+  const willOpen = !panel.classList.contains('open');
+
+  if (willOpen) {
+    panel.classList.add('open');
+    overlay.classList.add('active');
+  } else {
+    closeSettingsPanel();
+  }
+}
+
+function closeSettingsPanel() {
+  const panel = document.getElementById('settingsPanel');
+  const overlay = document.getElementById('settingsOverlay');
+
+  panel.classList.remove('open');
+  overlay.classList.remove('active');
+
+  document.querySelectorAll('.settings-submenu.open').forEach((s) => {
+    s.classList.remove('open');
+  });
+}
+
+function closeSettingsAndDo(fn) {
+  closeSettingsPanel();
+  setTimeout(fn, 180);
+}
+
+function toggleSettingsSubmenu(id) {
+  const submenu = document.getElementById(id);
+  if (!submenu) return;
+
+  const willOpen = !submenu.classList.contains('open');
+
+  document.querySelectorAll('.settings-submenu.open').forEach((s) => {
+    if (s.id !== id) s.classList.remove('open');
+  });
+
+  if (willOpen) {
+    submenu.classList.add('open');
+    if (id === 'soundSubmenu') renderSoundMenu();
+  } else {
+    submenu.classList.remove('open');
+  }
+}
+
 function applyTheme(theme) {
   currentTheme = theme;
   localStorage.setItem('devo_theme', theme);
-  
+
   let isDark = false;
+
   if (theme === 'system') {
     isDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
   } else {
     isDark = theme === 'dark';
   }
 
-  document.documentElement.setAttribute('data-theme', theme === 'custom' ? 'custom' : (isDark ? 'dark' : 'light'));
-  
+  document.documentElement.setAttribute(
+    'data-theme',
+    theme === 'custom' ? 'custom' : (isDark ? 'dark' : 'light')
+  );
+
   const iconEl = document.getElementById('themeIcon');
   if (iconEl) {
-    iconEl.setAttribute('data-lucide', theme === 'custom' ? 'palette' : (isDark ? 'moon' : 'sun'));
+    iconEl.setAttribute(
+      'data-lucide',
+      theme === 'custom' ? 'palette' : (isDark ? 'moon' : 'sun')
+    );
     safeIcons();
   }
 
-  document.querySelectorAll('#themeMenu .sound-item-btn').forEach(btn => {
+  const label = document.getElementById('themeCurrentLabel');
+  if (label) {
+    const names = {
+      light: 'Светлая',
+      dark: 'Тёмная',
+      system: 'Системная',
+      custom: 'Свой цвет'
+    };
+    label.textContent = names[theme] || 'Системная';
+  }
+
+  document.querySelectorAll('#themeSubmenu .sound-item-btn').forEach((btn) => {
     if (btn.id.startsWith('theme-')) {
       btn.classList.toggle('active-sound', btn.id === `theme-${theme}-btn`);
     }
@@ -9036,15 +9847,18 @@ function toggleBlobs() {
 function updateBlobsVisibility() {
   const bgBlobs = document.getElementById('bgBlobs');
   const blobsIcon = document.getElementById('blobsIcon');
+  const blobsLabel = document.getElementById('blobsToggleLabel');
+
   if (bgBlobs) bgBlobs.style.opacity = blobsEnabled ? '1' : '0';
   if (blobsIcon) blobsIcon.style.display = blobsEnabled ? 'inline-block' : 'none';
+  if (blobsLabel) blobsLabel.textContent = blobsEnabled ? 'Включен' : 'Выключен';
 }
 
 let blobTimer = null;
 
 function moveBlobsRandomly() {
   if (!blobsEnabled) return;
-  
+
   const b1 = document.getElementById('blob1');
   const b2 = document.getElementById('blob2');
   if (!b1 || !b2) return;
@@ -9060,19 +9874,21 @@ function moveBlobsRandomly() {
   const randY2 = (Math.random() - 0.5) * heightRange;
   const scale2 = 0.75 + Math.random() * 0.5;
 
-  b1.style.transform = `translate(${randX1}px, ${randY1}px) scale(${scale1})`;
-  b2.style.transform = `translate(${randX2}px, ${randY2}px) scale(${scale2})`;
+  b1.style.transform = `translate(${randX1}px, ${randY1}px) scale(${scale1}) translateZ(0)`;
+  b2.style.transform = `translate(${randX2}px, ${randY2}px) scale(${scale2}) translateZ(0)`;
 }
 
 function startBlobAnimation() {
   if (blobTimer) clearInterval(blobTimer);
+
   moveBlobsRandomly();
-  
+
   const speed = parseInt(blobIdleSpeed) || 5;
   const intervalMs = Math.max(800, 3200 - (speed * 240));
-  
+
   const b1 = document.getElementById('blob1');
   const b2 = document.getElementById('blob2');
+
   if (b1) b1.style.transition = `transform ${intervalMs / 1000 * 1.25}s cubic-bezier(0.25, 1, 0.5, 1)`;
   if (b2) b2.style.transition = `transform ${intervalMs / 1000 * 1.25}s cubic-bezier(0.25, 1, 0.5, 1)`;
 
@@ -9082,107 +9898,162 @@ function startBlobAnimation() {
 function changeBlobSpeed(val) {
   blobIdleSpeed = val;
   localStorage.setItem('devo_blob_speed', val);
-  
+
   const label = document.getElementById('speedValueLabel');
   if (label) label.textContent = val + 'x';
 
   startBlobAnimation();
 }
 
-function closeAllMenus(except) {
-  const menus = ['themeMenu', 'soundMenu', 'sortMenu'];
-  menus.forEach(id => {
-    if (id !== except) {
-      const m = document.getElementById(id);
-      if (m) m.classList.remove('open');
-    }
-  });
-}
-
-function toggleThemeMenu(e) {
-  if (e) e.stopPropagation();
-  const menu = document.getElementById('themeMenu');
-  const willOpen = !menu.classList.contains('open');
-  closeAllMenus('themeMenu');
-  if (willOpen) menu.classList.add('open');
-  else menu.classList.remove('open');
-}
-
 function setTheme(theme) {
   applyTheme(theme);
-  if (theme !== 'custom') {
-    document.getElementById('themeMenu').classList.remove('open');
-  }
 }
 
 window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
   if (currentTheme === 'system') applyTheme('system');
 });
 
-/* АУДИО */
 let audioCtx = null;
+
 function getAudioContext() {
   if (!audioCtx) {
     const AudioContextClass = window.AudioContext || window.webkitAudioContext;
     if (AudioContextClass) audioCtx = new AudioContextClass();
   }
+
   if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+
   return audioCtx;
 }
 
 function unlockAudio(e) {
   if (e) e.stopPropagation();
+
   const ctx = getAudioContext();
   if (ctx && ctx.state === 'suspended') ctx.resume().catch(() => {});
 }
 
 const SOUND_PROFILES = [
-  { id: 1, name: '1. Apple Pay Double-Chime', fn: (ctx, now) => {
-      const o1 = ctx.createOscillator(), g1 = ctx.createGain();
-      const o2 = ctx.createOscillator(), g2 = ctx.createGain();
-      o1.type = 'sine'; o1.frequency.setValueAtTime(1046.50, now);
-      g1.gain.setValueAtTime(0, now); g1.gain.linearRampToValueAtTime(0.2, now + 0.02);
+  {
+    id: 1,
+    name: '1. Apple Pay Double-Chime',
+    fn: (ctx, now) => {
+      const o1 = ctx.createOscillator();
+      const g1 = ctx.createGain();
+      const o2 = ctx.createOscillator();
+      const g2 = ctx.createGain();
+
+      o1.type = 'sine';
+      o1.frequency.setValueAtTime(1046.50, now);
+      g1.gain.setValueAtTime(0, now);
+      g1.gain.linearRampToValueAtTime(0.2, now + 0.02);
       g1.gain.exponentialRampToValueAtTime(0.0001, now + 0.35);
-      o1.connect(g1); g1.connect(ctx.destination);
-      o2.type = 'sine'; o2.frequency.setValueAtTime(1567.98, now + 0.08);
-      g2.gain.setValueAtTime(0, now + 0.08); g2.gain.linearRampToValueAtTime(0.3, now + 0.1);
+      o1.connect(g1);
+      g1.connect(ctx.destination);
+
+      o2.type = 'sine';
+      o2.frequency.setValueAtTime(1567.98, now + 0.08);
+      g2.gain.setValueAtTime(0, now + 0.08);
+      g2.gain.linearRampToValueAtTime(0.3, now + 0.1);
       g2.gain.exponentialRampToValueAtTime(0.0001, now + 0.6);
-      o2.connect(g2); g2.connect(ctx.destination);
-      o1.start(now); o1.stop(now + 0.4); o2.start(now + 0.08); o2.stop(now + 0.65);
-  }},
-  { id: 2, name: '2. Sci-Fi Confirmation', fn: (ctx, now) => {
-      const o1 = ctx.createOscillator(), o2 = ctx.createOscillator(), g = ctx.createGain();
-      o1.type = 'sine'; o1.frequency.setValueAtTime(587.33, now);
-      o2.type = 'sine'; o2.frequency.setValueAtTime(880, now + 0.07);
-      g.gain.setValueAtTime(0.2, now); g.gain.exponentialRampToValueAtTime(0.0001, now + 0.35);
-      o1.connect(g); o2.connect(g); g.connect(ctx.destination);
-      o1.start(now); o1.stop(now + 0.35); o2.start(now + 0.07); o2.stop(now + 0.35);
-  }},
-  { id: 3, name: '3. Glassy Bell', fn: (ctx, now) => {
-      const o = ctx.createOscillator(), g = ctx.createGain();
-      o.type = 'sine'; o.frequency.setValueAtTime(2093.00, now);
-      g.gain.setValueAtTime(0.2, now); g.gain.exponentialRampToValueAtTime(0.0001, now + 0.7);
-      o.connect(g); g.connect(ctx.destination);
-      o.start(now); o.stop(now + 0.75);
-  }},
-  { id: 4, name: '4. Sci-Fi Pulse', fn: (ctx, now) => {
-      const o = ctx.createOscillator(), g = ctx.createGain();
-      o.type = 'triangle'; o.frequency.setValueAtTime(440, now);
+      o2.connect(g2);
+      g2.connect(ctx.destination);
+
+      o1.start(now);
+      o1.stop(now + 0.4);
+      o2.start(now + 0.08);
+      o2.stop(now + 0.65);
+    }
+  },
+  {
+    id: 2,
+    name: '2. Sci-Fi Confirmation',
+    fn: (ctx, now) => {
+      const o1 = ctx.createOscillator();
+      const o2 = ctx.createOscillator();
+      const g = ctx.createGain();
+
+      o1.type = 'sine';
+      o1.frequency.setValueAtTime(587.33, now);
+      o2.type = 'sine';
+      o2.frequency.setValueAtTime(880, now + 0.07);
+
+      g.gain.setValueAtTime(0.2, now);
+      g.gain.exponentialRampToValueAtTime(0.0001, now + 0.35);
+
+      o1.connect(g);
+      o2.connect(g);
+      g.connect(ctx.destination);
+
+      o1.start(now);
+      o1.stop(now + 0.35);
+      o2.start(now + 0.07);
+      o2.stop(now + 0.35);
+    }
+  },
+  {
+    id: 3,
+    name: '3. Glassy Bell',
+    fn: (ctx, now) => {
+      const o = ctx.createOscillator();
+      const g = ctx.createGain();
+
+      o.type = 'sine';
+      o.frequency.setValueAtTime(2093.00, now);
+
+      g.gain.setValueAtTime(0.2, now);
+      g.gain.exponentialRampToValueAtTime(0.0001, now + 0.7);
+
+      o.connect(g);
+      g.connect(ctx.destination);
+
+      o.start(now);
+      o.stop(now + 0.75);
+    }
+  },
+  {
+    id: 4,
+    name: '4. Sci-Fi Pulse',
+    fn: (ctx, now) => {
+      const o = ctx.createOscillator();
+      const g = ctx.createGain();
+
+      o.type = 'triangle';
+      o.frequency.setValueAtTime(440, now);
       o.frequency.exponentialRampToValueAtTime(880, now + 0.15);
-      g.gain.setValueAtTime(0.25, now); g.gain.exponentialRampToValueAtTime(0.0001, now + 0.3);
-      o.connect(g); g.connect(ctx.destination);
-      o.start(now); o.stop(now + 0.35);
-  }},
-  { id: 5, name: '5. Harmonic Tri-Tone', fn: (ctx, now) => {
+
+      g.gain.setValueAtTime(0.25, now);
+      g.gain.exponentialRampToValueAtTime(0.0001, now + 0.3);
+
+      o.connect(g);
+      g.connect(ctx.destination);
+
+      o.start(now);
+      o.stop(now + 0.35);
+    }
+  },
+  {
+    id: 5,
+    name: '5. Harmonic Tri-Tone',
+    fn: (ctx, now) => {
       [659.25, 830.61, 987.77].forEach((f, i) => {
-        const o = ctx.createOscillator(), g = ctx.createGain();
-        o.type = 'sine'; o.frequency.setValueAtTime(f, now + i * 0.05);
+        const o = ctx.createOscillator();
+        const g = ctx.createGain();
+
+        o.type = 'sine';
+        o.frequency.setValueAtTime(f, now + i * 0.05);
+
         g.gain.setValueAtTime(0.15, now + i * 0.05);
         g.gain.exponentialRampToValueAtTime(0.0001, now + i * 0.05 + 0.3);
-        o.connect(g); g.connect(ctx.destination);
-        o.start(now + i * 0.05); o.stop(now + i * 0.05 + 0.35);
+
+        o.connect(g);
+        g.connect(ctx.destination);
+
+        o.start(now + i * 0.05);
+        o.stop(now + i * 0.05 + 0.35);
       });
-  }}
+    }
+  }
 ];
 
 let selectedSoundId = parseInt(localStorage.getItem('devo_sound_id') || '1');
@@ -9191,166 +10062,202 @@ function playSoundDirectly(id) {
   try {
     const ctx = getAudioContext();
     if (!ctx) return;
+
     const play = () => {
       const now = ctx.currentTime;
-      const item = SOUND_PROFILES.find(s => s.id === Number(id)) || SOUND_PROFILES[0];
+      const item = SOUND_PROFILES.find((s) => s.id === Number(id)) || SOUND_PROFILES[0];
       item.fn(ctx, now);
     };
-    if (ctx.state === 'suspended') ctx.resume().then(play).catch(() => play());
-    else play();
-  } catch (e) { console.error(e); }
+
+    if (ctx.state === 'suspended') {
+      ctx.resume().then(play).catch(() => play());
+    } else {
+      play();
+    }
+  } catch (e) {
+    console.error(e);
+  }
 }
 
 function renderSoundMenu() {
   const container = document.getElementById('soundListOptions');
   if (!container) return;
-  container.innerHTML = SOUND_PROFILES.map(s => {
+
+  container.innerHTML = SOUND_PROFILES.map((s) => {
     const isSelected = Number(s.id) === Number(selectedSoundId);
+
     return `
-      <button class="sound-item-btn ${isSelected ? 'active-sound' : ''}" 
+      <button class="sound-item-btn ${isSelected ? 'active-sound' : ''}"
               data-sound-id="${s.id}"
               onpointerdown="unlockAudio(event)"
               onclick="handleSoundSelect(event, ${s.id})">
         <span>${s.name}</span>
-        ${isSelected 
-          ? `<div class="check-circle-icon"><i data-lucide="check"></i></div>` 
+        ${isSelected
+          ? `<div class="check-circle-icon"><i data-lucide="check"></i></div>`
           : `<i data-lucide="volume-2" style="width:16px;height:16px;opacity:0.5"></i>`
         }
       </button>
     `;
   }).join('');
+
   safeIcons();
+  updateSoundLabel();
 }
 
-function toggleSoundMenu(e) {
-  if (e) { e.preventDefault(); e.stopPropagation(); }
-  getAudioContext();
-  const menu = document.getElementById('soundMenu');
-  const willOpen = !menu.classList.contains('open');
-  closeAllMenus('soundMenu');
-  if (willOpen) {
-    menu.classList.add('open');
-    renderSoundMenu();
-  } else {
-    menu.classList.remove('open');
-  }
+function updateSoundLabel() {
+  const label = document.getElementById('soundCurrentLabel');
+  if (!label) return;
+
+  const item = SOUND_PROFILES.find((s) => s.id === Number(selectedSoundId));
+  label.textContent = item ? item.name.replace(/^\d+\.\s*/, '') : 'Apple Pay Double-Chime';
 }
 
 function handleSoundSelect(e, id) {
   if (e) e.stopPropagation();
+
   unlockAudio();
+
   selectedSoundId = Number(id);
   localStorage.setItem('devo_sound_id', selectedSoundId);
+
   renderSoundMenu();
   playSoundDirectly(selectedSoundId);
 }
 
-/* ===== РЕАЛЬНОЕ ОБЛАКО: API БОТА (волна 22.21) =====
-   Дизайн приложения не менялся. Этот слой соединяет его с ОСНОВНОЙ базой
-   бота: список файлов — тот же, что в чате (☁️ Облако), хранилище — тот же
-   приватный канал (или СВОЙ личный канал из «🔗 Моё облако»). Загрузка идёт
-   чанками и уходит в канал КАК ДОКУМЕНТ — без сжатия, оригинал байт-в-байт. */
 const IS_TELEGRAM = !!(tg && tg.initData);
-
-/* 22.29: ВЕБ-СЕССИЯ — токен входа по Telegram ID + паролю (обычный браузер).
-   Хранится в localStorage; при IS_TELEGRAM остаётся старый путь initData. */
-var WEB_TOKEN = localStorage.getItem('devo_web_token') || '';
+let WEB_TOKEN = localStorage.getItem('devo_web_token') || '';
 
 function authHeaders(extra) {
   const h = Object.assign({ 'Cache-Control': 'no-store' }, extra || {});
+
   if (WEB_TOKEN) h['Authorization'] = 'Bearer ' + WEB_TOKEN;
   if (IS_TELEGRAM && tg.initData) h['X-Telegram-Init-Data'] = tg.initData;
+
   return h;
 }
 
 async function apiJson(url, options) {
   const r = await fetch(url, Object.assign({ headers: authHeaders() }, options || {}));
+
   let data = {};
-  try { data = await r.json(); } catch (e) {}
+  try {
+    data = await r.json();
+  } catch (e) {}
+
   if (!r.ok) {
     const err = new Error(data.message || ('HTTP ' + r.status));
-    err.code = String(data.error || '');  // 22.24: код (unauthorized/not_registered/…)
-    err.bot = String(data.bot || '');     // 22.24: @username бота для кнопки «Открыть чат бота»
-    // 22.29: сессия истекла/битый токен — предлагаем войти по паролю заново.
-    // В Telegram остаётся прежняя карточка (initData-вход не через токен).
+    err.code = String(data.error || '');
+    err.bot = String(data.bot || '');
+
     if (r.status === 401 && !IS_TELEGRAM) openLoginModal();
+
     throw err;
   }
+
   return data;
 }
 
-/* 22.24: честный текст сбоя облака. Ошибки сервера уже конкретны и по-русски
-   (401 «откройте через Telegram», 403 «бот не админ канала», 503 «бот ещё
-   запускается») — показываем их КАК ЕСТЬ; «Failed to fetch» — вот это по-
-   настоящему «нет связи», его и называем связью. */
-var AUTH_BOT = '';
+let AUTH_BOT = '';
+
 function cloudErrText(e) {
   const m = (e && e.message) ? String(e.message) : '';
-  if (!m || /failed to fetch|networkerror|load failed|timed? ?out/i.test(m))
+
+  if (!m || /failed to fetch|networkerror|load failed|timed? ?out/i.test(m)) {
     return 'Нет связи с сервером. Сервис мог просыпаться — попробуйте ещё раз через минуту.';
+  }
+
   if (e && e.bot) AUTH_BOT = e.bot;
+
   return m;
 }
+
 function showAuthCard(text) {
   const card = document.getElementById('authModal');
   if (!card) return;
+
   document.getElementById('authText').textContent = text || 'Нет доступа к облаку.';
+
   const btn = document.getElementById('authOpenBtn');
   if (btn) btn.style.display = AUTH_BOT ? '' : 'none';
+
   card.classList.add('open');
   document.body.classList.add('modal-open');
 }
+
 function closeAuthModal(e) {
   if (e) e.stopPropagation();
+
   document.getElementById('authModal').classList.remove('open');
   document.body.classList.remove('modal-open');
 }
+
 function openBotChat() {
   const url = 'https://t.me/' + (AUTH_BOT || '');
+
   try {
     if (tg && tg.openTelegramLink) tg.openTelegramLink(url);
     else window.open(url, '_blank');
-  } catch (e) { window.open(url, '_blank'); }
+  } catch (e) {
+    window.open(url, '_blank');
+  }
 }
 
-/* ===== 22.29: ВХОД ПО TELEGRAM ID + ВЕБ-ПАРОЛЮ (обычный браузер) =====
-   Старый вход через Telegram НЕ ТРОНУТ: когда initData доходит — он
-   работает как раньше. Это ДОПОЛНИТЕЛЬНЫЙ путь для VPN/школьных сетей,
-   где telegram.org недоступен. Никакой панели разработчика тут нет. */
 function openLoginModal() {
   const m = document.getElementById('loginModal');
   if (!m) return;
+
   m.classList.add('open');
   document.body.classList.add('modal-open');
 }
 
 function closeLoginModal(e) {
   if (e) e.stopPropagation();
+
   const m = document.getElementById('loginModal');
   if (m) m.classList.remove('open');
+
   document.body.classList.remove('modal-open');
 }
 
 async function webLogin() {
   const uid = (document.getElementById('loginUserId')?.value || '').trim();
   const pw = document.getElementById('loginPassword')?.value || '';
-  if (!uid || !pw) { showToast('Введите ID и пароль'); return; }
+
+  if (!uid || !pw) {
+    showToast('Введите ID и пароль');
+    return;
+  }
+
   const btn = document.getElementById('loginSubmitBtn');
   if (btn) btn.disabled = true;
+
   try {
     const r = await fetch('/api/web_login', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
-      body: JSON.stringify({ user_id: uid, password: pw })
+      headers: {
+        'Content-Type': 'application/json',
+        'Cache-Control': 'no-store'
+      },
+      body: JSON.stringify({
+        user_id: uid,
+        password: pw
+      })
     });
+
     let data = {};
-    try { data = await r.json(); } catch (e) {}
+    try {
+      data = await r.json();
+    } catch (e) {}
+
     if (r.ok && data.token) {
       WEB_TOKEN = String(data.token);
       localStorage.setItem('devo_web_token', WEB_TOKEN);
+
       document.getElementById('loginPassword').value = '';
+
       closeLoginModal();
       showToast('Вход выполнен');
+
       loadFiles();
     } else {
       showToast(data.message || ('Не удалось войти (HTTP ' + r.status + ')'));
@@ -9362,188 +10269,281 @@ async function webLogin() {
   }
 }
 
-/* ===== 22.29: МУЛЬТИВЫБОР ФАЙЛОВ (галочки + ZIP/распаковать/удалить) ===== */
 let selectMode = false;
 let selectedIds = new Set();
 
 function toggleSelectMode() {
   selectMode = !selectMode;
+
   if (!selectMode) selectedIds.clear();
+
   const bar = document.getElementById('selectionBar');
-  if (bar) bar.style.display = selectMode ? '' : 'none';
+  if (bar) {
+    if (selectMode) bar.classList.add('visible');
+    else bar.classList.remove('visible');
+  }
+
   updateSelCount();
   renderAll();
 }
 
 function updateSelCount() {
-  const el = document.getElementById('selCount');
-  if (el) el.textContent = 'Выбрано: ' + selectedIds.size;
+  const numEl = document.getElementById('selCountNum');
+  const countEl = document.getElementById('selCount');
   const unzipBtn = document.getElementById('unzipBtn');
+
+  if (numEl) {
+    const oldVal = numEl.textContent;
+    const newVal = String(selectedIds.size);
+
+    numEl.textContent = newVal;
+
+    if (oldVal !== newVal && countEl) {
+      countEl.classList.remove('pulse');
+      void countEl.offsetWidth;
+      countEl.classList.add('pulse');
+    }
+  }
+
   if (unzipBtn) {
-    const only = (selectedIds.size === 1);
-    const f = only ? ALL_FILES.find(x => x.id === [...selectedIds][0]) : null;
-    unzipBtn.style.display = (f && /\.zip$/i.test(f.name || '')) ? '' : 'none';
+    const only = selectedIds.size === 1;
+    const f = only ? ALL_FILES.find((x) => x.id === [...selectedIds][0]) : null;
+    const show = f && /\.zip$/i.test(f.name || '');
+
+    unzipBtn.classList.toggle('hidden', !show);
   }
 }
 
 function toggleFileSelection(e, id) {
   if (e) e.stopPropagation();
+
   if (selectedIds.has(id)) selectedIds.delete(id);
   else selectedIds.add(id);
+
   updateSelCount();
   renderFiles(applyFilters());
 }
 
 async function zipSelected() {
-  if (!selectedIds.size) { showToast('Сначала выберите файлы'); return; }
+  if (!selectedIds.size) {
+    showToast('Сначала выберите файлы');
+    return;
+  }
+
   showToast('📦 Собираю архив…');
+
   try {
     const data = await apiJson('/api/files/zip_selected', {
       method: 'POST',
       headers: authHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ ids: [...selectedIds] })
     });
+
     if (data.file) {
       ALL_FILES.unshift({
-        id: data.file.id, name: data.file.name, kind: data.file.kind,
-        size: +data.file.size || 0, ts: data.file.ts || '', vault: !!data.file.vault
+        id: data.file.id,
+        name: data.file.name,
+        kind: data.file.kind,
+        size: +data.file.size || 0,
+        ts: data.file.ts || '',
+        vault: !!data.file.vault
       });
+
       renderAll();
       showToast('✅ Архив создан: ' + data.file.name);
     }
-  } catch (e) { showToast(cloudErrText(e)); }
+  } catch (e) {
+    showToast(cloudErrText(e));
+  }
 }
 
 async function unzipSelected() {
-  if (selectedIds.size !== 1) { showToast('Выберите ОДИН ZIP-архив'); return; }
+  if (selectedIds.size !== 1) {
+    showToast('Выберите ОДИН ZIP-архив');
+    return;
+  }
+
   const id = [...selectedIds][0];
-  const f = ALL_FILES.find(x => x.id === id);
-  if (!f || !/\.zip$/i.test(f.name || '')) { showToast('Это не ZIP-архив'); return; }
+  const f = ALL_FILES.find((x) => x.id === id);
+
+  if (!f || !/\.zip$/i.test(f.name || '')) {
+    showToast('Это не ZIP-архив');
+    return;
+  }
+
   showToast('🗂 Распаковываю…');
+
   try {
     const data = await apiJson('/api/files/unzip', {
       method: 'POST',
       headers: authHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ id: id })
     });
-    (data.files || []).forEach(rec => {
+
+    (data.files || []).forEach((rec) => {
       ALL_FILES.unshift({
-        id: rec.id, name: rec.name, kind: rec.kind,
-        size: +rec.size || 0, ts: rec.ts || '', vault: !!rec.vault
+        id: rec.id,
+        name: rec.name,
+        kind: rec.kind,
+        size: +rec.size || 0,
+        ts: rec.ts || '',
+        vault: !!rec.vault
       });
     });
+
     renderAll();
-    showToast('✅ Файлов получено: ' + (data.files || []).length +
-      (data.skipped ? ' · пропущено: ' + data.skipped : ''));
-  } catch (e) { showToast(cloudErrText(e)); }
+
+    showToast(
+      '✅ Файлов получено: ' + (data.files || []).length +
+      (data.skipped ? ' · пропущено: ' + data.skipped : '')
+    );
+  } catch (e) {
+    showToast(cloudErrText(e));
+  }
 }
 
 async function deleteSelected() {
-  if (!selectedIds.size) { showToast('Сначала выберите файлы'); return; }
+  if (!selectedIds.size) {
+    showToast('Сначала выберите файлы');
+    return;
+  }
+
   const ids = [...selectedIds];
+
   showToast('🗑 Удаляю ' + ids.length + '…');
+
   let ok = 0;
+
   for (const id of ids) {
     try {
       await apiJson('/api/files/' + encodeURIComponent(id), { method: 'DELETE' });
-      ALL_FILES = ALL_FILES.filter(x => x.id !== id);
+      ALL_FILES = ALL_FILES.filter((x) => x.id !== id);
       ok++;
-    } catch (e) { /* не смогли — остаётся в списке */ }
+    } catch (e) {}
   }
+
   selectedIds.clear();
   updateSelCount();
   renderAll();
+
   showToast(ok === ids.length ? '✅ Удалено: ' + ok : 'Удалено ' + ok + ' из ' + ids.length);
 }
 
 let ALL_FILES = [];
 let listLoading = false;
 
-/* 22.26: ВИДИМОЕ доказательство связи с ботом — сервер сам присылает своё
-   имя и сборку в каждом ответе (build/bot). Показываем в окне «Хранилище»
-   и после синхронизации: пользователь всегда видит, К ЧЕМУ подключён. */
-var CONN = { bot: '', build: '' };
-var LAST_ERR = null; // 22.26: последняя ошибка облака (для честной кнопки)
-var NETERR_RE = /failed to fetch|networkerror|load failed|timed? ?out/i;
-var LAST_SYNC = 0;   // 22.26: момент последней успешной синхронизации
+const CONN = {
+  bot: '',
+  build: ''
+};
+
+let LAST_ERR = null;
+const NETERR_RE = /failed to fetch|networkerror|load failed|timed? ?out/i;
+let LAST_SYNC = 0;
 
 async function loadFiles(silent) {
   if (listLoading) return false;
+
   listLoading = true;
+
   try {
     const data = await apiJson('/api/files');
-    ALL_FILES = (data.files || []).map(f => ({
-      id: String(f.id || ''), name: String(f.name || 'файл'),
-      kind: String(f.kind || 'document'), size: +f.size || 0,
-      ts: String(f.ts || ''), vault: !!f.vault
+
+    ALL_FILES = (data.files || []).map((f) => ({
+      id: String(f.id || ''),
+      name: String(f.name || 'файл'),
+      kind: String(f.kind || 'document'),
+      size: +f.size || 0,
+      ts: String(f.ts || ''),
+      vault: !!f.vault
     }));
-    // 22.26: сервер подтвердил связь — запоминаем, кем и чем отвечает
+
     CONN.bot = String(data.bot || CONN.bot || '');
     CONN.build = String(data.build || CONN.build || '');
+
     LAST_ERR = null;
     LAST_SYNC = Date.now();
+
     renderAll();
+
     return true;
   } catch (e) {
     LAST_ERR = e;
+
     if (!silent) {
-      const t = cloudErrText(e); // 22.24: честная причина вместо слепого «нет связи»
+      const t = cloudErrText(e);
       showToast(t);
-      if (e && (e.code === 'unauthorized' || e.code === 'not_registered')) showAuthCard(t);
+
+      if (e && (e.code === 'unauthorized' || e.code === 'not_registered')) {
+        showAuthCard(t);
+      }
     }
+
     return false;
   } finally {
     listLoading = false;
   }
 }
 
-/* 22.26: кнопка синхронизации больше НЕ слепая. Раньше она звала loadFiles
-   в тихом режиме и показывала голое «Ошибка синхронизации» — даже честная
-   причина 22.24 до пользователя не доходила. Теперь: до 3 попыток (сервер
-   Render может просыпаться до ~30 секунд), после — причина КАК ЕСТЬ и окно
-   входа, если дело в авторизации. */
 async function syncNow() {
   const netFail = () => !!(LAST_ERR && LAST_ERR.message && NETERR_RE.test(String(LAST_ERR.message)));
+
   let ok = false;
+
   for (let i = 1; i <= 3; i++) {
     if (i > 1) {
       showToast('Подключаюсь… попытка ' + i + ' из 3');
-      await new Promise(r => setTimeout(r, 2500));
+      await new Promise((r) => setTimeout(r, 2500));
     }
+
     ok = await loadFiles(true);
-    if (ok || !netFail()) break; // серверная причина — повтор не поможет
+
+    if (ok || !netFail()) break;
   }
+
   if (ok) {
     showToast('Синхронизировано' + (CONN.build ? ' • сборка ' + CONN.build : ''));
     return;
   }
+
   const t = cloudErrText(LAST_ERR || new Error(''));
   showToast(t);
-  if (LAST_ERR && (LAST_ERR.code === 'unauthorized' || LAST_ERR.code === 'not_registered')) showAuthCard(t);
+
+  if (LAST_ERR && (LAST_ERR.code === 'unauthorized' || LAST_ERR.code === 'not_registered')) {
+    showAuthCard(t);
+  }
 }
 
-/* 22.26: автосинхронизация при возврате в мини-апп — список свежий,
-   даже если пользователь не трогает кнопку синхронизации. */
 let RESYNC_TIMER = null;
+
 function maybeAutoResync() {
   if (!IS_TELEGRAM || listLoading || isUploading) return;
-  if (Date.now() - LAST_SYNC < 20000) return; // не чаще раза в 20 секунд
+  if (Date.now() - LAST_SYNC < 20000) return;
+
   loadFiles(true);
 }
+
 document.addEventListener('visibilitychange', function () {
-  if (!document.hidden) { clearTimeout(RESYNC_TIMER); RESYNC_TIMER = setTimeout(maybeAutoResync, 600); }
+  if (!document.hidden) {
+    clearTimeout(RESYNC_TIMER);
+    RESYNC_TIMER = setTimeout(maybeAutoResync, 600);
+  }
 });
-try { if (tg && tg.onEvent) tg.onEvent('activated', maybeAutoResync); } catch (e) {}
+
+try {
+  if (tg && tg.onEvent) tg.onEvent('activated', maybeAutoResync);
+} catch (e) {}
 
 let FILTER = 'all';
 let SEARCH = '';
 let SORT = 'date-desc';
+
 let isUploading = false;
 let isPaused = false;
 let activeEditingFileId = null;
 
-/* Движок реальной загрузки: чанки по 4 МБ, честный прогресс, пауза/отмена. */
 const CHUNK_SIZE = 4 * 1024 * 1024;
+
 let uploadQueue = [];
 let uploadAbortFlag = false;
 let uploadXhr = null;
@@ -9558,16 +10558,20 @@ let clickCount = 0;
 
 function showToast(text) {
   const c = document.getElementById('toastContainer');
+
   const t = document.createElement('div');
   t.className = 'toast-msg';
   t.style.cssText = 'background:var(--btn-bg);color:var(--btn-text);font-size:14px;font-weight:700;padding:12px 20px;border-radius:9999px;box-shadow:0 10px 25px rgba(0,0,0,.25);text-align:center';
   t.textContent = text;
+
   c.appendChild(t);
+
   setTimeout(() => t.remove(), 3500);
 }
 
 function flashScreen() {
   const flash = document.getElementById('themeFlash');
+
   flash.classList.remove('active');
   void flash.offsetWidth;
   flash.classList.add('active');
@@ -9575,35 +10579,62 @@ function flashScreen() {
 
 function fmtSize(n) {
   n = +n || 0;
-  const u = ['Б','КБ','МБ','ГБ'];
+
+  const u = ['Б', 'КБ', 'МБ', 'ГБ'];
+
   let i = 0;
-  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+
+  while (n >= 1024 && i < u.length - 1) {
+    n /= 1024;
+    i++;
+  }
+
   return n.toFixed(i === 0 ? 0 : 1) + ' ' + u[i];
 }
 
 function iconFor(kind) {
-  return ({ photo:'image', video:'film', audio:'music', document:'file-text' })[kind] || 'file';
+  return ({
+    photo: 'image',
+    video: 'film',
+    audio: 'music',
+    document: 'file-text'
+  })[kind] || 'file';
 }
 
 function applyFilters() {
   let list = [...ALL_FILES];
-  if (FILTER === 'vault') list = list.filter(f => f.vault === true);
-  else if (FILTER !== 'all') list = list.filter(f => f.kind === FILTER && !f.vault);
-  
+
+  if (FILTER === 'vault') list = list.filter((f) => f.vault === true);
+  else if (FILTER !== 'all') list = list.filter((f) => f.kind === FILTER && !f.vault);
+
   if (SEARCH.trim()) {
     const q = SEARCH.trim().toLowerCase();
-    list = list.filter(f => (f.name || '').toLowerCase().includes(q));
+    list = list.filter((f) => (f.name || '').toLowerCase().includes(q));
   }
+
   const [key, dir] = SORT.split('-');
+
   list.sort((a, b) => {
-    let va, vb;
-    if (key === 'date') { va = a.ts || ''; vb = b.ts || ''; }
-    else if (key === 'name') { va = (a.name || '').toLowerCase(); vb = (b.name || '').toLowerCase(); }
-    else if (key === 'size') { va = +a.size || 0; vb = +b.size || 0; }
+    let va;
+    let vb;
+
+    if (key === 'date') {
+      va = a.ts || '';
+      vb = b.ts || '';
+    } else if (key === 'name') {
+      va = (a.name || '').toLowerCase();
+      vb = (b.name || '').toLowerCase();
+    } else if (key === 'size') {
+      va = +a.size || 0;
+      vb = +b.size || 0;
+    }
+
     if (va < vb) return dir === 'asc' ? -1 : 1;
     if (va > vb) return dir === 'asc' ? 1 : -1;
+
     return 0;
   });
+
   return list;
 }
 
@@ -9614,9 +10645,16 @@ function renderAll() {
 
 function renderStats() {
   document.getElementById('statFiles').textContent = ALL_FILES.length;
-  document.getElementById('statSize').textContent = fmtSize(ALL_FILES.reduce((s, f) => s + (+f.size || 0), 0));
+  document.getElementById('statSize').textContent = fmtSize(
+    ALL_FILES.reduce((s, f) => s + (+f.size || 0), 0)
+  );
+
   const shown = applyFilters().length;
-  document.getElementById('filesCount').textContent = shown === ALL_FILES.length ? `${ALL_FILES.length} файлов` : `${shown} из ${ALL_FILES.length}`;
+
+  document.getElementById('filesCount').textContent =
+    shown === ALL_FILES.length
+      ? `${ALL_FILES.length} файлов`
+      : `${shown} из ${ALL_FILES.length}`;
 }
 
 function renderFiles(files) {
@@ -9630,45 +10668,64 @@ function renderFiles(files) {
   }
 
   empty.style.display = 'none';
-  list.innerHTML = files.map(f => {
+
+  list.innerHTML = files.map((f) => {
     const sel = selectMode && selectedIds.has(f.id);
+
     const cardAction = selectMode
       ? `toggleFileSelection(event,'${f.id}')`
       : `openEditModal('${f.id}')`;
+
     const checkHtml = selectMode ? `
-      <div onclick="toggleFileSelection(event,'${f.id}')" style="flex-shrink:0;width:24px;height:24px;border-radius:8px;display:flex;align-items:center;justify-content:center;border:2px solid ${sel ? 'var(--btn-text)' : 'var(--border-color)'};background:${sel ? 'var(--btn-text)' : 'transparent'};transition:all .15s">
+      <div onclick="toggleFileSelection(event,'${f.id}')" style="flex-shrink:0;width:24px;height:24px;border-radius:8px;display:flex;align-items:center;justify-content:center;border:2px solid ${sel ? 'var(--btn-text)' : 'var(--border-color)'};background:${sel ? 'var(--btn-text)' : 'transparent'};transition:all .12s">
         ${sel ? '<i data-lucide="check" style="width:14px;height:14px;stroke:var(--card-bg)"></i>' : ''}
-      </div>` : '';
-    return `
-    <article class="file-card animate-fade-in" style="display:flex;align-items:center;gap:12px;${sel ? 'outline:2px solid var(--btn-text);outline-offset:-2px' : ''}" onclick="${cardAction}">
-      ${checkHtml}
-      <div class="icon-wrap" style="flex-shrink:0">
-        <i data-lucide="${f.vault ? 'lock' : iconFor(f.kind)}" style="width:20px;height:20px"></i>
       </div>
-      <div style="flex:1;min-width:0">
-        <p style="font-weight:800;font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">
-          ${escapeHtml(f.name || 'файл')}
-        </p>
-        <p style="font-weight:600;font-size:12px;color:var(--subtext-color);margin-top:2px">
-          ${fmtSize(f.size)} · ${(f.ts || '').slice(0, 10)}
-        </p>
-      </div>
+    ` : '';
+
+    const actionsHtml = selectMode ? '' : `
       <div style="display:flex;gap:4px;flex-shrink:0" onclick="event.stopPropagation()">
         <button class="action-btn" onclick="openEditModal('${f.id}')" title="Редактировать">
           <i data-lucide="more-vertical" style="width:16px;height:16px"></i>
         </button>
       </div>
-    </article>
-  `;
+    `;
+
+    return `
+      <article class="file-card" style="display:flex;align-items:center;gap:12px;${sel ? 'outline:2px solid var(--btn-text);outline-offset:-2px' : ''}" onclick="${cardAction}">
+        ${checkHtml}
+
+        <div class="icon-wrap" style="flex-shrink:0">
+          <i data-lucide="${f.vault ? 'lock' : iconFor(f.kind)}" style="width:20px;height:20px"></i>
+        </div>
+
+        <div style="flex:1;min-width:0">
+          <p style="font-weight:800;font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">
+            ${escapeHtml(f.name || 'файл')}
+          </p>
+
+          <p style="font-weight:600;font-size:12px;color:var(--subtext-color);margin-top:2px">
+            ${fmtSize(f.size)} · ${(f.ts || '').slice(0, 10)}
+          </p>
+        </div>
+
+        ${actionsHtml}
+      </article>
+    `;
   }).join('');
+
   safeIcons();
 }
 
 function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  return String(s).replace(/[&<>"']/g, (c) => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;'
+  }[c]));
 }
 
-/* СВАЙП ЗАКРЫТИЕ МОДАЛКИ */
 let touchStartY = 0;
 let touchCurrentY = 0;
 let isDraggingModal = false;
@@ -9683,119 +10740,137 @@ modalCard.addEventListener('touchstart', (e) => {
 
 modalCard.addEventListener('touchmove', (e) => {
   if (!isDraggingModal) return;
+
   touchCurrentY = e.touches[0].clientY;
+
   const deltaY = touchCurrentY - touchStartY;
+
   if (deltaY > 0) {
-    modalCard.style.transform = `translateY(${deltaY}px)`;
+    modalCard.style.transform = `translateY(${deltaY}px) translateZ(0)`;
   }
 }, { passive: true });
 
 modalCard.addEventListener('touchend', () => {
   if (!isDraggingModal) return;
+
   isDraggingModal = false;
+
   const deltaY = touchCurrentY - touchStartY;
-  modalCard.style.transition = 'transform 0.5s cubic-bezier(0.16, 1, 0.3, 1)';
-  
+
+  modalCard.style.transition = 'transform 0.28s cubic-bezier(0.16, 1, 0.3, 1)';
+
   if (deltaY > 100) {
     closeEditModal();
   } else {
-    modalCard.style.transform = 'translateY(0)';
+    modalCard.style.transform = 'translateY(0) translateZ(0)';
   }
+
   touchStartY = 0;
   touchCurrentY = 0;
 });
 
 function openEditModal(id) {
-  const f = ALL_FILES.find(x => x.id === id);
+  const f = ALL_FILES.find((x) => x.id === id);
   if (!f) return;
+
   activeEditingFileId = id;
 
   document.getElementById('modalFileName').textContent = f.name;
   document.getElementById('modalInputName').value = f.name;
-  // 22.30: НАСТОЯЩИЙ Сейф вместо косметической галочки Vault:
-  // обычный файл → «Переместить в Сейф»; файл Сейфа → «Достать из Сейфа».
+
   const inSafe = !!f.vault;
+
   document.getElementById('modalToSafeBtn').style.display = inSafe ? 'none' : '';
   document.getElementById('modalFromSafeBtn').style.display = inSafe ? '' : 'none';
 
   modalCard.style.transform = '';
+
   document.getElementById('editModal').classList.add('open');
   document.body.classList.add('modal-open');
 }
 
 function closeEditModal(e) {
   if (e) e.stopPropagation();
-  modalCard.style.transform = 'translateY(100%)';
+
+  modalCard.style.transform = 'translateY(100%) translateZ(0)';
+
   document.getElementById('editModal').classList.remove('open');
   document.body.classList.remove('modal-open');
+
   setTimeout(() => {
     activeEditingFileId = null;
     modalCard.style.transform = '';
-  }, 350);
+  }, 280);
 }
 
 async function saveFileName() {
   if (!activeEditingFileId) return;
+
   const newName = document.getElementById('modalInputName').value.trim();
   if (!newName) return;
+
   try {
     const data = await apiJson('/api/files/' + encodeURIComponent(activeEditingFileId), {
       method: 'PATCH',
       headers: authHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ name: newName })
     });
-    const f = ALL_FILES.find(x => x.id === activeEditingFileId);
+
+    const f = ALL_FILES.find((x) => x.id === activeEditingFileId);
     if (f) f.name = (data.file && data.file.name) || newName;
+
     renderAll();
     showToast('Имя изменено');
   } catch (e) {
     showToast('Не удалось: ' + e.message);
   }
+
   closeEditModal();
 }
 
-/* ===== 22.30: НАСТОЯЩИЙ СЕЙФ — перенос в Сейф и обратно =====
-   Раньше галочка «Vault» была лишь пометкой в списке. Теперь «🔐 В Сейф»
-   реально шифрует файл паролем Сейфа (как кнопка 🔐 в чате бота), а
-   «🔓 Достать» расшифровывает и возвращает в облако. Пароль — тот же,
-   что в чате; он живёт ТОЛЬКО в памяти страницы. */
-var VAULT_PW = '';  // пароль, введённый на этой странице (RAM; не localStorage)
-var VAULT_SERVER_UNLOCKED = false;  // серверная веб-сессия уже разблокирована
+let VAULT_PW = '';
+let VAULT_SERVER_UNLOCKED = false;
 
 function vaultHeaders(extra) {
   const h = authHeaders(extra);
-  // Пароль в заголовок — только если пользователь ВВОДИЛ его здесь.
-  // Если Сейф разблокирован через веб-сессию (кнопка 🔒 в браузере), пароль
-  // уже лежит в RAM-сессии сервера — туда отправлять ничего не нужно.
+
   if (VAULT_PW) h['X-Vault-Password'] = VAULT_PW;
+
   return h;
 }
 
 function openSafeModal() {
   const m = document.getElementById('safeModal');
   if (!m) return;
+
   loadSafeStatus();
+
   m.classList.add('open');
   document.body.classList.add('modal-open');
 }
 
 function closeSafeModal(e) {
   if (e) e.stopPropagation();
+
   const m = document.getElementById('safeModal');
   if (m) m.classList.remove('open');
+
   document.body.classList.remove('modal-open');
 }
 
 async function loadSafeStatus() {
   const line = document.getElementById('safeStatusLine');
+
   try {
     const s = await apiJson('/api/safe/status', { headers: vaultHeaders() });
+
     if (s.unlocked) {
       VAULT_SERVER_UNLOCKED = true;
       line.textContent = 'Сейф разблокирован. Файлов в Сейфе: ' + (s.count || 0) + '.';
     } else {
-      line.textContent = 'Сейф заблокирован. Введите пароль Сейфа, чтобы ' +
-        'скачивать зашифрованные файлы и переносить файлы в Сейф. Файлов: ' + (s.count || 0) + '.';
+      line.textContent =
+        'Сейф заблокирован. Введите пароль Сейфа, чтобы скачивать зашифрованные файлы и переносить файлы в Сейф. Файлов: ' +
+        (s.count || 0) + '.';
     }
   } catch (e) {
     line.textContent = cloudErrText(e);
@@ -9805,16 +10880,25 @@ async function loadSafeStatus() {
 async function unlockSafe() {
   const input = document.getElementById('safePassword');
   const pw = (input && input.value) || '';
-  if (!pw) { showToast('Введите пароль Сейфа'); return; }
+
+  if (!pw) {
+    showToast('Введите пароль Сейфа');
+    return;
+  }
+
   try {
     await apiJson('/api/safe/unlock', {
       method: 'POST',
       headers: authHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ password: pw })
     });
+
     VAULT_PW = pw;
+
     if (input) input.value = '';
+
     showToast('🔒 Сейф разблокирован');
+
     closeSafeModal();
     loadFiles(true);
   } catch (e) {
@@ -9824,324 +10908,151 @@ async function unlockSafe() {
 
 async function lockSafe() {
   try {
-    await apiJson('/api/safe/lock', { method: 'POST', headers: authHeaders() });
+    await apiJson('/api/safe/lock', {
+      method: 'POST',
+      headers: authHeaders()
+    });
   } catch (e) {}
+
   VAULT_PW = '';
   VAULT_SERVER_UNLOCKED = false;
+
   showToast('Сейф заблокирован');
+
   closeSafeModal();
 }
 
 function ensureSafeUnlocked() {
   if (VAULT_PW || VAULT_SERVER_UNLOCKED) return true;
-  showToast('Сначала введите пароль Сейфа (🔒 в шапке)');
+
+  showToast('Сначала введите пароль Сейфа (⚙️ → Сейф)');
   openSafeModal();
+
   return false;
 }
 
 async function toSafeCurrentFile() {
-  const f = ALL_FILES.find(x => x.id === activeEditingFileId);
+  const f = ALL_FILES.find((x) => x.id === activeEditingFileId);
+
   closeEditModal();
+
   if (!f) return;
   if (!ensureSafeUnlocked()) return;
+
   showToast('🔐 Шифрую и переношу в Сейф…');
+
   try {
     await apiJson('/api/files/' + encodeURIComponent(f.id) + '/to_safe', {
       method: 'POST',
       headers: vaultHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({})
     });
+
     showToast('Файл в Сейфе — теперь он и в чате, и здесь');
+
     loadFiles(true);
   } catch (e) {
-    if (e.code === 'safe_locked') { VAULT_PW = ''; VAULT_SERVER_UNLOCKED = false; openSafeModal(); }
+    if (e.code === 'safe_locked') {
+      VAULT_PW = '';
+      VAULT_SERVER_UNLOCKED = false;
+      openSafeModal();
+    }
+
     showToast(cloudErrText(e));
   }
 }
 
 async function fromSafeCurrentFile() {
-  const f = ALL_FILES.find(x => x.id === activeEditingFileId);
+  const f = ALL_FILES.find((x) => x.id === activeEditingFileId);
+
   closeEditModal();
+
   if (!f) return;
   if (!ensureSafeUnlocked()) return;
+
   showToast('🔓 Расшифровываю и возвращаю в облако…');
+
   try {
     await apiJson('/api/files/' + encodeURIComponent(f.id) + '/from_safe', {
       method: 'POST',
       headers: vaultHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({})
     });
+
     showToast('Файл достан из Сейфа в обычное облако');
+
     loadFiles(true);
   } catch (e) {
-    if (e.code === 'safe_locked') { VAULT_PW = ''; VAULT_SERVER_UNLOCKED = false; openSafeModal(); }
+    if (e.code === 'safe_locked') {
+      VAULT_PW = '';
+      VAULT_SERVER_UNLOCKED = false;
+      openSafeModal();
+    }
+
     showToast(cloudErrText(e));
   }
 }
 
 async function downloadCurrentFile() {
-  const f = ALL_FILES.find(x => x.id === activeEditingFileId);
+  const f = ALL_FILES.find((x) => x.id === activeEditingFileId);
+
   closeEditModal();
+
   if (!f) return;
+
   if (f.vault && !VAULT_PW && !ensureSafeUnlocked()) return;
-  /* 22.30: ССЫЛКА ВМЕСТО BLOB. Раньше файл целиком собирался в память
-     страницы и сохранялся кликом по виртуальной ссылке — WebView Telegram
-     такие загрузки часто блокирует («скачивание не работает»), а 2 ГБ
-     в память телефона вообще не собрать. Теперь сервер выдаёт одноразовую
-     ссылку, файл качает сам системный браузер ПОТОКОМ. */
+
   showToast('📥 Готовлю скачивание…');
+
   try {
     const data = await apiJson('/api/files/' + encodeURIComponent(f.id) + '/link', {
       headers: vaultHeaders()
     });
+
     const abs = new URL(data.url, location.origin).href;
+
     if (IS_TELEGRAM && tg && tg.openLink) {
-      tg.openLink(abs);  // открывает системный обработчик — файл качается
+      tg.openLink(abs);
     } else {
       const a = document.createElement('a');
       a.href = abs;
       a.download = f.name || 'file';
       a.rel = 'noopener';
+
       document.body.appendChild(a);
       a.click();
       a.remove();
     }
+
     showToast('Скачивание началось');
   } catch (e) {
-    if (e.code === 'safe_locked') { VAULT_PW = ''; VAULT_SERVER_UNLOCKED = false; openSafeModal(); }
+    if (e.code === 'safe_locked') {
+      VAULT_PW = '';
+      VAULT_SERVER_UNLOCKED = false;
+      openSafeModal();
+    }
+
     showToast('Ошибка скачивания: ' + cloudErrText(e));
   }
 }
 
 async function deleteCurrentFile() {
   if (!activeEditingFileId) return;
+
   const id = activeEditingFileId;
+
   try {
     await apiJson('/api/files/' + encodeURIComponent(id), { method: 'DELETE' });
-    ALL_FILES = ALL_FILES.filter(x => x.id !== id);
+
+    ALL_FILES = ALL_FILES.filter((x) => x.id !== id);
+
     renderAll();
     showToast('🗑 Удалено');
   } catch (e) {
     showToast('Не удалось: ' + e.message);
   }
+
   closeEditModal();
-}
-
-function onSearch() {
-  SEARCH = document.getElementById('searchInput').value;
-  document.getElementById('clearSearch').style.display = SEARCH ? 'flex' : 'none';
-  renderAll();
-}
-
-function clearSearch() {
-  document.getElementById('searchInput').value = '';
-  SEARCH = '';
-  document.getElementById('clearSearch').style.display = 'none';
-  renderAll();
-}
-
-function setFilter(f) {
-  FILTER = f;
-  document.querySelectorAll('.chip[data-filter]').forEach(b => {
-    b.classList.toggle('active', b.dataset.filter === f);
-  });
-  renderAll();
-}
-
-function toggleSortMenu(e) {
-  e.stopPropagation();
-  const menu = document.getElementById('sortMenu');
-  const willOpen = !menu.classList.contains('open');
-  closeAllMenus('sortMenu');
-  if (willOpen) menu.classList.add('open');
-  else menu.classList.remove('open');
-}
-
-function setSort(s) {
-  SORT = s;
-  const labels = { 'date-desc':'По дате', 'date-asc':'Старые', 'name-asc':'А→Я', 'name-desc':'Я→А', 'size-desc':'Большие', 'size-asc':'Маленькие' };
-  document.getElementById('sortLabel').textContent = labels[s] || 'По дате';
-  document.getElementById('sortMenu').classList.remove('open');
-  renderAll();
-}
-
-document.addEventListener('pointerdown', (e) => {
-  const soundMenu = document.getElementById('soundMenu');
-  const soundBtn = document.getElementById('soundToggleBtn');
-  const sortMenu = document.getElementById('sortMenu');
-  const sortBtn = document.getElementById('sortToggleBtn');
-  const themeMenu = document.getElementById('themeMenu');
-  const themeBtn = document.getElementById('themeToggleBtn');
-
-  if (soundMenu && !soundMenu.contains(e.target) && !soundBtn.contains(e.target)) soundMenu.classList.remove('open');
-  if (sortMenu && !sortMenu.contains(e.target) && !sortBtn.contains(e.target)) sortMenu.classList.remove('open');
-  if (themeMenu && !themeMenu.contains(e.target) && !themeBtn.contains(e.target)) themeMenu.classList.remove('open');
-});
-
-function handleDropZoneClick(e) {
-  if (isUploading) return;
-  document.getElementById('fileInput').click();
-}
-
-function handleLoaderClick(e) {
-  if (e) e.stopPropagation();
-  if (!isUploading) return;
-
-  clickCount++;
-  if (clickCount === 1) {
-    clickTimer = setTimeout(() => {
-      togglePauseUpload();
-      clickCount = 0;
-    }, 260);
-  } else if (clickCount === 2) {
-    clearTimeout(clickTimer);
-    clickCount = 0;
-    cancelUpload();
-  }
-}
-
-function togglePauseUpload() {
-  isPaused = !isPaused;
-  const downloadText = document.getElementById('downloadText');
-  const squareStop = document.getElementById('squareStop');
-
-  if (isPaused) {
-    downloadText.textContent = 'Пауза (нажмите для продолжения)';
-    if (squareStop) squareStop.style.opacity = '0.4';
-  } else {
-    downloadText.textContent = 'Загрузка... (1 клик - пауза, 2 - отмена)';
-    if (squareStop) squareStop.style.opacity = '1';
-  }
-}
-
-function cancelUpload() {
-  if (!isUploading) return;
-  uploadAbortFlag = true;
-  if (uploadXhr) { try { uploadXhr.abort(); } catch (e) {} }
-  showToast('⏹ Загрузка отменена');
-}
-
-/* ОКНО ВЫБОРА РЕЖИМА ИМЕНОВАНИЯ */
-function openNameChoiceModal() {
-  document.getElementById('nameChoiceCount').textContent = pendingFiles.length;
-  const modal = document.getElementById('nameChoiceModal');
-  modal.classList.add('open');
-  document.body.classList.add('modal-open');
-}
-
-function closeNameChoiceModal(e) {
-  if (e) e.stopPropagation();
-  const modal = document.getElementById('nameChoiceModal');
-  modal.classList.remove('open');
-  document.body.classList.remove('modal-open');
-}
-
-function chooseNameMode(mode) {
-  nameMode = mode;
-  closeNameChoiceModal();
-
-  if (mode === 'skip') {
-    setTimeout(() => startActualUpload(), 400);
-  } else if (mode === 'album') {
-    setTimeout(() => openAlbumModal(), 400);
-  } else {
-    currentNameIndex = 0;
-    setTimeout(() => openNameModal(), 400);
-  }
-}
-
-/* АЛЬБОМНОЕ ИМЕНОВАНИЕ */
-function openAlbumModal() {
-  const modal = document.getElementById('albumModal');
-  const counter = document.getElementById('albumModalCounter');
-  const input = document.getElementById('albumModalInput');
-  const preview = document.getElementById('albumPreview');
-
-  counter.textContent = `${pendingFiles.length} файлов получат одно общее имя`;
-
-  input.value = '';
-  preview.innerHTML = '';
-
-  input.oninput = () => {
-    renderAlbumPreview(input.value);
-  };
-
-  renderAlbumPreview('');
-  input.focus();
-
-  modal.classList.add('open');
-  document.body.classList.add('modal-open');
-}
-
-function renderAlbumPreview(baseName) {
-  const preview = document.getElementById('albumPreview');
-  if (!baseName.trim()) {
-    preview.innerHTML = '<span style="opacity:0.6">Введите название, чтобы увидеть превью</span>';
-    return;
-  }
-
-  const items = pendingFiles.slice(0, 4).map((f, i) => {
-    const ext = f.name.includes('.') ? '.' + f.name.split('.').pop() : '';
-    return `<div style="padding:2px 0">${escapeHtml(baseName.trim())} ${i + 1}${escapeHtml(ext)}</div>`;
-  });
-
-  const more = pendingFiles.length > 4 ? `<div style="opacity:0.6;padding:2px 0">... и ещё ${pendingFiles.length - 4}</div>` : '';
-  preview.innerHTML = items.join('') + more;
-}
-
-function closeAlbumModal(e) {
-  if (e) e.stopPropagation();
-  const modal = document.getElementById('albumModal');
-  modal.classList.remove('open');
-  document.body.classList.remove('modal-open');
-}
-
-function confirmAlbumName() {
-  const baseName = document.getElementById('albumModalInput').value.trim();
-  if (!baseName) {
-    showToast('Введите название');
-    return;
-  }
-
-  pendingFiles.forEach((f, i) => {
-    const ext = f.name.includes('.') ? '.' + f.name.split('.').pop() : '';
-    pendingNames[f.id] = `${baseName} ${i + 1}${ext}`;
-  });
-
-  closeAlbumModal();
-  setTimeout(() => startActualUpload(), 400);
-}
-
-/* ИНДИВИДУАЛЬНОЕ ИМЕНОВАНИЕ */
-function openNameModal() {
-  const modal = document.getElementById('nameModal');
-  const counter = document.getElementById('nameModalCounter');
-  const input = document.getElementById('nameModalInput');
-  const original = document.getElementById('nameModalOriginal');
-
-  if (currentNameIndex >= pendingFiles.length) {
-    closeNameModal();
-    setTimeout(() => startActualUpload(), 400);
-    return;
-  }
-
-  const file = pendingFiles[currentNameIndex];
-  counter.textContent = `Файл ${currentNameIndex + 1} из ${pendingFiles.length}`;
-  input.value = '';
-  input.placeholder = 'Оставьте пустым для оригинала';
-  original.textContent = `Оригинал: ${file.name}`;
-
-  modal.classList.add('open');
-  document.body.classList.add('modal-open');
-
-  setTimeout(() => input.focus(), 300);
-}
-
-function closeNameModal(e) {
-  if (e) e.stopPropagation();
-  const modal = document.getElementById('nameModal');
-  modal.classList.remove('open');
-  document.body.classList.remove('modal-open');
 }
 
 /* ===== Хранилище («Моё облако») — волна 22.23: реальное API бота ===== */
@@ -10259,68 +11170,239 @@ function closeStorageModal(e) {
   document.body.classList.remove('modal-open');
 }
 
-function confirmNameAndNext() {
-  const file = pendingFiles[currentNameIndex];
-  const newName = document.getElementById('nameModalInput').value.trim();
-  if (newName) {
-    pendingNames[file.id] = newName;
+function onSearch() {
+  SEARCH = document.getElementById('searchInput').value;
+
+  document.getElementById('clearSearch').style.display = SEARCH ? 'flex' : 'none';
+
+  renderAll();
+}
+
+function clearSearch() {
+  document.getElementById('searchInput').value = '';
+  SEARCH = '';
+
+  document.getElementById('clearSearch').style.display = 'none';
+
+  renderAll();
+}
+
+function setFilter(f) {
+  FILTER = f;
+
+  document.querySelectorAll('.chip[data-filter]').forEach((b) => {
+    b.classList.toggle('active', b.dataset.filter === f);
+  });
+
+  renderAll();
+}
+
+function toggleSortMenu(e) {
+  e.stopPropagation();
+
+  const menu = document.getElementById('sortMenu');
+  const willOpen = !menu.classList.contains('open');
+
+  if (willOpen) menu.classList.add('open');
+  else menu.classList.remove('open');
+}
+
+function setSort(s) {
+  SORT = s;
+
+  const labels = {
+    'date-desc': 'По дате',
+    'date-asc': 'Старые',
+    'name-asc': 'А→Я',
+    'name-desc': 'Я→А',
+    'size-desc': 'Большие',
+    'size-asc': 'Маленькие'
+  };
+
+  document.getElementById('sortLabel').textContent = labels[s] || 'По дате';
+  document.getElementById('sortMenu').classList.remove('open');
+
+  renderAll();
+}
+
+document.addEventListener('pointerdown', (e) => {
+  const sortMenu = document.getElementById('sortMenu');
+  const sortBtn = document.getElementById('sortToggleBtn');
+
+  if (sortMenu && !sortMenu.contains(e.target) && !sortBtn.contains(e.target)) {
+    sortMenu.classList.remove('open');
   }
-  currentNameIndex++;
+
+  const panel = document.getElementById('settingsPanel');
+  const btn = document.getElementById('settingsToggleBtn');
+
+  if (
+    panel &&
+    panel.classList.contains('open') &&
+    !panel.contains(e.target) &&
+    !btn.contains(e.target)
+  ) {
+    closeSettingsPanel();
+  }
+});
+
+function handleDropZoneClick(e) {
+  if (isUploading) return;
+
+  document.getElementById('fileInput').click();
+}
+
+function handleLoaderClick(e) {
+  if (e) e.stopPropagation();
+
+  if (!isUploading) return;
+
+  clickCount++;
+
+  if (clickCount === 1) {
+    clickTimer = setTimeout(() => {
+      togglePauseUpload();
+      clickCount = 0;
+    }, 260);
+  } else if (clickCount === 2) {
+    clearTimeout(clickTimer);
+    clickCount = 0;
+    cancelUpload();
+  }
+}
+
+function togglePauseUpload() {
+  isPaused = !isPaused;
+
+  const downloadText = document.getElementById('downloadText');
+  const squareStop = document.getElementById('squareStop');
+
+  if (isPaused) {
+    downloadText.textContent = 'Пауза (нажмите для продолжения)';
+    if (squareStop) squareStop.style.opacity = '0.4';
+  } else {
+    downloadText.textContent = 'Загрузка... (1 клик - пауза, 2 - отмена)';
+    if (squareStop) squareStop.style.opacity = '1';
+  }
+}
+
+function cancelUpload() {
+  if (!isUploading) return;
+
+  uploadAbortFlag = true;
+
+  if (uploadXhr) {
+    try {
+      uploadXhr.abort();
+    } catch (e) {}
+  }
+
+  showToast('⏹ Загрузка отменена');
+}
+
+function openNameChoiceModal() {
+  startActualUpload();
+}
+
+function closeNameChoiceModal(e) {
+  if (e) e.stopPropagation();
+
+  const modal = document.getElementById('nameChoiceModal');
+  if (modal) modal.classList.remove('open');
+
+  document.body.classList.remove('modal-open');
+}
+
+function chooseNameMode(mode) {
+  closeNameChoiceModal();
+  startActualUpload();
+}
+
+function openAlbumModal() {
+  startActualUpload();
+}
+
+function renderAlbumPreview(baseName) {
+  const preview = document.getElementById('albumPreview');
+  if (!preview) return;
+
+  if (!baseName || !baseName.trim()) {
+    preview.innerHTML = '<span style="opacity:0.6">Введите название, чтобы увидеть превью</span>';
+    return;
+  }
+
+  const items = pendingFiles.slice(0, 4).map((f, i) => {
+    const ext = f.name.includes('.') ? '.' + f.name.split('.').pop() : '';
+    return `<div style="padding:2px 0">${escapeHtml(baseName.trim())} ${i + 1}${escapeHtml(ext)}</div>`;
+  });
+
+  const more = pendingFiles.length > 4
+    ? `<div style="opacity:0.6;padding:2px 0">... и ещё ${pendingFiles.length - 4}</div>`
+    : '';
+
+  preview.innerHTML = items.join('') + more;
+}
+
+function closeAlbumModal(e) {
+  if (e) e.stopPropagation();
+
+  const modal = document.getElementById('albumModal');
+  if (modal) modal.classList.remove('open');
+
+  document.body.classList.remove('modal-open');
+}
+
+function confirmAlbumName() {
+  closeAlbumModal();
+  startActualUpload();
+}
+
+function openNameModal() {
+  startActualUpload();
+}
+
+function closeNameModal(e) {
+  if (e) e.stopPropagation();
+
+  const modal = document.getElementById('nameModal');
+  if (modal) modal.classList.remove('open');
+
+  document.body.classList.remove('modal-open');
+}
+
+function confirmNameAndNext() {
   closeNameModal();
-  setTimeout(() => openNameModal(), 400);
+  startActualUpload();
 }
 
 function skipNameAndNext() {
-  currentNameIndex++;
   closeNameModal();
-  setTimeout(() => openNameModal(), 400);
+  startActualUpload();
 }
 
 function skipAllNames() {
   closeNameModal();
-  setTimeout(() => startActualUpload(), 450);
+  startActualUpload();
 }
 
 function startActualUpload() {
   if (!pendingFiles.length) return;
-
-  /* 22.21: имена применяем к САМИМ File-объектам (uploadName) — исходные
-     байты должны остаться при файле для реальной чанковой загрузки. */
-  pendingFiles.forEach(f => {
-    if (pendingNames[f.id]) {
-      const customName = pendingNames[f.id];
-      if (nameMode === 'album') {
-        f.uploadName = customName;
-      } else {
-        const ext = f.name.includes('.') ? '.' + f.name.split('.').pop() : '';
-        f.uploadName = customName + ext;
-      }
-    }
-  });
 
   proceedUpload(pendingFiles);
 }
 
 function uploadFiles(fileList) {
   const files = Array.from(fileList);
-  if (!files.length || isUploading) return;
-  
-  pendingFiles = files.map((f, i) => {
-    f.id = 'tmp_' + i + '_' + Math.random().toString(36).substr(2, 5);
-    return f;
-  });
-  pendingNames = {};
-  currentNameIndex = 0;
-  nameMode = 'each';
 
-  if (pendingFiles.length === 1) {
-    openNameModal();
-  } else {
-    openNameChoiceModal();
-  }
+  if (!files.length || isUploading) return;
+
+  // НИЧЕГО НЕ СПРАШИВАЕМ: сразу загружаем файлы с оригинальными именами
+  proceedUpload(files);
 }
 
 function proceedUpload(files) {
+  if (!files.length) return;
+
   isUploading = true;
   isPaused = false;
   uploadAbortFlag = false;
@@ -10336,21 +11418,27 @@ function proceedUpload(files) {
   if (files.length === 1) {
     filenameEl.innerHTML = `Загружается:<br><b>${escapeHtml(files[0].uploadName || files[0].name)}</b>`;
   } else {
-    const namesPreview = files.slice(0, 2).map(f => escapeHtml(f.uploadName || f.name)).join(', ');
+    const namesPreview = files.slice(0, 2).map((f) => escapeHtml(f.uploadName || f.name)).join(', ');
     const moreText = files.length > 2 ? ` и ещё ${files.length - 2}` : '';
-    filenameEl.innerHTML = `Загружается файлов: <b>${files.length}</b><br><span style="font-size:11px;opacity:0.8">${namesPreview}${moreText}</span>`;
+
+    filenameEl.innerHTML =
+      `Загружается файлов: <b>${files.length}</b><br>` +
+      `<span style="font-size:11px;opacity:0.8">${namesPreview}${moreText}</span>`;
   }
+
   filenameEl.style.display = 'block';
 
   initial.style.display = 'none';
   wrap.classList.add('active');
-  
+
   const circumference = 157;
+
   bar.classList.remove('success');
   bar.style.strokeDasharray = `${circumference}`;
   bar.style.strokeDashoffset = `${circumference}`;
-  
+
   if (checkmark) checkmark.classList.remove('show');
+
   if (squareStop) {
     squareStop.style.display = 'block';
     squareStop.style.opacity = '1';
@@ -10363,32 +11451,43 @@ function proceedUpload(files) {
 
 function setUploadPct(pct, bar) {
   const circumference = 157;
+
   if (pct >= 100) pct = 100;
+
   bar.style.strokeDashoffset = String(circumference - (pct / 100) * circumference);
 }
 
-function sleepMs(ms) { return new Promise(r => setTimeout(r, ms)); }
+function sleepMs(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
 
 function resetUploadUI(bar, checkmark, squareStop) {
   const initial = document.getElementById('initialState');
   const filenameEl = document.getElementById('uploadFilename');
   const wrap = document.getElementById('progressWrap');
+
   const circumference = 157;
 
   wrap.classList.remove('active');
   filenameEl.style.display = 'none';
   initial.style.display = 'flex';
+
   bar.classList.remove('success');
   bar.style.strokeDashoffset = `${circumference}`;
+
   if (checkmark) checkmark.classList.remove('show');
+
   if (squareStop) {
     squareStop.style.display = 'block';
     squareStop.style.opacity = '1';
   }
+
   isUploading = false;
   isPaused = false;
+
   uploadQueue = [];
   uploadAbortFlag = false;
+
   pendingFiles = [];
   pendingNames = {};
 }
@@ -10396,64 +11495,111 @@ function resetUploadUI(bar, checkmark, squareStop) {
 function sendChunk(uploadId, index, blobPart, onLoaded) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
+
     uploadXhr = xhr;
-    xhr.open('POST', '/api/upload/chunk?uploadId=' + encodeURIComponent(uploadId) + '&index=' + index);
+
+    xhr.open(
+      'POST',
+      '/api/upload/chunk?uploadId=' + encodeURIComponent(uploadId) + '&index=' + index
+    );
+
     const headers = authHeaders();
+
     for (const k in headers) {
-      try { xhr.setRequestHeader(k, headers[k]); } catch (e) {}
+      try {
+        xhr.setRequestHeader(k, headers[k]);
+      } catch (e) {}
     }
-    try { xhr.setRequestHeader('Content-Type', 'application/octet-stream'); } catch (e) {}
-    xhr.upload.onprogress = (ev) => { if (ev.lengthComputable && onLoaded) onLoaded(ev.loaded); };
+
+    try {
+      xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+    } catch (e) {}
+
+    xhr.upload.onprogress = (ev) => {
+      if (ev.lengthComputable && onLoaded) onLoaded(ev.loaded);
+    };
+
     xhr.onload = () => {
       uploadXhr = null;
+
       if (xhr.status >= 200 && xhr.status < 300) return resolve();
+
       let msg = 'HTTP ' + xhr.status;
-      try { msg = JSON.parse(xhr.responseText).message || msg; } catch (e) {}
+
+      try {
+        msg = JSON.parse(xhr.responseText).message || msg;
+      } catch (e) {}
+
       reject(new Error(msg));
     };
-    xhr.onerror = () => { uploadXhr = null; reject(new Error('нет связи с ботом')); };
-    xhr.onabort = () => { uploadXhr = null; reject(new Error('aborted')); };
+
+    xhr.onerror = () => {
+      uploadXhr = null;
+      reject(new Error('нет связи с ботом'));
+    };
+
+    xhr.onabort = () => {
+      uploadXhr = null;
+      reject(new Error('aborted'));
+    };
+
     xhr.send(blobPart);
   });
 }
 
 async function uploadOneFile(file, reportBytes) {
   const upName = String(file.uploadName || file.name || 'file.bin').slice(0, 120);
+
   const initData = await apiJson('/api/upload/init', {
     method: 'POST',
     headers: authHeaders({ 'Content-Type': 'application/json' }),
-    body: JSON.stringify({ name: upName, size: +file.size || 0, mime: file.type || '' })
+    body: JSON.stringify({
+      name: upName,
+      size: +file.size || 0,
+      mime: file.type || ''
+    })
   });
+
   const uploadId = initData.uploadId;
+
   let offset = 0;
   let index = 0;
 
   while (offset < file.size) {
     while (isPaused && !uploadAbortFlag) await sleepMs(150);
+
     if (uploadAbortFlag) {
       apiJson('/api/upload/abort', {
         method: 'POST',
         headers: authHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({ uploadId })
       }).catch(() => {});
+
       throw new Error('aborted');
     }
+
     const end = Math.min(offset + CHUNK_SIZE, file.size);
-    /* 22.30: повтор куска при сбое сети (2 доп. попытки). Сервер теперь
-       идемпотентен: пересланный кусок не задваивается, файл не портится. */
+
     let lastErr = null;
+
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
         await sendChunk(uploadId, index, file.slice(offset, end), (n) => reportBytes(offset + n));
+
         lastErr = null;
+
         break;
       } catch (err) {
         if (err && err.message === 'aborted') throw err;
+
         lastErr = err;
+
         if (attempt < 2) await sleepMs(1200 * (attempt + 1));
       }
     }
+
     if (lastErr) throw lastErr;
+
     offset = end;
     index++;
   }
@@ -10463,41 +11609,55 @@ async function uploadOneFile(file, reportBytes) {
     headers: authHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({ uploadId })
   });
+
   return done.file;
 }
 
 async function uploadEngine(bar) {
   const checkmark = document.getElementById('checkmark');
   const squareStop = document.getElementById('squareStop');
+
   const totalBytes = uploadQueue.reduce((s, f) => s + (+f.size || 0), 0) || 1;
+
   let doneBytes = 0;
   const added = [];
   let failed = null;
 
   for (const file of uploadQueue.slice()) {
     if (uploadAbortFlag || failed) break;
+
     try {
       const rec = await uploadOneFile(file, (cur) => {
         setUploadPct(((doneBytes + cur) / totalBytes) * 100, bar);
       });
+
       if (rec) added.push(rec);
+
       doneBytes += (+file.size || 0);
+
       setUploadPct((doneBytes / totalBytes) * 100, bar);
     } catch (e) {
       if (e.message === 'aborted' || uploadAbortFlag) break;
+
       failed = e;
+
       break;
     }
   }
 
   if (uploadAbortFlag) {
-    /* Тост отмены уже показан в cancelUpload — здесь только тихий сброс UI. */
     resetUploadUI(bar, checkmark, squareStop);
     return;
   }
+
   if (failed) {
-    showToast('Ошибка загрузки: ' + failed.message + (added.length ? ' (что успело — уже сохранено)' : ''));
+    showToast(
+      'Ошибка загрузки: ' + failed.message +
+      (added.length ? ' (что успело — уже сохранено)' : '')
+    );
+
     resetUploadUI(bar, checkmark, squareStop);
+
     return;
   }
 
@@ -10505,6 +11665,7 @@ async function uploadEngine(bar) {
   bar.style.strokeDashoffset = '0';
 
   bar.classList.add('success');
+
   if (squareStop) squareStop.style.display = 'none';
   if (checkmark) checkmark.classList.add('show');
 
@@ -10513,109 +11674,90 @@ async function uploadEngine(bar) {
   playSoundDirectly(selectedSoundId);
   flashScreen();
 
-  added.forEach(rec => {
+  added.forEach((rec) => {
     ALL_FILES.unshift({
-      id: rec.id, name: rec.name, kind: rec.kind,
-      size: +rec.size || 0, ts: rec.ts || '', vault: !!rec.vault
+      id: rec.id,
+      name: rec.name,
+      kind: rec.kind,
+      size: +rec.size || 0,
+      ts: rec.ts || '',
+      vault: !!rec.vault
     });
   });
+
   renderAll();
 
   setTimeout(() => {
     resetUploadUI(bar, checkmark, squareStop);
-  }, 1200);
+  }, 1000);
 }
 
 document.getElementById('fileInput').addEventListener('change', (e) => {
   if (e.target.files?.length) uploadFiles(e.target.files);
+
   e.target.value = '';
 });
 
 const dz = document.getElementById('dropZone');
-['dragenter','dragover'].forEach(ev => dz.addEventListener(ev, e => e.preventDefault()));
-['dragleave','drop'].forEach(ev => dz.addEventListener(ev, e => e.preventDefault()));
-dz.addEventListener('drop', e => {
+
+['dragenter', 'dragover'].forEach((ev) =>
+  dz.addEventListener(ev, (e) => e.preventDefault())
+);
+
+['dragleave', 'drop'].forEach((ev) =>
+  dz.addEventListener(ev, (e) => e.preventDefault())
+);
+
+dz.addEventListener('drop', (e) => {
   if (e.dataTransfer?.files?.length) uploadFiles(e.dataTransfer.files);
 });
 
 const blobSpeedInput = document.getElementById('blobSpeedInput');
 if (blobSpeedInput) blobSpeedInput.value = blobIdleSpeed;
 
+const speedLabel = document.getElementById('speedValueLabel');
+if (speedLabel) speedLabel.textContent = blobIdleSpeed + 'x';
+
 initCustomColors();
 applyTheme(currentTheme);
 updateBlobsVisibility();
 startBlobAnimation();
 renderSoundMenu();
+updateSoundLabel();
 setSort('date-desc');
 renderAll();
 
-/* 22.29: СТАРТ. В Telegram — как раньше: initData → loadFiles (22.26 тихий
-   ретрай, если сервер Render просыпается). Вне Telegram: есть веб-токен —
-   проверяем GET /api/web_me (200 → грузим файлы; 401 → стираем токен и
-   открываем вход); токена нет — сразу окно входа по ID + паролю. */
 if (!IS_TELEGRAM) {
   if (WEB_TOKEN) {
-    fetch('/api/web_me', { headers: authHeaders() }).then(function (r) {
-      if (r.ok) {
-        loadFiles();
-      } else {
-        localStorage.removeItem('devo_web_token');
-        WEB_TOKEN = '';
+    fetch('/api/web_me', { headers: authHeaders() })
+      .then(function (r) {
+        if (r.ok) {
+          loadFiles();
+        } else {
+          localStorage.removeItem('devo_web_token');
+          WEB_TOKEN = '';
+          openLoginModal();
+        }
+      })
+      .catch(function () {
         openLoginModal();
-      }
-    }).catch(function () { openLoginModal(); });
+      });
   } else {
     openLoginModal();
   }
 } else {
   loadFiles().then(function (ok) {
-    if (!ok) setTimeout(function () { loadFiles(true); }, 4000);
+    if (!ok) {
+      setTimeout(function () {
+        loadFiles(true);
+      }, 4000);
+    }
   });
 }
+
 safeIcons();
 </script>
 
-<!-- 22.29: панель действий мультивыбора (видна в режиме выбора) -->
-<div id="selectionBar" style="display:none;position:fixed;left:0;right:0;bottom:0;z-index:60;padding:10px 14px calc(10px + env(safe-area-inset-bottom));background:var(--card-bg);border-top:1px solid var(--border-color);box-shadow:0 -8px 24px rgba(0,0,0,.12)">
-  <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-    <span id="selCount" style="font-weight:800;font-size:13px">Выбрано: 0</span>
-    <span style="flex:1"></span>
-    <button class="sound-item-btn" onclick="zipSelected()" style="padding:8px 10px"><span>📦 В ZIP</span></button>
-    <button class="sound-item-btn" id="unzipBtn" onclick="unzipSelected()" style="padding:8px 10px;display:none"><span>🗂 Распаковать</span></button>
-    <button class="sound-item-btn" onclick="deleteSelected()" style="padding:8px 10px;color:#ef4444"><span>🗑 Удалить</span></button>
-    <button class="sound-item-btn" onclick="toggleSelectMode()" style="padding:8px 10px;background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)"><span>Готово</span></button>
-  </div>
-</div>
-
-<!-- 22.29: вход по Telegram ID + веб-паролю — обычный браузер, без Telegram
-     (для тех, у кого VPN/школьная сеть не пускает telegram.org и initData
-     не доходит). Пароль задаётся в чате бота: ☁️ Облако → «🔑 Веб-пароль». -->
-<div id="loginModal" class="modal-overlay">
-  <div class="modal-card" onclick="event.stopPropagation()">
-    <div class="sheet-handle-area">
-      <div class="sheet-handle"></div>
-    </div>
-    <h3 style="font-weight:900;font-size:20px;margin-bottom:4px">Вход в DEVO+ Облако</h3>
-    <p style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:14px">Открыто вне Telegram, войдите по ID и паролю, заданному в боте</p>
-
-    <div style="margin-bottom:12px">
-      <label for="loginUserId" style="font-size:11px;font-weight:800;color:var(--subtext-color);text-transform:uppercase;letter-spacing:0.04em">Telegram ID</label>
-      <input type="text" id="loginUserId" inputmode="numeric" autocomplete="username" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;margin-top:4px;outline:none;font-size:15px" placeholder="Например: 123456789">
-    </div>
-    <div style="margin-bottom:14px">
-      <label for="loginPassword" style="font-size:11px;font-weight:800;color:var(--subtext-color);text-transform:uppercase;letter-spacing:0.04em">Пароль</label>
-      <input type="password" id="loginPassword" autocomplete="current-password" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;margin-top:4px;outline:none;font-size:15px" placeholder="Веб-пароль из бота">
-    </div>
-
-    <div style="display:flex;flex-direction:column;gap:8px">
-      <button class="sound-item-btn" id="loginSubmitBtn" onclick="webLogin()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
-        <span>Войти</span> <i data-lucide="log-in" style="width:18px;height:18px"></i>
-      </button>
-    </div>
-
-    <p style="font-size:11px;font-weight:600;color:var(--subtext-color);margin-top:12px;line-height:1.5">Пароль задаётся в боте через ☁️ Облако → «🔑 Веб-пароль». Логин — ваш Telegram ID (бот показывает его при создании пароля). 5 неверных попыток — пауза 10 минут.</p>
-  </div>
-</div>
 </body>
 </html>
 """
