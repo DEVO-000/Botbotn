@@ -6,13 +6,6 @@
 <title>DEVO+ Облако</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <script>
-/* ===== ВОЛНА 22.28: ФОЛБЭК, ЕСЛИ telegram.org НЕДОСТУПЕН =====
-   Официальный скрипт грузится с telegram.org, который в ряде сетей
-   (особенно школьных/российских) заблокирован. Без него window.Telegram
-   пуст, initData не передаётся — и КАЖДЫЙ запрос к /api/* отвечал 401
-   («нет связи с облаком»), хотя бот работал. Telegram всегда передаёт
-   initData в URL-хэше (tgWebAppData=...) — собираем минимальный WebApp-шим
-   прямо из него. Если официальный скрипт загрузился — ничего не делаем. */
 (function () {
   try {
     if (window.Telegram && window.Telegram.WebApp && window.Telegram.WebApp.initData) return;
@@ -37,13 +30,10 @@
     var _hf = { impactOccurred: _noop, notificationOccurred: _noop, selectionChanged: _noop };
     window.Telegram = window.Telegram || {};
     window.Telegram.WebApp = {
-      initData: initData,
-      initDataUnsafe: unsafe,
-      version: '6.9', platform: 'unknown',
+      initData: initData, initDataUnsafe: unsafe, version: '6.9', platform: 'unknown',
       colorScheme: (themeParams.bg_color && /^#([0-9a-f]{6})$/i.test(themeParams.bg_color)
         ? (parseInt(themeParams.bg_color.slice(1), 16) < 0x800000 ? 'dark' : 'light') : 'light'),
-      themeParams: themeParams,
-      isExpanded: true, viewportStableHeight: window.innerHeight,
+      themeParams: themeParams, isExpanded: true, viewportStableHeight: window.innerHeight,
       ready: _noop, expand: _noop, close: _noop,
       onEvent: _noop, offEvent: _noop,
       enableClosingConfirmation: _noop, disableClosingConfirmation: _noop,
@@ -65,799 +55,447 @@
 <script src="https://unpkg.com/lucide@latest"></script>
 <style>
 :root {
-  --bg-color: #f8f9fa;
-  --bg-gradient: none;
-  --text-color: #0d0d0d;
-  --card-bg: rgba(255, 255, 255, 0.8);
-  --card-active: rgba(240, 242, 245, 0.9);
-  --stat-bg: rgba(255, 255, 255, 0.8);
-  --btn-bg: #000000;
-  --btn-text: #ffffff;
-  --border-color: rgba(226, 232, 240, 0.85);
-  --subtext-color: #64748b;
-  --drop-bg: rgba(241, 245, 249, 0.7);
-  --drop-active: rgba(226, 232, 240, 0.85);
-  --dropdown-bg: #ffffff;
-  --loader-bg: #cbd5e1;
-  --loader-bar: #000000;
-  --blob-1: #60a5fa;
-  --blob-2: #c084fc;
+  --bg-color: #f8f9fa; --bg-gradient: none; --text-color: #0d0d0d;
+  --card-bg: rgba(255, 255, 255, 0.8); --card-active: rgba(240, 242, 245, 0.9);
+  --stat-bg: rgba(255, 255, 255, 0.8); --btn-bg: #000000; --btn-text: #ffffff;
+  --border-color: rgba(226, 232, 240, 0.85); --subtext-color: #64748b;
+  --drop-bg: rgba(241, 245, 249, 0.7); --drop-active: rgba(226, 232, 240, 0.85);
+  --dropdown-bg: #ffffff; --loader-bg: #cbd5e1; --loader-bar: #000000;
+  --blob-1: #60a5fa; --blob-2: #c084fc;
 }
-
 [data-theme="dark"] {
-  --bg-color: #121212;
-  --bg-gradient: none;
-  --text-color: #ffffff;
-  --card-bg: rgba(30, 30, 32, 0.8);
-  --card-active: rgba(42, 42, 45, 0.9);
-  --stat-bg: rgba(24, 24, 26, 0.8);
-  --btn-bg: #ffffff;
-  --btn-text: #000000;
-  --border-color: rgba(46, 46, 50, 0.85);
-  --subtext-color: #aaaaaa;
-  --drop-bg: rgba(34, 34, 37, 0.7);
-  --drop-active: rgba(44, 44, 48, 0.85);
-  --dropdown-bg: #1e1e20;
-  --loader-bg: #444448;
-  --loader-bar: #ffffff;
-  --blob-1: #3b82f6;
-  --blob-2: #9333ea;
+  --bg-color: #121212; --bg-gradient: none; --text-color: #ffffff;
+  --card-bg: rgba(30, 30, 32, 0.8); --card-active: rgba(42, 42, 45, 0.9);
+  --stat-bg: rgba(24, 24, 26, 0.8); --btn-bg: #ffffff; --btn-text: #000000;
+  --border-color: rgba(46, 46, 50, 0.85); --subtext-color: #aaaaaa;
+  --drop-bg: rgba(34, 34, 37, 0.7); --drop-active: rgba(44, 44, 48, 0.85);
+  --dropdown-bg: #1e1e20; --loader-bg: #444448; --loader-bar: #ffffff;
+  --blob-1: #3b82f6; --blob-2: #9333ea;
 }
-
 [data-theme="custom"] {
   --bg-color: var(--custom-bg1, #4f46e5);
   --bg-gradient: linear-gradient(var(--custom-angle, 135deg), var(--custom-bg1, #4f46e5), var(--custom-bg2, #9333ea));
-  --text-color: #ffffff;
-  --card-bg: rgba(255, 255, 255, 0.18);
-  --card-active: rgba(255, 255, 255, 0.28);
-  --stat-bg: rgba(255, 255, 255, 0.15);
-  --btn-bg: var(--custom-btn-bg, #ffffff);
-  --btn-text: var(--custom-btn-text, #000000);
-  --border-color: rgba(255, 255, 255, 0.3);
-  --subtext-color: rgba(255, 255, 255, 0.8);
-  --drop-bg: rgba(255, 255, 255, 0.12);
-  --drop-active: rgba(255, 255, 255, 0.22);
-  --dropdown-bg: #1e1e20;
-  --loader-bg: rgba(255, 255, 255, 0.3);
-  --loader-bar: var(--custom-btn-bg, #ffffff);
-  --blob-1: var(--custom-bg1, #4f46e5);
-  --blob-2: var(--custom-bg2, #9333ea);
+  --text-color: #ffffff; --card-bg: rgba(255, 255, 255, 0.18); --card-active: rgba(255, 255, 255, 0.28);
+  --stat-bg: rgba(255, 255, 255, 0.15); --btn-bg: var(--custom-btn-bg, #ffffff);
+  --btn-text: var(--custom-btn-text, #000000); --border-color: rgba(255, 255, 255, 0.3);
+  --subtext-color: rgba(255, 255, 255, 0.8); --drop-bg: rgba(255, 255, 255, 0.12);
+  --drop-active: rgba(255, 255, 255, 0.22); --dropdown-bg: #1e1e20;
+  --loader-bg: rgba(255, 255, 255, 0.3); --loader-bar: var(--custom-btn-bg, #ffffff);
+  --blob-1: var(--custom-bg1, #4f46e5); --blob-2: var(--custom-bg2, #9333ea);
 }
-
 *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent;user-select:none}
-
-html, body {
-  min-height: 100%;
-  overflow-x: hidden;
-  overflow-y: auto;
-}
-
+html, body { min-height: 100%; overflow-x: hidden; overflow-y: auto; -webkit-font-smoothing: antialiased; }
 body{
   font-family:'Nunito',sans-serif;
-  background: var(--bg-gradient, var(--bg-color));
-  background-color: var(--bg-color);
+  background: var(--bg-gradient, var(--bg-color)); background-color: var(--bg-color);
   color:var(--text-color);
   transition: background 1.2s cubic-bezier(0.25, 1, 0.5, 1), color 1.2s cubic-bezier(0.25, 1, 0.5, 1);
-  position: relative;
+  position: relative; contain: layout style;
 }
-
-body.modal-open {
-  overflow: hidden;
-  touch-action: none;
-}
-
-/* ВСПЫШКА В ЦВЕТАХ ТЕМЫ */
-.theme-flash {
-  position: fixed;
-  inset: 0;
-  z-index: 999;
-  pointer-events: none;
-  opacity: 0;
-  mix-blend-mode: screen;
-}
-.theme-flash.active {
-  animation: themeFlash 1.1s cubic-bezier(0.16, 1, 0.3, 1) forwards;
-}
+body.modal-open { overflow: hidden; touch-action: none; }
+.theme-flash { position: fixed; inset: 0; z-index: 999; pointer-events: none; opacity: 0; mix-blend-mode: screen; }
+.theme-flash.active { animation: themeFlash 1.1s cubic-bezier(0.16, 1, 0.3, 1) forwards; }
 @keyframes themeFlash {
-  0%   { opacity: 0; filter: brightness(1); }
-  15%  { opacity: 0.55; filter: brightness(1.4); }
-  40%  { opacity: 0.35; filter: brightness(1.2); }
-  70%  { opacity: 0.45; filter: brightness(1.3); }
+  0% { opacity: 0; filter: brightness(1); } 15% { opacity: 0.55; filter: brightness(1.4); }
+  40% { opacity: 0.35; filter: brightness(1.2); } 70% { opacity: 0.45; filter: brightness(1.3); }
   100% { opacity: 0; filter: brightness(1); }
 }
-
-.theme-flash::before,
-.theme-flash::after {
-  content: '';
-  position: absolute;
-  border-radius: 50%;
-  filter: blur(80px);
-}
-.theme-flash::before {
-  width: 70vw; height: 70vw;
-  background: var(--blob-1);
-  top: 10%; left: -10%;
-  animation: flashMove1 1.1s ease-out forwards;
-}
-.theme-flash::after {
-  width: 75vw; height: 75vw;
-  background: var(--blob-2);
-  bottom: 10%; right: -10%;
-  animation: flashMove2 1.1s ease-out forwards;
-}
-@keyframes flashMove1 {
-  0%   { transform: scale(0.6); opacity: 0; }
-  30%  { transform: scale(1.15); opacity: 0.8; }
-  100% { transform: scale(1.4); opacity: 0; }
-}
-@keyframes flashMove2 {
-  0%   { transform: scale(0.6); opacity: 0; }
-  30%  { transform: scale(1.15); opacity: 0.8; }
-  100% { transform: scale(1.4); opacity: 0; }
-}
-
-.bg-blobs-container {
-  position: fixed;
-  top: 0; left: 0; width: 100vw; height: 100vh;
-  z-index: 0;
-  pointer-events: none;
-  overflow: hidden;
-  transition: opacity 1.5s ease;
-}
-
-.blob {
-  position: absolute;
-  border-radius: 50%;
-  filter: blur(90px);
-  opacity: 0.65;
-  will-change: transform;
-  transition: transform 3s cubic-bezier(0.25, 1, 0.5, 1);
-}
-
-.blob-1 {
-  width: 320px; height: 320px;
-  background: var(--blob-1);
-  top: 20%; left: 10%;
-}
-
-.blob-2 {
-  width: 360px; height: 360px;
-  background: var(--blob-2);
-  bottom: 20%; right: 10%;
-}
-
-.main-wrapper {
-  position: relative;
-  z-index: 1;
-  width: 100%;
-  max-width: 560px;
-  min-height: 100vh;
-  margin: 0 auto;
-  padding: 20px 18px 40px 18px;
-  display: flex;
-  flex-direction: column;
-}
-
+.theme-flash::before, .theme-flash::after { content: ''; position: absolute; border-radius: 50%; filter: blur(80px); }
+.theme-flash::before { width: 70vw; height: 70vw; background: var(--blob-1); top: 10%; left: -10%; animation: flashMove1 1.1s ease-out forwards; }
+.theme-flash::after { width: 75vw; height: 75vw; background: var(--blob-2); bottom: 10%; right: -10%; animation: flashMove2 1.1s ease-out forwards; }
+@keyframes flashMove1 { 0% { transform: scale(0.6); opacity: 0; } 30% { transform: scale(1.15); opacity: 0.8; } 100% { transform: scale(1.4); opacity: 0; } }
+@keyframes flashMove2 { 0% { transform: scale(0.6); opacity: 0; } 30% { transform: scale(1.15); opacity: 0.8; } 100% { transform: scale(1.4); opacity: 0; } }
+.bg-blobs-container { position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; z-index: 0; pointer-events: none; overflow: hidden; transition: opacity 1.5s ease; }
+.blob { position: absolute; border-radius: 50%; filter: blur(90px); opacity: 0.65; will-change: transform; transition: transform 3s cubic-bezier(0.25, 1, 0.5, 1); transform: translate3d(0, 0, 0); }
+.blob-1 { width: 320px; height: 320px; background: var(--blob-1); top: 20%; left: 10%; }
+.blob-2 { width: 360px; height: 360px; background: var(--blob-2); bottom: 20%; right: 10%; }
+.main-wrapper { position: relative; z-index: 1; width: 100%; max-width: 560px; min-height: 100vh; margin: 0 auto; padding: 20px 18px 40px 18px; display: flex; flex-direction: column; contain: layout; }
 .logo-font{font-weight:900;letter-spacing:-.04em;color:var(--text-color);font-size:32px;line-height:1}
-
-.animate-fade-in{
-  animation: smoothInsert 0.8s cubic-bezier(0.16, 1, 0.3, 1) forwards;
-  will-change: transform, opacity;
-  opacity: 0;
-  transform: translateY(20px) scale(0.98);
-}
-
-@keyframes smoothInsert {
-  0% { opacity: 0; transform: translateY(20px) scale(0.98); }
-  100% { opacity: 1; transform: translateY(0) scale(1); }
-}
-
+.animate-fade-in{ animation: smoothInsert 0.8s cubic-bezier(0.16, 1, 0.3, 1) forwards; will-change: transform, opacity; opacity: 0; transform: translateY(20px) scale(0.98); }
+@keyframes smoothInsert { 0% { opacity: 0; transform: translateY(20px) scale(0.98); } 100% { opacity: 1; transform: translateY(0) scale(1); } }
 .toast-msg{animation:fadeInOut 3.5s cubic-bezier(.16,1,.3,1) forwards}
-@keyframes fadeInOut{
-  0%{opacity:0;transform:translateY(15px)}
-  15%{opacity:1;transform:translateY(0)}
-  85%{opacity:1;transform:translateY(0)}
-  100%{opacity:0;transform:translateY(10px)}
-}
-
+@keyframes fadeInOut{ 0%{opacity:0;transform:translateY(15px)} 15%{opacity:1;transform:translateY(0)} 85%{opacity:1;transform:translateY(0)} 100%{opacity:0;transform:translateY(10px)} }
 .file-card{
-  background:var(--card-bg);
-  border: 1px solid var(--border-color);
-  border-radius:20px;
-  cursor: pointer;
-  backdrop-filter: blur(14px);
-  -webkit-backdrop-filter: blur(14px);
-  padding: 12px 14px;
+  background:var(--card-bg); border: 1px solid var(--border-color); border-radius:20px; cursor: pointer;
+  backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); padding: 12px 14px;
   transition: transform 0.4s cubic-bezier(0.2, 0.8, 0.2, 1), background 0.6s ease;
+  transform: translate3d(0, 0, 0); will-change: transform;
 }
-.file-card:active{transform:scale(.98);background:var(--card-active)}
-
-.icon-wrap{
-  width:46px;height:46px;border-radius:14px;
-  background:var(--btn-bg);
-  color:var(--btn-text);
-  display:flex;align-items:center;justify-content:center;
-  transition: background 0.6s ease, color 0.6s ease;
-}
-
+.file-card:active{transform:scale(.98) translate3d(0, 0, 0);background:var(--card-active)}
+.icon-wrap{ width:46px;height:46px;border-radius:14px; background:var(--btn-bg); color:var(--btn-text); display:flex;align-items:center;justify-content:center; transition: background 0.6s ease, color 0.6s ease; }
 .action-btn{
-  width:40px;height:40px;border-radius:9999px;
-  background:var(--btn-bg);
+  width:40px;height:40px;border-radius:9999px; background:var(--btn-bg);
   display:flex;align-items:center;justify-content:center;
   color:var(--btn-text);border:none;cursor:pointer;
   transition: transform 0.35s cubic-bezier(0.2, 0.8, 0.2, 1), opacity 0.5s ease, background 0.6s ease, color 0.6s ease;
+  transform: translate3d(0, 0, 0); will-change: transform; -webkit-tap-highlight-color: transparent;
 }
-.action-btn:active{transform:scale(.92);opacity:.8}
+.action-btn:active{transform:scale(.92) translate3d(0, 0, 0);opacity:.8}
+
+.settings-btn{
+  width:44px;height:44px;border-radius:9999px; background:var(--btn-bg);
+  display:flex;align-items:center;justify-content:center;
+  color:var(--btn-text);border:none;cursor:pointer;
+  transition: transform 0.5s cubic-bezier(0.34, 1.56, 0.64, 1), background 0.6s ease, color 0.6s ease;
+  transform: translate3d(0, 0, 0) rotate(0deg); will-change: transform;
+  -webkit-tap-highlight-color: transparent; z-index: 60; position: relative;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+}
+.settings-btn:active{ transform: scale(0.88) translate3d(0, 0, 0) rotate(0deg); }
+.settings-btn.open{ transform: translate3d(0, 0, 0) rotate(90deg); }
+
+.settings-panel{
+  position: absolute; top: calc(100% + 12px); right: 0;
+  background: var(--card-bg); border: 1px solid var(--border-color); border-radius: 24px;
+  padding: 16px; min-width: 280px;
+  box-shadow: 0 20px 60px rgba(0,0,0,0.25), 0 8px 24px rgba(0,0,0,0.15);
+  backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px);
+  opacity: 0; pointer-events: none;
+  transform: translate3d(0, -20px, 0) scale(0.92);
+  transition: opacity 0.4s cubic-bezier(0.16, 1, 0.3, 1), transform 0.5s cubic-bezier(0.34, 1.56, 0.64, 1);
+  transform-origin: top right; will-change: transform, opacity; z-index: 50; contain: layout style;
+}
+.settings-panel.open{ opacity: 1; pointer-events: auto; transform: translate3d(0, 0, 0) scale(1); }
+.settings-panel .settings-grid{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 12px; }
+.settings-panel .settings-action{
+  display: flex; flex-direction: column; align-items: center; gap: 6px;
+  padding: 12px 8px; border-radius: 16px; background: var(--card-bg);
+  border: 1px solid var(--border-color); cursor: pointer;
+  transition: transform 0.4s cubic-bezier(0.34, 1.56, 0.64, 1), background 0.3s ease;
+  transform: translate3d(0, 0, 0) scale(1); will-change: transform;
+  -webkit-tap-highlight-color: transparent; opacity: 0; animation: none;
+}
+.settings-panel.open .settings-action{ opacity: 1; animation: settingsItemIn 0.6s cubic-bezier(0.34, 1.56, 0.64, 1) forwards; }
+.settings-panel.open .settings-action:nth-child(1){animation-delay: 0.05s;}
+.settings-panel.open .settings-action:nth-child(2){animation-delay: 0.1s;}
+.settings-panel.open .settings-action:nth-child(3){animation-delay: 0.15s;}
+.settings-panel.open .settings-action:nth-child(4){animation-delay: 0.2s;}
+.settings-panel.open .settings-action:nth-child(5){animation-delay: 0.25s;}
+.settings-panel.open .settings-action:nth-child(6){animation-delay: 0.3s;}
+@keyframes settingsItemIn {
+  0% { opacity: 0; transform: translate3d(0, 15px, 0) scale(0.7); }
+  100% { opacity: 1; transform: translate3d(0, 0, 0) scale(1); }
+}
+.settings-action:active{ transform: translate3d(0, 0, 0) scale(0.88); }
+.settings-action .settings-icon{
+  width: 44px; height: 44px; border-radius: 14px; background: var(--btn-bg);
+  color: var(--btn-text); display: flex; align-items: center; justify-content: center;
+  transition: background 0.6s ease, color 0.6s ease;
+}
+.settings-action .settings-label{
+  font-size: 11px; font-weight: 700; color: var(--subtext-color); text-align: center; line-height: 1.2;
+}
 
 .chip{
-  padding:8px 10px;border-radius:9999px;
-  background:var(--card-bg);color:var(--text-color);font-weight:700;font-size:14px;
-  border: 1px solid var(--border-color);cursor:pointer;
-  backdrop-filter: blur(10px);
-  -webkit-backdrop-filter: blur(10px);
+  padding:8px 10px;border-radius:9999px; background:var(--card-bg);color:var(--text-color);
+  font-weight:700;font-size:14px; border: 1px solid var(--border-color);cursor:pointer;
+  backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
   transition: transform 0.4s cubic-bezier(0.2, 0.8, 0.2, 1), background 0.6s ease, color 0.6s ease;
-  white-space:nowrap;
-  display:inline-flex;align-items:center;justify-content:center;gap:6px;
-  flex-shrink:0;
+  white-space:nowrap; display:inline-flex;align-items:center;justify-content:center;gap:6px; flex-shrink:0;
+  transform: translate3d(0, 0, 0);
 }
-.chip:active{transform:scale(.95)}
+.chip:active{transform:scale(.95) translate3d(0, 0, 0)}
 .chip.active{background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)}
-
-.filters-scroll-wrap{
-  display:flex;gap:6px;padding-bottom:6px;margin-bottom:12px;
-  justify-content: space-between;
-  width: 100%;
-}
-.filters-scroll-wrap .chip {
-  flex: 1 1 0;
-  min-width: 0;
-  padding: 8px 4px;
-}
-
-.search-box{
-  position:relative;border:1.5px solid var(--border-color);
-  background: var(--card-bg);
-  backdrop-filter: blur(10px);
-  -webkit-backdrop-filter: blur(10px);
-  border-radius:9999px;
-  padding:8px 16px 8px 40px;
-  transition: border-color 0.6s ease;
-}
-.search-box input{
-  width:100%;background:transparent;border:none;outline:none;
-  font-family:'Nunito',sans-serif;font-weight:700;font-size:15px;color:var(--text-color);
-}
+.filters-scroll-wrap{ display:flex;gap:6px;padding-bottom:6px;margin-bottom:12px; justify-content: space-between; width: 100%; }
+.filters-scroll-wrap .chip { flex: 1 1 0; min-width: 0; padding: 8px 4px; }
+.search-box{ position:relative;border:1.5px solid var(--border-color); background: var(--card-bg); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); border-radius:9999px; padding:8px 16px 8px 40px; transition: border-color 0.6s ease; }
+.search-box input{ width:100%;background:transparent;border:none;outline:none; font-family:'Nunito',sans-serif;font-weight:700;font-size:15px;color:var(--text-color); }
 .search-box input::placeholder{color:var(--subtext-color);font-weight:600}
-
 .drop-zone{
-  background:var(--drop-bg);
-  border: 1.5px dashed var(--border-color);
-  border-radius:24px;
-  padding:16px;
-  text-align:center;
-  cursor:pointer;
-  display:flex;
-  flex-direction:column;
-  align-items:center;
-  justify-content:center;
-  min-height:110px;
-  position:relative;
-  backdrop-filter: blur(10px);
-  -webkit-backdrop-filter: blur(10px);
+  background:var(--drop-bg); border: 1.5px dashed var(--border-color); border-radius:24px;
+  padding:16px; text-align:center; cursor:pointer; display:flex; flex-direction:column;
+  align-items:center; justify-content:center; min-height:110px; position:relative;
+  backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
   transition: transform 0.4s cubic-bezier(0.2, 0.8, 0.2, 1), background 0.6s ease;
-  margin-bottom: 12px;
+  margin-bottom: 12px; transform: translate3d(0, 0, 0); will-change: transform;
 }
-.drop-zone:active{transform:scale(.99);background:var(--drop-active)}
-
-.initial-state{
-  display:flex;
-  flex-direction:column;
-  align-items:center;
-  gap:4px;
-}
-
-.upload-filename{
-  font-weight:800;
-  font-size:13px;
-  color:var(--text-color);
-  margin-bottom:6px;
-  max-width:300px;
-  text-align:center;
-  display:none;
-  word-break: break-word;
-}
-
-.download-progress-wrap{
-  display:none;
-  flex-direction:column;
-  align-items:center;
-  justify-content:center;
-  gap:8px;
-  opacity:0;
-  transition: opacity 0.6s ease;
-}
-.download-progress-wrap.active{
-  display:flex;
-  opacity:1;
-}
-
-.drop-loader{
-  width:58px;height:58px;position:relative;
-  display:flex;align-items:center;justify-content:center;
-  cursor: pointer;
-}
+.drop-zone:active{transform:scale(.99) translate3d(0, 0, 0);background:var(--drop-active)}
+.initial-state{ display:flex; flex-direction:column; align-items:center; gap:4px; }
+.upload-filename{ font-weight:800; font-size:13px; color:var(--text-color); margin-bottom:6px; max-width:300px; text-align:center; display:none; word-break: break-word; }
+.download-progress-wrap{ display:none; flex-direction:column; align-items:center; justify-content:center; gap:8px; opacity:0; transition: opacity 0.6s ease; }
+.download-progress-wrap.active{ display:flex; opacity:1; }
+.drop-loader{ width:58px;height:58px;position:relative; display:flex;align-items:center;justify-content:center; cursor: pointer; }
 .drop-loader svg{width:58px;height:58px}
 .drop-loader > svg:first-child{transform:rotate(-90deg)}
 .drop-loader circle.bg{stroke:var(--loader-bg);stroke-width:6;fill:none}
-.drop-loader circle.bar{
-  stroke:var(--loader-bar);stroke-width:6;fill:none;
-  stroke-dasharray:157;stroke-dashoffset:157;stroke-linecap:round;
-  transition: stroke-dashoffset 0.3s linear, stroke 0.6s ease;
-}
-.drop-loader circle.bar.success {
-  stroke: #22c55e !important;
-}
-
-/* === ПРАВИЛЬНАЯ ГАЛОЧКА (SVG) === */
-.checkmark-svg {
-  position: absolute;
-  width: 58px;
-  height: 58px;
-  top: 0;
-  left: 0;
-  pointer-events: none;
-  opacity: 0;
-  transition: opacity 0.3s ease;
-}
-.checkmark-svg path {
-  stroke-dasharray: 60;
-  stroke-dashoffset: 60;
-  transition: stroke-dashoffset 0.6s cubic-bezier(0.65, 0, 0.35, 1);
-}
-.checkmark-svg.show {
-  opacity: 1;
-}
-.checkmark-svg.show path {
-  stroke-dashoffset: 0;
-}
-
-.square-stop{
-  width:16px;height:16px;background:var(--btn-bg);border-radius:4px;
-  position:absolute; transition: transform 0.4s ease, opacity 0.4s ease;
-}
-
+.drop-loader circle.bar{ stroke:var(--loader-bar);stroke-width:6;fill:none; stroke-dasharray:157;stroke-dashoffset:157;stroke-linecap:round; transition: stroke-dashoffset 0.3s linear, stroke 0.6s ease; }
+.drop-loader circle.bar.success { stroke: #22c55e !important; }
+.checkmark-svg { position: absolute; width: 58px; height: 58px; top: 0; left: 0; pointer-events: none; opacity: 0; transition: opacity 0.3s ease; }
+.checkmark-svg path { stroke-dasharray: 60; stroke-dashoffset: 60; transition: stroke-dashoffset 0.6s cubic-bezier(0.65, 0, 0.35, 1); }
+.checkmark-svg.show { opacity: 1; }
+.checkmark-svg.show path { stroke-dashoffset: 0; }
+.square-stop{ width:16px;height:16px;background:var(--btn-bg);border-radius:4px; position:absolute; transition: transform 0.4s ease, opacity 0.4s ease; }
 .download-text{font-weight:800;font-size:13px;color:var(--subtext-color);}
-
-.files-container {
-  width: 100%;
-  margin-top: 6px;
-}
-
+.files-container { width: 100%; margin-top: 6px; }
 .empty-state{padding:40px 20px;text-align:center;display:none}
-
 .dropdown-menu{
   position:absolute;top:calc(100% + 10px);right:0;
   background:var(--card-bg);border:1px solid var(--border-color);border-radius:20px;
-  box-shadow:0 15px 35px rgba(0,0,0,.18);
-  padding:10px;min-width:260px;z-index:30;
+  box-shadow:0 15px 35px rgba(0,0,0,.18); padding:10px;min-width:260px;z-index:30;
   opacity:0;pointer-events:none;
   transform:translateY(-8px) scale(0.96);
   transition: transform 0.4s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.3s ease, background 0.6s ease;
   transform-origin:top right;
-  backdrop-filter: blur(14px);
-  -webkit-backdrop-filter: blur(14px);
-  will-change: transform, opacity;
+  backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); will-change: transform, opacity;
 }
 .dropdown-menu.open{opacity:1;pointer-events:auto;transform:translateY(0) scale(1)}
-
 .sound-item-btn {
   width: 100%;text-align: left;padding: 10px 12px;border-radius: 14px;
   background: var(--card-bg);border: 1px solid var(--border-color);cursor: pointer;
   font-family: 'Nunito', sans-serif;font-weight: 700;font-size: 14px;
   color: var(--text-color);display: flex;align-items: center;justify-content: space-between;
   gap: 10px;margin-bottom: 6px;transition: transform 0.3s ease, background-color 0.6s ease, color 0.6s ease;
+  transform: translate3d(0, 0, 0);
 }
 .sound-item-btn:last-child { margin-bottom: 0; }
-.sound-item-btn:active { transform: scale(0.98); }
-.sound-item-btn.active-sound {
-  background: var(--btn-bg) !important;
-  color: var(--btn-text) !important;
-  border-color: var(--btn-bg) !important;
-}
-
-.check-circle-icon {
-  width: 22px;height: 22px;border-radius: 50%;background: #34c759;
-  display: flex;align-items: center;justify-content: center;flex-shrink: 0;
-}
+.sound-item-btn:active { transform: scale(0.98) translate3d(0, 0, 0); }
+.sound-item-btn.active-sound { background: var(--btn-bg) !important; color: var(--btn-text) !important; border-color: var(--btn-bg) !important; }
+.check-circle-icon { width: 22px;height: 22px;border-radius: 50%;background: #34c759; display: flex;align-items: center;justify-content: center;flex-shrink: 0; }
 .check-circle-icon svg { stroke: #fff !important; width: 13px; height: 13px; }
-
-.custom-theme-picker {
-  display: none;
-  flex-direction: column;
-  gap: 10px;
-  padding: 12px;
-  background: var(--card-bg);
-  border: 1px solid var(--border-color);
-  border-radius: 14px;
-  margin-top: 8px;
-}
+.custom-theme-picker { display: none; flex-direction: column; gap: 10px; padding: 12px; background: var(--card-bg); border: 1px solid var(--border-color); border-radius: 14px; margin-top: 8px; }
 .custom-theme-picker.active { display: flex; }
 .color-picker-row { display: flex; align-items: center; justify-content: space-between; font-size: 13px; font-weight: 700; }
-.color-picker-wrap {
-  position: relative; width: 32px; height: 32px; border-radius: 50%;
-  border: 2px solid var(--border-color); overflow: hidden; cursor: pointer;
-}
-.color-picker-wrap input[type="color"] {
-  position: absolute; top: -10px; left: -10px; width: 50px; height: 50px;
-  border: none; cursor: pointer; background: none;
-}
-
+.color-picker-wrap { position: relative; width: 32px; height: 32px; border-radius: 50%; border: 2px solid var(--border-color); overflow: hidden; cursor: pointer; }
+.color-picker-wrap input[type="color"] { position: absolute; top: -10px; left: -10px; width: 50px; height: 50px; border: none; cursor: pointer; background: none; }
 .modal-overlay {
   position: fixed; top: 0; left: 0; right: 0; bottom: 0;
-  background: rgba(0,0,0,0.5);
-  backdrop-filter: blur(8px);
-  -webkit-backdrop-filter: blur(8px);
+  background: rgba(0,0,0,0.5); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
   z-index: 100; display: flex; align-items: flex-end; justify-content: center;
   opacity: 0; pointer-events: none;
   transition: opacity 0.4s cubic-bezier(0.16, 1, 0.3, 1);
-  overscroll-behavior: contain;
-  touch-action: none;
+  overscroll-behavior: contain; touch-action: none;
 }
 .modal-overlay.open { opacity: 1; pointer-events: auto; }
-
 .modal-card {
-  background: var(--card-bg);
-  border: 1px solid var(--border-color);
-  border-bottom: none;
+  background: var(--card-bg); border: 1px solid var(--border-color); border-bottom: none;
   border-top-left-radius: 32px; border-top-right-radius: 32px;
   padding: 14px 22px 32px 22px; width: 100%; max-width: 560px;
-  box-shadow: 0 -10px 40px rgba(0,0,0,0.25);
-  transform: translateY(100%);
-  transition: transform 0.5s cubic-bezier(0.16, 1, 0.3, 1);
-  will-change: transform;
-  backdrop-filter: blur(20px);
-  -webkit-backdrop-filter: blur(20px);
-  overscroll-behavior: contain;
-  touch-action: pan-y;
+  box-shadow: 0 -10px 40px rgba(0,0,0,0.25); transform: translateY(100%);
+  transition: transform 0.5s cubic-bezier(0.16, 1, 0.3, 1); will-change: transform;
+  backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px);
+  overscroll-behavior: contain; touch-action: pan-y;
 }
 .modal-overlay.open .modal-card { transform: translateY(0); }
-
-.sheet-handle-area {
-  width: 100%;
-  padding: 6px 0 16px 0;
-  cursor: grab;
-  display: flex;
-  justify-content: center;
-}
-.sheet-handle {
-  width: 48px; height: 5px; background: var(--border-color);
-  border-radius: 999px; opacity: 0.8;
-}
+.sheet-handle-area { width: 100%; padding: 6px 0 16px 0; cursor: grab; display: flex; justify-content: center; }
+.sheet-handle { width: 48px; height: 5px; background: var(--border-color); border-radius: 999px; opacity: 0.8; }
 </style>
 </head>
 <body>
-
 <div class="theme-flash" id="themeFlash"></div>
-
 <div class="bg-blobs-container" id="bgBlobs">
   <div class="blob blob-1" id="blob1"></div>
   <div class="blob blob-2" id="blob2"></div>
 </div>
-
 <div id="toastContainer" style="position:fixed;bottom:24px;left:50%;transform:translateX(-50%);z-index:150;display:flex;flex-direction:column;align-items:center;gap:8px;pointer-events:none;width:100%;max-width:400px;padding:0 16px"></div>
 
-<!-- Модальное окно действий с файлом -->
 <div id="editModal" class="modal-overlay" onclick="closeEditModal(event)">
   <div class="modal-card" id="modalCard" onclick="event.stopPropagation()">
-    <div class="sheet-handle-area" id="modalHandle">
-      <div class="sheet-handle"></div>
-    </div>
+    <div class="sheet-handle-area" id="modalHandle"><div class="sheet-handle"></div></div>
     <h3 style="font-weight:900;font-size:20px;margin-bottom:4px">Действия с файлом</h3>
     <p id="modalFileName" style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:14px;word-break:break-all"></p>
-    
     <div style="margin-bottom:14px">
       <label style="font-size:11px;font-weight:800;color:var(--subtext-color);text-transform:uppercase;letter-spacing:0.04em">Название файла</label>
       <input type="text" id="modalInputName" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;margin-top:4px;outline:none;font-size:15px">
     </div>
-
     <div style="display:flex;flex-direction:column;gap:8px">
-      <button class="sound-item-btn" onclick="saveFileName()">
-        <span>Сохранить имя</span> <i data-lucide="check" style="width:18px;height:18px"></i>
-      </button>
-      <!-- 22.30: НАСТОЯЩИЙ Сейф — перенос туда-обратно вместо косметической галочки.
-           Для файла в Сейфе показываем «Достать из Сейфа», для обычного — «В Сейф». -->
-      <button class="sound-item-btn" id="modalToSafeBtn" onclick="toSafeCurrentFile()">
-        <span>🔐 Переместить в Сейф</span> <i data-lucide="lock" style="width:18px;height:18px"></i>
-      </button>
-      <button class="sound-item-btn" id="modalFromSafeBtn" onclick="fromSafeCurrentFile()" style="display:none">
-        <span>🔓 Достать из Сейфа</span> <i data-lucide="lock-open" style="width:18px;height:18px"></i>
-      </button>
-      <button class="sound-item-btn" onclick="downloadCurrentFile()">
-        <span>Скачать файл</span> <i data-lucide="download" style="width:18px;height:18px"></i>
-      </button>
-      <button class="sound-item-btn" style="color:#ef4444" onclick="deleteCurrentFile()">
-        <span>Удалить файл</span> <i data-lucide="trash-2" style="width:18px;height:18px;stroke:#ef4444"></i>
-      </button>
+      <button class="sound-item-btn" onclick="saveFileName()"><span>Сохранить имя</span> <i data-lucide="check" style="width:18px;height:18px"></i></button>
+      <button class="sound-item-btn" id="modalToSafeBtn" onclick="toSafeCurrentFile()"><span>🔐 Переместить в Сейф</span> <i data-lucide="lock" style="width:18px;height:18px"></i></button>
+      <button class="sound-item-btn" id="modalFromSafeBtn" onclick="fromSafeCurrentFile()" style="display:none"><span>🔓 Достать из Сейфа</span> <i data-lucide="lock-open" style="width:18px;height:18px"></i></button>
+      <button class="sound-item-btn" onclick="downloadCurrentFile()"><span>Скачать файл</span> <i data-lucide="download" style="width:18px;height:18px"></i></button>
+      <button class="sound-item-btn" style="color:#ef4444" onclick="deleteCurrentFile()"><span>Удалить файл</span> <i data-lucide="trash-2" style="width:18px;height:18px;stroke:#ef4444"></i></button>
     </div>
   </div>
 </div>
 
-<!-- 22.30: модальное окно Сейфа (разблокировка паролем) -->
 <div id="safeModal" class="modal-overlay" onclick="closeSafeModal(event)">
   <div class="modal-card" onclick="event.stopPropagation()">
-    <div class="sheet-handle-area">
-      <div class="sheet-handle"></div>
-    </div>
+    <div class="sheet-handle-area"><div class="sheet-handle"></div></div>
     <h3 style="font-weight:900;font-size:20px;margin-bottom:4px">🔒 Сейф</h3>
     <p id="safeStatusLine" style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:14px;line-height:1.5">Загружаю…</p>
-
     <div style="margin-bottom:14px">
-      <label style="font-size:11px;font-weight:800;color:var(--subtext-color);text-transform:uppercase;letter-spacing:0.04em">Пароль Сейфа (тот же, что в чате)</label>
+      <label style="font-size:11px;font-weight:800;color:var(--subtext-color);text-transform:uppercase;letter-spacing:0.04em">Пароль Сейфа</label>
       <input type="password" id="safePassword" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;margin-top:4px;outline:none;font-size:15px" placeholder="Пароль">
     </div>
-
     <div style="display:flex;flex-direction:column;gap:8px">
-      <button class="sound-item-btn" onclick="unlockSafe()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
-        <span>Разблокировать</span> <i data-lucide="unlock" style="width:18px;height:18px"></i>
-      </button>
-      <button class="sound-item-btn" onclick="lockSafe()">
-        <span>Заблокировать снова</span> <i data-lucide="lock" style="width:18px;height:18px"></i>
-      </button>
-      <button class="sound-item-btn" onclick="closeSafeModal()">
-        <span>Закрыть</span> <i data-lucide="x" style="width:18px;height:18px"></i>
-      </button>
+      <button class="sound-item-btn" onclick="unlockSafe()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)"><span>Разблокировать</span> <i data-lucide="unlock" style="width:18px;height:18px"></i></button>
+      <button class="sound-item-btn" onclick="lockSafe()"><span>Заблокировать снова</span> <i data-lucide="lock" style="width:18px;height:18px"></i></button>
+      <button class="sound-item-btn" onclick="closeSafeModal()"><span>Закрыть</span> <i data-lucide="x" style="width:18px;height:18px"></i></button>
     </div>
-    <p style="font-size:11px;font-weight:600;color:var(--subtext-color);margin-top:12px;line-height:1.5">Пароль Сейфа нужен, чтобы скачать зашифрованный файл или переместить файл в Сейф из веб-облака. Пароль держится только в памяти страницы и никогда не сохраняется.</p>
+    <p style="font-size:11px;font-weight:600;color:var(--subtext-color);margin-top:12px;line-height:1.5">Пароль Сейфа нужен, чтобы скачать зашифрованный файл или переместить файл в Сейф. Пароль держится только в памяти страницы.</p>
   </div>
 </div>
 
-<!-- Модальное окно выбора режима именования -->
 <div id="nameChoiceModal" class="modal-overlay" onclick="closeNameChoiceModal(event)">
   <div class="modal-card" onclick="event.stopPropagation()">
-    <div class="sheet-handle-area">
-      <div class="sheet-handle"></div>
-    </div>
+    <div class="sheet-handle-area"><div class="sheet-handle"></div></div>
     <h3 style="font-weight:900;font-size:20px;margin-bottom:4px">Выбрано файлов: <span id="nameChoiceCount">0</span></h3>
     <p style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:16px">Как назвать эти файлы?</p>
-
     <div style="display:flex;flex-direction:column;gap:8px">
       <button class="sound-item-btn" onclick="chooseNameMode('album')" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
-        <div style="text-align:left">
-          <div style="font-weight:800">Назвать альбомом</div>
-          <div style="font-size:11px;opacity:0.7;margin-top:2px">Одно имя для всех: Имя 1, Имя 2, ...</div>
-        </div>
+        <div style="text-align:left"><div style="font-weight:800">Назвать альбомом</div><div style="font-size:11px;opacity:0.7;margin-top:2px">Одно имя для всех</div></div>
         <i data-lucide="layers" style="width:18px;height:18px"></i>
       </button>
       <button class="sound-item-btn" onclick="chooseNameMode('each')">
-        <div style="text-align:left">
-          <div style="font-weight:800">Назвать по одному</div>
-          <div style="font-size:11px;opacity:0.7;margin-top:2px">Каждому файлу своё имя</div>
-        </div>
+        <div style="text-align:left"><div style="font-weight:800">Назвать по одному</div><div style="font-size:11px;opacity:0.7;margin-top:2px">Каждому файлу своё имя</div></div>
         <i data-lucide="list" style="width:18px;height:18px"></i>
       </button>
       <button class="sound-item-btn" onclick="chooseNameMode('skip')">
-        <div style="text-align:left">
-          <div style="font-weight:800">Пропустить всё</div>
-          <div style="font-size:11px;opacity:0.7;margin-top:2px">Оставить оригинальные имена</div>
-        </div>
+        <div style="text-align:left"><div style="font-weight:800">Пропустить всё</div><div style="font-size:11px;opacity:0.7;margin-top:2px">Оставить оригинальные имена</div></div>
         <i data-lucide="fast-forward" style="width:18px;height:18px"></i>
       </button>
     </div>
   </div>
 </div>
 
-<!-- Модальное окно именования одного файла -->
 <div id="nameModal" class="modal-overlay" onclick="closeNameModal(event)">
   <div class="modal-card" onclick="event.stopPropagation()">
-    <div class="sheet-handle-area">
-      <div class="sheet-handle"></div>
-    </div>
+    <div class="sheet-handle-area"><div class="sheet-handle"></div></div>
     <h3 style="font-weight:900;font-size:20px;margin-bottom:4px">Назовите файл</h3>
     <p id="nameModalCounter" style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:14px"></p>
-    
     <div style="margin-bottom:14px">
       <label style="font-size:11px;font-weight:800;color:var(--subtext-color);text-transform:uppercase;letter-spacing:0.04em">Новое название</label>
       <input type="text" id="nameModalInput" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;margin-top:4px;outline:none;font-size:15px" placeholder="Оставьте пустым для оригинала">
     </div>
-
     <p id="nameModalOriginal" style="font-size:12px;font-weight:600;color:var(--subtext-color);margin-bottom:16px;word-break:break-all"></p>
-
     <div style="display:flex;flex-direction:column;gap:8px">
-      <button class="sound-item-btn" onclick="confirmNameAndNext()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
-        <span>Сохранить и продолжить</span> <i data-lucide="arrow-right" style="width:18px;height:18px"></i>
-      </button>
-      <button class="sound-item-btn" onclick="skipNameAndNext()">
-        <span>Пропустить</span> <i data-lucide="skip-forward" style="width:18px;height:18px"></i>
-      </button>
-      <button class="sound-item-btn" onclick="skipAllNames()">
-        <span>Пропустить все</span> <i data-lucide="fast-forward" style="width:18px;height:18px"></i>
-      </button>
+      <button class="sound-item-btn" onclick="confirmNameAndNext()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)"><span>Сохранить и продолжить</span> <i data-lucide="arrow-right" style="width:18px;height:18px"></i></button>
+      <button class="sound-item-btn" onclick="skipNameAndNext()"><span>Пропустить</span> <i data-lucide="skip-forward" style="width:18px;height:18px"></i></button>
+      <button class="sound-item-btn" onclick="skipAllNames()"><span>Пропустить все</span> <i data-lucide="fast-forward" style="width:18px;height:18px"></i></button>
     </div>
   </div>
 </div>
 
-<!-- Модальное окно альбомного именования -->
 <div id="albumModal" class="modal-overlay" onclick="closeAlbumModal(event)">
   <div class="modal-card" onclick="event.stopPropagation()">
-    <div class="sheet-handle-area">
-      <div class="sheet-handle"></div>
-    </div>
+    <div class="sheet-handle-area"><div class="sheet-handle"></div></div>
     <h3 style="font-weight:900;font-size:20px;margin-bottom:4px">Название альбома</h3>
     <p id="albumModalCounter" style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:14px"></p>
-    
     <div style="margin-bottom:14px">
       <label style="font-size:11px;font-weight:800;color:var(--subtext-color);text-transform:uppercase;letter-spacing:0.04em">Общее название</label>
       <input type="text" id="albumModalInput" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;margin-top:4px;outline:none;font-size:15px" placeholder="Например: Отпуск 2026">
     </div>
-
     <div style="padding:12px;background:var(--card-bg);border:1px solid var(--border-color);border-radius:14px;margin-bottom:16px;font-size:12px;font-weight:600;color:var(--subtext-color)">
       <div style="font-weight:800;color:var(--text-color);margin-bottom:6px">Файлы получат имена:</div>
       <div id="albumPreview"></div>
     </div>
-
     <div style="display:flex;flex-direction:column;gap:8px">
-      <button class="sound-item-btn" onclick="confirmAlbumName()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
-        <span>Применить ко всем</span> <i data-lucide="check" style="width:18px;height:18px"></i>
-      </button>
-      <button class="sound-item-btn" onclick="closeAlbumModal()">
-        <span>Отмена</span> <i data-lucide="x" style="width:18px;height:18px"></i>
-      </button>
+      <button class="sound-item-btn" onclick="confirmAlbumName()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)"><span>Применить ко всем</span> <i data-lucide="check" style="width:18px;height:18px"></i></button>
+      <button class="sound-item-btn" onclick="closeAlbumModal()"><span>Отмена</span> <i data-lucide="x" style="width:18px;height:18px"></i></button>
     </div>
   </div>
 </div>
 
-<!-- Модальное окно хранилища («Моё облако» — волна 22.23) -->
 <div id="storageModal" class="modal-overlay" onclick="closeStorageModal(event)">
   <div class="modal-card" onclick="event.stopPropagation()">
-    <div class="sheet-handle-area">
-      <div class="sheet-handle"></div>
-    </div>
+    <div class="sheet-handle-area"><div class="sheet-handle"></div></div>
     <h3 style="font-weight:900;font-size:20px;margin-bottom:4px">Хранилище</h3>
     <p style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:12px">Куда попадают ваши файлы</p>
-
     <div id="storageStatus" style="padding:12px;background:var(--card-bg);border:1px solid var(--border-color);border-radius:14px;margin-bottom:14px;font-size:13px;font-weight:700;color:var(--subtext-color);line-height:1.5">Загружаю…</div>
-
-    <!-- 22.25: переключатель «хранить файлы БЕЗ шифрования» (виден при подключённом канале) -->
     <button class="sound-item-btn" id="storagePlainBtn" onclick="togglePlain()" style="display:none;margin-bottom:14px">
       <span id="storagePlainLabel">Шифрование файлов</span> <i data-lucide="lock" style="width:18px;height:18px"></i>
     </button>
-
     <div style="margin-bottom:14px">
-      <label style="font-size:11px;font-weight:800;color:var(--subtext-color);text-transform:uppercase;letter-spacing:0.04em">Ваш канал: @имя или -100…id</label>
+      <label style="font-size:11px;font-weight:800;color:var(--subtext-color);text-transform:uppercase;letter-spacing:0.04em">Ваш канал</label>
       <input type="text" id="storageInput" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;margin-top:4px;outline:none;font-size:15px" placeholder="@my_cloud или -100…">
     </div>
-
     <div style="display:flex;flex-direction:column;gap:8px">
-      <button class="sound-item-btn" id="storageConnectBtn" onclick="connectStorage()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
-        <span>Подключить канал</span> <i data-lucide="link" style="width:18px;height:18px"></i>
-      </button>
-      <button class="sound-item-btn" id="storageOffBtn" onclick="disconnectStorage()" style="color:#ef4444;display:none">
-        <span>Отключить мой канал</span> <i data-lucide="unlink" style="width:18px;height:18px;stroke:#ef4444"></i>
-      </button>
+      <button class="sound-item-btn" id="storageConnectBtn" onclick="connectStorage()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)"><span>Подключить канал</span> <i data-lucide="link" style="width:18px;height:18px"></i></button>
+      <button class="sound-item-btn" id="storageOffBtn" onclick="disconnectStorage()" style="color:#ef4444;display:none"><span>Отключить мой канал</span> <i data-lucide="unlink" style="width:18px;height:18px;stroke:#ef4444"></i></button>
     </div>
-
-    <p style="font-size:11px;font-weight:600;color:var(--subtext-color);margin-top:12px;line-height:1.5">Бот должен быть админом канала с правом «Публикация сообщений». Приватный канал без @username: перешлите любое сообщение из него боту в чат (Сейф → 🔗 Моё облако). Канал общий для чата и веб-облака: подключите/смените здесь — и в боте он тот же, и наоборот.</p>
+    <p style="font-size:11px;font-weight:600;color:var(--subtext-color);margin-top:12px;line-height:1.5">Бот должен быть админом канала с правом «Публикация сообщений».</p>
   </div>
 </div>
 
-<!-- 22.24: честное окно «нет доступа» (открыто вне Telegram / не зарегистрирован) -->
 <div id="authModal" class="modal-overlay" onclick="closeAuthModal(event)">
   <div class="modal-card" onclick="event.stopPropagation()">
-    <div class="sheet-handle-area">
-      <div class="sheet-handle"></div>
-    </div>
+    <div class="sheet-handle-area"><div class="sheet-handle"></div></div>
     <h3 style="font-weight:900;font-size:20px;margin-bottom:4px">Нет доступа к облаку</h3>
     <p id="authText" style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:14px;line-height:1.5">Проверяем…</p>
     <div style="display:flex;flex-direction:column;gap:8px">
-      <button class="sound-item-btn" id="authOpenBtn" onclick="openBotChat()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg);display:none">
-        <span>Открыть чат бота</span> <i data-lucide="send" style="width:18px;height:18px"></i>
-      </button>
-      <button class="sound-item-btn" onclick="closeAuthModal()">
-        <span>Понятно</span> <i data-lucide="x" style="width:18px;height:18px"></i>
-      </button>
+      <button class="sound-item-btn" id="authOpenBtn" onclick="openBotChat()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg);display:none"><span>Открыть чат бота</span> <i data-lucide="send" style="width:18px;height:18px"></i></button>
+      <button class="sound-item-btn" onclick="closeAuthModal()"><span>Понятно</span> <i data-lucide="x" style="width:18px;height:18px"></i></button>
     </div>
   </div>
 </div>
 
 <div class="main-wrapper">
-
   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
     <h1 class="logo-font">DEVO+</h1>
-    <div style="display:flex;gap:8px;position:relative">
-
-      <!-- 22.30: 🔒 Сейф — разблокировка паролем для скачивания/переносов -->
-      <button class="action-btn" onclick="openSafeModal()" title="Сейф (разблокировать)">
-        <i data-lucide="lock" style="width:18px;height:18px"></i>
+    <div style="position:relative">
+      <button class="settings-btn" id="settingsBtn" onclick="toggleSettingsPanel(event)" title="Настройки">
+        <i id="settingsIcon" data-lucide="settings" style="width:20px;height:20px"></i>
       </button>
 
-      <button class="action-btn" onclick="openStorageModal()" title="Хранилище (Моё облако)">
-        <i data-lucide="cloud" style="width:18px;height:18px"></i>
-      </button>
+      <div id="settingsPanel" class="settings-panel" onclick="event.stopPropagation()">
+        <div class="settings-grid">
+          <div class="settings-action" onclick="handleSettingsAction('safe')">
+            <div class="settings-icon"><i data-lucide="lock" style="width:20px;height:20px"></i></div>
+            <span class="settings-label">Сейф</span>
+          </div>
+          <div class="settings-action" onclick="handleSettingsAction('storage')">
+            <div class="settings-icon"><i data-lucide="cloud" style="width:20px;height:20px"></i></div>
+            <span class="settings-label">Хранилище</span>
+          </div>
+          <div class="settings-action" onclick="handleSettingsAction('select')">
+            <div class="settings-icon"><i data-lucide="check-square" style="width:20px;height:20px"></i></div>
+            <span class="settings-label">Выбрать</span>
+          </div>
+          <div class="settings-action" onclick="handleSettingsAction('theme')">
+            <div class="settings-icon"><i id="themeIcon" data-lucide="sun" style="width:20px;height:20px"></i></div>
+            <span class="settings-label">Тема</span>
+          </div>
+          <div class="settings-action" onclick="handleSettingsAction('sound')">
+            <div class="settings-icon"><i id="soundIcon" data-lucide="volume-2" style="width:20px;height:20px"></i></div>
+            <span class="settings-label">Звук</span>
+          </div>
+          <div class="settings-action" onclick="handleSettingsAction('sync')">
+            <div class="settings-icon"><i data-lucide="refresh-cw" style="width:20px;height:20px"></i></div>
+            <span class="settings-label">Синхро</span>
+          </div>
+        </div>
 
-      <!-- 22.29: мультивыбор файлов (галочки + «В ZIP»/«Распаковать»/«Удалить») -->
-      <button class="action-btn" id="selectModeBtn" onclick="toggleSelectMode()" title="Выбрать файлы">
-        <i data-lucide="check-square" style="width:18px;height:18px"></i>
-      </button>
+        <div id="themeMenu" class="dropdown-menu" style="position:static;transform:none;opacity:1;pointer-events:auto;box-shadow:none;margin-top:12px;display:none">
+          <div style="padding:4px 8px 6px;font-weight:800;font-size:11px;color:var(--subtext-color);text-transform:uppercase;letter-spacing:.05em">Тема оформления</div>
+          <button class="sound-item-btn" id="theme-light-btn" onclick="setTheme('light')"><span>Светлая</span> <i data-lucide="sun" style="width:16px;height:16px"></i></button>
+          <button class="sound-item-btn" id="theme-dark-btn" onclick="setTheme('dark')"><span>Тёмная</span> <i data-lucide="moon" style="width:16px;height:16px"></i></button>
+          <button class="sound-item-btn" id="theme-system-btn" onclick="setTheme('system')"><span>Системная</span> <i data-lucide="laptop" style="width:16px;height:16px"></i></button>
+          <button class="sound-item-btn" id="theme-custom-btn" onclick="setTheme('custom')"><span>Свой цвет / Градиент</span> <i data-lucide="palette" style="width:16px;height:16px"></i></button>
 
-      <button class="action-btn" id="themeToggleBtn" onclick="toggleThemeMenu(event)" title="Тема оформления">
-        <i id="themeIcon" data-lucide="sun" style="width:18px;height:18px"></i>
-      </button>
-
-      <div id="themeMenu" class="dropdown-menu" style="right:96px" onclick="event.stopPropagation()">
-        <div style="padding:4px 8px 6px;font-weight:800;font-size:11px;color:var(--subtext-color);text-transform:uppercase;letter-spacing:.05em">Тема оформления</div>
-        <button class="sound-item-btn" id="theme-light-btn" onclick="setTheme('light')">
-          <span>Светлая</span> <i data-lucide="sun" style="width:16px;height:16px"></i>
-        </button>
-        <button class="sound-item-btn" id="theme-dark-btn" onclick="setTheme('dark')">
-          <span>Тёмная</span> <i data-lucide="moon" style="width:16px;height:16px"></i>
-        </button>
-        <button class="sound-item-btn" id="theme-system-btn" onclick="setTheme('system')">
-          <span>Системная</span> <i data-lucide="laptop" style="width:16px;height:16px"></i>
-        </button>
-        <button class="sound-item-btn" id="theme-custom-btn" onclick="setTheme('custom')">
-          <span>Свой цвет / Градиент</span> <i data-lucide="palette" style="width:16px;height:16px"></i>
-        </button>
-
-        <div id="customThemePicker" class="custom-theme-picker">
-          <div class="color-picker-row">
-            <span>Цвет 1 (Фон):</span>
-            <div class="color-picker-wrap">
-              <input type="color" id="customColor1" value="#4f46e5" onchange="updateCustomColors()">
+          <div id="customThemePicker" class="custom-theme-picker">
+            <div class="color-picker-row"><span>Цвет 1 (Фон):</span>
+              <div class="color-picker-wrap"><input type="color" id="customColor1" value="#4f46e5" onchange="updateCustomColors()"></div>
+            </div>
+            <div class="color-picker-row"><span>Цвет 2 (Фон):</span>
+              <div class="color-picker-wrap"><input type="color" id="customColor2" value="#9333ea" onchange="updateCustomColors()"></div>
+            </div>
+            <div class="color-picker-row"><span>Угол градиента:</span>
+              <input type="range" id="customAngle" min="0" max="360" value="135" oninput="updateCustomColors()" style="width:90px">
+            </div>
+            <div class="color-picker-row"><span>Цвет кнопок:</span>
+              <div class="color-picker-wrap"><input type="color" id="customBtnBg" value="#ffffff" onchange="updateCustomColors()"></div>
+            </div>
+            <div class="color-picker-row"><span>Текст кнопок:</span>
+              <div class="color-picker-wrap"><input type="color" id="customBtnText" value="#000000" onchange="updateCustomColors()"></div>
             </div>
           </div>
-          <div class="color-picker-row">
-            <span>Цвет 2 (Фон):</span>
-            <div class="color-picker-wrap">
-              <input type="color" id="customColor2" value="#9333ea" onchange="updateCustomColors()">
-            </div>
-          </div>
-          <div class="color-picker-row">
-            <span>Угол градиента:</span>
-            <input type="range" id="customAngle" min="0" max="360" value="135" oninput="updateCustomColors()" style="width:90px">
-          </div>
-          <div class="color-picker-row">
-            <span>Цвет кнопок:</span>
-            <div class="color-picker-wrap">
-              <input type="color" id="customBtnBg" value="#ffffff" onchange="updateCustomColors()">
-            </div>
-          </div>
-          <div class="color-picker-row">
-            <span>Текст кнопок:</span>
-            <div class="color-picker-wrap">
-              <input type="color" id="customBtnText" value="#000000" onchange="updateCustomColors()">
+
+          <div style="border-top:1px solid var(--border-color);margin:8px 0;padding-top:8px">
+            <div style="padding:0 8px 6px;font-weight:800;font-size:11px;color:var(--subtext-color);text-transform:uppercase;letter-spacing:.05em">Живой фон</div>
+            <button class="sound-item-btn" id="blobsToggleBtn" onclick="toggleBlobs()"><span>Включен</span> <i id="blobsIcon" data-lucide="check" style="width:16px;height:16px"></i></button>
+            <div style="padding:8px 10px;background:var(--card-bg);border:1px solid var(--border-color);border-radius:12px;margin-top:5px">
+              <div style="display:flex;justify-content:space-between;font-size:12px;font-weight:700;margin-bottom:4px">
+                <span>Скорость движения:</span><span id="speedValueLabel" style="color:var(--subtext-color)">5x</span>
+              </div>
+              <input type="range" id="blobSpeedInput" min="1" max="10" step="1" value="5" oninput="changeBlobSpeed(this.value)" style="width:100%;cursor:pointer">
             </div>
           </div>
         </div>
 
-        <div style="border-top:1px solid var(--border-color);margin:8px 0;padding-top:8px">
-          <div style="padding:0 8px 6px;font-weight:800;font-size:11px;color:var(--subtext-color);text-transform:uppercase;letter-spacing:.05em">Живой фон</div>
-          
-          <button class="sound-item-btn" id="blobsToggleBtn" onclick="toggleBlobs()">
-            <span>Включен</span> <i id="blobsIcon" data-lucide="check" style="width:16px;height:16px"></i>
-          </button>
-
-          <div style="padding:8px 10px;background:var(--card-bg);border:1px solid var(--border-color);border-radius:12px;margin-top:5px">
-            <div style="display:flex;justify-content:space-between;font-size:12px;font-weight:700;margin-bottom:4px">
-              <span>Скорость движения:</span>
-              <span id="speedValueLabel" style="color:var(--subtext-color)">5x</span>
-            </div>
-            <input type="range" id="blobSpeedInput" min="1" max="10" step="1" value="5" oninput="changeBlobSpeed(this.value)" style="width:100%;cursor:pointer">
-          </div>
+        <div id="soundMenu" class="dropdown-menu" style="position:static;transform:none;opacity:1;pointer-events:auto;box-shadow:none;margin-top:12px;display:none">
+          <div style="padding:4px 8px 8px;font-weight:800;font-size:11px;color:var(--subtext-color);text-transform:uppercase;letter-spacing:.05em">Выберите звук</div>
+          <div id="soundListOptions" style="max-height:240px;overflow-y:auto"></div>
         </div>
       </div>
-
-      <button id="soundToggleBtn" class="action-btn" onpointerdown="unlockAudio(event)" onclick="toggleSoundMenu(event)" title="Выбор звука">
-        <i id="soundIcon" data-lucide="volume-2" style="width:18px;height:18px"></i>
-      </button>
-      
-      <div id="soundMenu" class="dropdown-menu" style="right:48px" onclick="event.stopPropagation()">
-        <div style="padding:4px 8px 8px;font-weight:800;font-size:11px;color:var(--subtext-color);text-transform:uppercase;letter-spacing:.05em">Выберите звук</div>
-        <div id="soundListOptions" style="max-height:240px;overflow-y:auto"></div>
-      </div>
-
-      <button class="action-btn" onclick="syncNow()" title="Синхронизация">
-        <i data-lucide="refresh-cw" style="width:18px;height:18px"></i>
-      </button>
     </div>
   </div>
 
@@ -882,21 +520,11 @@ body.modal-open {
 
   <div class="filters-scroll-wrap">
     <button class="chip active" data-filter="all" onclick="setFilter('all')">Все</button>
-    <button class="chip" data-filter="photo" onclick="setFilter('photo')">
-      <i data-lucide="image" style="width:16px;height:16px"></i>
-    </button>
-    <button class="chip" data-filter="video" onclick="setFilter('video')">
-      <i data-lucide="film" style="width:16px;height:16px"></i>
-    </button>
-    <button class="chip" data-filter="audio" onclick="setFilter('audio')">
-      <i data-lucide="music" style="width:16px;height:16px"></i>
-    </button>
-    <button class="chip" data-filter="document" onclick="setFilter('document')">
-      <i data-lucide="file-text" style="width:16px;height:16px"></i>
-    </button>
-    <button class="chip" data-filter="vault" onclick="setFilter('vault')">
-      <i data-lucide="lock" style="width:16px;height:16px"></i>
-    </button>
+    <button class="chip" data-filter="photo" onclick="setFilter('photo')"><i data-lucide="image" style="width:16px;height:16px"></i></button>
+    <button class="chip" data-filter="video" onclick="setFilter('video')"><i data-lucide="film" style="width:16px;height:16px"></i></button>
+    <button class="chip" data-filter="audio" onclick="setFilter('audio')"><i data-lucide="music" style="width:16px;height:16px"></i></button>
+    <button class="chip" data-filter="document" onclick="setFilter('document')"><i data-lucide="file-text" style="width:16px;height:16px"></i></button>
+    <button class="chip" data-filter="vault" onclick="setFilter('vault')"><i data-lucide="lock" style="width:16px;height:16px"></i></button>
   </div>
 
   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;position:relative;">
@@ -907,24 +535,12 @@ body.modal-open {
         <span id="sortLabel">По дате</span>
       </button>
       <div id="sortMenu" class="dropdown-menu" onclick="event.stopPropagation()">
-        <button class="sound-item-btn" data-sort="date-desc" onclick="setSort('date-desc')">
-          <i data-lucide="clock" style="width:16px;height:16px"></i> Сначала новые
-        </button>
-        <button class="sound-item-btn" data-sort="date-asc" onclick="setSort('date-asc')">
-          <i data-lucide="history" style="width:16px;height:16px"></i> Сначала старые
-        </button>
-        <button class="sound-item-btn" data-sort="name-asc" onclick="setSort('name-asc')">
-          <i data-lucide="arrow-down-a-z" style="width:16px;height:16px"></i> По имени (А→Я)
-        </button>
-        <button class="sound-item-btn" data-sort="name-desc" onclick="setSort('name-desc')">
-          <i data-lucide="arrow-up-z-a" style="width:16px;height:16px"></i> По имени (Я→А)
-        </button>
-        <button class="sound-item-btn" data-sort="size-desc" onclick="setSort('size-desc')">
-          <i data-lucide="arrow-down-wide-narrow" style="width:16px;height:16px"></i> Сначала большие
-        </button>
-        <button class="sound-item-btn" data-sort="size-asc" onclick="setSort('size-asc')">
-          <i data-lucide="arrow-up-narrow-wide" style="width:16px;height:16px"></i> Сначала маленькие
-        </button>
+        <button class="sound-item-btn" data-sort="date-desc" onclick="setSort('date-desc')"><i data-lucide="clock" style="width:16px;height:16px"></i> Сначала новые</button>
+        <button class="sound-item-btn" data-sort="date-asc" onclick="setSort('date-asc')"><i data-lucide="history" style="width:16px;height:16px"></i> Сначала старые</button>
+        <button class="sound-item-btn" data-sort="name-asc" onclick="setSort('name-asc')"><i data-lucide="arrow-down-a-z" style="width:16px;height:16px"></i> По имени (А→Я)</button>
+        <button class="sound-item-btn" data-sort="name-desc" onclick="setSort('name-desc')"><i data-lucide="arrow-up-z-a" style="width:16px;height:16px"></i> По имени (Я→А)</button>
+        <button class="sound-item-btn" data-sort="size-desc" onclick="setSort('size-desc')"><i data-lucide="arrow-down-wide-narrow" style="width:16px;height:16px"></i> Сначала большие</button>
+        <button class="sound-item-btn" data-sort="size-asc" onclick="setSort('size-asc')"><i data-lucide="arrow-up-narrow-wide" style="width:16px;height:16px"></i> Сначала маленькие</button>
       </div>
     </div>
   </div>
@@ -932,16 +548,12 @@ body.modal-open {
   <div class="drop-zone" id="dropZone" onclick="handleDropZoneClick(event)">
     <div class="initial-state" id="initialState">
       <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M4 14.899A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.5 8.242"/>
-        <path d="M12 12v9"/>
-        <path d="m16 16-4-4-4 4"/>
+        <path d="M4 14.899A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.5 8.242"/><path d="M12 12v9"/><path d="m16 16-4-4-4 4"/>
       </svg>
       <p style="font-weight:800;font-size:15px;color:var(--text-color)">Загрузить файлы</p>
       <p style="font-weight:600;font-size:12px;color:var(--subtext-color)">нажмите или перетащите файлы сюда</p>
     </div>
-
     <div class="upload-filename" id="uploadFilename"></div>
-
     <div class="download-progress-wrap" id="progressWrap">
       <div class="drop-loader" id="dropLoader" onclick="handleLoaderClick(event)" title="1 клик - пауза/старт, 2 клика - отмена">
         <svg viewBox="0 0 60 60">
@@ -955,13 +567,11 @@ body.modal-open {
       </div>
       <p class="download-text" id="downloadText">Загрузка...</p>
     </div>
-
     <input type="file" id="fileInput" multiple style="display:none">
   </div>
 
   <div class="files-container">
     <section id="filesList" style="display:flex;flex-direction:column;gap:10px"></section>
-
     <section id="emptyState" class="empty-state">
       <div class="icon-wrap" style="margin:0 auto 12px;background:var(--card-bg);width:54px;height:54px;border:1px solid var(--border-color)">
         <i data-lucide="folder-open" style="width:26px;height:26px;color:var(--text-color);opacity:.4"></i>
@@ -970,19 +580,41 @@ body.modal-open {
       <p id="emptySub" style="font-weight:600;font-size:13px;color:var(--subtext-color);margin-top:2px">Загрузите первые файлы</p>
     </section>
   </div>
+</div>
 
+<div id="selectionBar" style="display:none;position:fixed;left:0;right:0;bottom:0;z-index:60;padding:10px 14px calc(10px + env(safe-area-inset-bottom));background:var(--card-bg);border-top:1px solid var(--border-color);box-shadow:0 -8px 24px rgba(0,0,0,.12)">
+  <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+    <span id="selCount" style="font-weight:800;font-size:13px">Выбрано: 0</span>
+    <span style="flex:1"></span>
+    <button class="sound-item-btn" onclick="zipSelected()" style="padding:8px 10px"><span>📦 В ZIP</span></button>
+    <button class="sound-item-btn" id="unzipBtn" onclick="unzipSelected()" style="padding:8px 10px;display:none"><span>🗂 Распаковать</span></button>
+    <button class="sound-item-btn" onclick="deleteSelected()" style="padding:8px 10px;color:#ef4444"><span>🗑 Удалить</span></button>
+    <button class="sound-item-btn" onclick="toggleSelectMode()" style="padding:8px 10px;background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)"><span>Готово</span></button>
+  </div>
+</div>
+
+<div id="loginModal" class="modal-overlay">
+  <div class="modal-card" onclick="event.stopPropagation()">
+    <div class="sheet-handle-area"><div class="sheet-handle"></div></div>
+    <h3 style="font-weight:900;font-size:20px;margin-bottom:4px">Вход в DEVO+ Облако</h3>
+    <p style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:14px">Открыто вне Telegram, войдите по ID и паролю</p>
+    <div style="margin-bottom:12px">
+      <label style="font-size:11px;font-weight:800;color:var(--subtext-color);text-transform:uppercase;letter-spacing:0.04em">Telegram ID</label>
+      <input type="text" id="loginUserId" inputmode="numeric" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;margin-top:4px;outline:none;font-size:15px" placeholder="Например: 123456789">
+    </div>
+    <div style="margin-bottom:14px">
+      <label style="font-size:11px;font-weight:800;color:var(--subtext-color);text-transform:uppercase;letter-spacing:0.04em">Пароль</label>
+      <input type="password" id="loginPassword" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;margin-top:4px;outline:none;font-size:15px" placeholder="Веб-пароль из бота">
+    </div>
+    <div style="display:flex;flex-direction:column;gap:8px">
+      <button class="sound-item-btn" id="loginSubmitBtn" onclick="webLogin()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)"><span>Войти</span> <i data-lucide="log-in" style="width:18px;height:18px"></i></button>
+    </div>
+    <p style="font-size:11px;font-weight:600;color:var(--subtext-color);margin-top:12px;line-height:1.5">Пароль задаётся в боте через ☁️ Облако → «🔑 Веб-пароль».</p>
+  </div>
 </div>
 
 <script>
-/* 22.28: безопасная отрисовка иконок — unpkg.com тоже бывает недоступен
-   (школьные сети). Без guard'а вызов lucide падал с ReferenceError
-   ВНУТРИ applyTheme на старте — и весь скрипт приложения умирал:
-   не было ни списка файлов, ни авторизации («мини апп не работает»). */
-function safeIcons() {
-  try {
-    if (window.lucide && typeof lucide.createIcons === 'function') lucide.createIcons();
-  } catch (e) {}
-}
+function safeIcons() { try { if (window.lucide && typeof lucide.createIcons === 'function') lucide.createIcons(); } catch (e) {} }
 const tg = window.Telegram?.WebApp;
 if (tg) { tg.ready(); tg.expand(); }
 
@@ -993,31 +625,17 @@ let blobIdleSpeed = localStorage.getItem('devo_blob_speed') || '5';
 function applyTheme(theme) {
   currentTheme = theme;
   localStorage.setItem('devo_theme', theme);
-  
   let isDark = false;
-  if (theme === 'system') {
-    isDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-  } else {
-    isDark = theme === 'dark';
-  }
-
+  if (theme === 'system') isDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+  else isDark = theme === 'dark';
   document.documentElement.setAttribute('data-theme', theme === 'custom' ? 'custom' : (isDark ? 'dark' : 'light'));
-  
   const iconEl = document.getElementById('themeIcon');
-  if (iconEl) {
-    iconEl.setAttribute('data-lucide', theme === 'custom' ? 'palette' : (isDark ? 'moon' : 'sun'));
-    safeIcons();
-  }
-
+  if (iconEl) { iconEl.setAttribute('data-lucide', theme === 'custom' ? 'palette' : (isDark ? 'moon' : 'sun')); safeIcons(); }
   document.querySelectorAll('#themeMenu .sound-item-btn').forEach(btn => {
-    if (btn.id.startsWith('theme-')) {
-      btn.classList.toggle('active-sound', btn.id === `theme-${theme}-btn`);
-    }
+    if (btn.id.startsWith('theme-')) btn.classList.toggle('active-sound', btn.id === `theme-${theme}-btn`);
   });
-
   const picker = document.getElementById('customThemePicker');
   if (picker) picker.classList.toggle('active', theme === 'custom');
-
   if (theme === 'custom') updateCustomColors();
 }
 
@@ -1027,13 +645,11 @@ function updateCustomColors() {
   const angle = document.getElementById('customAngle').value;
   const btnBg = document.getElementById('customBtnBg').value;
   const btnText = document.getElementById('customBtnText').value;
-
   document.documentElement.style.setProperty('--custom-bg1', c1);
   document.documentElement.style.setProperty('--custom-bg2', c2);
   document.documentElement.style.setProperty('--custom-angle', angle + 'deg');
   document.documentElement.style.setProperty('--custom-btn-bg', btnBg);
   document.documentElement.style.setProperty('--custom-btn-text', btnText);
-
   localStorage.setItem('devo_custom_c1', c1);
   localStorage.setItem('devo_custom_c2', c2);
   localStorage.setItem('devo_custom_angle', angle);
@@ -1047,7 +663,6 @@ function initCustomColors() {
   const angle = localStorage.getItem('devo_custom_angle') || '135';
   const btnBg = localStorage.getItem('devo_custom_btn_bg') || '#ffffff';
   const btnText = localStorage.getItem('devo_custom_btn_text') || '#000000';
-
   if (document.getElementById('customColor1')) {
     document.getElementById('customColor1').value = c1;
     document.getElementById('customColor2').value = c2;
@@ -1071,25 +686,19 @@ function updateBlobsVisibility() {
 }
 
 let blobTimer = null;
-
 function moveBlobsRandomly() {
   if (!blobsEnabled) return;
-  
   const b1 = document.getElementById('blob1');
   const b2 = document.getElementById('blob2');
   if (!b1 || !b2) return;
-
   const widthRange = window.innerWidth * 0.45;
   const heightRange = window.innerHeight * 0.45;
-
   const randX1 = (Math.random() - 0.5) * widthRange;
   const randY1 = (Math.random() - 0.5) * heightRange;
   const scale1 = 0.75 + Math.random() * 0.5;
-
   const randX2 = (Math.random() - 0.5) * widthRange;
   const randY2 = (Math.random() - 0.5) * heightRange;
   const scale2 = 0.75 + Math.random() * 0.5;
-
   b1.style.transform = `translate(${randX1}px, ${randY1}px) scale(${scale1})`;
   b2.style.transform = `translate(${randX2}px, ${randY2}px) scale(${scale2})`;
 }
@@ -1097,25 +706,20 @@ function moveBlobsRandomly() {
 function startBlobAnimation() {
   if (blobTimer) clearInterval(blobTimer);
   moveBlobsRandomly();
-  
   const speed = parseInt(blobIdleSpeed) || 5;
   const intervalMs = Math.max(800, 3200 - (speed * 240));
-  
   const b1 = document.getElementById('blob1');
   const b2 = document.getElementById('blob2');
   if (b1) b1.style.transition = `transform ${intervalMs / 1000 * 1.25}s cubic-bezier(0.25, 1, 0.5, 1)`;
   if (b2) b2.style.transition = `transform ${intervalMs / 1000 * 1.25}s cubic-bezier(0.25, 1, 0.5, 1)`;
-
   blobTimer = setInterval(moveBlobsRandomly, intervalMs);
 }
 
 function changeBlobSpeed(val) {
   blobIdleSpeed = val;
   localStorage.setItem('devo_blob_speed', val);
-  
   const label = document.getElementById('speedValueLabel');
   if (label) label.textContent = val + 'x';
-
   startBlobAnimation();
 }
 
@@ -1124,32 +728,73 @@ function closeAllMenus(except) {
   menus.forEach(id => {
     if (id !== except) {
       const m = document.getElementById(id);
-      if (m) m.classList.remove('open');
+      if (m) m.style.display = 'none';
     }
   });
 }
 
-function toggleThemeMenu(e) {
+let settingsPanelOpen = false;
+
+function toggleSettingsPanel(e) {
   if (e) e.stopPropagation();
-  const menu = document.getElementById('themeMenu');
-  const willOpen = !menu.classList.contains('open');
-  closeAllMenus('themeMenu');
-  if (willOpen) menu.classList.add('open');
-  else menu.classList.remove('open');
+  settingsPanelOpen = !settingsPanelOpen;
+  const panel = document.getElementById('settingsPanel');
+  const btn = document.getElementById('settingsBtn');
+  if (settingsPanelOpen) {
+    panel.classList.add('open');
+    btn.classList.add('open');
+    closeAllMenus();
+  } else {
+    panel.classList.remove('open');
+    btn.classList.remove('open');
+    closeAllMenus();
+  }
+}
+
+function handleSettingsAction(action) {
+  switch(action) {
+    case 'safe':
+      toggleSettingsPanel();
+      setTimeout(() => openSafeModal(), 300);
+      break;
+    case 'storage':
+      toggleSettingsPanel();
+      setTimeout(() => openStorageModal(), 300);
+      break;
+    case 'select':
+      toggleSettingsPanel();
+      setTimeout(() => toggleSelectMode(), 300);
+      break;
+    case 'theme':
+      const themeMenu = document.getElementById('themeMenu');
+      const soundMenu = document.getElementById('soundMenu');
+      closeAllMenus('themeMenu');
+      if (themeMenu.style.display === 'none') { themeMenu.style.display = 'block'; soundMenu.style.display = 'none'; }
+      else { themeMenu.style.display = 'none'; }
+      break;
+    case 'sound':
+      const themeMenu2 = document.getElementById('themeMenu');
+      const soundMenu2 = document.getElementById('soundMenu');
+      closeAllMenus('soundMenu');
+      if (soundMenu2.style.display === 'none') { soundMenu2.style.display = 'block'; themeMenu2.style.display = 'none'; renderSoundMenu(); }
+      else { soundMenu2.style.display = 'none'; }
+      break;
+    case 'sync':
+      toggleSettingsPanel();
+      setTimeout(() => syncNow(), 300);
+      break;
+  }
 }
 
 function setTheme(theme) {
   applyTheme(theme);
-  if (theme !== 'custom') {
-    document.getElementById('themeMenu').classList.remove('open');
-  }
+  if (theme !== 'custom') document.getElementById('themeMenu').style.display = 'none';
 }
 
 window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
   if (currentTheme === 'system') applyTheme('system');
 });
 
-/* АУДИО */
 let audioCtx = null;
 function getAudioContext() {
   if (!audioCtx) {
@@ -1252,20 +897,6 @@ function renderSoundMenu() {
   safeIcons();
 }
 
-function toggleSoundMenu(e) {
-  if (e) { e.preventDefault(); e.stopPropagation(); }
-  getAudioContext();
-  const menu = document.getElementById('soundMenu');
-  const willOpen = !menu.classList.contains('open');
-  closeAllMenus('soundMenu');
-  if (willOpen) {
-    menu.classList.add('open');
-    renderSoundMenu();
-  } else {
-    menu.classList.remove('open');
-  }
-}
-
 function handleSoundSelect(e, id) {
   if (e) e.stopPropagation();
   unlockAudio();
@@ -1275,15 +906,7 @@ function handleSoundSelect(e, id) {
   playSoundDirectly(selectedSoundId);
 }
 
-/* ===== РЕАЛЬНОЕ ОБЛАКО: API БОТА (волна 22.21) =====
-   Дизайн приложения не менялся. Этот слой соединяет его с ОСНОВНОЙ базой
-   бота: список файлов — тот же, что в чате (☁️ Облако), хранилище — тот же
-   приватный канал (или СВОЙ личный канал из «🔗 Моё облако»). Загрузка идёт
-   чанками и уходит в канал КАК ДОКУМЕНТ — без сжатия, оригинал байт-в-байт. */
 const IS_TELEGRAM = !!(tg && tg.initData);
-
-/* 22.29: ВЕБ-СЕССИЯ — токен входа по Telegram ID + паролю (обычный браузер).
-   Хранится в localStorage; при IS_TELEGRAM остаётся старый путь initData. */
 var WEB_TOKEN = localStorage.getItem('devo_web_token') || '';
 
 function authHeaders(extra) {
@@ -1299,20 +922,14 @@ async function apiJson(url, options) {
   try { data = await r.json(); } catch (e) {}
   if (!r.ok) {
     const err = new Error(data.message || ('HTTP ' + r.status));
-    err.code = String(data.error || '');  // 22.24: код (unauthorized/not_registered/…)
-    err.bot = String(data.bot || '');     // 22.24: @username бота для кнопки «Открыть чат бота»
-    // 22.29: сессия истекла/битый токен — предлагаем войти по паролю заново.
-    // В Telegram остаётся прежняя карточка (initData-вход не через токен).
+    err.code = String(data.error || '');
+    err.bot = String(data.bot || '');
     if (r.status === 401 && !IS_TELEGRAM) openLoginModal();
     throw err;
   }
   return data;
 }
 
-/* 22.24: честный текст сбоя облака. Ошибки сервера уже конкретны и по-русски
-   (401 «откройте через Telegram», 403 «бот не админ канала», 503 «бот ещё
-   запускается») — показываем их КАК ЕСТЬ; «Failed to fetch» — вот это по-
-   настоящему «нет связи», его и называем связью. */
 var AUTH_BOT = '';
 function cloudErrText(e) {
   const m = (e && e.message) ? String(e.message) : '';
@@ -1337,16 +954,10 @@ function closeAuthModal(e) {
 }
 function openBotChat() {
   const url = 'https://t.me/' + (AUTH_BOT || '');
-  try {
-    if (tg && tg.openTelegramLink) tg.openTelegramLink(url);
-    else window.open(url, '_blank');
-  } catch (e) { window.open(url, '_blank'); }
+  try { if (tg && tg.openTelegramLink) tg.openTelegramLink(url); else window.open(url, '_blank'); }
+  catch (e) { window.open(url, '_blank'); }
 }
 
-/* ===== 22.29: ВХОД ПО TELEGRAM ID + ВЕБ-ПАРОЛЮ (обычный браузер) =====
-   Старый вход через Telegram НЕ ТРОНУТ: когда initData доходит — он
-   работает как раньше. Это ДОПОЛНИТЕЛЬНЫЙ путь для VPN/школьных сетей,
-   где telegram.org недоступен. Никакой панели разработчика тут нет. */
 function openLoginModal() {
   const m = document.getElementById('loginModal');
   if (!m) return;
@@ -1392,7 +1003,6 @@ async function webLogin() {
   }
 }
 
-/* ===== 22.29: МУЛЬТИВЫБОР ФАЙЛОВ (галочки + ZIP/распаковать/удалить) ===== */
 let selectMode = false;
 let selectedIds = new Set();
 
@@ -1478,7 +1088,7 @@ async function deleteSelected() {
       await apiJson('/api/files/' + encodeURIComponent(id), { method: 'DELETE' });
       ALL_FILES = ALL_FILES.filter(x => x.id !== id);
       ok++;
-    } catch (e) { /* не смогли — остаётся в списке */ }
+    } catch (e) {}
   }
   selectedIds.clear();
   updateSelCount();
@@ -1488,14 +1098,10 @@ async function deleteSelected() {
 
 let ALL_FILES = [];
 let listLoading = false;
-
-/* 22.26: ВИДИМОЕ доказательство связи с ботом — сервер сам присылает своё
-   имя и сборку в каждом ответе (build/bot). Показываем в окне «Хранилище»
-   и после синхронизации: пользователь всегда видит, К ЧЕМУ подключён. */
 var CONN = { bot: '', build: '' };
-var LAST_ERR = null; // 22.26: последняя ошибка облака (для честной кнопки)
+var LAST_ERR = null;
 var NETERR_RE = /failed to fetch|networkerror|load failed|timed? ?out/i;
-var LAST_SYNC = 0;   // 22.26: момент последней успешной синхронизации
+var LAST_SYNC = 0;
 
 async function loadFiles(silent) {
   if (listLoading) return false;
@@ -1507,7 +1113,6 @@ async function loadFiles(silent) {
       kind: String(f.kind || 'document'), size: +f.size || 0,
       ts: String(f.ts || ''), vault: !!f.vault
     }));
-    // 22.26: сервер подтвердил связь — запоминаем, кем и чем отвечает
     CONN.bot = String(data.bot || CONN.bot || '');
     CONN.build = String(data.build || CONN.build || '');
     LAST_ERR = null;
@@ -1517,21 +1122,14 @@ async function loadFiles(silent) {
   } catch (e) {
     LAST_ERR = e;
     if (!silent) {
-      const t = cloudErrText(e); // 22.24: честная причина вместо слепого «нет связи»
+      const t = cloudErrText(e);
       showToast(t);
       if (e && (e.code === 'unauthorized' || e.code === 'not_registered')) showAuthCard(t);
     }
     return false;
-  } finally {
-    listLoading = false;
-  }
+  } finally { listLoading = false; }
 }
 
-/* 22.26: кнопка синхронизации больше НЕ слепая. Раньше она звала loadFiles
-   в тихом режиме и показывала голое «Ошибка синхронизации» — даже честная
-   причина 22.24 до пользователя не доходила. Теперь: до 3 попыток (сервер
-   Render может просыпаться до ~30 секунд), после — причина КАК ЕСТЬ и окно
-   входа, если дело в авторизации. */
 async function syncNow() {
   const netFail = () => !!(LAST_ERR && LAST_ERR.message && NETERR_RE.test(String(LAST_ERR.message)));
   let ok = false;
@@ -1541,23 +1139,18 @@ async function syncNow() {
       await new Promise(r => setTimeout(r, 2500));
     }
     ok = await loadFiles(true);
-    if (ok || !netFail()) break; // серверная причина — повтор не поможет
+    if (ok || !netFail()) break;
   }
-  if (ok) {
-    showToast('Синхронизировано' + (CONN.build ? ' • сборка ' + CONN.build : ''));
-    return;
-  }
+  if (ok) { showToast('Синхронизировано' + (CONN.build ? ' • сборка ' + CONN.build : '')); return; }
   const t = cloudErrText(LAST_ERR || new Error(''));
   showToast(t);
   if (LAST_ERR && (LAST_ERR.code === 'unauthorized' || LAST_ERR.code === 'not_registered')) showAuthCard(t);
 }
 
-/* 22.26: автосинхронизация при возврате в мини-апп — список свежий,
-   даже если пользователь не трогает кнопку синхронизации. */
 let RESYNC_TIMER = null;
 function maybeAutoResync() {
   if (!IS_TELEGRAM || listLoading || isUploading) return;
-  if (Date.now() - LAST_SYNC < 20000) return; // не чаще раза в 20 секунд
+  if (Date.now() - LAST_SYNC < 20000) return;
   loadFiles(true);
 }
 document.addEventListener('visibilitychange', function () {
@@ -1571,18 +1164,14 @@ let SORT = 'date-desc';
 let isUploading = false;
 let isPaused = false;
 let activeEditingFileId = null;
-
-/* Движок реальной загрузки: чанки по 4 МБ, честный прогресс, пауза/отмена. */
 const CHUNK_SIZE = 4 * 1024 * 1024;
 let uploadQueue = [];
 let uploadAbortFlag = false;
 let uploadXhr = null;
-
 let pendingFiles = [];
 let pendingNames = {};
 let currentNameIndex = 0;
 let nameMode = 'each';
-
 let clickTimer = null;
 let clickCount = 0;
 
@@ -1619,7 +1208,6 @@ function applyFilters() {
   let list = [...ALL_FILES];
   if (FILTER === 'vault') list = list.filter(f => f.vault === true);
   else if (FILTER !== 'all') list = list.filter(f => f.kind === FILTER && !f.vault);
-  
   if (SEARCH.trim()) {
     const q = SEARCH.trim().toLowerCase();
     list = list.filter(f => (f.name || '').toLowerCase().includes(q));
@@ -1637,10 +1225,7 @@ function applyFilters() {
   return list;
 }
 
-function renderAll() {
-  renderFiles(applyFilters());
-  renderStats();
-}
+function renderAll() { renderFiles(applyFilters()); renderStats(); }
 
 function renderStats() {
   document.getElementById('statFiles').textContent = ALL_FILES.length;
@@ -1652,19 +1237,11 @@ function renderStats() {
 function renderFiles(files) {
   const list = document.getElementById('filesList');
   const empty = document.getElementById('emptyState');
-
-  if (!files.length) {
-    list.innerHTML = '';
-    empty.style.display = 'block';
-    return;
-  }
-
+  if (!files.length) { list.innerHTML = ''; empty.style.display = 'block'; return; }
   empty.style.display = 'none';
   list.innerHTML = files.map(f => {
     const sel = selectMode && selectedIds.has(f.id);
-    const cardAction = selectMode
-      ? `toggleFileSelection(event,'${f.id}')`
-      : `openEditModal('${f.id}')`;
+    const cardAction = selectMode ? `toggleFileSelection(event,'${f.id}')` : `openEditModal('${f.id}')`;
     const checkHtml = selectMode ? `
       <div onclick="toggleFileSelection(event,'${f.id}')" style="flex-shrink:0;width:24px;height:24px;border-radius:8px;display:flex;align-items:center;justify-content:center;border:2px solid ${sel ? 'var(--btn-text)' : 'var(--border-color)'};background:${sel ? 'var(--btn-text)' : 'transparent'};transition:all .15s">
         ${sel ? '<i data-lucide="check" style="width:14px;height:14px;stroke:var(--card-bg)"></i>' : ''}
@@ -1676,20 +1253,15 @@ function renderFiles(files) {
         <i data-lucide="${f.vault ? 'lock' : iconFor(f.kind)}" style="width:20px;height:20px"></i>
       </div>
       <div style="flex:1;min-width:0">
-        <p style="font-weight:800;font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">
-          ${escapeHtml(f.name || 'файл')}
-        </p>
-        <p style="font-weight:600;font-size:12px;color:var(--subtext-color);margin-top:2px">
-          ${fmtSize(f.size)} · ${(f.ts || '').slice(0, 10)}
-        </p>
+        <p style="font-weight:800;font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escapeHtml(f.name || 'файл')}</p>
+        <p style="font-weight:600;font-size:12px;color:var(--subtext-color);margin-top:2px">${fmtSize(f.size)} · ${(f.ts || '').slice(0, 10)}</p>
       </div>
       <div style="display:flex;gap:4px;flex-shrink:0" onclick="event.stopPropagation()">
         <button class="action-btn" onclick="openEditModal('${f.id}')" title="Редактировать">
           <i data-lucide="more-vertical" style="width:16px;height:16px"></i>
         </button>
       </div>
-    </article>
-  `;
+    </article>`;
   }).join('');
   safeIcons();
 }
@@ -1698,11 +1270,9 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
-/* СВАЙП ЗАКРЫТИЕ МОДАЛКИ */
 let touchStartY = 0;
 let touchCurrentY = 0;
 let isDraggingModal = false;
-
 const modalCard = document.getElementById('modalCard');
 
 modalCard.addEventListener('touchstart', (e) => {
@@ -1715,9 +1285,7 @@ modalCard.addEventListener('touchmove', (e) => {
   if (!isDraggingModal) return;
   touchCurrentY = e.touches[0].clientY;
   const deltaY = touchCurrentY - touchStartY;
-  if (deltaY > 0) {
-    modalCard.style.transform = `translateY(${deltaY}px)`;
-  }
+  if (deltaY > 0) modalCard.style.transform = `translateY(${deltaY}px)`;
 }, { passive: true });
 
 modalCard.addEventListener('touchend', () => {
@@ -1725,12 +1293,8 @@ modalCard.addEventListener('touchend', () => {
   isDraggingModal = false;
   const deltaY = touchCurrentY - touchStartY;
   modalCard.style.transition = 'transform 0.5s cubic-bezier(0.16, 1, 0.3, 1)';
-  
-  if (deltaY > 100) {
-    closeEditModal();
-  } else {
-    modalCard.style.transform = 'translateY(0)';
-  }
+  if (deltaY > 100) closeEditModal();
+  else modalCard.style.transform = 'translateY(0)';
   touchStartY = 0;
   touchCurrentY = 0;
 });
@@ -1739,15 +1303,11 @@ function openEditModal(id) {
   const f = ALL_FILES.find(x => x.id === id);
   if (!f) return;
   activeEditingFileId = id;
-
   document.getElementById('modalFileName').textContent = f.name;
   document.getElementById('modalInputName').value = f.name;
-  // 22.30: НАСТОЯЩИЙ Сейф вместо косметической галочки Vault:
-  // обычный файл → «Переместить в Сейф»; файл Сейфа → «Достать из Сейфа».
   const inSafe = !!f.vault;
   document.getElementById('modalToSafeBtn').style.display = inSafe ? 'none' : '';
   document.getElementById('modalFromSafeBtn').style.display = inSafe ? '' : 'none';
-
   modalCard.style.transform = '';
   document.getElementById('editModal').classList.add('open');
   document.body.classList.add('modal-open');
@@ -1758,10 +1318,7 @@ function closeEditModal(e) {
   modalCard.style.transform = 'translateY(100%)';
   document.getElementById('editModal').classList.remove('open');
   document.body.classList.remove('modal-open');
-  setTimeout(() => {
-    activeEditingFileId = null;
-    modalCard.style.transform = '';
-  }, 350);
+  setTimeout(() => { activeEditingFileId = null; modalCard.style.transform = ''; }, 350);
 }
 
 async function saveFileName() {
@@ -1778,25 +1335,15 @@ async function saveFileName() {
     if (f) f.name = (data.file && data.file.name) || newName;
     renderAll();
     showToast('Имя изменено');
-  } catch (e) {
-    showToast('Не удалось: ' + e.message);
-  }
+  } catch (e) { showToast('Не удалось: ' + e.message); }
   closeEditModal();
 }
 
-/* ===== 22.30: НАСТОЯЩИЙ СЕЙФ — перенос в Сейф и обратно =====
-   Раньше галочка «Vault» была лишь пометкой в списке. Теперь «🔐 В Сейф»
-   реально шифрует файл паролем Сейфа (как кнопка 🔐 в чате бота), а
-   «🔓 Достать» расшифровывает и возвращает в облако. Пароль — тот же,
-   что в чате; он живёт ТОЛЬКО в памяти страницы. */
-var VAULT_PW = '';  // пароль, введённый на этой странице (RAM; не localStorage)
-var VAULT_SERVER_UNLOCKED = false;  // серверная веб-сессия уже разблокирована
+var VAULT_PW = '';
+var VAULT_SERVER_UNLOCKED = false;
 
 function vaultHeaders(extra) {
   const h = authHeaders(extra);
-  // Пароль в заголовок — только если пользователь ВВОДИЛ его здесь.
-  // Если Сейф разблокирован через веб-сессию (кнопка 🔒 в браузере), пароль
-  // уже лежит в RAM-сессии сервера — туда отправлять ничего не нужно.
   if (VAULT_PW) h['X-Vault-Password'] = VAULT_PW;
   return h;
 }
@@ -1824,12 +1371,9 @@ async function loadSafeStatus() {
       VAULT_SERVER_UNLOCKED = true;
       line.textContent = 'Сейф разблокирован. Файлов в Сейфе: ' + (s.count || 0) + '.';
     } else {
-      line.textContent = 'Сейф заблокирован. Введите пароль Сейфа, чтобы ' +
-        'скачивать зашифрованные файлы и переносить файлы в Сейф. Файлов: ' + (s.count || 0) + '.';
+      line.textContent = 'Сейф заблокирован. Введите пароль Сейфа. Файлов: ' + (s.count || 0) + '.';
     }
-  } catch (e) {
-    line.textContent = cloudErrText(e);
-  }
+  } catch (e) { line.textContent = cloudErrText(e); }
 }
 
 async function unlockSafe() {
@@ -1847,15 +1391,11 @@ async function unlockSafe() {
     showToast('🔒 Сейф разблокирован');
     closeSafeModal();
     loadFiles(true);
-  } catch (e) {
-    showToast(cloudErrText(e));
-  }
+  } catch (e) { showToast(cloudErrText(e)); }
 }
 
 async function lockSafe() {
-  try {
-    await apiJson('/api/safe/lock', { method: 'POST', headers: authHeaders() });
-  } catch (e) {}
+  try { await apiJson('/api/safe/lock', { method: 'POST', headers: authHeaders() }); } catch (e) {}
   VAULT_PW = '';
   VAULT_SERVER_UNLOCKED = false;
   showToast('Сейф заблокирован');
@@ -1914,27 +1454,15 @@ async function downloadCurrentFile() {
   closeEditModal();
   if (!f) return;
   if (f.vault && !VAULT_PW && !ensureSafeUnlocked()) return;
-  /* 22.30: ССЫЛКА ВМЕСТО BLOB. Раньше файл целиком собирался в память
-     страницы и сохранялся кликом по виртуальной ссылке — WebView Telegram
-     такие загрузки часто блокирует («скачивание не работает»), а 2 ГБ
-     в память телефона вообще не собрать. Теперь сервер выдаёт одноразовую
-     ссылку, файл качает сам системный браузер ПОТОКОМ. */
   showToast('📥 Готовлю скачивание…');
   try {
-    const data = await apiJson('/api/files/' + encodeURIComponent(f.id) + '/link', {
-      headers: vaultHeaders()
-    });
+    const data = await apiJson('/api/files/' + encodeURIComponent(f.id) + '/link', { headers: vaultHeaders() });
     const abs = new URL(data.url, location.origin).href;
-    if (IS_TELEGRAM && tg && tg.openLink) {
-      tg.openLink(abs);  // открывает системный обработчик — файл качается
-    } else {
+    if (IS_TELEGRAM && tg && tg.openLink) tg.openLink(abs);
+    else {
       const a = document.createElement('a');
-      a.href = abs;
-      a.download = f.name || 'file';
-      a.rel = 'noopener';
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
+      a.href = abs; a.download = f.name || 'file'; a.rel = 'noopener';
+      document.body.appendChild(a); a.click(); a.remove();
     }
     showToast('Скачивание началось');
   } catch (e) {
@@ -1951,9 +1479,7 @@ async function deleteCurrentFile() {
     ALL_FILES = ALL_FILES.filter(x => x.id !== id);
     renderAll();
     showToast('🗑 Удалено');
-  } catch (e) {
-    showToast('Не удалось: ' + e.message);
-  }
+  } catch (e) { showToast('Не удалось: ' + e.message); }
   closeEditModal();
 }
 
@@ -1972,9 +1498,7 @@ function clearSearch() {
 
 function setFilter(f) {
   FILTER = f;
-  document.querySelectorAll('.chip[data-filter]').forEach(b => {
-    b.classList.toggle('active', b.dataset.filter === f);
-  });
+  document.querySelectorAll('.chip[data-filter]').forEach(b => b.classList.toggle('active', b.dataset.filter === f));
   renderAll();
 }
 
@@ -1982,9 +1506,7 @@ function toggleSortMenu(e) {
   e.stopPropagation();
   const menu = document.getElementById('sortMenu');
   const willOpen = !menu.classList.contains('open');
-  closeAllMenus('sortMenu');
-  if (willOpen) menu.classList.add('open');
-  else menu.classList.remove('open');
+  menu.classList.toggle('open', willOpen);
 }
 
 function setSort(s) {
@@ -1996,16 +1518,14 @@ function setSort(s) {
 }
 
 document.addEventListener('pointerdown', (e) => {
-  const soundMenu = document.getElementById('soundMenu');
-  const soundBtn = document.getElementById('soundToggleBtn');
+  const settingsPanel = document.getElementById('settingsPanel');
+  const settingsBtn = document.getElementById('settingsBtn');
   const sortMenu = document.getElementById('sortMenu');
   const sortBtn = document.getElementById('sortToggleBtn');
-  const themeMenu = document.getElementById('themeMenu');
-  const themeBtn = document.getElementById('themeToggleBtn');
-
-  if (soundMenu && !soundMenu.contains(e.target) && !soundBtn.contains(e.target)) soundMenu.classList.remove('open');
+  if (settingsPanel && !settingsPanel.contains(e.target) && !settingsBtn.contains(e.target)) {
+    if (settingsPanelOpen) toggleSettingsPanel();
+  }
   if (sortMenu && !sortMenu.contains(e.target) && !sortBtn.contains(e.target)) sortMenu.classList.remove('open');
-  if (themeMenu && !themeMenu.contains(e.target) && !themeBtn.contains(e.target)) themeMenu.classList.remove('open');
 });
 
 function handleDropZoneClick(e) {
@@ -2016,13 +1536,9 @@ function handleDropZoneClick(e) {
 function handleLoaderClick(e) {
   if (e) e.stopPropagation();
   if (!isUploading) return;
-
   clickCount++;
   if (clickCount === 1) {
-    clickTimer = setTimeout(() => {
-      togglePauseUpload();
-      clickCount = 0;
-    }, 260);
+    clickTimer = setTimeout(() => { togglePauseUpload(); clickCount = 0; }, 260);
   } else if (clickCount === 2) {
     clearTimeout(clickTimer);
     clickCount = 0;
@@ -2034,7 +1550,6 @@ function togglePauseUpload() {
   isPaused = !isPaused;
   const downloadText = document.getElementById('downloadText');
   const squareStop = document.getElementById('squareStop');
-
   if (isPaused) {
     downloadText.textContent = 'Пауза (нажмите для продолжения)';
     if (squareStop) squareStop.style.opacity = '0.4';
@@ -2051,7 +1566,6 @@ function cancelUpload() {
   showToast('⏹ Загрузка отменена');
 }
 
-/* ОКНО ВЫБОРА РЕЖИМА ИМЕНОВАНИЯ */
 function openNameChoiceModal() {
   document.getElementById('nameChoiceCount').textContent = pendingFiles.length;
   const modal = document.getElementById('nameChoiceModal');
@@ -2069,36 +1583,22 @@ function closeNameChoiceModal(e) {
 function chooseNameMode(mode) {
   nameMode = mode;
   closeNameChoiceModal();
-
-  if (mode === 'skip') {
-    setTimeout(() => startActualUpload(), 400);
-  } else if (mode === 'album') {
-    setTimeout(() => openAlbumModal(), 400);
-  } else {
-    currentNameIndex = 0;
-    setTimeout(() => openNameModal(), 400);
-  }
+  if (mode === 'skip') setTimeout(() => startActualUpload(), 400);
+  else if (mode === 'album') setTimeout(() => openAlbumModal(), 400);
+  else { currentNameIndex = 0; setTimeout(() => openNameModal(), 400); }
 }
 
-/* АЛЬБОМНОЕ ИМЕНОВАНИЕ */
 function openAlbumModal() {
   const modal = document.getElementById('albumModal');
   const counter = document.getElementById('albumModalCounter');
   const input = document.getElementById('albumModalInput');
   const preview = document.getElementById('albumPreview');
-
   counter.textContent = `${pendingFiles.length} файлов получат одно общее имя`;
-
   input.value = '';
   preview.innerHTML = '';
-
-  input.oninput = () => {
-    renderAlbumPreview(input.value);
-  };
-
+  input.oninput = () => { renderAlbumPreview(input.value); };
   renderAlbumPreview('');
   input.focus();
-
   modal.classList.add('open');
   document.body.classList.add('modal-open');
 }
@@ -2109,12 +1609,10 @@ function renderAlbumPreview(baseName) {
     preview.innerHTML = '<span style="opacity:0.6">Введите название, чтобы увидеть превью</span>';
     return;
   }
-
   const items = pendingFiles.slice(0, 4).map((f, i) => {
     const ext = f.name.includes('.') ? '.' + f.name.split('.').pop() : '';
     return `<div style="padding:2px 0">${escapeHtml(baseName.trim())} ${i + 1}${escapeHtml(ext)}</div>`;
   });
-
   const more = pendingFiles.length > 4 ? `<div style="opacity:0.6;padding:2px 0">... и ещё ${pendingFiles.length - 4}</div>` : '';
   preview.innerHTML = items.join('') + more;
 }
@@ -2128,66 +1626,27 @@ function closeAlbumModal(e) {
 
 function confirmAlbumName() {
   const baseName = document.getElementById('albumModalInput').value.trim();
-  if (!baseName) {
-    showToast('Введите название');
-    return;
-  }
-
+  if (!baseName) { showToast('Введите название'); return; }
   pendingFiles.forEach((f, i) => {
     const ext = f.name.includes('.') ? '.' + f.name.split('.').pop() : '';
     pendingNames[f.id] = `${baseName} ${i + 1}${ext}`;
   });
-
   closeAlbumModal();
   setTimeout(() => startActualUpload(), 400);
 }
 
-/* ИНДИВИДУАЛЬНОЕ ИМЕНОВАНИЕ */
-function openNameModal() {
-  const modal = document.getElementById('nameModal');
-  const counter = document.getElementById('nameModalCounter');
-  const input = document.getElementById('nameModalInput');
-  const original = document.getElementById('nameModalOriginal');
-
-  if (currentNameIndex >= pendingFiles.length) {
-    closeNameModal();
-    setTimeout(() => startActualUpload(), 400);
-    return;
-  }
-
-  const file = pendingFiles[currentNameIndex];
-  counter.textContent = `Файл ${currentNameIndex + 1} из ${pendingFiles.length}`;
-  input.value = '';
-  input.placeholder = 'Оставьте пустым для оригинала';
-  original.textContent = `Оригинал: ${file.name}`;
-
-  modal.classList.add('open');
-  document.body.classList.add('modal-open');
-
-  setTimeout(() => input.focus(), 300);
-}
-
-function closeNameModal(e) {
-  if (e) e.stopPropagation();
-  const modal = document.getElementById('nameModal');
-  modal.classList.remove('open');
-  document.body.classList.remove('modal-open');
-}
-
-/* ===== Хранилище («Моё облако») — волна 22.23: реальное API бота ===== */
 async function loadStorageStatus() {
   const box = document.getElementById('storageStatus');
   box.textContent = 'Загружаю…';
-  try {
-    renderStorage(await apiJson('/api/storage'));
-  } catch (e) {
-    const t = cloudErrText(e); // 22.24: честная причина, не «нет связи с облаком»
+  try { renderStorage(await apiJson('/api/storage')); }
+  catch (e) {
+    const t = cloudErrText(e);
     box.textContent = '⚠️ ' + t;
     if (e && (e.code === 'unauthorized' || e.code === 'not_registered')) showAuthCard(t);
   }
 }
 
-let STORAGE_STATE = null; // 22.25: последний статус хранилища (для togglePlain)
+let STORAGE_STATE = null;
 
 function renderStorage(d) {
   const box = document.getElementById('storageStatus');
@@ -2195,8 +1654,6 @@ function renderStorage(d) {
   const connLabel = document.querySelector('#storageConnectBtn span');
   const plainBtn = document.getElementById('storagePlainBtn');
   STORAGE_STATE = d || null;
-  // 22.26: сервер подтверждает связь — честная строка «связь с ботом».
-  // Если сборка/имя не пришли (старый сервер) — строки нет, честно.
   if (d) {
     CONN.bot = String(d.bot || CONN.bot || '');
     CONN.build = String(d.build || CONN.build || '');
@@ -2210,11 +1667,9 @@ function renderStorage(d) {
     : '';
   if (d.connected) {
     box.innerHTML = '✅ Ваш канал: <b style="color:var(--text-color)">' + escapeHtml(d.title || '') + '</b>'
-      + '<br><span style="font-size:11px">подключён ' + escapeHtml(d.added || '') + ' — новые загрузки уходят только в него</span>'
-      + ident;
+      + '<br><span style="font-size:11px">подключён ' + escapeHtml(d.added || '') + '</span>' + ident;
     offBtn.style.display = '';
     connLabel.textContent = 'Заменить канал';
-    // 22.25: честное состояние шифрования для личного канала.
     if (plainBtn) {
       plainBtn.style.display = '';
       const pl = document.getElementById('storagePlainLabel');
@@ -2224,16 +1679,14 @@ function renderStorage(d) {
     }
   } else {
     box.innerHTML = (d.has_general
-      ? '☁️ Сейчас файлы уходят в общее хранилище бота. Подключите свой приватный канал — и они будут лежать только у вас.'
-      : '⚠️ Хранилище не настроено — загрузки будут неудачными. Подключите свой канал ниже.') + ident;
+      ? '☁️ Сейчас файлы уходят в общее хранилище бота.'
+      : '⚠️ Хранилище не настроено.') + ident;
     offBtn.style.display = 'none';
     connLabel.textContent = 'Подключить канал';
     if (plainBtn) plainBtn.style.display = 'none';
   }
 }
 
-/* 22.25: переключатель «хранить файлы БЕЗ шифрования» — только для личного
-   канала. В общем хранилище бота незашифрованные файлы Сейфа не хранятся. */
 async function togglePlain() {
   const btn = document.getElementById('storagePlainBtn');
   btn.disabled = true;
@@ -2241,12 +1694,9 @@ async function togglePlain() {
     const cur = !!(STORAGE_STATE && STORAGE_STATE.plain);
     const d = await apiJson('/api/storage/plain', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ plain: !cur }) });
     renderStorage(d);
-    showToast(d.plain
-      ? '🔓 Новые файлы будут храниться БЕЗ шифра'
-      : '🔒 Шифрование включено — файлы снова под паролем');
-  } catch (e) {
-    showToast('❌ ' + cloudErrText(e));
-  } finally { btn.disabled = false; }
+    showToast(d.plain ? '🔓 Шифрование ВЫКЛ' : '🔒 Шифрование включено');
+  } catch (e) { showToast('❌ ' + cloudErrText(e)); }
+  finally { btn.disabled = false; }
 }
 
 async function connectStorage() {
@@ -2259,11 +1709,9 @@ async function connectStorage() {
     document.getElementById('storageInput').value = '';
     renderStorage(d);
     showToast('✅ Канал «' + d.title + '» подключён');
-    /* 22.30: сразу обновляем список — файлы теперь лягут в новый канал и в чате */
     loadFiles(true);
-  } catch (e) {
-    showToast('❌ ' + e.message);
-  } finally { btn.disabled = false; }
+  } catch (e) { showToast('❌ ' + e.message); }
+  finally { btn.disabled = false; }
 }
 
 async function disconnectStorage() {
@@ -2272,9 +1720,7 @@ async function disconnectStorage() {
     renderStorage(d);
     showToast('🗑 Личный канал отключён');
     loadFiles(true);
-  } catch (e) {
-    showToast('❌ ' + e.message);
-  }
+  } catch (e) { showToast('❌ ' + e.message); }
 }
 
 function openStorageModal() {
@@ -2292,9 +1738,7 @@ function closeStorageModal(e) {
 function confirmNameAndNext() {
   const file = pendingFiles[currentNameIndex];
   const newName = document.getElementById('nameModalInput').value.trim();
-  if (newName) {
-    pendingNames[file.id] = newName;
-  }
+  if (newName) pendingNames[file.id] = newName;
   currentNameIndex++;
   closeNameModal();
   setTimeout(() => openNameModal(), 400);
@@ -2313,81 +1757,54 @@ function skipAllNames() {
 
 function startActualUpload() {
   if (!pendingFiles.length) return;
-
-  /* 22.21: имена применяем к САМИМ File-объектам (uploadName) — исходные
-     байты должны остаться при файле для реальной чанковой загрузки. */
   pendingFiles.forEach(f => {
     if (pendingNames[f.id]) {
       const customName = pendingNames[f.id];
-      if (nameMode === 'album') {
-        f.uploadName = customName;
-      } else {
+      if (nameMode === 'album') f.uploadName = customName;
+      else {
         const ext = f.name.includes('.') ? '.' + f.name.split('.').pop() : '';
         f.uploadName = customName + ext;
       }
     }
   });
-
   proceedUpload(pendingFiles);
 }
 
 function uploadFiles(fileList) {
   const files = Array.from(fileList);
   if (!files.length || isUploading) return;
-  
-  pendingFiles = files.map((f, i) => {
-    f.id = 'tmp_' + i + '_' + Math.random().toString(36).substr(2, 5);
-    return f;
-  });
+  pendingFiles = files.map((f, i) => { f.id = 'tmp_' + i + '_' + Math.random().toString(36).substr(2, 5); return f; });
   pendingNames = {};
   currentNameIndex = 0;
   nameMode = 'each';
-
-  if (pendingFiles.length === 1) {
-    openNameModal();
-  } else {
-    openNameChoiceModal();
-  }
+  if (pendingFiles.length === 1) openNameModal();
+  else openNameChoiceModal();
 }
 
 function proceedUpload(files) {
-  isUploading = true;
-  isPaused = false;
-  uploadAbortFlag = false;
-  uploadQueue = files.slice();
-
+  isUploading = true; isPaused = false; uploadAbortFlag = false; uploadQueue = files.slice();
   const initial = document.getElementById('initialState');
   const filenameEl = document.getElementById('uploadFilename');
   const wrap = document.getElementById('progressWrap');
   const bar = document.getElementById('progressBar');
   const checkmark = document.getElementById('checkmark');
   const squareStop = document.getElementById('squareStop');
-
-  if (files.length === 1) {
-    filenameEl.innerHTML = `Загружается:<br><b>${escapeHtml(files[0].uploadName || files[0].name)}</b>`;
-  } else {
+  if (files.length === 1) filenameEl.innerHTML = `Загружается:<br><b>${escapeHtml(files[0].uploadName || files[0].name)}</b>`;
+  else {
     const namesPreview = files.slice(0, 2).map(f => escapeHtml(f.uploadName || f.name)).join(', ');
     const moreText = files.length > 2 ? ` и ещё ${files.length - 2}` : '';
     filenameEl.innerHTML = `Загружается файлов: <b>${files.length}</b><br><span style="font-size:11px;opacity:0.8">${namesPreview}${moreText}</span>`;
   }
   filenameEl.style.display = 'block';
-
   initial.style.display = 'none';
   wrap.classList.add('active');
-  
   const circumference = 157;
   bar.classList.remove('success');
   bar.style.strokeDasharray = `${circumference}`;
   bar.style.strokeDashoffset = `${circumference}`;
-  
   if (checkmark) checkmark.classList.remove('show');
-  if (squareStop) {
-    squareStop.style.display = 'block';
-    squareStop.style.opacity = '1';
-  }
-
+  if (squareStop) { squareStop.style.display = 'block'; squareStop.style.opacity = '1'; }
   document.getElementById('downloadText').textContent = 'Загрузка... (1 клик - пауза, 2 - отмена)';
-
   uploadEngine(bar);
 }
 
@@ -2404,23 +1821,14 @@ function resetUploadUI(bar, checkmark, squareStop) {
   const filenameEl = document.getElementById('uploadFilename');
   const wrap = document.getElementById('progressWrap');
   const circumference = 157;
-
   wrap.classList.remove('active');
   filenameEl.style.display = 'none';
   initial.style.display = 'flex';
   bar.classList.remove('success');
   bar.style.strokeDashoffset = `${circumference}`;
   if (checkmark) checkmark.classList.remove('show');
-  if (squareStop) {
-    squareStop.style.display = 'block';
-    squareStop.style.opacity = '1';
-  }
-  isUploading = false;
-  isPaused = false;
-  uploadQueue = [];
-  uploadAbortFlag = false;
-  pendingFiles = [];
-  pendingNames = {};
+  if (squareStop) { squareStop.style.display = 'block'; squareStop.style.opacity = '1'; }
+  isUploading = false; isPaused = false; uploadQueue = []; uploadAbortFlag = false; pendingFiles = []; pendingNames = {};
 }
 
 function sendChunk(uploadId, index, blobPart, onLoaded) {
@@ -2429,9 +1837,7 @@ function sendChunk(uploadId, index, blobPart, onLoaded) {
     uploadXhr = xhr;
     xhr.open('POST', '/api/upload/chunk?uploadId=' + encodeURIComponent(uploadId) + '&index=' + index);
     const headers = authHeaders();
-    for (const k in headers) {
-      try { xhr.setRequestHeader(k, headers[k]); } catch (e) {}
-    }
+    for (const k in headers) { try { xhr.setRequestHeader(k, headers[k]); } catch (e) {} }
     try { xhr.setRequestHeader('Content-Type', 'application/octet-stream'); } catch (e) {}
     xhr.upload.onprogress = (ev) => { if (ev.lengthComputable && onLoaded) onLoaded(ev.loaded); };
     xhr.onload = () => {
@@ -2455,9 +1861,7 @@ async function uploadOneFile(file, reportBytes) {
     body: JSON.stringify({ name: upName, size: +file.size || 0, mime: file.type || '' })
   });
   const uploadId = initData.uploadId;
-  let offset = 0;
-  let index = 0;
-
+  let offset = 0; let index = 0;
   while (offset < file.size) {
     while (isPaused && !uploadAbortFlag) await sleepMs(150);
     if (uploadAbortFlag) {
@@ -2469,8 +1873,6 @@ async function uploadOneFile(file, reportBytes) {
       throw new Error('aborted');
     }
     const end = Math.min(offset + CHUNK_SIZE, file.size);
-    /* 22.30: повтор куска при сбое сети (2 доп. попытки). Сервер теперь
-       идемпотентен: пересланный кусок не задваивается, файл не портится. */
     let lastErr = null;
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
@@ -2487,7 +1889,6 @@ async function uploadOneFile(file, reportBytes) {
     offset = end;
     index++;
   }
-
   const done = await apiJson('/api/upload/complete', {
     method: 'POST',
     headers: authHeaders({ 'Content-Type': 'application/json' }),
@@ -2503,13 +1904,10 @@ async function uploadEngine(bar) {
   let doneBytes = 0;
   const added = [];
   let failed = null;
-
   for (const file of uploadQueue.slice()) {
     if (uploadAbortFlag || failed) break;
     try {
-      const rec = await uploadOneFile(file, (cur) => {
-        setUploadPct(((doneBytes + cur) / totalBytes) * 100, bar);
-      });
+      const rec = await uploadOneFile(file, (cur) => { setUploadPct(((doneBytes + cur) / totalBytes) * 100, bar); });
       if (rec) added.push(rec);
       doneBytes += (+file.size || 0);
       setUploadPct((doneBytes / totalBytes) * 100, bar);
@@ -2519,30 +1917,20 @@ async function uploadEngine(bar) {
       break;
     }
   }
-
-  if (uploadAbortFlag) {
-    /* Тост отмены уже показан в cancelUpload — здесь только тихий сброс UI. */
-    resetUploadUI(bar, checkmark, squareStop);
-    return;
-  }
+  if (uploadAbortFlag) { resetUploadUI(bar, checkmark, squareStop); return; }
   if (failed) {
     showToast('Ошибка загрузки: ' + failed.message + (added.length ? ' (что успело — уже сохранено)' : ''));
     resetUploadUI(bar, checkmark, squareStop);
     return;
   }
-
   setUploadPct(100, bar);
   bar.style.strokeDashoffset = '0';
-
   bar.classList.add('success');
   if (squareStop) squareStop.style.display = 'none';
   if (checkmark) checkmark.classList.add('show');
-
   document.getElementById('downloadText').textContent = 'Успешно загружено!';
-
   playSoundDirectly(selectedSoundId);
   flashScreen();
-
   added.forEach(rec => {
     ALL_FILES.unshift({
       id: rec.id, name: rec.name, kind: rec.kind,
@@ -2550,10 +1938,7 @@ async function uploadEngine(bar) {
     });
   });
   renderAll();
-
-  setTimeout(() => {
-    resetUploadUI(bar, checkmark, squareStop);
-  }, 1200);
+  setTimeout(() => { resetUploadUI(bar, checkmark, squareStop); }, 1200);
 }
 
 document.getElementById('fileInput').addEventListener('change', (e) => {
@@ -2564,9 +1949,7 @@ document.getElementById('fileInput').addEventListener('change', (e) => {
 const dz = document.getElementById('dropZone');
 ['dragenter','dragover'].forEach(ev => dz.addEventListener(ev, e => e.preventDefault()));
 ['dragleave','drop'].forEach(ev => dz.addEventListener(ev, e => e.preventDefault()));
-dz.addEventListener('drop', e => {
-  if (e.dataTransfer?.files?.length) uploadFiles(e.dataTransfer.files);
-});
+dz.addEventListener('drop', e => { if (e.dataTransfer?.files?.length) uploadFiles(e.dataTransfer.files); });
 
 const blobSpeedInput = document.getElementById('blobSpeedInput');
 if (blobSpeedInput) blobSpeedInput.value = blobIdleSpeed;
@@ -2579,72 +1962,44 @@ renderSoundMenu();
 setSort('date-desc');
 renderAll();
 
-/* 22.29: СТАРТ. В Telegram — как раньше: initData → loadFiles (22.26 тихий
-   ретрай, если сервер Render просыпается). Вне Telegram: есть веб-токен —
-   проверяем GET /api/web_me (200 → грузим файлы; 401 → стираем токен и
-   открываем вход); токена нет — сразу окно входа по ID + паролю. */
 if (!IS_TELEGRAM) {
   if (WEB_TOKEN) {
     fetch('/api/web_me', { headers: authHeaders() }).then(function (r) {
-      if (r.ok) {
-        loadFiles();
-      } else {
-        localStorage.removeItem('devo_web_token');
-        WEB_TOKEN = '';
-        openLoginModal();
-      }
+      if (r.ok) loadFiles();
+      else { localStorage.removeItem('devo_web_token'); WEB_TOKEN = ''; openLoginModal(); }
     }).catch(function () { openLoginModal(); });
-  } else {
-    openLoginModal();
-  }
+  } else openLoginModal();
 } else {
-  loadFiles().then(function (ok) {
-    if (!ok) setTimeout(function () { loadFiles(true); }, 4000);
-  });
+  loadFiles().then(function (ok) { if (!ok) setTimeout(function () { loadFiles(true); }, 4000); });
 }
 safeIcons();
+
+function openNameModal() {
+  const modal = document.getElementById('nameModal');
+  const counter = document.getElementById('nameModalCounter');
+  const input = document.getElementById('nameModalInput');
+  const original = document.getElementById('nameModalOriginal');
+  if (currentNameIndex >= pendingFiles.length) {
+    closeNameModal();
+    setTimeout(() => startActualUpload(), 400);
+    return;
+  }
+  const file = pendingFiles[currentNameIndex];
+  counter.textContent = `Файл ${currentNameIndex + 1} из ${pendingFiles.length}`;
+  input.value = '';
+  input.placeholder = 'Оставьте пустым для оригинала';
+  original.textContent = `Оригинал: ${file.name}`;
+  modal.classList.add('open');
+  document.body.classList.add('modal-open');
+  setTimeout(() => input.focus(), 300);
+}
+
+function closeNameModal(e) {
+  if (e) e.stopPropagation();
+  const modal = document.getElementById('nameModal');
+  modal.classList.remove('open');
+  document.body.classList.remove('modal-open');
+}
 </script>
-
-<!-- 22.29: панель действий мультивыбора (видна в режиме выбора) -->
-<div id="selectionBar" style="display:none;position:fixed;left:0;right:0;bottom:0;z-index:60;padding:10px 14px calc(10px + env(safe-area-inset-bottom));background:var(--card-bg);border-top:1px solid var(--border-color);box-shadow:0 -8px 24px rgba(0,0,0,.12)">
-  <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-    <span id="selCount" style="font-weight:800;font-size:13px">Выбрано: 0</span>
-    <span style="flex:1"></span>
-    <button class="sound-item-btn" onclick="zipSelected()" style="padding:8px 10px"><span>📦 В ZIP</span></button>
-    <button class="sound-item-btn" id="unzipBtn" onclick="unzipSelected()" style="padding:8px 10px;display:none"><span>🗂 Распаковать</span></button>
-    <button class="sound-item-btn" onclick="deleteSelected()" style="padding:8px 10px;color:#ef4444"><span>🗑 Удалить</span></button>
-    <button class="sound-item-btn" onclick="toggleSelectMode()" style="padding:8px 10px;background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)"><span>Готово</span></button>
-  </div>
-</div>
-
-<!-- 22.29: вход по Telegram ID + веб-паролю — обычный браузер, без Telegram
-     (для тех, у кого VPN/школьная сеть не пускает telegram.org и initData
-     не доходит). Пароль задаётся в чате бота: ☁️ Облако → «🔑 Веб-пароль». -->
-<div id="loginModal" class="modal-overlay">
-  <div class="modal-card" onclick="event.stopPropagation()">
-    <div class="sheet-handle-area">
-      <div class="sheet-handle"></div>
-    </div>
-    <h3 style="font-weight:900;font-size:20px;margin-bottom:4px">Вход в DEVO+ Облако</h3>
-    <p style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:14px">Открыто вне Telegram, войдите по ID и паролю, заданному в боте</p>
-
-    <div style="margin-bottom:12px">
-      <label for="loginUserId" style="font-size:11px;font-weight:800;color:var(--subtext-color);text-transform:uppercase;letter-spacing:0.04em">Telegram ID</label>
-      <input type="text" id="loginUserId" inputmode="numeric" autocomplete="username" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;margin-top:4px;outline:none;font-size:15px" placeholder="Например: 123456789">
-    </div>
-    <div style="margin-bottom:14px">
-      <label for="loginPassword" style="font-size:11px;font-weight:800;color:var(--subtext-color);text-transform:uppercase;letter-spacing:0.04em">Пароль</label>
-      <input type="password" id="loginPassword" autocomplete="current-password" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;margin-top:4px;outline:none;font-size:15px" placeholder="Веб-пароль из бота">
-    </div>
-
-    <div style="display:flex;flex-direction:column;gap:8px">
-      <button class="sound-item-btn" id="loginSubmitBtn" onclick="webLogin()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
-        <span>Войти</span> <i data-lucide="log-in" style="width:18px;height:18px"></i>
-      </button>
-    </div>
-
-    <p style="font-size:11px;font-weight:600;color:var(--subtext-color);margin-top:12px;line-height:1.5">Пароль задаётся в боте через ☁️ Облако → «🔑 Веб-пароль». Логин — ваш Telegram ID (бот показывает его при создании пароля). 5 неверных попыток — пауза 10 минут.</p>
-  </div>
-</div>
 </body>
 </html>
