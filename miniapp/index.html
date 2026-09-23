@@ -570,8 +570,39 @@ body.modal-open {
       <button class="sound-item-btn" onclick="downloadCurrentFile()">
         <span>Скачать файл</span> <i data-lucide="download" style="width:18px;height:18px"></i>
       </button>
+      <!-- 22.30: перенос файла из веба в шифрованный Сейф (и видео до 2 ГБ) -->
+      <button class="sound-item-btn" id="modalSealBtn" onclick="moveCurrentFileToSafe()">
+        <span>🔐 Перенести в Сейф</span> <i data-lucide="shield-check" style="width:18px;height:18px"></i>
+      </button>
       <button class="sound-item-btn" style="color:#ef4444" onclick="deleteCurrentFile()">
         <span>Удалить файл</span> <i data-lucide="trash-2" style="width:18px;height:18px;stroke:#ef4444"></i>
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- 22.30: ввод пароля Сейфа для переноса файла из веба в Сейф.
+     Своя модалка вместо window.prompt(): в браузере Telegram prompt()
+     заблокирован и молча возвращает null — пароль ввести бы не дали. -->
+<div id="safePwModal" class="modal-overlay" onclick="closeSafePwModal(event)">
+  <div class="modal-card" onclick="event.stopPropagation()">
+    <div class="sheet-handle-area">
+      <div class="sheet-handle"></div>
+    </div>
+    <h3 style="font-weight:900;font-size:20px;margin-bottom:4px">🔐 Перенести в Сейф</h3>
+    <p id="safePwFileName" style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:12px;word-break:break-all"></p>
+    <p style="font-size:12px;font-weight:600;color:var(--subtext-color);margin-bottom:12px;line-height:1.5">Введите пароль Сейфа: файл будет зашифрован им прямо на сервере (AES-256, до 2 ГБ) и переедет в 🔐 Сейф — в чате бота. Открыть его сможет только этот пароль. Оригинал из облака сотрётся.</p>
+
+    <div style="margin-bottom:14px">
+      <input type="password" id="safePwInput" autocomplete="current-password" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;outline:none;font-size:15px" placeholder="Пароль Сейфа">
+    </div>
+
+    <div style="display:flex;flex-direction:column;gap:8px">
+      <button class="sound-item-btn" id="safePwSubmitBtn" onclick="submitSafePw()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
+        <span>🔐 Зашифровать и перенести</span> <i data-lucide="shield-check" style="width:18px;height:18px"></i>
+      </button>
+      <button class="sound-item-btn" onclick="closeSafePwModal()">
+        <span>Отмена</span>
       </button>
     </div>
   </div>
@@ -1353,7 +1384,7 @@ async function webLogin() {
   }
 }
 
-/* ===== 22.29: МУЛЬТИВЫБОР ФАЙЛОВ (галочки + ZIP/распаковать/удалить) ===== */
+/* ===== 22.29: МУЛЬТИВЫБОР ФАЙЛОВ (галочки + скачать/ZIP/распаковать/удалить) ===== */
 let selectMode = false;
 let selectedIds = new Set();
 
@@ -1362,6 +1393,13 @@ function toggleSelectMode() {
   if (!selectMode) selectedIds.clear();
   const bar = document.getElementById('selectionBar');
   if (bar) bar.style.display = selectMode ? '' : 'none';
+  /* 22.30 (ИСПРАВЛЕНО «нижняя панель мешает выбрать»): панель фиксированная
+     и перекрывала последние строки списка — теперь при её появлении список
+     получает нижний отступ ровно по высоте панели. */
+  const wrap = document.querySelector('.main-wrapper');
+  if (wrap) wrap.style.paddingBottom = selectMode
+    ? 'calc(96px + env(safe-area-inset-bottom))'
+    : '';
   updateSelCount();
   renderAll();
 }
@@ -1383,6 +1421,60 @@ function toggleFileSelection(e, id) {
   else selectedIds.add(id);
   updateSelCount();
   renderFiles(applyFilters());
+}
+
+/* ===== 22.30: СКАЧИВАНИЕ ПО ГАЛОЧКАМ (то, чего не хватало) =====
+   Blob-ссылки в браузере Telegram (особенно iOS) часто не работают, поэтому
+   сервер выдаёт ОДНОРАЗОВУЮ ссылку /api/dl/{token}: 1 файл — как есть,
+   несколько — сервер фон собирает ZIP и отдаёт ссылку, когда готов.
+   Открываем внешний браузер через tg.openLink — скачивание срабатывает всегда. */
+function openDlUrl(url) {
+  try {
+    if (IS_TELEGRAM && window.Telegram && Telegram.WebApp && typeof Telegram.WebApp.openLink === 'function') {
+      Telegram.WebApp.openLink(url);
+      return;
+    }
+  } catch (e) { /* фолбэк ниже */ }
+  window.open(url, '_blank');
+}
+
+async function downloadSelected() {
+  if (!selectedIds.size) { showToast('Сначала выберите файлы'); return; }
+  const ids = [...selectedIds];
+  try {
+    const data = await apiJson('/api/files/prep_download', {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ ids: ids })
+    });
+    if (data.ready && data.token) {
+      openDlUrl(location.origin + '/api/dl/' + encodeURIComponent(data.token));
+      showToast('📥 Отдаю файл браузеру…');
+      return;
+    }
+    if (data.job) {
+      showToast('📦 Собираю архив из ' + data.count + ' файлов…');
+      const job = data.job;
+      let tries = 0;
+      const timer = setInterval(async () => {
+        tries++;
+        try {
+          const st = await apiJson('/api/files/dl_status/' + encodeURIComponent(job));
+          if (st.state === 'ok' && st.token) {
+            clearInterval(timer);
+            openDlUrl(location.origin + '/api/dl/' + encodeURIComponent(st.token));
+            showToast('📦 Архив готов — скачиваю…');
+          } else if (st.state === 'err') {
+            clearInterval(timer);
+            showToast('Не получилось: ' + (st.error || 'сбой сборки'));
+          } else if (tries % 5 === 0) {
+            showToast('📦 Ещё собираю архив…');
+          }
+        } catch (e) { /* сеть могла мигнуть — пробуем дальше */ }
+        if (tries > 600) { clearInterval(timer); showToast('Слишком долго — попробуйте ещё раз'); }
+      }, 2000);
+    }
+  } catch (e) { showToast(cloudErrText(e)); }
 }
 
 async function zipSelected() {
@@ -1466,7 +1558,8 @@ async function loadFiles(silent) {
     ALL_FILES = (data.files || []).map(f => ({
       id: String(f.id || ''), name: String(f.name || 'файл'),
       kind: String(f.kind || 'document'), size: +f.size || 0,
-      ts: String(f.ts || ''), vault: !!f.vault
+      ts: String(f.ts || ''), vault: !!f.vault,
+      seal: String(f.seal || ''), seal_err: String(f.seal_err || '')
     }));
     // 22.26: сервер подтвердил связь — запоминаем, кем и чем отвечает
     CONN.bot = String(data.bot || CONN.bot || '');
@@ -1630,6 +1723,16 @@ function renderFiles(files) {
       <div onclick="toggleFileSelection(event,'${f.id}')" style="flex-shrink:0;width:24px;height:24px;border-radius:8px;display:flex;align-items:center;justify-content:center;border:2px solid ${sel ? 'var(--btn-text)' : 'var(--border-color)'};background:${sel ? 'var(--btn-text)' : 'transparent'};transition:all .15s">
         ${sel ? '<i data-lucide="check" style="width:14px;height:14px;stroke:var(--card-bg)"></i>' : ''}
       </div>` : '';
+    /* 22.30: бейдж переноса в Сейф + в режиме выбора кнопка ⋮ тоже ВЫБИРАЕТ
+       файл (раньше открывала меню и сбивала с толку). */
+    const sealBadge = f.seal === 'run'
+      ? '<span style="flex-shrink:0;font-weight:800;font-size:10px;color:var(--subtext-color);border:1px solid var(--border-color);border-radius:8px;padding:3px 6px">⏳ В Сейф…</span>'
+      : (f.seal === 'err'
+        ? `<span onclick="event.stopPropagation();showToast(${JSON.stringify((f.seal_err || 'Перенос не удался')).replace(/"/g, '&quot;')})" style="flex-shrink:0;font-weight:800;font-size:10px;color:#ef4444;border:1px solid #ef4444;border-radius:8px;padding:3px 6px">⚠ Ошибка</span>`
+        : '');
+    const dotsAction = selectMode
+      ? `toggleFileSelection(event,'${f.id}')`
+      : `openEditModal('${f.id}')`;
     return `
     <article class="file-card animate-fade-in" style="display:flex;align-items:center;gap:12px;${sel ? 'outline:2px solid var(--btn-text);outline-offset:-2px' : ''}" onclick="${cardAction}">
       ${checkHtml}
@@ -1644,8 +1747,9 @@ function renderFiles(files) {
           ${fmtSize(f.size)} · ${(f.ts || '').slice(0, 10)}
         </p>
       </div>
+      ${sealBadge}
       <div style="display:flex;gap:4px;flex-shrink:0" onclick="event.stopPropagation()">
-        <button class="action-btn" onclick="openEditModal('${f.id}')" title="Редактировать">
+        <button class="action-btn" onclick="${dotsAction}" title="${selectMode ? 'Выбрать' : 'Редактировать'}">
           <i data-lucide="more-vertical" style="width:16px;height:16px"></i>
         </button>
       </div>
@@ -1765,26 +1869,23 @@ async function downloadCurrentFile() {
   const f = ALL_FILES.find(x => x.id === activeEditingFileId);
   closeEditModal();
   if (!f) return;
-  showToast('📥 Скачивание...');
+  /* 22.30: blob-ссылки в браузере Telegram (iOS) часто блокируются — теперь
+     сервер выдаёт одноразовую ссылку, которую открывает внешний браузер.
+     Работает и для больших файлов (MTProto, до 2 ГБ). */
+  showToast('📥 Готовлю скачивание…');
   try {
-    const r = await fetch('/api/files/' + encodeURIComponent(f.id) + '/download', { headers: authHeaders() });
-    if (!r.ok) {
-      let msg = 'HTTP ' + r.status;
-      try { msg = (await r.json()).message || msg; } catch (e) {}
-      throw new Error(msg);
+    const data = await apiJson('/api/files/prep_download', {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ ids: [f.id] })
+    });
+    if (data.ready && data.token) {
+      openDlUrl(location.origin + '/api/dl/' + encodeURIComponent(data.token));
+    } else {
+      showToast('Не удалось подготовить скачивание');
     }
-    const blob = await r.blob();
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = f.name || 'file';
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 10000);
-    showToast('✅ Скачано: ' + fmtSize(blob.size));
   } catch (e) {
-    showToast('Ошибка скачивания: ' + e.message);
+    showToast(cloudErrText(e));
   }
 }
 
@@ -1800,6 +1901,76 @@ async function deleteCurrentFile() {
     showToast('Не удалось: ' + e.message);
   }
   closeEditModal();
+}
+
+/* ===== 22.30: ПЕРЕНОС ФАЙЛА В СЕЙФ ПРЯМО ИЗ ВЕБА =====
+   Раньше синхронизации с Сейфом не было: веб-файлы лежали без шифрования,
+   а перенос в чате работал только до 20 МБ. Теперь: вводим пароль Сейфа —
+   сервер скачивает файл из канала, шифрует потоково (AES-256-GCM, до 2 ГБ)
+   и кладёт в Сейф; оригинал стирает. Статус виден по бейджу у файла. */
+let safePwTargetId = null;
+
+function moveCurrentFileToSafe() {
+  const f = ALL_FILES.find(x => x.id === activeEditingFileId);
+  if (!f) return;
+  if (f.seal === 'run') { showToast('Этот файл уже переносится…'); return; }
+  closeEditModal();
+  safePwTargetId = f.id;
+  document.getElementById('safePwFileName').textContent = f.name || '';
+  document.getElementById('safePwInput').value = '';
+  document.getElementById('safePwModal').classList.add('open');
+}
+
+function closeSafePwModal(e) {
+  if (e && e.stopPropagation) e.stopPropagation();
+  document.getElementById('safePwModal').classList.remove('open');
+  safePwTargetId = null;
+}
+
+async function submitSafePw() {
+  const pw = document.getElementById('safePwInput').value;
+  if (!pw.trim()) { showToast('Введите пароль Сейфа'); return; }
+  const fid = safePwTargetId;
+  closeSafePwModal();
+  if (!fid) return;
+  const btn = document.getElementById('modalSealBtn');
+  if (btn) btn.disabled = true;
+  showToast('🔐 Начинаю перенос — файл зашифруется и уедет в Сейф…');
+  try {
+    await apiJson('/api/files/' + encodeURIComponent(fid) + '/to_safe', {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ password: pw })
+    });
+    const f = ALL_FILES.find(x => x.id === fid);
+    if (f) { f.seal = 'run'; f.seal_err = ''; }
+    renderAll();
+    showToast('⏳ Переношу в Сейф… Для больших файлов это занимает время');
+    /* Фоновая проверка статуса: готово → файл исчезнет из облака (он в Сейфе). */
+    let tries = 0;
+    const timer = setInterval(async () => {
+      tries++;
+      try {
+        await loadFiles(true);
+        const gone = !ALL_FILES.some(x => x.id === fid);
+        if (gone) {
+          clearInterval(timer);
+          showToast('✅ Готово: файл зашифрован и лежит в Сейфе (чат бота → 🔐)');
+          return;
+        }
+        const cur = ALL_FILES.find(x => x.id === fid);
+        if (cur && cur.seal === 'err') {
+          clearInterval(timer);
+          showToast('Не получилось: ' + (cur.seal_err || 'перенос не удался'));
+        }
+      } catch (e) { /* сеть мигнула — продолжаем */ }
+      if (tries > 900) clearInterval(timer);
+    }, 3000);
+  } catch (e) {
+    showToast(cloudErrText(e));
+  } finally {
+    if (btn) btn.disabled = false;
+  }
 }
 
 function onSearch() {
@@ -2069,7 +2240,7 @@ function renderStorage(d) {
     }
   } else {
     box.innerHTML = (d.has_general
-      ? '☁️ Сейчас файлы уходят в общее хранилище бота. Подключите свой приватный канал — и они будут лежать только у вас.'
+      ? '☁️ Сейчас файлы уходят в общее хранилище бота: в Сейфе — шифром, веб-загрузки — как есть. Там же лежат резервные zip-копии базы бота — это нормально. Подключите свой приватный канал — и ваши файлы будут лежать отдельной «полкой» только у вас.'
       : '⚠️ Хранилище не настроено — загрузки будут неудачными. Подключите свой канал ниже.') + ident;
     offBtn.style.display = 'none';
     connLabel.textContent = 'Подключить канал';
@@ -2438,10 +2609,13 @@ safeIcons();
   <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
     <span id="selCount" style="font-weight:800;font-size:13px">Выбрано: 0</span>
     <span style="flex:1"></span>
+    <!-- 22.30: кнопка «Скачать» — то, чего не хватало: скачивает выбранное
+         НА УСТРОЙСТВО (1 файл — как есть, несколько — ZIP-архивом) -->
+    <button class="sound-item-btn" onclick="downloadSelected()" style="padding:8px 10px;background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)"><span>📥 Скачать</span></button>
     <button class="sound-item-btn" onclick="zipSelected()" style="padding:8px 10px"><span>📦 В ZIP</span></button>
     <button class="sound-item-btn" id="unzipBtn" onclick="unzipSelected()" style="padding:8px 10px;display:none"><span>🗂 Распаковать</span></button>
     <button class="sound-item-btn" onclick="deleteSelected()" style="padding:8px 10px;color:#ef4444"><span>🗑 Удалить</span></button>
-    <button class="sound-item-btn" onclick="toggleSelectMode()" style="padding:8px 10px;background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)"><span>Готово</span></button>
+    <button class="sound-item-btn" onclick="toggleSelectMode()" style="padding:8px 10px"><span>Готово</span></button>
   </div>
 </div>
 
@@ -2462,7 +2636,7 @@ safeIcons();
     </div>
     <div style="margin-bottom:14px">
       <label for="loginPassword" style="font-size:11px;font-weight:800;color:var(--subtext-color);text-transform:uppercase;letter-spacing:0.04em">Пароль</label>
-      <input type="password" id="loginPassword" autocomplete="current-password" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;margin-top:4px;outline:none;font-size:15px" placeholder="Веб-пароль из бота">
+      <input type="password" id="loginPassword" autocomplete="current-password" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;margin-top:4px;outline:none;font-size:15px" placeholder="Пароль из бота (7 цифр)">
     </div>
 
     <div style="display:flex;flex-direction:column;gap:8px">
@@ -2471,7 +2645,7 @@ safeIcons();
       </button>
     </div>
 
-    <p style="font-size:11px;font-weight:600;color:var(--subtext-color);margin-top:12px;line-height:1.5">Пароль задаётся в боте через ☁️ Облако → «🔑 Веб-пароль». Логин — ваш Telegram ID (бот показывает его при создании пароля). 5 неверных попыток — пауза 10 минут.</p>
+    <p style="font-size:11px;font-weight:600;color:var(--subtext-color);margin-top:12px;line-height:1.5">Пароль задаётся в боте через ☁️ Облако → «🔑 Веб-пароль» — это РОВНО 7 ЦИФР, и он ОДИН для веб-облака и мини-аппа. Логин — ваш Telegram ID (бот показывает его при создании пароля). 5 неверных попыток — пауза 10 минут.</p>
   </div>
 </div>
 </body>
