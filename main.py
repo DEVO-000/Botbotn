@@ -1276,7 +1276,14 @@ async def start_keep_alive_server():
     плюс JSON API к ОСНОВНОЙ базе бота (/api/*). Раньше `/` отдавал только
     «OK»; теперь отдаёт мини-апп (это тоже честный 200 для health-check),
     а /health остаётся как был — self-ping и платформы проверяют его."""
-    app = web.Application()
+    app = web.Application(
+        # ВОЛНА 22.30: КРИТИЧЕСКИЙ ФИКС загрузок. aiohttp по умолчанию режет
+        # тело POST до 1 МБ (client_max_size=1024**2) — чанки мини-аппа по
+        # 4 МБ получали 413: «видео не загружается», «большой файл не
+        # заливается», работали только файлы меньше 1 МБ. Проверено тестом
+        # scripts/test_aiohttp_maxsize.py (4 МБ → 413 без параметра, → 200 с ним).
+        # Ставим 32 МБ: 4 МБ-чанк влезает с огромным запасом.
+        client_max_size=32 * 1024 * 1024)
     app.router.add_get('/health', health_check)
     try:
         mount_miniapp_routes(app)
@@ -3498,7 +3505,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.29"
+BOT_BUILD = "22.30"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -4301,7 +4308,7 @@ def get_quick_timer_keyboard():
         # напоминаний с управлением (выключить/удалить/изменить).
         [InlineKeyboardButton("📋 Мои напоминания", callback_data="timer_list")],
         # ВОЛНА 22.28: «в таймере добавь помодоро таймер» — сессии работа/перерыв.
-        [InlineKeyboardButton("🍅 Помодоро", callback_data="pomo_menu")],
+        [InlineKeyboardButton("📚 Таймер учёбы", callback_data="pomo_menu")],
         [InlineKeyboardButton("❌ Отмена", callback_data="cancel_action")],
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -7116,9 +7123,30 @@ def _cloud_menu_text(user):
             "перенесите их в Сейф кнопкой 🔐 у файла"
         )
     lines.append("")
+    # ВОЛНА 22.30: «ПО ПОЛОЧКАМ» — честно и коротко, где что лежит.
     lines.append(
-        "ФАЙЛЫ ВСЕГДА ЖИВУТ В СЕЙФЕ: перед отправкой в приватный канал каждый "
-        "файл шифруется вашим паролем (AES-256). В канале — только шум; открыть "
+        "📚 ПОЛОЧКИ (чтобы ничего не путалось):\n"
+        "1️⃣ 🔐 СЕЙФ — ваши зашифрованные файлы. ВСЕГДА под шифром AES-256 "
+        "(пароль Сейфа). Лежат: "
+        + (f"в ВАШЕМ канале «{_uch[1]}»" if _uch
+           else "в приватных каналах-хранилищах бота")
+        + ".\n"
+        "2️⃣ 🌐 ВЕБ-ОБЛАКО (мини-апп «☁️ DEVO+») — то же хранилище, просто "
+        "открытое в браузере/Telegram: загруженные туда файлы попадают в "
+        "обычное облако и их можно перенести в Сейф кнопкой 🔐 прямо в "
+        "мини-аппе.\n"
+        "3️⃣ 🗂 СТАРЫЕ файлы — загрузки до волны 9, без шифра; перенесите "
+        "их в Сейф.\n\n"
+        "💡 Надёжнее всего СВОЙ канал: создайте частный канал, "
+        "добавьте бота администратором с правом «Публикация сообщений» и "
+        "подключите его через 🔗 Моё облако — тогда ВСЕ ваши файлы (и Сейф, "
+        "и веб-облако) будут лежать только в вашем собственном хранилище, "
+        "а не в каналах бота."
+    )
+    lines.append("")
+    lines.append(
+        "ФАЙЛЫ СЕЙФА ВСЕГДА ШИФРОВАНЫ: перед отправкой в канал каждый файл "
+        "шифруется вашим паролем (AES-256). В канале — только шум; открыть "
         "не сможет никто: ни разработчик, ни Telegram. Забыли пароль — вернёте "
         "доступ по своим 3 секретным вопросам."
     )
@@ -7142,9 +7170,9 @@ def get_cloud_menu_keyboard(user=None):
         [InlineKeyboardButton("📤 Загрузить в Сейф", callback_data="vault_put")],
         # ВОЛНА 22.20: своя настройка облака — личный канал пользователя.
         [InlineKeyboardButton("🔗 Моё облако", callback_data="vault_cloud")],
-        # ВОЛНА 22.29: веб-пароль — вход в Веб-облако из обычного браузера
-        # по Telegram ID + паролю (без Telegram/VPN).
-        [InlineKeyboardButton("🔑 Веб-пароль", callback_data="web_password_menu")],
+        # ВОЛНА 22.29/22.30: веб-вход в Веб-облако без Telegram — по паролю
+        # Сейфа (с 22.30 пароль Сейфа = пароль веб-входа).
+        [InlineKeyboardButton("🌐 Веб-вход (пароль Сейфа)", callback_data="web_password_menu")],
     ]
     if legacy:
         rows.append([InlineKeyboardButton(
@@ -7799,9 +7827,19 @@ async def _api_get_user_any(request):
     return await _miniapp_user_from_request(request)
 
 
-def _miniapp_rec_out(rec):
+def _miniapp_rec_out(rec, user=None):
     """Запись cloud_files → JSON для мини-аппа (те же поля, что были в макете:
-    id/name/kind/size/ts/vault). Флаг va = галочка Vault из веб-облака."""
+    id/name/kind/size/ts/vault). Флаг va = галочка Vault из веб-облака.
+    ВОЛНА 22.30: flag own — файл лежит в ЛИЧНОМ канале пользователя
+    (True) или в общих каналах бота (False) — «по полочкам» в интерфейсе."""
+    _own = False
+    if user is not None:
+        try:
+            _vc = getattr(user, "vault_channel", None)
+            _vc_id = int((_vc or {}).get("id") or 0)
+            _own = bool(_vc_id) and int(rec.get("channel_id") or 0) == _vc_id
+        except (TypeError, ValueError):
+            _own = False
     return {
         "id": str(rec.get("id") or ""),
         "name": str(rec.get("name") or "файл"),
@@ -7809,6 +7847,7 @@ def _miniapp_rec_out(rec):
         "size": int(rec.get("size") or 0),
         "ts": str(rec.get("ts") or ""),
         "vault": bool(rec.get("va")),
+        "own": _own,
     }
 
 
@@ -8430,6 +8469,10 @@ body.modal-open {
       <button class="sound-item-btn" id="modalVaultBtn" onclick="toggleFileVault()">
         <span id="modalVaultText">Защитить в Vault</span> <i data-lucide="lock" style="width:18px;height:18px"></i>
       </button>
+      <!-- 22.30: перенос обычного файла В Сейф (шифрование паролем Сейфа) -->
+      <button class="sound-item-btn" id="modalToVaultBtn" onclick="openToVaultPw()">
+        <span>🔐 Перенести в Сейф</span> <i data-lucide="shield" style="width:18px;height:18px"></i>
+      </button>
       <button class="sound-item-btn" onclick="downloadCurrentFile()">
         <span>Скачать файл</span> <i data-lucide="download" style="width:18px;height:18px"></i>
       </button>
@@ -8437,6 +8480,46 @@ body.modal-open {
         <span>Удалить файл</span> <i data-lucide="trash-2" style="width:18px;height:18px;stroke:#ef4444"></i>
       </button>
     </div>
+  </div>
+</div>
+
+<!-- 22.30: СЕЙФ в мини-аппе — список зашифрованных файлов -->
+<div id="vaultModal" class="modal-overlay" onclick="closeVaultModal(event)">
+  <div class="modal-card" onclick="event.stopPropagation()">
+    <div class="sheet-handle-area">
+      <div class="sheet-handle"></div>
+    </div>
+    <h3 style="font-weight:900;font-size:20px;margin-bottom:4px">🔐 Сейф</h3>
+    <p style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:12px">Файлы под шифром AES-256. Для скачивания — пароль Сейфа.</p>
+
+    <div id="vaultStatus" style="padding:10px 12px;background:var(--card-bg);border:1px solid var(--border-color);border-radius:14px;margin-bottom:12px;font-size:12px;font-weight:700;color:var(--subtext-color);line-height:1.5">Загружаю…</div>
+
+    <div id="vaultList" style="display:flex;flex-direction:column;gap:8px;max-height:40vh;overflow:auto"></div>
+
+    <button class="sound-item-btn" onclick="closeVaultModal()" style="margin-top:12px">
+      <span>Закрыть</span> <i data-lucide="x" style="width:18px;height:18px"></i>
+    </button>
+  </div>
+</div>
+
+<!-- 22.30: пароль Сейфа для скачивания/переноса (нигде не сохраняется) -->
+<div id="vaultPwModal" class="modal-overlay">
+  <div class="modal-card" onclick="event.stopPropagation()">
+    <div class="sheet-handle-area">
+      <div class="sheet-handle"></div>
+    </div>
+    <h3 id="vaultPwTitle" style="font-weight:900;font-size:20px;margin-bottom:4px">Пароль Сейфа</h3>
+    <p id="vaultPwSub" style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:12px">Введите пароль Сейфа</p>
+    <input type="password" id="vaultPwInput" autocomplete="off" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;margin-bottom:14px;outline:none;font-size:15px" placeholder="Пароль Сейфа">
+    <div style="display:flex;flex-direction:column;gap:8px">
+      <button class="sound-item-btn" id="vaultPwGoBtn" onclick="vaultPwConfirm()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
+        <span id="vaultPwGoText">Скачать</span> <i data-lucide="unlock" style="width:18px;height:18px"></i>
+      </button>
+      <button class="sound-item-btn" onclick="closeVaultPwModal()">
+        <span>Отмена</span> <i data-lucide="x" style="width:18px;height:18px"></i>
+      </button>
+    </div>
+    <p style="font-size:11px;font-weight:600;color:var(--subtext-color);margin-top:12px;line-height:1.5">Пароль не сохраняется и никуда не записывается: сервер расшифрует файл в памяти и сразу забудет пароль.</p>
   </div>
 </div>
 
@@ -8598,9 +8681,14 @@ body.modal-open {
         <i data-lucide="cloud" style="width:18px;height:18px"></i>
       </button>
 
-      <!-- 22.29: мультивыбор файлов (галочки + «В ZIP»/«Распаковать»/«Удалить») -->
+      <!-- 22.30: мультивыбор файлов (галочки + «В ZIP»/«Распаковать»/«Удалить») -->
       <button class="action-btn" id="selectModeBtn" onclick="toggleSelectMode()" title="Выбрать файлы">
         <i data-lucide="check-square" style="width:18px;height:18px"></i>
+      </button>
+
+      <!-- 22.30: Сейф — список зашифрованных файлов и скачивание по паролю -->
+      <button class="action-btn" id="vaultBtn" onclick="openVaultModal()" title="🔐 Сейф (зашифрованные файлы)">
+        <i data-lucide="shield" style="width:18px;height:18px"></i>
       </button>
 
       <button class="action-btn" id="themeToggleBtn" onclick="toggleThemeMenu(event)" title="Тема оформления">
@@ -9225,6 +9313,9 @@ function toggleSelectMode() {
   if (!selectMode) selectedIds.clear();
   const bar = document.getElementById('selectionBar');
   if (bar) bar.style.display = selectMode ? '' : 'none';
+  /* 22.30: панель внизу НЕ перекрывает последний файл — отступ снизу */
+  const wrap = document.querySelector('.main-wrapper');
+  if (wrap) wrap.style.paddingBottom = selectMode ? '96px' : '';
   updateSelCount();
   renderAll();
 }
@@ -9310,6 +9401,183 @@ async function deleteSelected() {
   showToast(ok === ids.length ? '✅ Удалено: ' + ok : 'Удалено ' + ok + ' из ' + ids.length);
 }
 
+/* 22.30: СКАЧИВАНИЕ ВЫБРАННОГО: один файл — как есть, несколько — одним ZIP */
+function _saveBlob(blob, name) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = name || 'file';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+}
+
+async function _fetchDownload(id, fallbackName) {
+  const r = await fetch('/api/files/' + encodeURIComponent(id) + '/download', { headers: authHeaders() });
+  if (!r.ok) {
+    let msg = 'HTTP ' + r.status;
+    try { msg = (await r.json()).message || msg; } catch (e) {}
+    throw new Error(msg);
+  }
+  const blob = await r.blob();
+  let name = fallbackName;
+  if (!name) {
+    const cd = r.headers.get('Content-Disposition') || '';
+    const m = cd.match(/filename\*=UTF-8''([^;]+)/);
+    if (m) { try { name = decodeURIComponent(m[1]); } catch (e) {} }
+  }
+  _saveBlob(blob, name || 'file');
+}
+
+async function downloadSelected() {
+  if (!selectedIds.size) { showToast('Сначала выберите файлы'); return; }
+  const ids = [...selectedIds];
+  if (ids.length === 1) {
+    const f = ALL_FILES.find(x => x.id === ids[0]);
+    showToast('📥 Скачиваю…');
+    try {
+      await _fetchDownload(ids[0], f ? f.name : null);
+      showToast('✅ Скачано');
+    } catch (e) { showToast(cloudErrText(e)); }
+    return;
+  }
+  showToast('📦 Собираю ZIP из ' + ids.length + '…');
+  try {
+    const data = await apiJson('/api/files/zip_selected', {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ ids: ids })
+    });
+    if (data.file) {
+      await _fetchDownload(data.file.id, data.file.name);
+      showToast('✅ ZIP скачан');
+    }
+  } catch (e) { showToast(cloudErrText(e)); }
+}
+
+/* ============ 22.30: СЕЙФ В МИНИ-АППЕ ============ */
+let VAULT_ITEMS = [];
+let pendingVaultAction = null; // {mode:'download', id, label} | {mode:'toVault', id, name}
+
+async function openVaultModal() {
+  document.getElementById('vaultModal').classList.add('open');
+  document.body.classList.add('modal-open');
+  await loadVaultList();
+}
+
+function closeVaultModal(e) {
+  if (e) e.stopPropagation();
+  document.getElementById('vaultModal').classList.remove('open');
+  document.body.classList.remove('modal-open');
+}
+
+async function loadVaultList() {
+  const st = document.getElementById('vaultStatus');
+  const lst = document.getElementById('vaultList');
+  st.textContent = 'Загружаю…';
+  lst.innerHTML = '';
+  try {
+    const d = await apiJson('/api/vault/list');
+    VAULT_ITEMS = (d.files || []);
+    if (CONN.bot || d.bot) CONN.bot = String(d.bot || CONN.bot || '');
+    if (d.build) CONN.build = String(d.build);
+    if (!d.crypto) {
+      st.textContent = '⚠️ На сервере нет библиотеки шифрования — скачивание через чат Сейфа.';
+    } else if (!d.safe_set) {
+      st.textContent = '🔐 Сейф ещё не настроен: задайте пароль и 3 вопроса в боте (☁️ Облако → 📤 Загрузить в Сейф).';
+    } else {
+      st.textContent = '✅ Сейф готов · файлов: ' + VAULT_ITEMS.length + ' · сборка ' + (d.build || '?');
+    }
+    if (!VAULT_ITEMS.length) {
+      lst.innerHTML = '<div style="font-size:12px;font-weight:700;color:var(--subtext-color);padding:8px 4px">Пока пусто. Загружайте файлы через ☁️ Облако → 📤 Загрузить в Сейф (или переносите кнопкой «🔐 В Сейф» у файла).</div>';
+      return;
+    }
+    lst.innerHTML = VAULT_ITEMS.map(v => `
+      <button class="sound-item-btn" onclick="askVaultDownload('${escapeHtml(v.id)}')">
+        <span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">🔐 ${escapeHtml(v.label || 'без подписи')} · ${fmtSize(+v.size || 0)}</span>
+        <i data-lucide="download" style="width:16px;height:16px;flex-shrink:0"></i>
+      </button>
+    `).join('');
+    safeIcons();
+  } catch (e) {
+    st.textContent = '⚠️ ' + cloudErrText(e);
+  }
+}
+
+function openVaultPwModal(mode, id, label) {
+  pendingVaultAction = { mode: mode, id: id, label: label };
+  document.getElementById('vaultPwInput').value = '';
+  document.getElementById('vaultPwGoText').textContent = mode === 'toVault' ? '🔐 Зашифровать в Сейф' : '📥 Скачать';
+  document.getElementById('vaultPwTitle').textContent = mode === 'toVault' ? 'Перенести в Сейф' : 'Пароль Сейфа';
+  document.getElementById('vaultPwSub').textContent = mode === 'toVault'
+    ? ('«' + (label || 'файл') + '» будет зашифрован паролем Сейфа, оригинал удалён')
+    : 'Файл расшифруется только с вашим паролем Сейфа';
+  document.getElementById('vaultPwModal').classList.add('open');
+  document.body.classList.add('modal-open');
+}
+
+function closeVaultPwModal() {
+  document.getElementById('vaultPwModal').classList.remove('open');
+  document.body.classList.remove('modal-open');
+  pendingVaultAction = null;
+}
+
+function askVaultDownload(id) {
+  const v = VAULT_ITEMS.find(x => String(x.id) === String(id));
+  openVaultPwModal('download', id, v ? v.label : '');
+}
+
+function openToVaultPw() {
+  if (!activeEditingFileId) return;
+  const f = ALL_FILES.find(x => x.id === activeEditingFileId);
+  closeEditModal();
+  openVaultPwModal('toVault', activeEditingFileId, f ? f.name : '');
+}
+
+async function vaultPwConfirm() {
+  if (!pendingVaultAction) return;
+  const pw = document.getElementById('vaultPwInput').value;
+  if (!pw) { showToast('Введите пароль Сейфа'); return; }
+  const btn = document.getElementById('vaultPwGoBtn');
+  btn.disabled = true;
+  const act = pendingVaultAction;
+  try {
+    if (act.mode === 'toVault') {
+      const d = await apiJson('/api/files/to_vault', {
+        method: 'POST',
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ id: act.id, password: pw })
+      });
+      ALL_FILES = ALL_FILES.filter(x => x.id !== act.id);
+      closeVaultPwModal();
+      renderAll();
+      showToast('🔐 Перенесено в Сейф: ' + (d.vault && d.vault.label ? d.vault.label : 'файл'));
+    } else {
+      const r = await fetch('/api/vault/download', {
+        method: 'POST',
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ id: act.id, password: pw })
+      });
+      if (!r.ok) {
+        let msg = 'HTTP ' + r.status;
+        try { msg = (await r.json()).message || msg; } catch (e) {}
+        throw new Error(msg);
+      }
+      const blob = await r.blob();
+      let name = act.label || 'vault_file';
+      const cd = r.headers.get('Content-Disposition') || '';
+      const m = cd.match(/filename\*=UTF-8''([^;]+)/);
+      if (m) { try { name = decodeURIComponent(m[1]); } catch (e) {} }
+      _saveBlob(blob, name);
+      closeVaultPwModal();
+      showToast('✅ Файл Сейфа скачан');
+    }
+  } catch (e) {
+    showToast('❌ ' + cloudErrText(e));
+  } finally { btn.disabled = false; }
+}
+
 let ALL_FILES = [];
 let listLoading = false;
 
@@ -9329,7 +9597,7 @@ async function loadFiles(silent) {
     ALL_FILES = (data.files || []).map(f => ({
       id: String(f.id || ''), name: String(f.name || 'файл'),
       kind: String(f.kind || 'document'), size: +f.size || 0,
-      ts: String(f.ts || ''), vault: !!f.vault
+      ts: String(f.ts || ''), vault: !!f.vault, own: !!f.own
     }));
     // 22.26: сервер подтвердил связь — запоминаем, кем и чем отвечает
     CONN.bot = String(data.bot || CONN.bot || '');
@@ -9505,6 +9773,7 @@ function renderFiles(files) {
         </p>
         <p style="font-weight:600;font-size:12px;color:var(--subtext-color);margin-top:2px">
           ${fmtSize(f.size)} · ${(f.ts || '').slice(0, 10)}
+          <span title="${f.own ? 'лежит в ВАШЕМ канале' : 'лежит в канале бота'}"> · ${f.own ? '🏢 ваш канал' : '☁️ канал бота'}</span>
         </p>
       </div>
       <div style="display:flex;gap:4px;flex-shrink:0" onclick="event.stopPropagation()">
@@ -9917,8 +10186,13 @@ function renderStorage(d) {
       + '</span>'
     : '';
   if (d.connected) {
+    // 22.30: «ПО ПОЛОЧКАМ» — честно: куда идут файлы и сколько их.
+    const _cnt = (d.counts || {});
     box.innerHTML = '✅ Ваш канал: <b style="color:var(--text-color)">' + escapeHtml(d.title || '') + '</b>'
       + '<br><span style="font-size:11px">подключён ' + escapeHtml(d.added || '') + ' — новые загрузки уходят только в него</span>'
+      + '<br><span style="font-size:11px">📦 Обычных файлов: ' + (_cnt.cloud != null ? _cnt.cloud : '…')
+      + ' • 🔐 В Сейфе: ' + (_cnt.vault != null ? _cnt.vault : '…') + '\u00b7 '
+      + (d.plain ? 'шифрование ВЫКЛ' : 'файлы Сейфа под шифром') + '</span>'
       + ident;
     offBtn.style.display = '';
     connLabel.textContent = 'Заменить канал';
@@ -9933,7 +10207,11 @@ function renderStorage(d) {
   } else {
     box.innerHTML = (d.has_general
       ? '☁️ Сейчас файлы уходят в общее хранилище бота. Подключите свой приватный канал — и они будут лежать только у вас.'
-      : '⚠️ Хранилище не настроено — загрузки будут неудачными. Подключите свой канал ниже.') + ident;
+      : '⚠️ Хранилище не настроено — загрузки будут неудачными. Подключите свой канал ниже.')
+      + '<br><span style="font-size:11px">📦 Обычных файлов: ' + ((d.counts || {}).cloud != null ? d.counts.cloud : '…')
+      + ' • 🔐 В Сейфе: ' + ((d.counts || {}).vault != null ? d.counts.vault : '…') + '</span>'
+      + '<br><span style="font-size:11px;color:#f59e0b">💡 Надёжнее всего СВОЙ частный канал: создайте его, добавьте бота админом с правом «Публикация сообщений» и подключите ниже — данные будут только в вашем хранилище.</span>'
+      + ident;
     offBtn.style.display = 'none';
     connLabel.textContent = 'Подключить канал';
     if (plainBtn) plainBtn.style.display = 'none';
@@ -10301,6 +10579,8 @@ safeIcons();
   <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
     <span id="selCount" style="font-weight:800;font-size:13px">Выбрано: 0</span>
     <span style="flex:1"></span>
+    <!-- 22.30: «Скачать» — скачивание выбранного (одного) или архивом (нескольких) -->
+    <button class="sound-item-btn" onclick="downloadSelected()" style="padding:8px 10px"><span>📥 Скачать</span></button>
     <button class="sound-item-btn" onclick="zipSelected()" style="padding:8px 10px"><span>📦 В ZIP</span></button>
     <button class="sound-item-btn" id="unzipBtn" onclick="unzipSelected()" style="padding:8px 10px;display:none"><span>🗂 Распаковать</span></button>
     <button class="sound-item-btn" onclick="deleteSelected()" style="padding:8px 10px;color:#ef4444"><span>🗑 Удалить</span></button>
@@ -10308,16 +10588,16 @@ safeIcons();
   </div>
 </div>
 
-<!-- 22.29: вход по Telegram ID + веб-паролю — обычный браузер, без Telegram
-     (для тех, у кого VPN/школьная сеть не пускает telegram.org и initData
-     не доходит). Пароль задаётся в чате бота: ☁️ Облако → «🔑 Веб-пароль». -->
+<!-- 22.29/22.30: вход по Telegram ID + паролю Сейфа — обычный браузер,
+     без Telegram (для тех, у кого VPN/школьная сеть не пускает telegram.org).
+     Пароль = пароль Сейфа (задаётся в боте: ☁️ Облако → 🔐 Сейф). -->
 <div id="loginModal" class="modal-overlay">
   <div class="modal-card" onclick="event.stopPropagation()">
     <div class="sheet-handle-area">
       <div class="sheet-handle"></div>
     </div>
     <h3 style="font-weight:900;font-size:20px;margin-bottom:4px">Вход в DEVO+ Облако</h3>
-    <p style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:14px">Открыто вне Telegram, войдите по ID и паролю, заданному в боте</p>
+    <p style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:14px">Открыто вне Telegram: войдите по ID и паролю Сейфа</p>
 
     <div style="margin-bottom:12px">
       <label for="loginUserId" style="font-size:11px;font-weight:800;color:var(--subtext-color);text-transform:uppercase;letter-spacing:0.04em">Telegram ID</label>
@@ -10325,7 +10605,7 @@ safeIcons();
     </div>
     <div style="margin-bottom:14px">
       <label for="loginPassword" style="font-size:11px;font-weight:800;color:var(--subtext-color);text-transform:uppercase;letter-spacing:0.04em">Пароль</label>
-      <input type="password" id="loginPassword" autocomplete="current-password" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;margin-top:4px;outline:none;font-size:15px" placeholder="Веб-пароль из бота">
+      <input type="password" id="loginPassword" autocomplete="current-password" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;margin-top:4px;outline:none;font-size:15px" placeholder="Пароль Сейфа">
     </div>
 
     <div style="display:flex;flex-direction:column;gap:8px">
@@ -10334,7 +10614,7 @@ safeIcons();
       </button>
     </div>
 
-    <p style="font-size:11px;font-weight:600;color:var(--subtext-color);margin-top:12px;line-height:1.5">Пароль задаётся в боте через ☁️ Облако → «🔑 Веб-пароль». Логин — ваш Telegram ID (бот показывает его при создании пароля). 5 неверных попыток — пауза 10 минут.</p>
+    <p style="font-size:11px;font-weight:600;color:var(--subtext-color);margin-top:12px;line-height:1.5">Пароль — тот же, что открывает ваш 🔐 Сейф (задаётся в боте: ☁️ Облако → 🔐 Сейф; смена — там же или по 3 секретным вопросам). Логин — ваш Telegram ID. 5 неверных попыток — пауза 10 минут.</p>
   </div>
 </div>
 </body>
@@ -10381,7 +10661,7 @@ async def miniapp_files_get(request):
     files = [f for f in (getattr(user, "cloud_files", []) or []) if isinstance(f, dict)]
     total = sum(int(f.get("size", 0) or 0) for f in files)
     return web.json_response({
-        "files": [_miniapp_rec_out(f) for f in files],
+        "files": [_miniapp_rec_out(f, user) for f in files],
         "stats": {"count": len(files), "size": total},
         "limit": get_price('cloud_max_files', 50),
         # ВОЛНА 22.26: сервер сам подтверждает связь — кем и чем отвечает.
@@ -10410,7 +10690,7 @@ async def miniapp_files_patch(request):
     if "vault" in body:
         rec["va"] = bool(body.get("vault"))
     save_user(user)
-    return web.json_response({"file": _miniapp_rec_out(rec)})
+    return web.json_response({"file": _miniapp_rec_out(rec, user)})
 
 
 async def miniapp_files_delete(request):
@@ -10667,7 +10947,7 @@ async def miniapp_upload_complete(request):
                             if isinstance(f, dict)]
         user.cloud_files.append(rec)
         save_user(user)
-        return web.json_response({"file": _miniapp_rec_out(rec)})
+        return web.json_response({"file": _miniapp_rec_out(rec, user)})
     finally:
         for p in (s["path"], mt_renamed):
             try:
@@ -10701,6 +10981,9 @@ async def miniapp_storage_get(request):
             added = str((getattr(user, "vault_channel", None) or {}).get("added") or "")
         except Exception:
             added = ""
+    # ВОЛНА 22.30: «ПО ПОЛОЧКАМ» — счётчики и куда что пойдёт.
+    _cloud_n = len([f for f in (getattr(user, "cloud_files", []) or []) if isinstance(f, dict)])
+    _vault_n = len([f for f in (getattr(user, "vault_files", []) or []) if isinstance(f, dict)])
     return web.json_response({
         "connected": bool(vc),
         "id": int(vc[0]) if vc else None,
@@ -10709,6 +10992,8 @@ async def miniapp_storage_get(request):
         # ВОЛНА 22.25: режим «файлы БЕЗ шифрования» (только с личным каналом).
         "plain": _vault_channel_plain(user),
         "has_general": bool(get_cloud_channel_ids()),
+        # 22.30: сколько чего в хранилище + пометка, есть ли личный канал.
+        "counts": {"cloud": _cloud_n, "vault": _vault_n},
         # ВОЛНА 22.26: видимое подтверждение связи с ботом.
         "build": BOT_BUILD,
         "bot": _miniapp_bot_username(),
@@ -10869,9 +11154,17 @@ def _web_lock_remaining_minutes(user) -> int:
 
 async def miniapp_web_login(request):
     """POST /api/web_login {"user_id", "password"} → {"token","user_id",
-    "expires_in","build","bot"}. Неверный ID/пароль — ОДИНАКОВОЕ 401
-    (не раскрываем, существует ли пользователь). 5 промахов подряд —
-    блокировка на 10 минут (429 с количеством минут)."""
+    "expires_in","build","bot"}.
+
+    ВОЛНА 22.30 (по просьбе пользователя): пароль веб-облака = ПАРОЛЬ СЕЙФА.
+    Проверяем _vault_check_safe_password (user.vault_auth) — тот же пароль,
+    что открывает Сейф в чате; сменить его можно в Сейфе или по 3 секретным
+    вопросам («восстановить» в чате) — веб-вход меняется вместе с ним.
+    Совместимость с волной 22.29: если у пользователя нет Сейфа, но есть
+    отдельный веб-пароль (web_password_hash) — принимаем его.
+
+    Неверный ID/пароль — ОДИНАКОВОЕ 401 (не раскрываем, существует ли
+    пользователь). 5 промахов подряд — блокировка на 10 минут (429)."""
     try:
         body = await request.json()
     except Exception:
@@ -10883,15 +11176,25 @@ async def miniapp_web_login(request):
     if not user_id or not password:
         return _miniapp_err(400, "bad_request", "Укажите ID и пароль.")
     user = get_user(user_id)
-    # ЧЕСТНАЯ БЕЗОПАСНОСТЬ: «нет пользователя» и «нет пароля» неразличимы.
-    if not user or not isinstance(getattr(user, "web_password_hash", None), dict):
+    if not user:
+        # ЧЕСТНАЯ БЕЗОПАСНОСТЬ: «нет пользователя» и «неверный пароль»
+        # отвечаются ОДИНАКОВО — существование аккаунтов не раскрываем.
         return _miniapp_err(401, "unauthorized", "Неверный ID или пароль.")
+    # Сначала блокировка: перебор паролей останавливаем ДО проверки.
     mins_left = _web_lock_remaining_minutes(user)
     if mins_left > 0:
         return _miniapp_err(
             429, "locked",
             f"Слишком много попыток. Подождите {mins_left} мин.")
-    if not _web_check_password(user, password):
+    # ВОЛНА 22.30: пароль веб-облака = пароль Сейфа (vault_auth).
+    # Совместимость с 22.29: принимаем и отдельный веб-пароль, если он был
+    # задан и Сейфа нет.
+    ok = _vault_check_safe_password(user, password)
+    _via = "Сейф"
+    if not ok and isinstance(getattr(user, "web_password_hash", None), dict):
+        ok = _web_check_password(user, password)
+        _via = "веб-пароль 22.29"
+    if not ok:
         user.web_login_attempts = int(getattr(user, "web_login_attempts", 0) or 0) + 1
         if user.web_login_attempts >= _WEB_LOGIN_MAX_ATTEMPTS:
             user.web_login_locked_until = (
@@ -10904,7 +11207,8 @@ async def miniapp_web_login(request):
     user.web_login_locked_until = None
     save_user(user)
     token = _web_create_session(user.user_id)
-    logger.info(f"web_login: пользователь {user.user_id} вошёл в веб-облако по паролю")
+    logger.info(f"web_login: пользователь {user.user_id} вошёл в веб-облако "
+                f"по паролю ({_via})")
     return web.json_response({
         "token": token,
         "user_id": str(user.user_id),
@@ -11124,7 +11428,7 @@ async def miniapp_files_zip_selected(request):
     save_user(user)
     logger.info(f"zip_selected: {uid} собрал архив из {len(recs)} файлов "
                 f"({len(archive)} байт)")
-    return web.json_response({"file": _miniapp_rec_out(new_rec)})
+    return web.json_response({"file": _miniapp_rec_out(new_rec, user)})
 
 
 def _zip_entry_base_name(info_name: str) -> "str | None":
@@ -11213,7 +11517,7 @@ async def miniapp_files_unzip(request):
         user.cloud_files = [f for f in (getattr(user, "cloud_files", []) or [])
                             if isinstance(f, dict)]
         user.cloud_files.append(new_rec)
-        created.append(_miniapp_rec_out(new_rec))
+        created.append(_miniapp_rec_out(new_rec, user))
     try:
         zf.close()
     except Exception:
@@ -11226,6 +11530,219 @@ async def miniapp_files_unzip(request):
     logger.info(f"unzip: {uid} распаковал «{rec.get('name')}»: "
                 f"{len(created)} файлов, пропущено {skipped}")
     return web.json_response({"files": created, "skipped": skipped})
+
+
+# --- ВОЛНА 22.30: СЕЙФ В МИНИ-АППЕ («не синхронизируется с сейфом» — фикс) ---
+# Раньше веб-облако показывало ТОЛЬКО обычные файлы (cloud_files), а Сейф
+# жил отдельно в чате — пользователь честно жаловался. Теперь мини-апп:
+#   1) показывает список Сейфа (подписи/размеры — настоящие имена зашифрованы);
+#   2) выдаёт файл по ПАРОЛЮ СЕЙФА (расшифровка в памяти сервера, на диск
+#      ничего не пишется, пароль нигде не сохраняется);
+#   3) умеет перенести файл из облака В Сейф («🔐 В Сейф») с шифрованием.
+# Честные ограничения: веб-выдача/перенос — файлы до 20 МБ (большие качайте
+# через чат Сейфа); нужен настроенный Сейф (пароль + 3 вопроса).
+
+_VAULT_WEB_MAX_BYTES = 20 * 1024 * 1024
+
+
+def _miniapp_vault_out(rec):
+    """Запись vault_files → JSON для мини-аппа: НИКАКИХ секретов (соль,
+    верификатор, указатели канала) наружу не отдаём."""
+    return {
+        "id": str(rec.get("id") or ""),
+        "label": str(rec.get("label") or ""),
+        "kind": str(rec.get("kind") or "document"),
+        "size": int(rec.get("size_orig") or 0),
+        "ts": str(rec.get("ts") or ""),
+        "cat": str(rec.get("cat") or ""),
+    }
+
+
+async def miniapp_vault_list(request):
+    """GET /api/vault/list — список файлов Сейфа (подписи видны, содержимое
+    зашифровано) + статус Сейфа. Пароль НЕ нужен."""
+    user, uid, err = await _api_get_user_any(request)
+    if err is not None:
+        return err
+    files = [f for f in (getattr(user, "vault_files", []) or []) if isinstance(f, dict)]
+    total = sum(int(f.get("size_orig", 0) or 0) for f in files)
+    return web.json_response({
+        "files": [_miniapp_vault_out(f) for f in files],
+        "stats": {"count": len(files), "size": total},
+        # Сейф настроен? (пароль + 3 вопроса) — иначе веб-выдача невозможна.
+        "safe_set": _vault_auth_valid(user),
+        "crypto": AESGCM is not None,
+        "build": BOT_BUILD,
+        "bot": _miniapp_bot_username(),
+    })
+
+
+async def miniapp_vault_download(request):
+    """POST /api/vault/download {"id","password"} — расшифровка В ПАМЯТИ
+    и отдача файла. Пароль Сейфа нигде не сохраняется; на диск не пишем."""
+    user, uid, err = await _api_get_user_any(request)
+    if err is not None:
+        return err
+    try:
+        body = await request.json()
+    except Exception:
+        return _miniapp_err(400, "bad_json", "Ожидался JSON.")
+    rec = _vault_find_record(user, str((body or {}).get("id") or ""))
+    if not rec:
+        return _miniapp_err(404, "not_found", "Файл не найден в Сейфе.")
+    if AESGCM is None:
+        return _miniapp_err(503, "no_crypto",
+                            "На сервере нет библиотеки шифрования — "
+                            "скачайте файл через чат Сейфа.")
+    password = str((body or {}).get("password") or "")
+    if rec.get("plain"):
+        # Режим «без шифра»: пароля нет, отдаём как есть.
+        container = await _miniapp_fetch_file_bytes(rec, _VAULT_WEB_MAX_BYTES)
+        if container is None:
+            return _miniapp_err(502, "download_failed",
+                                "Не удалось скачать файл из хранилища.")
+        name = str(rec.get("name") or "file")
+        return web.Response(
+            body=container,
+            content_type="application/octet-stream",
+            headers={"Content-Disposition": _miniapp_content_disposition(name),
+                     "Cache-Control": "no-store"})
+    if rec.get("dvf2") or int(rec.get("size_orig", 0) or 0) > _VAULT_WEB_MAX_BYTES:
+        return _miniapp_err(
+            413, "too_big",
+            "Этот файл больше 20 МБ — в веб-облаке такие не расшифровываются. "
+            "Скачайте его через чат: 🔐 Сейф → выберите файл → пароль.")
+    if not password:
+        return _miniapp_err(401, "need_password", "Введите пароль Сейфа.")
+    if not _vault_check_password(user, rec, password):
+        return _miniapp_err(401, "bad_password", "Неверный пароль Сейфа.")
+    container = await _miniapp_fetch_file_bytes(rec, _VAULT_WEB_MAX_BYTES)
+    if container is None:
+        return _miniapp_err(502, "download_failed",
+                            "Не удалось скачать шифр из хранилища. "
+                            "Попробуйте позже или через чат Сейфа.")
+    try:
+        meta, payload = _vault_unpack(password, container)
+    except Exception:
+        return _miniapp_err(401, "bad_password",
+                            "Неверный пароль Сейфа (или файл повреждён).")
+    name = str((meta or {}).get("name") or f"vault_{rec.get('id', 'file')}")
+    mime = str((meta or {}).get("mime") or "application/octet-stream")
+    logger.info(f"vault web download: {uid} выдал файл Сейфа {rec.get('id')}")
+    return web.Response(
+        body=payload,
+        content_type=mime if mime else "application/octet-stream",
+        headers={"Content-Disposition": _miniapp_content_disposition(name),
+                 "Cache-Control": "no-store"})
+
+
+async def miniapp_files_to_vault(request):
+    """POST /api/files/to_vault {"id","password"} — переносит обычный файл
+    облака В СЕЙФ: шифрует паролем Сейфа, заливает шифр в канал, оригинал
+    стирает (тот же смысл, что кнопка 🔐 в чате)."""
+    user, uid, err = await _api_get_user_any(request)
+    if err is not None:
+        return err
+    body = await _safe_json(request) or {}
+    rec = _cloud_find_record(user, str(body.get("id") or ""))
+    if not rec:
+        return _miniapp_err(404, "not_found", "Файл не найден (возможно, уже удалён).")
+    if AESGCM is None:
+        return _miniapp_err(503, "no_crypto",
+                            "На сервере нет библиотеки шифрования — "
+                            "перенесите файл в Сейф через чат (кнопка 🔐).")
+    if not _vault_auth_valid(user):
+        return _miniapp_err(
+            409, "no_safe",
+            "Сначала настройте Сейф в чате бота: ☁️ Облако → 📤 Загрузить в "
+            "Сейф — задайте пароль и 3 секретных вопроса. После этого перенос "
+            "из веб-облака заработает.")
+    password = str(body.get("password") or "")
+    if not password:
+        return _miniapp_err(401, "need_password", "Введите пароль Сейфа.")
+    if not _vault_check_safe_password(user, password):
+        return _miniapp_err(401, "bad_password", "Неверный пароль Сейфа.")
+    if int(rec.get("size") or 0) > _VAULT_WEB_MAX_BYTES:
+        return _miniapp_err(
+            413, "too_big",
+            "Файл больше 20 МБ — в Сейф из веб-облака такие не перенести. "
+            "Загрузите его в Сейф через чат (до 2 ГБ).")
+    data = await _miniapp_fetch_file_bytes(rec, _VAULT_WEB_MAX_BYTES)
+    if data is None:
+        return _miniapp_err(502, "download_failed",
+                            "Не удалось скачать файл из хранилища.")
+    name = str(rec.get("name") or "file")
+    mime = str(rec.get("mime") or "application/octet-stream")
+    meta = {"name": name[:120], "mime": mime, "ts": rec.get("ts") or ""}
+    # DVF1-контейнер (совместим с выдачей в чате) + свои соль/верификатор
+    # для записи vault_files (проверка пароля без скачивания).
+    salt = os.urandom(16)
+    nonce = os.urandom(12)
+    key = _vault_derive_key(password, salt, VAULT_KDF_ITERS)
+    header = json.dumps(meta, ensure_ascii=False).encode("utf-8")
+    plaintext = header + b"\x00" + data
+    try:
+        ct = AESGCM(key).encrypt(nonce, plaintext, VAULT_MAGIC + bytes([VAULT_VERSION]))
+    except Exception as e:
+        logger.error(f"to_vault: шифрование не удалось: {e}")
+        return _miniapp_err(500, "encrypt_failed", "Шифрование не удалось, файл не тронут.")
+    container = (VAULT_MAGIC + bytes([VAULT_VERSION])
+                 + VAULT_KDF_ITERS.to_bytes(4, "big") + salt + nonce + ct)
+    app = _MINIAPP_PTB_APP
+    if app is None:
+        return _miniapp_err(503, "no_bot", "Бот ещё запускается — попробуйте через минуту.")
+    sent = await _storage_upload_document(
+        _MiniappCtx(app.bot), container,
+        filename=f"vault_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{rec.get('id', 'f')}.bin",
+        caption="🔐 Сейф: зашифрованный файл (открыть без пароля невозможно).",
+        user=user)
+    if not sent:
+        return _miniapp_err(502, "upload_failed",
+                            "Telegram не принял шифр в хранилище. Файл не тронут.")
+    vrec = {
+        "id": _vault_gen_id(user),
+        "kind": str(rec.get("kind") or "document"), "mime": mime,
+        "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "size_orig": int(rec.get("size") or len(data)),
+        "size_enc": len(container),
+        "salt": salt.hex(),
+        "verifier": _vault_verifier(key).hex(),
+        "iters": int(VAULT_KDF_ITERS),
+        "nonce": nonce.hex(),
+        "msg_id": int(sent.get("message_id") or 0),
+        "file_id": sent.get("file_id"),
+        "channel_id": sent.get("channel_id"),
+        "label": name[:80],
+        "cat": str(rec.get("cat") or ""),
+    }
+    # Оригинал: стираем из канала и из базы облака (как cloud_del).
+    channel_id = rec.get("channel_id") or get_storage_channel_id()
+    if channel_id and rec.get("msg_id"):
+        try:
+            await app.bot.delete_message(chat_id=int(channel_id),
+                                         message_id=int(rec["msg_id"]))
+        except Exception:
+            pass
+    user.cloud_files = [f for f in (getattr(user, "cloud_files", []) or [])
+                        if not (isinstance(f, dict) and f.get("id") == rec.get("id"))]
+    user.vault_files = [f for f in (getattr(user, "vault_files", []) or [])
+                        if isinstance(f, dict)]
+    user.vault_files.append(vrec)
+    save_user(user)
+    _stat_bump("vault_upload")
+    logger.info(f"to_vault: {uid} перенёс «{name}» в Сейф ({len(container)} байт шифра)")
+    return web.json_response({
+        "vault": _miniapp_vault_out(vrec),
+        "file": _miniapp_rec_out(rec, user),
+    })
+
+
+async def _safe_json(request):
+    """Аккуратное чтение JSON-тела (None — не JSON)."""
+    try:
+        return await request.json()
+    except Exception:
+        return None
 
 
 def mount_miniapp_routes(app):
@@ -11254,6 +11771,10 @@ def mount_miniapp_routes(app):
     # ВОЛНА 22.29: мультивыбор — собранный ZIP из выбранных + распаковка ZIP
     app.router.add_post("/api/files/zip_selected", miniapp_files_zip_selected)
     app.router.add_post("/api/files/unzip", miniapp_files_unzip)
+    # ВОЛНА 22.30: Сейф в мини-аппе — список/выдача по паролю/перенос в Сейф
+    app.router.add_get("/api/vault/list", miniapp_vault_list)
+    app.router.add_post("/api/vault/download", miniapp_vault_download)
+    app.router.add_post("/api/files/to_vault", miniapp_files_to_vault)
 
 
 async def cloud_exit_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -14569,8 +15090,9 @@ def get_vault_menu_keyboard():
         # ВОЛНА 22.20: «🔗 Моё облако» — НАСТРОЙКА САМОГО ПОЛЬЗОВАТЕЛЯ:
         # свой приватный канал как личное хранилище (без панели разработчика).
         [InlineKeyboardButton("🔗 Моё облако", callback_data="vault_cloud")],
-        # ВОЛНА 22.29: веб-пароль для входа в Веб-облако без Telegram.
-        [InlineKeyboardButton("🔑 Веб-пароль", callback_data="web_password_menu")],
+        # ВОЛНА 22.29/22.30: веб-вход в Веб-облако без Telegram — по паролю
+        # Сейфа (с 22.30 пароль Сейфа = пароль веб-входа).
+        [InlineKeyboardButton("🌐 Веб-вход (пароль Сейфа)", callback_data="web_password_menu")],
         # ВОЛНА 9: восстановление и управление вопросами — прямо в меню Сейфа.
         [InlineKeyboardButton("🔑 Забыл пароль (восстановить)", callback_data="vault_rec")],
         [InlineKeyboardButton("❓ Сменить секретные вопросы", callback_data="vault_qs")],
@@ -14897,43 +15419,53 @@ async def vault_cloud_add_cb(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # ==================================
 
 def _web_password_text(user) -> str:
-    has_pw = isinstance(getattr(user, "web_password_hash", None), dict)
-    when = str(getattr(user, "web_password_set_at", "") or "")
-    if has_pw:
-        status = f"✅ Пароль задан{f' ({when[:16]})' if when else ''}.\n" \
-                 f"🆔 Ваш логин — Telegram ID: <code>{user.user_id}</code>"
-    else:
-        status = ("❌ Пароль не задан — вход в веб-облако по паролю "
-                  "пока закрыт.")
+    """ВОЛНА 22.30: пароль веб-облака = ПАРОЛЬ СЕЙФА (по просьбе пользователя).
+    Отдельного «веб-пароля» больше не создаём: вход в веб-облако принимает
+    тот же пароль, что открывает Сейф; смена — в Сейфе или по 3 вопросам."""
+    has_safe = _vault_auth_valid(user)
+    status = (
+        "✅ Сейф настроен: ваш пароль Сейфа уже работает для входа в "
+        "веб-облако."
+        if has_safe else
+        "❌ Сейф ещё не настроен — откройте ☁️ Облако → 🔐 Сейф и задайте "
+        "пароль (он же станет паролем веб-облака)."
+    )
     return (
-        "🔑 <b>Веб-пароль</b>\n\n"
-        "Вход в 🌐 Веб-облако из обычного браузера — без Telegram и без VPN.\n\n"
+        "🌐 <b>Веб-вход в DEVO+ Облако</b>\n\n"
         f"{status}\n\n"
-        "Требования к паролю: минимум 8 символов, хотя бы одна буква и одна "
-        "цифра. Сам пароль нигде не хранится — только его «отпечаток» "
-        "(PBKDF2, 200 000 раундов). 5 неверных попыток подряд — пауза на "
-        "10 минут.\n\n"
-        "Вход: откройте веб-облако и введите свой Telegram ID (виден выше) "
-        "и этот пароль."
+        "Как это работает:\n"
+        "• В Telegram: откройте мини-апп кнопкой меню «☁️ DEVO+» (или "
+        "☁️ Облако → 🌐 Веб-облако) — вход пройдёт сам, ничего вводить "
+        "не нужно.\n"
+        "• В обычном браузере (без Telegram, без VPN): на странице "
+        "веб-облака введите свой Telegram ID и ПАРОЛЬ СЕЙФА.\n"
+        "• Сменить пароль — в Сейфе (🔐), или восстановите доступ по СВОИМ "
+        "3 секретным вопросам («🔑 Забыл пароль») — веб-вход изменится "
+        "вместе с паролем Сейфа.\n\n"
+        "Требования к паролю: минимум 7 символов. 5 неверных попыток "
+        "веб-входа подряд — пауза на 10 минут.\n\n"
+        "💡 <b>Совет по надёжности:</b> лучше создать СВОЙ частный канал и "
+        "добавить бота администратором с правом «Публикация сообщений», "
+        "затем подключить его через ☁️ Облако → 🔗 Моё облако. Тогда файлы "
+        "лежат только в ВАШЕМ канале — это ваше собственное хранилище, и "
+        "данные надёжнее."
     )
 
 
 def _web_password_kb(user):
-    has_pw = isinstance(getattr(user, "web_password_hash", None), dict)
-    rows = []
-    if has_pw:
-        rows.append([InlineKeyboardButton("🔁 Сменить пароль", callback_data="web_pw_change")])
-        rows.append([InlineKeyboardButton("🗑 Удалить пароль", callback_data="web_pw_delete")])
-    else:
-        rows.append([InlineKeyboardButton("➕ Задать пароль", callback_data="web_pw_set")])
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="cloud_menu")])
+    rows = [
+        [InlineKeyboardButton("🔐 Открыть Сейф", callback_data="vault_menu")],
+        [InlineKeyboardButton("🔗 Моё облако (свой канал)", callback_data="vault_cloud")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="cloud_menu")],
+    ]
     return InlineKeyboardMarkup(rows)
 
 
 def _web_pw_validate(password: str) -> "str | None":
-    """None — пароль годен; иначе текст ошибки (для пользователя)."""
-    if not password or len(password) < 8:
-        return "Пароль слишком короткий — минимум 8 символов. Придумайте другой:"
+    """None — пароль годен; иначе текст ошибки (для пользователя).
+    ВОЛНА 22.30: минимум 7 символов (по просьбе пользователя), буква и цифра."""
+    if not password or len(password) < 7:
+        return "Пароль слишком короткий — минимум 7 символов. Придумайте другой:"
     if not re.search(r"[A-Za-zА-Яа-яЁё]", password):
         return "В пароле должна быть хотя бы одна буква. Придумайте другой:"
     if not re.search(r"\d", password):
@@ -14942,7 +15474,9 @@ def _web_pw_validate(password: str) -> "str | None":
 
 
 async def web_password_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Экран «🔑 Веб-пароль»: статус + Задать/Сменить/Удалить."""
+    """Экран «🌐 Веб-вход»: пароль веб-облака = пароль Сейфа (22.30).
+    Ссылку на хостинг НЕ даём — вход через кнопку меню бота или по адресу
+    веб-облака, который открывает сам разработчик."""
     query = update.callback_query
     try:
         await query.answer()
@@ -14954,21 +15488,6 @@ async def web_password_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYP
             await query.answer("Сначала зарегистрируйтесь — /start", show_alert=True)
         except Exception:
             pass
-        return MAIN_MENU
-    if not MINIAPP_URL:
-        # Честно: без адреса веб-облака пароль задавать некуда.
-        try:
-            await query.edit_message_text(
-                "🌐 Разработчик не настроил адрес веб-облака, задать пароль нельзя.",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("⬅️ Назад", callback_data="cloud_menu")]]),
-            )
-        except Exception:
-            try:
-                await query.message.reply_text(
-                    "🌐 Разработчик не настроил адрес веб-облака, задать пароль нельзя.")
-            except Exception:
-                pass
         return MAIN_MENU
     try:
         await query.edit_message_text(
@@ -15006,7 +15525,7 @@ async def web_pw_set_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await query.edit_message_text(
             "🔐 Придумайте веб-пароль и пришлите его следующим сообщением.\n\n"
-            "Требования: минимум 8 символов, хотя бы одна буква и одна цифра.\n"
+            "Требования: минимум 7 символов, хотя бы одна буква и одна цифра.\n"
             "Сообщение с паролем я удалю из чата после сохранения.\n\n"
             "«отмена» — выйти без изменений.")
     except Exception:
@@ -15037,7 +15556,7 @@ async def web_pw_change_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await query.edit_message_text(
                 "🔐 Пароль ещё не задан. Пришлите новый пароль одним "
-                "сообщением (минимум 8 символов, буква и цифра).")
+                "сообщением (минимум 7 символов, буква и цифра).")
         except Exception:
             pass
         return WEB_PW_ENTER
@@ -15105,14 +15624,16 @@ async def web_pw_old_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["web_pw_mode"] = "change"
     await update.message.reply_text(
         "✅ Старый пароль верный.\n\nШаг 2 из 2: пришлите НОВЫЙ пароль "
-        "(минимум 8 символов, хотя бы одна буква и одна цифра). "
+        "(минимум 7 символов, хотя бы одна буква и одна цифра). "
         "Сообщение я удалю из чата.")
     return WEB_PW_ENTER
 
 
 async def web_pw_enter_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Сохранение нового веб-пароля (состояние WEB_PW_ENTER).
-    Валидации: ≥8 символов, буква и цифра. Сообщение пользователя удаляется."""
+    Валидации: ≥7 символов (22.30), буква и цифра. Сообщение пользователя
+    удаляется. Ссылку на хостинг НЕ показываем (просьба пользователя): вход
+    — через кнопку меню бота или по адресу веб-облака."""
     user = get_user(str(update.effective_user.id))
     if not user:
         return MAIN_MENU
@@ -15137,15 +15658,16 @@ async def web_pw_enter_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("web_pw_mode", None)
     logger.info(f"web_password: пользователь {user.user_id} "
                 f"{'сменил' if _mode == 'change' else 'задал'} веб-пароль")
+    # ВОЛНА 22.30: ссылку на хостинг НЕ даём (просьба пользователя) —
+    # вход через кнопку меню бота или по адресу веб-облака разработчика.
     await update.message.reply_text(
-        "✅ Веб-пароль сохранён. Войдите в веб-облако:\n"
-        f"{MINIAPP_URL}\n\n"
+        "✅ Веб-пароль сохранён.\n\n"
+        "Вход: мини-апп «☁️ DEVO+» кнопкой меню бота — вход пройдёт сам, "
+        "или на странице веб-облака в обычном браузере:\n"
         f"🆔 Логин — ваш Telegram ID: <code>{user.user_id}</code>\n"
-        "Пункт «🔑 Веб-пароль» живёт в ☁️ Облако и 🔐 Сейфе.",
+        "🔑 Пароль — тот, что вы сейчас задали (а если настроен Сейф — "
+        "используется пароль Сейфа).",
         parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("🌐 Открыть веб-облако", url=MINIAPP_URL)]])
-        if MINIAPP_URL else None,
     )
     return MAIN_MENU
 
@@ -25174,8 +25696,9 @@ def _fuzzy_menu_target(low: str) -> "str | None":
 
 def _more_menu_kb(user, context):
     """Клавиатура «📋 Ещё»: скрытые кнопки (перемещённые через настройки)
-    + «🎂 ДР одноклассников». Соответствие «номер → кнопка» живёт в
-    context.user_data['more_map'] (callback_data ограничен 64 байтами)."""
+    + «🤒 Я болел(а)» (22.30) + «🎂 ДР одноклассников». Соответствие
+    «номер → кнопка» живёт в context.user_data['more_map']
+    (callback_data ограничен 64 байтами)."""
     hidden = [b for b in (getattr(user, 'hidden_buttons', []) or [])
               if isinstance(b, str) and b]
     more_map = {}
@@ -25184,6 +25707,8 @@ def _more_menu_kb(user, context):
         for i, name in enumerate(hidden[:40]):
             more_map[str(i)] = name
             rows.append([InlineKeyboardButton(name, callback_data=f"more_run_{i}")])
+    # ВОЛНА 22.30: «Я болел(а)» — по просьбе пользователя живёт и в «Ещё».
+    rows.append([InlineKeyboardButton("🤒 Я болел(а)", callback_data="more_run_sick")])
     rows.append([InlineKeyboardButton("🎂 ДР одноклассников", callback_data="bd_list")])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_to_main")])
     context.user_data["more_map"] = more_map
@@ -25247,7 +25772,12 @@ async def more_run_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user:
         return MAIN_MENU
     more_map = context.user_data.get("more_map") or {}
-    name = more_map.get(query.data.replace("more_run_", "", 1))
+    raw_key = query.data.replace("more_run_", "", 1)
+    # ВОЛНА 22.30: фиксированные пункты «Ещё» вне скрытых кнопок.
+    if raw_key == "sick":
+        name = "🤒 Я болел(а)"
+    else:
+        name = more_map.get(raw_key)
     if not name:
         kb, hidden_count = _more_menu_kb(user, context)
         try:
@@ -33341,19 +33871,23 @@ def _pomo_menu_text(sess, cfg, tz=3):
             _left = max(0, int((_ends - _now_local).total_seconds() // 60))
         except (TypeError, ValueError):
             _left = None
-        _ph = {'work': '▶️ работа', 'break': '☕️ короткий перерыв',
-               'long': '🛌 длинный перерыв'}.get(sess.get('phase'), sess.get('phase'))
+        _ph = {'work': '▶️ УЧУСЬ', 'break': '☕️ ОТДЫХАЮ',
+               'long': '🛌 БОЛЬШОЙ ОТДЫХ'}.get(sess.get('phase'), sess.get('phase'))
         _left_line = f" · осталось ≈{_left} мин" if _left is not None else ""
-        return (f"🍅 Помодоро\n\n"
-                f"Сессия ИДЁТ: {_ph}{_left_line}\n"
-                f"🔁 Цикл: {sess.get('cycle_done', 0)}/{sess.get('cycles', 4)}\n"
-                f"⚙️ {sess.get('work')}/{sess.get('brk')}/{sess.get('long')} мин\n\n"
-                "Фазы сменяются сами — бот пришлёт уведомление.")
-    return (f"🍅 Помодоро\n\n"
-            f"Настройка: ▶️ работа {cfg['work']} мин → ☕️ перерыв {cfg['brk']} мин; "
-            f"после {cfg['cycles']} циклов — 🛌 длинный перерыв {cfg['long']} мин.\n\n"
-            "Классическая схема: 25 минут работы, 5 минут перерыва, "
-            "длинный перерыв после 4 циклов.")
+        return (f"📚 Таймер учёбы — ИДЁТ\n\n"
+                f"Сейчас: {_ph}{_left_line}\n"
+                f"🔄 Круг: {sess.get('cycle_done', 0)} из {sess.get('cycles', 4)} пройдено\n"
+                f"⚙️ Учусь {sess.get('work')} мин → отдых {sess.get('brk')} мин\n\n"
+                "Фазы меняются сами — бот сам напишет, когда отдыхать, "
+                "а когда снова садиться за учёбу.")
+    return (f"📚 Таймер учёбы\n\n"
+            "Как это работает:\n"
+            f"1️⃣ УЧИТЕСЬ {cfg['work']} минут — бот молчит и ждёт.\n"
+            f"2️⃣ Когда время вышло — бот пишет: ОТДЫХАЙТЕ {cfg['brk']} минут.\n"
+            f"3️⃣ Так {cfg['cycles']} круга подряд, а потом большой отдых "
+            f"{cfg['long']} минут.\n\n"
+            "Бот сам говорит, когда учиться, а когда отдыхать — от вас "
+            "ничего нажимать не нужно. Жмите «▶️ Старт» и начинайте.")
 
 
 def _pomo_menu_kb(sess, cfg):
@@ -33392,8 +33926,8 @@ async def pomo_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def _pomo_setup_kb(cfg):
-    _names = {"work": "▶️ Работа", "brk": "☕️ Перерыв",
-              "long": "🛌 Длинный", "cycles": "🔁 Циклов"}
+    _names = {"work": "▶️ Учусь (мин)", "brk": "☕️ Отдых (мин)",
+              "long": "🛌 Большой отдых (мин)", "cycles": "🔄 Кругов"}
     rows = []
     for key in ("work", "brk", "long", "cycles"):
         rows.append([InlineKeyboardButton(
@@ -33413,8 +33947,12 @@ async def pomo_setup_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
     cfg = _pomo_cfg_from_user_data(context)
-    _txt = ("⚙️ Настройка помодоро\n\nВыберите длительности и число циклов "
-            "(✅ — текущий выбор):")
+    _txt = ("⚙️ Настройка таймера учёбы\n\n"
+            "• ▶️ Учусь — сколько учиться за один круг\n"
+            "• ☕️ Отдых — сколько отдыхать после круга\n"
+            "• 🔄 Кругов — сколько кругов подряд\n"
+            "• 🛌 Большой отдых — отдых после всех кругов\n\n"
+            "Выберите значения (✅ — текущий выбор):")
     try:
         await query.edit_message_text(_txt, reply_markup=_pomo_setup_kb(cfg))
     except Exception:
@@ -33438,8 +33976,12 @@ async def pomo_pick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cfg = _pomo_cfg_from_user_data(context)
     cfg[key] = _val
     context.user_data['pomo_cfg'] = cfg
-    _txt = ("⚙️ Настройка помодоро\n\nВыберите длительности и число циклов "
-            "(✅ — текущий выбор):")
+    _txt = ("⚙️ Настройка таймера учёбы\n\n"
+            "• ▶️ Учусь — сколько учиться за один круг\n"
+            "• ☕️ Отдых — сколько отдыхать после круга\n"
+            "• 🔄 Кругов — сколько кругов подряд\n"
+            "• 🛌 Большой отдых — отдых после всех кругов\n\n"
+            "Выберите значения (✅ — текущий выбор):")
     try:
         await query.edit_message_text(_txt, reply_markup=_pomo_setup_kb(cfg))
     except Exception:
@@ -33480,11 +34022,12 @@ async def pomo_start_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
     sessions[uid] = sess
     save_data(POMODORO_FILE, sessions)
-    _txt = (f"🍅 Помодоро запущен!\n\n"
-            f"▶️ Работа: {sess['work']} мин → ☕️ перерыв: {sess['brk']} мин\n"
-            f"🔁 Циклов: {sess['cycles']} · потом 🛌 длинный перерыв {sess['long']} мин\n"
-            f"⏰ Фаза закончится в {sess['ends'][11:]}\n\n"
-            f"Удачной работы! Фазы сменяются сами.")
+    _txt = (f"📚 Таймер учёбы запущен!\n\n"
+            f"▶️ Сейчас УЧИТЕСЬ {sess['work']} минут — бот молчит.\n"
+            f"☕️ Потом отдохнёте {sess['brk']} минут — бот напишет.\n"
+            f"🔄 Кругов: {sess['cycles']} · после них большой отдых {sess['long']} мин\n"
+            f"⏰ Конец круга в {sess['ends'][11:]}\n\n"
+            f"Садитесь за учёбу — об отдыхе бот напомнит сам.")
     try:
         await query.edit_message_text(_txt, reply_markup=_pomo_phase_kb())
     except Exception:
@@ -33507,7 +34050,7 @@ async def pomo_stop_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sessions[uid] = sess
         save_data(POMODORO_FILE, sessions)
         _n_done = int(sess.get('cycle_done', 0) or 0)
-        _txt = (f"⏹ Помодоро остановлен.\nЗавершено помодоро: {_n_done} из "
+        _txt = (f"⏹ Таймер учёбы остановлен.\nПройдено кругов: {_n_done} из "
                 f"{sess.get('cycles', 4)}.")
         _kb = InlineKeyboardMarkup([[InlineKeyboardButton(
             "▶️ Запустить заново", callback_data="pomo_menu")]])
@@ -33585,11 +34128,11 @@ async def _tick_send_pomodoro(bot):
                 try:
                     await bot.send_message(
                         chat_id=int(uid),
-                        text=(f"🎉 Помодоро-сессия завершена! Отличная работа: "
-                              f"{s.get('cycle_done', 0)} помодоро.\n\n"
-                              f"Запустить новую — «⏰ Таймер» → «🍅 Помодоро»."),
+                        text=(f"🎉 Таймер учёбы завершён! Отличная работа: "
+                              f"{s.get('cycle_done', 0)} кругов.\n\n"
+                              f"Запустить новую — «⏰ Таймер» → «📚 Таймер учёбы»."),
                         reply_markup=InlineKeyboardMarkup([[
-                            InlineKeyboardButton("🍅 Помодоро",
+                            InlineKeyboardButton("📚 Таймер учёбы",
                                                  callback_data="pomo_menu")]]))
                 except Exception as e:
                     logger.error(f"tick/pomodoro: завершение {uid}: {e}")
@@ -33604,15 +34147,15 @@ async def _tick_send_pomodoro(bot):
             sessions[uid] = s
             changed = True
             if nxt == 'break':
-                _msg = (f"🍅 Помодоро {s['cycle_done']}/{s.get('cycles', 4)} готов!\n\n"
-                        f"☕️ Перерыв {dur} мин — отойдите от учёбы.")
+                _msg = (f"☕️ Круг {s['cycle_done']} из {s.get('cycles', 4)} закончен!\n\n"
+                        f"ОТДЫХАЙТЕ {dur} мин — отойдите от учёбы.")
             elif nxt == 'long':
-                _msg = (f"🛌 Длинный перерыв {dur} мин — все "
-                        f"{s['cycle_done']}/{s.get('cycles', 4)} помодоро сделаны!")
+                _msg = (f"🛌 Большой отдых {dur} мин — все "
+                        f"{s['cycle_done']} круга из {s.get('cycles', 4)} сделаны!")
             else:
-                _msg = (f"☕️ Перерыв окончен — за работу!\n\n"
-                        f"▶️ Помодоро {s['cycle_done'] + 1}/{s.get('cycles', 4)} "
-                        f"на {dur} мин.")
+                _msg = (f"☕️ Отдых окончен — за учёбу!\n\n"
+                        f"▶️ УЧИТЕСЬ {dur} мин (круг "
+                        f"{s['cycle_done'] + 1} из {s.get('cycles', 4)}).")
             _msg += f"\n⏰ до {s['ends'][11:]}"
             try:
                 await bot.send_message(chat_id=int(uid), text=_msg,
