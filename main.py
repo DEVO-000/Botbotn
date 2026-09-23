@@ -242,6 +242,10 @@ TIMERS_FILE = _data_file("timers.json")
 # Хранится на диске и в канале-БД — сессия переживает рестарт и тикер сам
 # продолжит фазы (работа/перерыв) даже после падения сервера.
 POMODORO_FILE = _data_file("pomodoro.json")
+# ВОЛНА 22.31: «🧹 Дежурные» — состояние ротации дежурных по классам.
+# Хранится в канале-БД (как pomodoro.json): переживает рестарт, тикер
+# продолжает расписание (время/дни задал админ класса) после деплоя.
+DUTY_FILE = _data_file("duty.json")
 ANONYMOUS_MESSAGES_FILE = _data_file("anonymous_messages.json")
 SUGGESTIONS_FILE = _data_file("suggestions.json")
 HOMEWORK_FILE = _data_file("homework.json")
@@ -513,6 +517,7 @@ WEB_PW_ENTER_OLD = 151     # смена веб-пароля: сначала СТ
 DND_WAIT_TIME = 152        # «🌙 Не беспокоить»: ввод времени «со скольки»/«до скольки»
 SICK_WAIT_FROM = 153       # «🤒 Я болел(а)»: дата начала (ГГГГ-ММ-ДД)
 SICK_WAIT_TO = 154         # «🤒 Я болел(а)»: дата конца (ГГГГ-ММ-ДД)
+DUTY_WAIT_TIME = 155       # 22.31: «🧹 Дежурные» — ввод своего времени ЧЧ:ММ
 
 # ВОЛНА 22.4: «🎙 Пульт» удалён ПОЛНОСТЬЮ по решению пользователя — кнопки,
 # состояний (бывшие 126–131), хендлеров и хранилищ стилей больше нет.
@@ -540,7 +545,9 @@ _QUICK_SKIP_STATES = frozenset({VAULT_REN_WAIT, VAULT_LABEL_WAIT,
                                 VAULT_MYCLOUD_WAIT,
                                 # ВОЛНА 22.29: пароль/время/даты — не команды.
                                 WEB_PW_ENTER, WEB_PW_ENTER_OLD,
-                                DND_WAIT_TIME, SICK_WAIT_FROM, SICK_WAIT_TO})
+                                DND_WAIT_TIME, SICK_WAIT_FROM, SICK_WAIT_TO,
+                                # ВОЛНА 22.31: время дежурств — не команда.
+                                DUTY_WAIT_TIME})
 
 # ==================================
 # === ВОЛНА 12: ГЛОБАЛЬНАЯ КНОПКА ОТМЕНЫ ===
@@ -1203,6 +1210,8 @@ _SANITIZE_TARGET_FILES = [
     REPORTS_FILE,
     ADMIN_LOG_FILE,
     POMODORO_FILE,
+    # ВОЛНА 22.31: расписание и ротация дежурных — тоже в канале-БД.
+    DUTY_FILE,
 ]
 
 
@@ -1276,14 +1285,13 @@ async def start_keep_alive_server():
     плюс JSON API к ОСНОВНОЙ базе бота (/api/*). Раньше `/` отдавал только
     «OK»; теперь отдаёт мини-апп (это тоже честный 200 для health-check),
     а /health остаётся как был — self-ping и платформы проверяют его."""
-    app = web.Application(
-        # ВОЛНА 22.30: КРИТИЧЕСКИЙ ФИКС загрузок. aiohttp по умолчанию режет
-        # тело POST до 1 МБ (client_max_size=1024**2) — чанки мини-аппа по
-        # 4 МБ получали 413: «видео не загружается», «большой файл не
-        # заливается», работали только файлы меньше 1 МБ. Проверено тестом
-        # scripts/test_aiohttp_maxsize.py (4 МБ → 413 без параметра, → 200 с ним).
-        # Ставим 32 МБ: 4 МБ-чанк влезает с огромным запасом.
-        client_max_size=32 * 1024 * 1024)
+    # ВОЛНА 22.30 (ИСПРАВЛЕНО «не грузится большой файл»): у aiohttp по
+    # умолчанию client_max_size = 1 МБ — каждый 4-МБ кусок загрузки ОТВЕЧАЛСЯ
+    # HTTP 413, поэтому из мини-аппа нельзя было залить даже картинку больше
+    # 1 МБ (а видео 1.9 ГБ — тем более). Ставим честный потолок 64 МБ НА ОДИН
+    # ЗАПРОС: кусок загрузки всего 4 МБ, так что запас 16-кратный; при этом
+    # память сервера от одной запрос-атаки защищена (тело читается в ОЗУ).
+    app = web.Application(client_max_size=64 * 1024 * 1024)
     app.router.add_get('/health', health_check)
     try:
         mount_miniapp_routes(app)
@@ -2116,6 +2124,9 @@ STORAGE_BACKUP_FILES = (
     # ВОЛНА 22.28: активные помодоро-сессии переживают рестарт — тикер
     # продолжит прерванные фазы (работа/перерыв) автоматически.
     POMODORO_FILE,
+    # ВОЛНА 22.31: «🧹 Дежурные» переживают рестарт — тикер продолжит
+    # утренние анонсы по расписанию админа без дублей (флаг sent в файле).
+    DUTY_FILE,
 )
 
 PRICES = load_prices()
@@ -3505,7 +3516,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.30"
+BOT_BUILD = "22.29"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -4307,8 +4318,9 @@ def get_quick_timer_keyboard():
         # ВОЛНА 22.27: «все таймеры должны быть указаны» — список всех
         # напоминаний с управлением (выключить/удалить/изменить).
         [InlineKeyboardButton("📋 Мои напоминания", callback_data="timer_list")],
-        # ВОЛНА 22.28: «в таймере добавь помодоро таймер» — сессии работа/перерыв.
-        [InlineKeyboardButton("📚 Таймер учёбы", callback_data="pomo_menu")],
+        # ВОЛНА 22.28: сессии «занятие → отдых». 22.30: переименовано и
+        # объяснено просто — слово «помодоро» многие не понимают.
+        [InlineKeyboardButton("📚 Учёба с перерывами", callback_data="pomo_menu")],
         [InlineKeyboardButton("❌ Отмена", callback_data="cancel_action")],
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -7123,33 +7135,36 @@ def _cloud_menu_text(user):
             "перенесите их в Сейф кнопкой 🔐 у файла"
         )
     lines.append("")
-    # ВОЛНА 22.30: «ПО ПОЛОЧКАМ» — честно и коротко, где что лежит.
     lines.append(
-        "📚 ПОЛОЧКИ (чтобы ничего не путалось):\n"
-        "1️⃣ 🔐 СЕЙФ — ваши зашифрованные файлы. ВСЕГДА под шифром AES-256 "
-        "(пароль Сейфа). Лежат: "
-        + (f"в ВАШЕМ канале «{_uch[1]}»" if _uch
-           else "в приватных каналах-хранилищах бота")
-        + ".\n"
-        "2️⃣ 🌐 ВЕБ-ОБЛАКО (мини-апп «☁️ DEVO+») — то же хранилище, просто "
-        "открытое в браузере/Telegram: загруженные туда файлы попадают в "
-        "обычное облако и их можно перенести в Сейф кнопкой 🔐 прямо в "
-        "мини-аппе.\n"
-        "3️⃣ 🗂 СТАРЫЕ файлы — загрузки до волны 9, без шифра; перенесите "
-        "их в Сейф.\n\n"
-        "💡 Надёжнее всего СВОЙ канал: создайте частный канал, "
-        "добавьте бота администратором с правом «Публикация сообщений» и "
-        "подключите его через 🔗 Моё облако — тогда ВСЕ ваши файлы (и Сейф, "
-        "и веб-облако) будут лежать только в вашем собственном хранилище, "
-        "а не в каналах бота."
-    )
-    lines.append("")
-    lines.append(
-        "ФАЙЛЫ СЕЙФА ВСЕГДА ШИФРОВАНЫ: перед отправкой в канал каждый файл "
-        "шифруется вашим паролем (AES-256). В канале — только шум; открыть "
+        "ФАЙЛЫ ВСЕГДА ЖИВУТ В СЕЙФЕ: перед отправкой в приватный канал каждый "
+        "файл шифруется вашим паролем (AES-256). В канале — только шум; открыть "
         "не сможет никто: ни разработчик, ни Telegram. Забыли пароль — вернёте "
         "доступ по своим 3 секретным вопросам."
     )
+    # ВОЛНА 22.30: «разложим по полочкам», где что лежит — просьба
+    # пользователя, чтобы каналы не путались.
+    _uch2 = _uch
+    lines.append("")
+    lines.append("🗂 ГДЕ ЧТО ЛЕЖИТ (коротко):")
+    if _uch2:
+        lines.append(
+            f"• ВАШИ файлы (Сейф и веб-загрузки) → ВАШ личный канал "
+            f"«{_uch2[1]}»: в Сейфе — шифром, веб-загрузки — как есть.")
+        lines.append("• В общем канале бота в этом случае ваши файлы НЕ появляются.")
+    else:
+        lines.append(
+            "• ВАШИ файлы → общее хранилище бота (каналы, подключённые "
+            "разработчиком): в Сейфе — только шифр; веб-загрузки — как есть.")
+        lines.append(
+            "• Туда же бот складывает резервные копии базы (zip-архивы) — "
+            "это нормально, файлы разных пользователей перемешаны и без "
+            "паролей нечитаемы.")
+        lines.append(
+            "• Хотите отдельную «полку» только для себя — подключите СВОЙ "
+            "канал: 🔗 Моё облако → «➕ Подключить мой канал».")
+    lines.append(
+        "• База бота (классы, ДЗ, настройки) → закреплённый zip-снапшот в "
+        "канале-БД, зашифрован ключом бота.")
     lines.append("")
     lines.append("Выберите действие:")
     return "\n".join(lines)
@@ -7170,9 +7185,9 @@ def get_cloud_menu_keyboard(user=None):
         [InlineKeyboardButton("📤 Загрузить в Сейф", callback_data="vault_put")],
         # ВОЛНА 22.20: своя настройка облака — личный канал пользователя.
         [InlineKeyboardButton("🔗 Моё облако", callback_data="vault_cloud")],
-        # ВОЛНА 22.29/22.30: веб-вход в Веб-облако без Telegram — по паролю
-        # Сейфа (с 22.30 пароль Сейфа = пароль веб-входа).
-        [InlineKeyboardButton("🌐 Веб-вход (пароль Сейфа)", callback_data="web_password_menu")],
+        # ВОЛНА 22.29: веб-пароль — вход в Веб-облако из обычного браузера
+        # по Telegram ID + паролю (без Telegram/VPN).
+        [InlineKeyboardButton("🔑 Веб-пароль", callback_data="web_password_menu")],
     ]
     if legacy:
         rows.append([InlineKeyboardButton(
@@ -7827,19 +7842,11 @@ async def _api_get_user_any(request):
     return await _miniapp_user_from_request(request)
 
 
-def _miniapp_rec_out(rec, user=None):
+def _miniapp_rec_out(rec):
     """Запись cloud_files → JSON для мини-аппа (те же поля, что были в макете:
     id/name/kind/size/ts/vault). Флаг va = галочка Vault из веб-облака.
-    ВОЛНА 22.30: flag own — файл лежит в ЛИЧНОМ канале пользователя
-    (True) или в общих каналах бота (False) — «по полочкам» в интерфейсе."""
-    _own = False
-    if user is not None:
-        try:
-            _vc = getattr(user, "vault_channel", None)
-            _vc_id = int((_vc or {}).get("id") or 0)
-            _own = bool(_vc_id) and int(rec.get("channel_id") or 0) == _vc_id
-        except (TypeError, ValueError):
-            _own = False
+    ВОЛНА 22.30: seal — состояние переноса в Сейф из веба
+    ("run" — идёт, "err" — сбой: текст в seal_err)."""
     return {
         "id": str(rec.get("id") or ""),
         "name": str(rec.get("name") or "файл"),
@@ -7847,7 +7854,8 @@ def _miniapp_rec_out(rec, user=None):
         "size": int(rec.get("size") or 0),
         "ts": str(rec.get("ts") or ""),
         "vault": bool(rec.get("va")),
-        "own": _own,
+        "seal": str(rec.get("seal_state") or ""),
+        "seal_err": str(rec.get("seal_err") or ""),
     }
 
 
@@ -8469,12 +8477,12 @@ body.modal-open {
       <button class="sound-item-btn" id="modalVaultBtn" onclick="toggleFileVault()">
         <span id="modalVaultText">Защитить в Vault</span> <i data-lucide="lock" style="width:18px;height:18px"></i>
       </button>
-      <!-- 22.30: перенос обычного файла В Сейф (шифрование паролем Сейфа) -->
-      <button class="sound-item-btn" id="modalToVaultBtn" onclick="openToVaultPw()">
-        <span>🔐 Перенести в Сейф</span> <i data-lucide="shield" style="width:18px;height:18px"></i>
-      </button>
       <button class="sound-item-btn" onclick="downloadCurrentFile()">
         <span>Скачать файл</span> <i data-lucide="download" style="width:18px;height:18px"></i>
+      </button>
+      <!-- 22.30: перенос файла из веба в шифрованный Сейф (и видео до 2 ГБ) -->
+      <button class="sound-item-btn" id="modalSealBtn" onclick="moveCurrentFileToSafe()">
+        <span>🔐 Перенести в Сейф</span> <i data-lucide="shield-check" style="width:18px;height:18px"></i>
       </button>
       <button class="sound-item-btn" style="color:#ef4444" onclick="deleteCurrentFile()">
         <span>Удалить файл</span> <i data-lucide="trash-2" style="width:18px;height:18px;stroke:#ef4444"></i>
@@ -8483,43 +8491,30 @@ body.modal-open {
   </div>
 </div>
 
-<!-- 22.30: СЕЙФ в мини-аппе — список зашифрованных файлов -->
-<div id="vaultModal" class="modal-overlay" onclick="closeVaultModal(event)">
+<!-- 22.30: ввод пароля Сейфа для переноса файла из веба в Сейф.
+     Своя модалка вместо window.prompt(): в браузере Telegram prompt()
+     заблокирован и молча возвращает null — пароль ввести бы не дали. -->
+<div id="safePwModal" class="modal-overlay" onclick="closeSafePwModal(event)">
   <div class="modal-card" onclick="event.stopPropagation()">
     <div class="sheet-handle-area">
       <div class="sheet-handle"></div>
     </div>
-    <h3 style="font-weight:900;font-size:20px;margin-bottom:4px">🔐 Сейф</h3>
-    <p style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:12px">Файлы под шифром AES-256. Для скачивания — пароль Сейфа.</p>
+    <h3 style="font-weight:900;font-size:20px;margin-bottom:4px">🔐 Перенести в Сейф</h3>
+    <p id="safePwFileName" style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:12px;word-break:break-all"></p>
+    <p style="font-size:12px;font-weight:600;color:var(--subtext-color);margin-bottom:12px;line-height:1.5">Введите пароль Сейфа: файл будет зашифрован им прямо на сервере (AES-256, до 2 ГБ) и переедет в 🔐 Сейф — в чате бота. Открыть его сможет только этот пароль. Оригинал из облака сотрётся.</p>
 
-    <div id="vaultStatus" style="padding:10px 12px;background:var(--card-bg);border:1px solid var(--border-color);border-radius:14px;margin-bottom:12px;font-size:12px;font-weight:700;color:var(--subtext-color);line-height:1.5">Загружаю…</div>
-
-    <div id="vaultList" style="display:flex;flex-direction:column;gap:8px;max-height:40vh;overflow:auto"></div>
-
-    <button class="sound-item-btn" onclick="closeVaultModal()" style="margin-top:12px">
-      <span>Закрыть</span> <i data-lucide="x" style="width:18px;height:18px"></i>
-    </button>
-  </div>
-</div>
-
-<!-- 22.30: пароль Сейфа для скачивания/переноса (нигде не сохраняется) -->
-<div id="vaultPwModal" class="modal-overlay">
-  <div class="modal-card" onclick="event.stopPropagation()">
-    <div class="sheet-handle-area">
-      <div class="sheet-handle"></div>
+    <div style="margin-bottom:14px">
+      <input type="password" id="safePwInput" autocomplete="current-password" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;outline:none;font-size:15px" placeholder="Пароль Сейфа">
     </div>
-    <h3 id="vaultPwTitle" style="font-weight:900;font-size:20px;margin-bottom:4px">Пароль Сейфа</h3>
-    <p id="vaultPwSub" style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:12px">Введите пароль Сейфа</p>
-    <input type="password" id="vaultPwInput" autocomplete="off" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;margin-bottom:14px;outline:none;font-size:15px" placeholder="Пароль Сейфа">
+
     <div style="display:flex;flex-direction:column;gap:8px">
-      <button class="sound-item-btn" id="vaultPwGoBtn" onclick="vaultPwConfirm()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
-        <span id="vaultPwGoText">Скачать</span> <i data-lucide="unlock" style="width:18px;height:18px"></i>
+      <button class="sound-item-btn" id="safePwSubmitBtn" onclick="submitSafePw()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
+        <span>🔐 Зашифровать и перенести</span> <i data-lucide="shield-check" style="width:18px;height:18px"></i>
       </button>
-      <button class="sound-item-btn" onclick="closeVaultPwModal()">
-        <span>Отмена</span> <i data-lucide="x" style="width:18px;height:18px"></i>
+      <button class="sound-item-btn" onclick="closeSafePwModal()">
+        <span>Отмена</span>
       </button>
     </div>
-    <p style="font-size:11px;font-weight:600;color:var(--subtext-color);margin-top:12px;line-height:1.5">Пароль не сохраняется и никуда не записывается: сервер расшифрует файл в памяти и сразу забудет пароль.</p>
   </div>
 </div>
 
@@ -8681,14 +8676,9 @@ body.modal-open {
         <i data-lucide="cloud" style="width:18px;height:18px"></i>
       </button>
 
-      <!-- 22.30: мультивыбор файлов (галочки + «В ZIP»/«Распаковать»/«Удалить») -->
+      <!-- 22.29: мультивыбор файлов (галочки + «В ZIP»/«Распаковать»/«Удалить») -->
       <button class="action-btn" id="selectModeBtn" onclick="toggleSelectMode()" title="Выбрать файлы">
         <i data-lucide="check-square" style="width:18px;height:18px"></i>
-      </button>
-
-      <!-- 22.30: Сейф — список зашифрованных файлов и скачивание по паролю -->
-      <button class="action-btn" id="vaultBtn" onclick="openVaultModal()" title="🔐 Сейф (зашифрованные файлы)">
-        <i data-lucide="shield" style="width:18px;height:18px"></i>
       </button>
 
       <button class="action-btn" id="themeToggleBtn" onclick="toggleThemeMenu(event)" title="Тема оформления">
@@ -9304,7 +9294,7 @@ async function webLogin() {
   }
 }
 
-/* ===== 22.29: МУЛЬТИВЫБОР ФАЙЛОВ (галочки + ZIP/распаковать/удалить) ===== */
+/* ===== 22.29: МУЛЬТИВЫБОР ФАЙЛОВ (галочки + скачать/ZIP/распаковать/удалить) ===== */
 let selectMode = false;
 let selectedIds = new Set();
 
@@ -9313,9 +9303,13 @@ function toggleSelectMode() {
   if (!selectMode) selectedIds.clear();
   const bar = document.getElementById('selectionBar');
   if (bar) bar.style.display = selectMode ? '' : 'none';
-  /* 22.30: панель внизу НЕ перекрывает последний файл — отступ снизу */
+  /* 22.30 (ИСПРАВЛЕНО «нижняя панель мешает выбрать»): панель фиксированная
+     и перекрывала последние строки списка — теперь при её появлении список
+     получает нижний отступ ровно по высоте панели. */
   const wrap = document.querySelector('.main-wrapper');
-  if (wrap) wrap.style.paddingBottom = selectMode ? '96px' : '';
+  if (wrap) wrap.style.paddingBottom = selectMode
+    ? 'calc(96px + env(safe-area-inset-bottom))'
+    : '';
   updateSelCount();
   renderAll();
 }
@@ -9337,6 +9331,60 @@ function toggleFileSelection(e, id) {
   else selectedIds.add(id);
   updateSelCount();
   renderFiles(applyFilters());
+}
+
+/* ===== 22.30: СКАЧИВАНИЕ ПО ГАЛОЧКАМ (то, чего не хватало) =====
+   Blob-ссылки в браузере Telegram (особенно iOS) часто не работают, поэтому
+   сервер выдаёт ОДНОРАЗОВУЮ ссылку /api/dl/{token}: 1 файл — как есть,
+   несколько — сервер фон собирает ZIP и отдаёт ссылку, когда готов.
+   Открываем внешний браузер через tg.openLink — скачивание срабатывает всегда. */
+function openDlUrl(url) {
+  try {
+    if (IS_TELEGRAM && window.Telegram && Telegram.WebApp && typeof Telegram.WebApp.openLink === 'function') {
+      Telegram.WebApp.openLink(url);
+      return;
+    }
+  } catch (e) { /* фолбэк ниже */ }
+  window.open(url, '_blank');
+}
+
+async function downloadSelected() {
+  if (!selectedIds.size) { showToast('Сначала выберите файлы'); return; }
+  const ids = [...selectedIds];
+  try {
+    const data = await apiJson('/api/files/prep_download', {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ ids: ids })
+    });
+    if (data.ready && data.token) {
+      openDlUrl(location.origin + '/api/dl/' + encodeURIComponent(data.token));
+      showToast('📥 Отдаю файл браузеру…');
+      return;
+    }
+    if (data.job) {
+      showToast('📦 Собираю архив из ' + data.count + ' файлов…');
+      const job = data.job;
+      let tries = 0;
+      const timer = setInterval(async () => {
+        tries++;
+        try {
+          const st = await apiJson('/api/files/dl_status/' + encodeURIComponent(job));
+          if (st.state === 'ok' && st.token) {
+            clearInterval(timer);
+            openDlUrl(location.origin + '/api/dl/' + encodeURIComponent(st.token));
+            showToast('📦 Архив готов — скачиваю…');
+          } else if (st.state === 'err') {
+            clearInterval(timer);
+            showToast('Не получилось: ' + (st.error || 'сбой сборки'));
+          } else if (tries % 5 === 0) {
+            showToast('📦 Ещё собираю архив…');
+          }
+        } catch (e) { /* сеть могла мигнуть — пробуем дальше */ }
+        if (tries > 600) { clearInterval(timer); showToast('Слишком долго — попробуйте ещё раз'); }
+      }, 2000);
+    }
+  } catch (e) { showToast(cloudErrText(e)); }
 }
 
 async function zipSelected() {
@@ -9401,183 +9449,6 @@ async function deleteSelected() {
   showToast(ok === ids.length ? '✅ Удалено: ' + ok : 'Удалено ' + ok + ' из ' + ids.length);
 }
 
-/* 22.30: СКАЧИВАНИЕ ВЫБРАННОГО: один файл — как есть, несколько — одним ZIP */
-function _saveBlob(blob, name) {
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = name || 'file';
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 10000);
-}
-
-async function _fetchDownload(id, fallbackName) {
-  const r = await fetch('/api/files/' + encodeURIComponent(id) + '/download', { headers: authHeaders() });
-  if (!r.ok) {
-    let msg = 'HTTP ' + r.status;
-    try { msg = (await r.json()).message || msg; } catch (e) {}
-    throw new Error(msg);
-  }
-  const blob = await r.blob();
-  let name = fallbackName;
-  if (!name) {
-    const cd = r.headers.get('Content-Disposition') || '';
-    const m = cd.match(/filename\*=UTF-8''([^;]+)/);
-    if (m) { try { name = decodeURIComponent(m[1]); } catch (e) {} }
-  }
-  _saveBlob(blob, name || 'file');
-}
-
-async function downloadSelected() {
-  if (!selectedIds.size) { showToast('Сначала выберите файлы'); return; }
-  const ids = [...selectedIds];
-  if (ids.length === 1) {
-    const f = ALL_FILES.find(x => x.id === ids[0]);
-    showToast('📥 Скачиваю…');
-    try {
-      await _fetchDownload(ids[0], f ? f.name : null);
-      showToast('✅ Скачано');
-    } catch (e) { showToast(cloudErrText(e)); }
-    return;
-  }
-  showToast('📦 Собираю ZIP из ' + ids.length + '…');
-  try {
-    const data = await apiJson('/api/files/zip_selected', {
-      method: 'POST',
-      headers: authHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify({ ids: ids })
-    });
-    if (data.file) {
-      await _fetchDownload(data.file.id, data.file.name);
-      showToast('✅ ZIP скачан');
-    }
-  } catch (e) { showToast(cloudErrText(e)); }
-}
-
-/* ============ 22.30: СЕЙФ В МИНИ-АППЕ ============ */
-let VAULT_ITEMS = [];
-let pendingVaultAction = null; // {mode:'download', id, label} | {mode:'toVault', id, name}
-
-async function openVaultModal() {
-  document.getElementById('vaultModal').classList.add('open');
-  document.body.classList.add('modal-open');
-  await loadVaultList();
-}
-
-function closeVaultModal(e) {
-  if (e) e.stopPropagation();
-  document.getElementById('vaultModal').classList.remove('open');
-  document.body.classList.remove('modal-open');
-}
-
-async function loadVaultList() {
-  const st = document.getElementById('vaultStatus');
-  const lst = document.getElementById('vaultList');
-  st.textContent = 'Загружаю…';
-  lst.innerHTML = '';
-  try {
-    const d = await apiJson('/api/vault/list');
-    VAULT_ITEMS = (d.files || []);
-    if (CONN.bot || d.bot) CONN.bot = String(d.bot || CONN.bot || '');
-    if (d.build) CONN.build = String(d.build);
-    if (!d.crypto) {
-      st.textContent = '⚠️ На сервере нет библиотеки шифрования — скачивание через чат Сейфа.';
-    } else if (!d.safe_set) {
-      st.textContent = '🔐 Сейф ещё не настроен: задайте пароль и 3 вопроса в боте (☁️ Облако → 📤 Загрузить в Сейф).';
-    } else {
-      st.textContent = '✅ Сейф готов · файлов: ' + VAULT_ITEMS.length + ' · сборка ' + (d.build || '?');
-    }
-    if (!VAULT_ITEMS.length) {
-      lst.innerHTML = '<div style="font-size:12px;font-weight:700;color:var(--subtext-color);padding:8px 4px">Пока пусто. Загружайте файлы через ☁️ Облако → 📤 Загрузить в Сейф (или переносите кнопкой «🔐 В Сейф» у файла).</div>';
-      return;
-    }
-    lst.innerHTML = VAULT_ITEMS.map(v => `
-      <button class="sound-item-btn" onclick="askVaultDownload('${escapeHtml(v.id)}')">
-        <span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">🔐 ${escapeHtml(v.label || 'без подписи')} · ${fmtSize(+v.size || 0)}</span>
-        <i data-lucide="download" style="width:16px;height:16px;flex-shrink:0"></i>
-      </button>
-    `).join('');
-    safeIcons();
-  } catch (e) {
-    st.textContent = '⚠️ ' + cloudErrText(e);
-  }
-}
-
-function openVaultPwModal(mode, id, label) {
-  pendingVaultAction = { mode: mode, id: id, label: label };
-  document.getElementById('vaultPwInput').value = '';
-  document.getElementById('vaultPwGoText').textContent = mode === 'toVault' ? '🔐 Зашифровать в Сейф' : '📥 Скачать';
-  document.getElementById('vaultPwTitle').textContent = mode === 'toVault' ? 'Перенести в Сейф' : 'Пароль Сейфа';
-  document.getElementById('vaultPwSub').textContent = mode === 'toVault'
-    ? ('«' + (label || 'файл') + '» будет зашифрован паролем Сейфа, оригинал удалён')
-    : 'Файл расшифруется только с вашим паролем Сейфа';
-  document.getElementById('vaultPwModal').classList.add('open');
-  document.body.classList.add('modal-open');
-}
-
-function closeVaultPwModal() {
-  document.getElementById('vaultPwModal').classList.remove('open');
-  document.body.classList.remove('modal-open');
-  pendingVaultAction = null;
-}
-
-function askVaultDownload(id) {
-  const v = VAULT_ITEMS.find(x => String(x.id) === String(id));
-  openVaultPwModal('download', id, v ? v.label : '');
-}
-
-function openToVaultPw() {
-  if (!activeEditingFileId) return;
-  const f = ALL_FILES.find(x => x.id === activeEditingFileId);
-  closeEditModal();
-  openVaultPwModal('toVault', activeEditingFileId, f ? f.name : '');
-}
-
-async function vaultPwConfirm() {
-  if (!pendingVaultAction) return;
-  const pw = document.getElementById('vaultPwInput').value;
-  if (!pw) { showToast('Введите пароль Сейфа'); return; }
-  const btn = document.getElementById('vaultPwGoBtn');
-  btn.disabled = true;
-  const act = pendingVaultAction;
-  try {
-    if (act.mode === 'toVault') {
-      const d = await apiJson('/api/files/to_vault', {
-        method: 'POST',
-        headers: authHeaders({ 'Content-Type': 'application/json' }),
-        body: JSON.stringify({ id: act.id, password: pw })
-      });
-      ALL_FILES = ALL_FILES.filter(x => x.id !== act.id);
-      closeVaultPwModal();
-      renderAll();
-      showToast('🔐 Перенесено в Сейф: ' + (d.vault && d.vault.label ? d.vault.label : 'файл'));
-    } else {
-      const r = await fetch('/api/vault/download', {
-        method: 'POST',
-        headers: authHeaders({ 'Content-Type': 'application/json' }),
-        body: JSON.stringify({ id: act.id, password: pw })
-      });
-      if (!r.ok) {
-        let msg = 'HTTP ' + r.status;
-        try { msg = (await r.json()).message || msg; } catch (e) {}
-        throw new Error(msg);
-      }
-      const blob = await r.blob();
-      let name = act.label || 'vault_file';
-      const cd = r.headers.get('Content-Disposition') || '';
-      const m = cd.match(/filename\*=UTF-8''([^;]+)/);
-      if (m) { try { name = decodeURIComponent(m[1]); } catch (e) {} }
-      _saveBlob(blob, name);
-      closeVaultPwModal();
-      showToast('✅ Файл Сейфа скачан');
-    }
-  } catch (e) {
-    showToast('❌ ' + cloudErrText(e));
-  } finally { btn.disabled = false; }
-}
-
 let ALL_FILES = [];
 let listLoading = false;
 
@@ -9597,7 +9468,8 @@ async function loadFiles(silent) {
     ALL_FILES = (data.files || []).map(f => ({
       id: String(f.id || ''), name: String(f.name || 'файл'),
       kind: String(f.kind || 'document'), size: +f.size || 0,
-      ts: String(f.ts || ''), vault: !!f.vault, own: !!f.own
+      ts: String(f.ts || ''), vault: !!f.vault,
+      seal: String(f.seal || ''), seal_err: String(f.seal_err || '')
     }));
     // 22.26: сервер подтвердил связь — запоминаем, кем и чем отвечает
     CONN.bot = String(data.bot || CONN.bot || '');
@@ -9761,6 +9633,16 @@ function renderFiles(files) {
       <div onclick="toggleFileSelection(event,'${f.id}')" style="flex-shrink:0;width:24px;height:24px;border-radius:8px;display:flex;align-items:center;justify-content:center;border:2px solid ${sel ? 'var(--btn-text)' : 'var(--border-color)'};background:${sel ? 'var(--btn-text)' : 'transparent'};transition:all .15s">
         ${sel ? '<i data-lucide="check" style="width:14px;height:14px;stroke:var(--card-bg)"></i>' : ''}
       </div>` : '';
+    /* 22.30: бейдж переноса в Сейф + в режиме выбора кнопка ⋮ тоже ВЫБИРАЕТ
+       файл (раньше открывала меню и сбивала с толку). */
+    const sealBadge = f.seal === 'run'
+      ? '<span style="flex-shrink:0;font-weight:800;font-size:10px;color:var(--subtext-color);border:1px solid var(--border-color);border-radius:8px;padding:3px 6px">⏳ В Сейф…</span>'
+      : (f.seal === 'err'
+        ? `<span onclick="event.stopPropagation();showToast(${JSON.stringify((f.seal_err || 'Перенос не удался')).replace(/"/g, '&quot;')})" style="flex-shrink:0;font-weight:800;font-size:10px;color:#ef4444;border:1px solid #ef4444;border-radius:8px;padding:3px 6px">⚠ Ошибка</span>`
+        : '');
+    const dotsAction = selectMode
+      ? `toggleFileSelection(event,'${f.id}')`
+      : `openEditModal('${f.id}')`;
     return `
     <article class="file-card animate-fade-in" style="display:flex;align-items:center;gap:12px;${sel ? 'outline:2px solid var(--btn-text);outline-offset:-2px' : ''}" onclick="${cardAction}">
       ${checkHtml}
@@ -9773,11 +9655,11 @@ function renderFiles(files) {
         </p>
         <p style="font-weight:600;font-size:12px;color:var(--subtext-color);margin-top:2px">
           ${fmtSize(f.size)} · ${(f.ts || '').slice(0, 10)}
-          <span title="${f.own ? 'лежит в ВАШЕМ канале' : 'лежит в канале бота'}"> · ${f.own ? '🏢 ваш канал' : '☁️ канал бота'}</span>
         </p>
       </div>
+      ${sealBadge}
       <div style="display:flex;gap:4px;flex-shrink:0" onclick="event.stopPropagation()">
-        <button class="action-btn" onclick="openEditModal('${f.id}')" title="Редактировать">
+        <button class="action-btn" onclick="${dotsAction}" title="${selectMode ? 'Выбрать' : 'Редактировать'}">
           <i data-lucide="more-vertical" style="width:16px;height:16px"></i>
         </button>
       </div>
@@ -9897,26 +9779,23 @@ async function downloadCurrentFile() {
   const f = ALL_FILES.find(x => x.id === activeEditingFileId);
   closeEditModal();
   if (!f) return;
-  showToast('📥 Скачивание...');
+  /* 22.30: blob-ссылки в браузере Telegram (iOS) часто блокируются — теперь
+     сервер выдаёт одноразовую ссылку, которую открывает внешний браузер.
+     Работает и для больших файлов (MTProto, до 2 ГБ). */
+  showToast('📥 Готовлю скачивание…');
   try {
-    const r = await fetch('/api/files/' + encodeURIComponent(f.id) + '/download', { headers: authHeaders() });
-    if (!r.ok) {
-      let msg = 'HTTP ' + r.status;
-      try { msg = (await r.json()).message || msg; } catch (e) {}
-      throw new Error(msg);
+    const data = await apiJson('/api/files/prep_download', {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ ids: [f.id] })
+    });
+    if (data.ready && data.token) {
+      openDlUrl(location.origin + '/api/dl/' + encodeURIComponent(data.token));
+    } else {
+      showToast('Не удалось подготовить скачивание');
     }
-    const blob = await r.blob();
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = f.name || 'file';
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 10000);
-    showToast('✅ Скачано: ' + fmtSize(blob.size));
   } catch (e) {
-    showToast('Ошибка скачивания: ' + e.message);
+    showToast(cloudErrText(e));
   }
 }
 
@@ -9932,6 +9811,76 @@ async function deleteCurrentFile() {
     showToast('Не удалось: ' + e.message);
   }
   closeEditModal();
+}
+
+/* ===== 22.30: ПЕРЕНОС ФАЙЛА В СЕЙФ ПРЯМО ИЗ ВЕБА =====
+   Раньше синхронизации с Сейфом не было: веб-файлы лежали без шифрования,
+   а перенос в чате работал только до 20 МБ. Теперь: вводим пароль Сейфа —
+   сервер скачивает файл из канала, шифрует потоково (AES-256-GCM, до 2 ГБ)
+   и кладёт в Сейф; оригинал стирает. Статус виден по бейджу у файла. */
+let safePwTargetId = null;
+
+function moveCurrentFileToSafe() {
+  const f = ALL_FILES.find(x => x.id === activeEditingFileId);
+  if (!f) return;
+  if (f.seal === 'run') { showToast('Этот файл уже переносится…'); return; }
+  closeEditModal();
+  safePwTargetId = f.id;
+  document.getElementById('safePwFileName').textContent = f.name || '';
+  document.getElementById('safePwInput').value = '';
+  document.getElementById('safePwModal').classList.add('open');
+}
+
+function closeSafePwModal(e) {
+  if (e && e.stopPropagation) e.stopPropagation();
+  document.getElementById('safePwModal').classList.remove('open');
+  safePwTargetId = null;
+}
+
+async function submitSafePw() {
+  const pw = document.getElementById('safePwInput').value;
+  if (!pw.trim()) { showToast('Введите пароль Сейфа'); return; }
+  const fid = safePwTargetId;
+  closeSafePwModal();
+  if (!fid) return;
+  const btn = document.getElementById('modalSealBtn');
+  if (btn) btn.disabled = true;
+  showToast('🔐 Начинаю перенос — файл зашифруется и уедет в Сейф…');
+  try {
+    await apiJson('/api/files/' + encodeURIComponent(fid) + '/to_safe', {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ password: pw })
+    });
+    const f = ALL_FILES.find(x => x.id === fid);
+    if (f) { f.seal = 'run'; f.seal_err = ''; }
+    renderAll();
+    showToast('⏳ Переношу в Сейф… Для больших файлов это занимает время');
+    /* Фоновая проверка статуса: готово → файл исчезнет из облака (он в Сейфе). */
+    let tries = 0;
+    const timer = setInterval(async () => {
+      tries++;
+      try {
+        await loadFiles(true);
+        const gone = !ALL_FILES.some(x => x.id === fid);
+        if (gone) {
+          clearInterval(timer);
+          showToast('✅ Готово: файл зашифрован и лежит в Сейфе (чат бота → 🔐)');
+          return;
+        }
+        const cur = ALL_FILES.find(x => x.id === fid);
+        if (cur && cur.seal === 'err') {
+          clearInterval(timer);
+          showToast('Не получилось: ' + (cur.seal_err || 'перенос не удался'));
+        }
+      } catch (e) { /* сеть мигнула — продолжаем */ }
+      if (tries > 900) clearInterval(timer);
+    }, 3000);
+  } catch (e) {
+    showToast(cloudErrText(e));
+  } finally {
+    if (btn) btn.disabled = false;
+  }
 }
 
 function onSearch() {
@@ -10186,13 +10135,8 @@ function renderStorage(d) {
       + '</span>'
     : '';
   if (d.connected) {
-    // 22.30: «ПО ПОЛОЧКАМ» — честно: куда идут файлы и сколько их.
-    const _cnt = (d.counts || {});
     box.innerHTML = '✅ Ваш канал: <b style="color:var(--text-color)">' + escapeHtml(d.title || '') + '</b>'
       + '<br><span style="font-size:11px">подключён ' + escapeHtml(d.added || '') + ' — новые загрузки уходят только в него</span>'
-      + '<br><span style="font-size:11px">📦 Обычных файлов: ' + (_cnt.cloud != null ? _cnt.cloud : '…')
-      + ' • 🔐 В Сейфе: ' + (_cnt.vault != null ? _cnt.vault : '…') + '\u00b7 '
-      + (d.plain ? 'шифрование ВЫКЛ' : 'файлы Сейфа под шифром') + '</span>'
       + ident;
     offBtn.style.display = '';
     connLabel.textContent = 'Заменить канал';
@@ -10206,12 +10150,8 @@ function renderStorage(d) {
     }
   } else {
     box.innerHTML = (d.has_general
-      ? '☁️ Сейчас файлы уходят в общее хранилище бота. Подключите свой приватный канал — и они будут лежать только у вас.'
-      : '⚠️ Хранилище не настроено — загрузки будут неудачными. Подключите свой канал ниже.')
-      + '<br><span style="font-size:11px">📦 Обычных файлов: ' + ((d.counts || {}).cloud != null ? d.counts.cloud : '…')
-      + ' • 🔐 В Сейфе: ' + ((d.counts || {}).vault != null ? d.counts.vault : '…') + '</span>'
-      + '<br><span style="font-size:11px;color:#f59e0b">💡 Надёжнее всего СВОЙ частный канал: создайте его, добавьте бота админом с правом «Публикация сообщений» и подключите ниже — данные будут только в вашем хранилище.</span>'
-      + ident;
+      ? '☁️ Сейчас файлы уходят в общее хранилище бота: в Сейфе — шифром, веб-загрузки — как есть. Там же лежат резервные zip-копии базы бота — это нормально. Подключите свой приватный канал — и ваши файлы будут лежать отдельной «полкой» только у вас.'
+      : '⚠️ Хранилище не настроено — загрузки будут неудачными. Подключите свой канал ниже.') + ident;
     offBtn.style.display = 'none';
     connLabel.textContent = 'Подключить канал';
     if (plainBtn) plainBtn.style.display = 'none';
@@ -10579,25 +10519,26 @@ safeIcons();
   <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
     <span id="selCount" style="font-weight:800;font-size:13px">Выбрано: 0</span>
     <span style="flex:1"></span>
-    <!-- 22.30: «Скачать» — скачивание выбранного (одного) или архивом (нескольких) -->
-    <button class="sound-item-btn" onclick="downloadSelected()" style="padding:8px 10px"><span>📥 Скачать</span></button>
+    <!-- 22.30: кнопка «Скачать» — то, чего не хватало: скачивает выбранное
+         НА УСТРОЙСТВО (1 файл — как есть, несколько — ZIP-архивом) -->
+    <button class="sound-item-btn" onclick="downloadSelected()" style="padding:8px 10px;background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)"><span>📥 Скачать</span></button>
     <button class="sound-item-btn" onclick="zipSelected()" style="padding:8px 10px"><span>📦 В ZIP</span></button>
     <button class="sound-item-btn" id="unzipBtn" onclick="unzipSelected()" style="padding:8px 10px;display:none"><span>🗂 Распаковать</span></button>
     <button class="sound-item-btn" onclick="deleteSelected()" style="padding:8px 10px;color:#ef4444"><span>🗑 Удалить</span></button>
-    <button class="sound-item-btn" onclick="toggleSelectMode()" style="padding:8px 10px;background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)"><span>Готово</span></button>
+    <button class="sound-item-btn" onclick="toggleSelectMode()" style="padding:8px 10px"><span>Готово</span></button>
   </div>
 </div>
 
-<!-- 22.29/22.30: вход по Telegram ID + паролю Сейфа — обычный браузер,
-     без Telegram (для тех, у кого VPN/школьная сеть не пускает telegram.org).
-     Пароль = пароль Сейфа (задаётся в боте: ☁️ Облако → 🔐 Сейф). -->
+<!-- 22.29: вход по Telegram ID + веб-паролю — обычный браузер, без Telegram
+     (для тех, у кого VPN/школьная сеть не пускает telegram.org и initData
+     не доходит). Пароль задаётся в чате бота: ☁️ Облако → «🔑 Веб-пароль». -->
 <div id="loginModal" class="modal-overlay">
   <div class="modal-card" onclick="event.stopPropagation()">
     <div class="sheet-handle-area">
       <div class="sheet-handle"></div>
     </div>
     <h3 style="font-weight:900;font-size:20px;margin-bottom:4px">Вход в DEVO+ Облако</h3>
-    <p style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:14px">Открыто вне Telegram: войдите по ID и паролю Сейфа</p>
+    <p style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:14px">Открыто вне Telegram, войдите по ID и паролю, заданному в боте</p>
 
     <div style="margin-bottom:12px">
       <label for="loginUserId" style="font-size:11px;font-weight:800;color:var(--subtext-color);text-transform:uppercase;letter-spacing:0.04em">Telegram ID</label>
@@ -10605,7 +10546,7 @@ safeIcons();
     </div>
     <div style="margin-bottom:14px">
       <label for="loginPassword" style="font-size:11px;font-weight:800;color:var(--subtext-color);text-transform:uppercase;letter-spacing:0.04em">Пароль</label>
-      <input type="password" id="loginPassword" autocomplete="current-password" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;margin-top:4px;outline:none;font-size:15px" placeholder="Пароль Сейфа">
+      <input type="password" id="loginPassword" autocomplete="current-password" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;margin-top:4px;outline:none;font-size:15px" placeholder="Пароль из бота (7 цифр)">
     </div>
 
     <div style="display:flex;flex-direction:column;gap:8px">
@@ -10614,7 +10555,7 @@ safeIcons();
       </button>
     </div>
 
-    <p style="font-size:11px;font-weight:600;color:var(--subtext-color);margin-top:12px;line-height:1.5">Пароль — тот же, что открывает ваш 🔐 Сейф (задаётся в боте: ☁️ Облако → 🔐 Сейф; смена — там же или по 3 секретным вопросам). Логин — ваш Telegram ID. 5 неверных попыток — пауза 10 минут.</p>
+    <p style="font-size:11px;font-weight:600;color:var(--subtext-color);margin-top:12px;line-height:1.5">Пароль задаётся в боте через ☁️ Облако → «🔑 Веб-пароль» — это РОВНО 7 ЦИФР, и он ОДИН для веб-облака и мини-аппа. Логин — ваш Telegram ID (бот показывает его при создании пароля). 5 неверных попыток — пауза 10 минут.</p>
   </div>
 </div>
 </body>
@@ -10654,14 +10595,31 @@ async def miniapp_index(request):
 
 
 async def miniapp_files_get(request):
-    """Список файлов ОСНОВНОГО облака пользователя (та же база, что в чате)."""
+    """Список файлов ОСНОВНОГО облака пользователя (та же база, что в чате).
+    ВОЛНА 22.30: заодно подчищаем «зависшие» состояния переноса в Сейф
+    (рестарт сервера посреди задачи) — пользователь видит честную ошибку
+    вместо вечного «переношу…»."""
     user, _uid, err = await _api_get_user_any(request)
     if err is not None:
         return err
     files = [f for f in (getattr(user, "cloud_files", []) or []) if isinstance(f, dict)]
+    # Чистка зависших переносов в Сейф (рестарт/сбой процесса).
+    _fixed = False
+    for f in files:
+        if f.get("seal_state") == "run":
+            try:
+                _age = time.time() - float(f.get("seal_ts") or 0)
+            except (TypeError, ValueError):
+                _age = _WEB_SEAL_STALE_SEC + 1
+            if _age > _WEB_SEAL_STALE_SEC:
+                f["seal_state"] = "err"
+                f["seal_err"] = "Перенос прервался (рестарт сервера?) — попробуйте ещё раз."
+                _fixed = True
+    if _fixed:
+        save_user(user)
     total = sum(int(f.get("size", 0) or 0) for f in files)
     return web.json_response({
-        "files": [_miniapp_rec_out(f, user) for f in files],
+        "files": [_miniapp_rec_out(f) for f in files],
         "stats": {"count": len(files), "size": total},
         "limit": get_price('cloud_max_files', 50),
         # ВОЛНА 22.26: сервер сам подтверждает связь — кем и чем отвечает.
@@ -10690,7 +10648,7 @@ async def miniapp_files_patch(request):
     if "vault" in body:
         rec["va"] = bool(body.get("vault"))
     save_user(user)
-    return web.json_response({"file": _miniapp_rec_out(rec, user)})
+    return web.json_response({"file": _miniapp_rec_out(rec)})
 
 
 async def miniapp_files_delete(request):
@@ -10717,16 +10675,14 @@ async def miniapp_files_delete(request):
     return web.json_response({"ok": True})
 
 
-async def miniapp_files_download(request):
-    """Оригинал байт-в-байт. Путь 1: Bot API (≤20 МБ, есть file_id) — быстрый.
-    Путь 2: Telethon/MTProto по (channel_id, msg_id) — до 2 ГБ (большие
-    файлы, залитые через веб, лежат в канале без file_id Bot API)."""
-    user, _uid, err = await _api_get_user_any(request)
-    if err is not None:
-        return err
-    rec = _cloud_find_record(user, request.match_info["fid"])
-    if not rec:
-        return _miniapp_err(404, "not_found", "Файл не найден (возможно, уже удалён).")
+async def _miniapp_download_response(request, user, rec):
+    """ЯДРО скачивания одного файла (оригинал байт-в-байт). Путь 1: Bot API
+    (≤20 МБ, есть file_id) — быстрый. Путь 2: Telethon/MTProto по
+    (channel_id, msg_id) — до 2 ГБ (большие файлы, залитые через веб, лежат
+    в канале без file_id Bot API).
+    ВОЛНА 22.30: вынесено из miniapp_files_download, чтобы тот же код
+    работал и для одноразовых ссылок /api/dl/{token} (скачивание по
+    галочкам и из Telegram-браузера, где blob-ссылки часто блокируются)."""
     name = str(rec.get("name") or "file")
     size = int(rec.get("size") or 0)
     app = _MINIAPP_PTB_APP
@@ -10798,6 +10754,17 @@ async def miniapp_files_download(request):
             os.remove(tmppath)
         except Exception:
             pass
+
+
+async def miniapp_files_download(request):
+    """GET /api/files/{fid}/download — оригинал байт-в-байт."""
+    user, _uid, err = await _api_get_user_any(request)
+    if err is not None:
+        return err
+    rec = _cloud_find_record(user, request.match_info["fid"])
+    if not rec:
+        return _miniapp_err(404, "not_found", "Файл не найден (возможно, уже удалён).")
+    return await _miniapp_download_response(request, user, rec)
 
 
 async def miniapp_upload_init(request):
@@ -10947,7 +10914,7 @@ async def miniapp_upload_complete(request):
                             if isinstance(f, dict)]
         user.cloud_files.append(rec)
         save_user(user)
-        return web.json_response({"file": _miniapp_rec_out(rec, user)})
+        return web.json_response({"file": _miniapp_rec_out(rec)})
     finally:
         for p in (s["path"], mt_renamed):
             try:
@@ -10981,9 +10948,6 @@ async def miniapp_storage_get(request):
             added = str((getattr(user, "vault_channel", None) or {}).get("added") or "")
         except Exception:
             added = ""
-    # ВОЛНА 22.30: «ПО ПОЛОЧКАМ» — счётчики и куда что пойдёт.
-    _cloud_n = len([f for f in (getattr(user, "cloud_files", []) or []) if isinstance(f, dict)])
-    _vault_n = len([f for f in (getattr(user, "vault_files", []) or []) if isinstance(f, dict)])
     return web.json_response({
         "connected": bool(vc),
         "id": int(vc[0]) if vc else None,
@@ -10992,8 +10956,6 @@ async def miniapp_storage_get(request):
         # ВОЛНА 22.25: режим «файлы БЕЗ шифрования» (только с личным каналом).
         "plain": _vault_channel_plain(user),
         "has_general": bool(get_cloud_channel_ids()),
-        # 22.30: сколько чего в хранилище + пометка, есть ли личный канал.
-        "counts": {"cloud": _cloud_n, "vault": _vault_n},
         # ВОЛНА 22.26: видимое подтверждение связи с ботом.
         "build": BOT_BUILD,
         "bot": _miniapp_bot_username(),
@@ -11154,17 +11116,9 @@ def _web_lock_remaining_minutes(user) -> int:
 
 async def miniapp_web_login(request):
     """POST /api/web_login {"user_id", "password"} → {"token","user_id",
-    "expires_in","build","bot"}.
-
-    ВОЛНА 22.30 (по просьбе пользователя): пароль веб-облака = ПАРОЛЬ СЕЙФА.
-    Проверяем _vault_check_safe_password (user.vault_auth) — тот же пароль,
-    что открывает Сейф в чате; сменить его можно в Сейфе или по 3 секретным
-    вопросам («восстановить» в чате) — веб-вход меняется вместе с ним.
-    Совместимость с волной 22.29: если у пользователя нет Сейфа, но есть
-    отдельный веб-пароль (web_password_hash) — принимаем его.
-
-    Неверный ID/пароль — ОДИНАКОВОЕ 401 (не раскрываем, существует ли
-    пользователь). 5 промахов подряд — блокировка на 10 минут (429)."""
+    "expires_in","build","bot"}. Неверный ID/пароль — ОДИНАКОВОЕ 401
+    (не раскрываем, существует ли пользователь). 5 промахов подряд —
+    блокировка на 10 минут (429 с количеством минут)."""
     try:
         body = await request.json()
     except Exception:
@@ -11176,25 +11130,15 @@ async def miniapp_web_login(request):
     if not user_id or not password:
         return _miniapp_err(400, "bad_request", "Укажите ID и пароль.")
     user = get_user(user_id)
-    if not user:
-        # ЧЕСТНАЯ БЕЗОПАСНОСТЬ: «нет пользователя» и «неверный пароль»
-        # отвечаются ОДИНАКОВО — существование аккаунтов не раскрываем.
+    # ЧЕСТНАЯ БЕЗОПАСНОСТЬ: «нет пользователя» и «нет пароля» неразличимы.
+    if not user or not isinstance(getattr(user, "web_password_hash", None), dict):
         return _miniapp_err(401, "unauthorized", "Неверный ID или пароль.")
-    # Сначала блокировка: перебор паролей останавливаем ДО проверки.
     mins_left = _web_lock_remaining_minutes(user)
     if mins_left > 0:
         return _miniapp_err(
             429, "locked",
             f"Слишком много попыток. Подождите {mins_left} мин.")
-    # ВОЛНА 22.30: пароль веб-облака = пароль Сейфа (vault_auth).
-    # Совместимость с 22.29: принимаем и отдельный веб-пароль, если он был
-    # задан и Сейфа нет.
-    ok = _vault_check_safe_password(user, password)
-    _via = "Сейф"
-    if not ok and isinstance(getattr(user, "web_password_hash", None), dict):
-        ok = _web_check_password(user, password)
-        _via = "веб-пароль 22.29"
-    if not ok:
+    if not _web_check_password(user, password):
         user.web_login_attempts = int(getattr(user, "web_login_attempts", 0) or 0) + 1
         if user.web_login_attempts >= _WEB_LOGIN_MAX_ATTEMPTS:
             user.web_login_locked_until = (
@@ -11207,8 +11151,7 @@ async def miniapp_web_login(request):
     user.web_login_locked_until = None
     save_user(user)
     token = _web_create_session(user.user_id)
-    logger.info(f"web_login: пользователь {user.user_id} вошёл в веб-облако "
-                f"по паролю ({_via})")
+    logger.info(f"web_login: пользователь {user.user_id} вошёл в веб-облако по паролю")
     return web.json_response({
         "token": token,
         "user_id": str(user.user_id),
@@ -11428,7 +11371,7 @@ async def miniapp_files_zip_selected(request):
     save_user(user)
     logger.info(f"zip_selected: {uid} собрал архив из {len(recs)} файлов "
                 f"({len(archive)} байт)")
-    return web.json_response({"file": _miniapp_rec_out(new_rec, user)})
+    return web.json_response({"file": _miniapp_rec_out(new_rec)})
 
 
 def _zip_entry_base_name(info_name: str) -> "str | None":
@@ -11517,7 +11460,7 @@ async def miniapp_files_unzip(request):
         user.cloud_files = [f for f in (getattr(user, "cloud_files", []) or [])
                             if isinstance(f, dict)]
         user.cloud_files.append(new_rec)
-        created.append(_miniapp_rec_out(new_rec, user))
+        created.append(_miniapp_rec_out(new_rec))
     try:
         zf.close()
     except Exception:
@@ -11532,54 +11475,84 @@ async def miniapp_files_unzip(request):
     return web.json_response({"files": created, "skipped": skipped})
 
 
-# --- ВОЛНА 22.30: СЕЙФ В МИНИ-АППЕ («не синхронизируется с сейфом» — фикс) ---
-# Раньше веб-облако показывало ТОЛЬКО обычные файлы (cloud_files), а Сейф
-# жил отдельно в чате — пользователь честно жаловался. Теперь мини-апп:
-#   1) показывает список Сейфа (подписи/размеры — настоящие имена зашифрованы);
-#   2) выдаёт файл по ПАРОЛЮ СЕЙФА (расшифровка в памяти сервера, на диск
-#      ничего не пишется, пароль нигде не сохраняется);
-#   3) умеет перенести файл из облака В Сейф («🔐 В Сейф») с шифрованием.
-# Честные ограничения: веб-выдача/перенос — файлы до 20 МБ (большие качайте
-# через чат Сейфа); нужен настроенный Сейф (пароль + 3 вопроса).
+# ==================================
+# === ВОЛНА 22.30: СКАЧИВАНИЕ ПО ГАЛОЧКАМ + ПЕРЕНОС В СЕЙФ ИЗ ВЕБА ===
+# ==================================
+# Проблема была: в панели мультивыбора НЕ БЫЛО кнопки «Скачать» (только
+# «В ZIP» — тот архив создаётся ВНУТРИ облака, а не скачивается), а
+# классическое blob-скачивание не работает в браузере Telegram (iOS).
+# Решение: сервер готовит файл/ZIP и отдаёт ОДНОРАЗОВУЮ ссылку
+# /api/dl/{token} без заголовков авторизации — её открывает внешний
+# браузер через tg.openLink(), и скачивание срабатывает всегда.
+#
+# Вторая жалоба: «видео не синхронизируется с Сейфом». Файлы из веба
+# лежали в облаке БЕЗ шифрования, а кнопка 🔐 в чате отказывалась
+# переносить файлы больше 20 МБ. Теперь перенос в Сейф есть прямо в
+# мини-аппе: файл любого размера (до 2 ГБ) скачивается из канала,
+# потоково шифруется DVF2 (AES-256-GCM, в ОЗУ ≤1 МБ) и уходит в канал
+# уже ШИФРОМ — как будто его загрузили через Сейф в чате.
 
-_VAULT_WEB_MAX_BYTES = 20 * 1024 * 1024
+_WEB_DL_JOBS = {}     # job_id → {"uid","state","path","name","size","error","token","ts"}
+_WEB_DL_TOKENS = {}   # token  → {"uid","fid","job","expires"}
+_WEB_DL_TOKEN_TTL = 15 * 60                       # ссылка живёт 15 минут
+_WEB_DL_MAX_FILES = 50                            # максимум файлов одним архивом
+_WEB_DL_MAX_TOTAL = (2 * 1024 * 1024 * 1024) - 64 * 1024 * 1024  # суммарно ~1,94 ГБ
+_WEB_DL_JOB_TTL = 6 * 3600                        # готовый архив хранится 6 ч
+_WEB_SEAL_STALE_SEC = 3 * 3600                    # зависший перенос в Сейф
 
 
-def _miniapp_vault_out(rec):
-    """Запись vault_files → JSON для мини-аппа: НИКАКИХ секретов (соль,
-    верификатор, указатели канала) наружу не отдаём."""
-    return {
-        "id": str(rec.get("id") or ""),
-        "label": str(rec.get("label") or ""),
-        "kind": str(rec.get("kind") or "document"),
-        "size": int(rec.get("size_orig") or 0),
-        "ts": str(rec.get("ts") or ""),
-        "cat": str(rec.get("cat") or ""),
+def _web_dl_make_token(uid, fid=None, job=None):
+    token = secrets.token_urlsafe(24)
+    _WEB_DL_TOKENS[token] = {
+        "uid": str(uid),
+        "fid": str(fid) if fid else None,
+        "job": job,
+        "expires": time.time() + _WEB_DL_TOKEN_TTL,
     }
+    return token
 
 
-async def miniapp_vault_list(request):
-    """GET /api/vault/list — список файлов Сейфа (подписи видны, содержимое
-    зашифровано) + статус Сейфа. Пароль НЕ нужен."""
-    user, uid, err = await _api_get_user_any(request)
-    if err is not None:
-        return err
-    files = [f for f in (getattr(user, "vault_files", []) or []) if isinstance(f, dict)]
-    total = sum(int(f.get("size_orig", 0) or 0) for f in files)
-    return web.json_response({
-        "files": [_miniapp_vault_out(f) for f in files],
-        "stats": {"count": len(files), "size": total},
-        # Сейф настроен? (пароль + 3 вопроса) — иначе веб-выдача невозможна.
-        "safe_set": _vault_auth_valid(user),
-        "crypto": AESGCM is not None,
-        "build": BOT_BUILD,
-        "bot": _miniapp_bot_username(),
-    })
+def _web_dl_cleanup():
+    """Чистит просроченные токены и старые готовые архивы (с диска)."""
+    now = time.time()
+    for t in [k for k, v in _WEB_DL_TOKENS.items() if v.get("expires", 0) < now]:
+        _WEB_DL_TOKENS.pop(t, None)
+    for j in [k for k, v in _WEB_DL_JOBS.items() if now - v.get("ts", 0) > _WEB_DL_JOB_TTL]:
+        job = _WEB_DL_JOBS.pop(j, None)
+        if job and job.get("path"):
+            try:
+                os.remove(job["path"])
+            except Exception:
+                pass
 
 
-async def miniapp_vault_download(request):
-    """POST /api/vault/download {"id","password"} — расшифровка В ПАМЯТИ
-    и отдача файла. Пароль Сейфа нигде не сохраняется; на диск не пишем."""
+def _miniapp_dl_entry_name(name, used):
+    """Уникальное имя файла внутри ZIP-архива (без путей — защита от zip-slip)."""
+    n = str(name or "file").replace("\\", "/").split("/")[-1] or "file"
+    n = "".join(ch for ch in n if ord(ch) >= 32)[:120] or "file"
+    if n.lower() in used:
+        stem, dot, ext = n.rpartition(".")
+        if not dot:
+            stem, ext = n, ""
+        i = 2
+        while True:
+            cand = f"{stem} ({i}).{ext}" if ext else f"{stem} ({i})"
+            if cand.lower() not in used:
+                n = cand
+                break
+            i += 1
+    used.add(n.lower())
+    return n
+
+
+async def miniapp_files_prep_download(request):
+    """POST /api/files/prep_download {"ids": [...]} — подготовка скачивания.
+
+    1 файл → сразу {"ready": true, "token": ...}: /api/dl/{token} отдаст его.
+    Несколько → {"ready": false, "job": ...}: сервер ФОНОМ собирает ZIP
+    (маленькие файлы — Bot API, большие — MTProto-потоком, без потери
+    качества), статус: GET /api/files/dl_status/{job} → {"state":"ok",
+    "token": ...}. Ссылку открывает внешний браузер — blob не нужен."""
     user, uid, err = await _api_get_user_any(request)
     if err is not None:
         return err
@@ -11587,162 +11560,387 @@ async def miniapp_vault_download(request):
         body = await request.json()
     except Exception:
         return _miniapp_err(400, "bad_json", "Ожидался JSON.")
-    rec = _vault_find_record(user, str((body or {}).get("id") or ""))
-    if not rec:
-        return _miniapp_err(404, "not_found", "Файл не найден в Сейфе.")
-    if AESGCM is None:
-        return _miniapp_err(503, "no_crypto",
-                            "На сервере нет библиотеки шифрования — "
-                            "скачайте файл через чат Сейфа.")
-    password = str((body or {}).get("password") or "")
-    if rec.get("plain"):
-        # Режим «без шифра»: пароля нет, отдаём как есть.
-        container = await _miniapp_fetch_file_bytes(rec, _VAULT_WEB_MAX_BYTES)
-        if container is None:
-            return _miniapp_err(502, "download_failed",
-                                "Не удалось скачать файл из хранилища.")
-        name = str(rec.get("name") or "file")
-        return web.Response(
-            body=container,
-            content_type="application/octet-stream",
-            headers={"Content-Disposition": _miniapp_content_disposition(name),
-                     "Cache-Control": "no-store"})
-    if rec.get("dvf2") or int(rec.get("size_orig", 0) or 0) > _VAULT_WEB_MAX_BYTES:
-        return _miniapp_err(
-            413, "too_big",
-            "Этот файл больше 20 МБ — в веб-облаке такие не расшифровываются. "
-            "Скачайте его через чат: 🔐 Сейф → выберите файл → пароль.")
-    if not password:
-        return _miniapp_err(401, "need_password", "Введите пароль Сейфа.")
-    if not _vault_check_password(user, rec, password):
-        return _miniapp_err(401, "bad_password", "Неверный пароль Сейфа.")
-    container = await _miniapp_fetch_file_bytes(rec, _VAULT_WEB_MAX_BYTES)
-    if container is None:
-        return _miniapp_err(502, "download_failed",
-                            "Не удалось скачать шифр из хранилища. "
-                            "Попробуйте позже или через чат Сейфа.")
+    ids = (body or {}).get("ids") or []
+    if not isinstance(ids, list):
+        return _miniapp_err(400, "bad_ids", "Ожидался список ids.")
+    ids = [str(i) for i in ids if str(i).strip()][:_WEB_DL_MAX_FILES + 1]
+    if not ids:
+        return _miniapp_err(400, "empty", "Файлы не выбраны.")
+    if len(ids) > _WEB_DL_MAX_FILES:
+        return _miniapp_err(413, "too_many",
+                            f"За раз можно скачать максимум {_WEB_DL_MAX_FILES} файлов.")
+    _web_dl_cleanup()
+    recs, total = [], 0
+    for fid in ids:
+        rec = _cloud_find_record(user, fid)
+        if not rec:
+            return _miniapp_err(404, "not_found", f"Файл не найден: {fid}.")
+        if int(rec.get("size") or 0) > VAULT_MTPROTO_MAX_BYTES:
+            return _miniapp_err(
+                413, "too_big",
+                f"«{rec.get('name')}» больше {_fmt_bytes(VAULT_MTPROTO_MAX_BYTES)} — "
+                "столько Telegram не хранит даже через MTProto.")
+        total += int(rec.get("size") or 0)
+        recs.append(rec)
+    if total > _WEB_DL_MAX_TOTAL:
+        return _miniapp_err(413, "too_big_total",
+                            "Суммарный размер выбранных файлов больше 2 ГБ.")
+    if len(recs) == 1:
+        token = _web_dl_make_token(uid, fid=recs[0].get("id"))
+        return web.json_response({
+            "ready": True, "token": token, "count": 1,
+            "name": str(recs[0].get("name") or "file"),
+        })
+    job_id = secrets.token_hex(8)
+    _WEB_DL_JOBS[job_id] = {"uid": str(uid), "state": "run", "path": None,
+                            "name": None, "size": 0, "error": None,
+                            "token": None, "ts": time.time()}
+    # Фоновая задача; результат забирается через GET /api/files/dl_status/{job}.
+    asyncio.create_task(_miniapp_build_dl_zip(job_id, recs))
+    logger.info(f"prep_download: {uid} собирает ZIP из {len(recs)} файлов "
+                f"({_fmt_bytes(total)})")
+    token = _web_dl_make_token(uid, job=job_id)
+    _WEB_DL_JOBS[job_id]["token"] = token
+    return web.json_response({"ready": False, "job": job_id, "count": len(recs)})
+
+
+async def _miniapp_build_dl_zip(job_id, recs):
+    """Фон: собирает ZIP выбранных файлов НА ДИСК (не в ОЗУ). Файлы ≤20 МБ
+    качает Bot API, больше — MTProto-потоком прямо в архив (zip-запись
+    STORED — без пережатия, чтобы видео/фото не теряли качество и сборка
+    была быстрой). Готово → state='ok'; сбой → state='err' + честная причина."""
+    job = _WEB_DL_JOBS.get(job_id)
+    tmp = os.path.join(_miniapp_tmpdir(), f"dljob_{job_id}.zip")
+    used_names = set()
+    stamp = datetime.now().strftime("%d.%m.%Y %H-%M")
+    zip_name = f"DEVO_файлы_{stamp} ({len(recs)}).zip"
     try:
-        meta, payload = _vault_unpack(password, container)
-    except Exception:
-        return _miniapp_err(401, "bad_password",
-                            "Неверный пароль Сейфа (или файл повреждён).")
-    name = str((meta or {}).get("name") or f"vault_{rec.get('id', 'file')}")
-    mime = str((meta or {}).get("mime") or "application/octet-stream")
-    logger.info(f"vault web download: {uid} выдал файл Сейфа {rec.get('id')}")
-    return web.Response(
-        body=payload,
-        content_type=mime if mime else "application/octet-stream",
-        headers={"Content-Disposition": _miniapp_content_disposition(name),
-                 "Cache-Control": "no-store"})
+        total = sum(int(r.get("size") or 0) for r in recs)
+        if not _dvf2_disk_ok(total):
+            raise RuntimeError("мало свободного места на диске сервера — "
+                               "попробуйте позже или скачайте меньше файлов за раз")
+        client = await _mt_client()  # может быть None — тогда только ≤20 МБ
+        with zipfile.ZipFile(tmp, "w", allowZip64=True) as zf:
+            for rec in recs:
+                name = _miniapp_dl_entry_name(rec.get("name"), used_names)
+                size = int(rec.get("size") or 0)
+                zi = zipfile.ZipInfo(name, date_time=datetime.now().timetuple()[:6])
+                if client is not None and size > 20 * 1024 * 1024:
+                    # Большой файл: MTProto-поток прямо в zip-запись (STORED).
+                    channel_id = rec.get("channel_id") or get_storage_channel_id()
+                    if not channel_id or not rec.get("msg_id"):
+                        raise RuntimeError(f"«{name}»: источник файла недоступен")
+                    _m, doc = await _mt_fetch_document(
+                        client, int(channel_id), int(rec["msg_id"]))
+                    if doc is None:
+                        raise RuntimeError(f"«{name}»: в сообщении канала нет файла")
+                    doc_size = int(getattr(doc, "size", 0) or size or 0)
+                    zi.compress_type = zipfile.ZIP_STORED
+                    with zf.open(zi, "w", force_zip64=True) as dst:
+                        await _mt_download_stream(
+                            client, doc, doc_size, dst.write)
+                else:
+                    data = await _miniapp_fetch_file_bytes(rec, 20 * 1024 * 1024)
+                    if data is None:
+                        if client is None and size > 20 * 1024 * 1024:
+                            raise RuntimeError(
+                                f"«{name}»: файл больше 20 МБ, а MTProto (Telethon) "
+                                "на сервере недоступен — большие файлы без него "
+                                "не скачать. Проверьте TELETHON_SESSION.")
+                        raise RuntimeError(
+                            f"«{name}»: не удалось скачать из хранилища")
+                    zi.compress_type = zipfile.ZIP_DEFLATED
+                    zf.writestr(zi, data)
+                await asyncio.sleep(0)
+        job["state"] = "ok"
+        job["path"] = tmp
+        job["size"] = os.path.getsize(tmp)
+        job["name"] = zip_name
+        logger.info(f"prep_download: ZIP готов ({job['size']} байт): {len(recs)} файлов")
+    except Exception as e:
+        job["state"] = "err"
+        job["error"] = str(e)
+        logger.error(f"prep_download: сборка ZIP не удалась: {e}")
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
 
 
-async def miniapp_files_to_vault(request):
-    """POST /api/files/to_vault {"id","password"} — переносит обычный файл
-    облака В СЕЙФ: шифрует паролем Сейфа, заливает шифр в канал, оригинал
-    стирает (тот же смысл, что кнопка 🔐 в чате)."""
+async def miniapp_dl_status(request):
+    """GET /api/files/dl_status/{job} — статус сборки архива для скачивания."""
     user, uid, err = await _api_get_user_any(request)
     if err is not None:
         return err
-    body = await _safe_json(request) or {}
-    rec = _cloud_find_record(user, str(body.get("id") or ""))
+    job = _WEB_DL_JOBS.get(request.match_info["job"])
+    if not job or job.get("uid") != str(uid):
+        return _miniapp_err(404, "not_found", "Задача не найдена — соберите архив заново.")
+    out = {"state": job.get("state")}
+    if job.get("state") == "err":
+        out["error"] = job.get("error") or "не удалось собрать архив"
+    if job.get("state") == "ok":
+        out["token"] = job.get("token") or _web_dl_make_token(uid, job=request.match_info["job"])
+        out["name"] = job.get("name") or "DEVO_файлы.zip"
+    return web.json_response(out)
+
+
+async def miniapp_dl_token(request):
+    """GET /api/dl/{token} — ОДНОРАЗОВАЯ ссылка скачивания (без заголовков
+    авторизации: её открывает внешний браузер через tg.openLink)."""
+    token = request.match_info["token"]
+    rec = _WEB_DL_TOKENS.pop(token, None)
+    if not rec or float(rec.get("expires", 0)) < time.time():
+        return web.Response(
+            status=404, content_type="text/plain", charset="utf-8",
+            text="Ссылка устарела. Откройте облако и запросите скачивание заново.")
+    user = get_user(rec.get("uid"))
+    if not user:
+        return web.Response(status=404, content_type="text/plain",
+                            charset="utf-8", text="Пользователь не найден.")
+    if rec.get("job"):
+        job = _WEB_DL_JOBS.pop(rec["job"], None)
+        path = job.get("path") if job else None
+        if not path or not os.path.exists(path):
+            return web.Response(status=404, content_type="text/plain",
+                                charset="utf-8",
+                                text="Архив не найден — соберите его заново.")
+        name = job.get("name") or "DEVO_files.zip"
+        response = web.StreamResponse(status=200, headers={
+            "Content-Type": "application/zip",
+            "Content-Disposition": _miniapp_content_disposition(name),
+            "Cache-Control": "no-store",
+        })
+        response.content_length = os.path.getsize(path)
+        await response.prepare(request)
+        try:
+            with open(path, "rb") as f:
+                while True:
+                    chunk = f.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    await response.write(chunk)
+            await response.write_eof()
+        finally:
+            try:
+                os.remove(path)  # одноразовость: архив стираем после выдачи
+            except Exception:
+                pass
+        return response
+    f_rec = _cloud_find_record(user, rec.get("fid"))
+    if not f_rec:
+        return web.Response(status=404, content_type="text/plain",
+                            charset="utf-8",
+                            text="Файл уже удалён из облака.")
+    return await _miniapp_download_response(request, user, f_rec)
+
+
+# --- ВОЛНА 22.30: ПЕРЕНОС ФАЙЛА ИЗ ВЕБ-ОБЛАКА В СЕЙФ (шифрование) ---
+
+async def miniapp_files_to_safe(request):
+    """POST /api/files/{fid}/to_safe {"password": "..."} — переносит файл из
+    веб-облака в 🔐 Сейф: сервер проверяет пароль Сейфа, скачивает файл из
+    канала, потоково шифрует (DVF2, AES-256-GCM) и заливает шифр обратно,
+    оригинал стирает. Файлы до 2 ГБ (MTProto). Работа идёт ФОНОМ: ответ
+    приходит сразу, статус — в поле seal у файла (GET /api/files)."""
+    user, uid, err = await _api_get_user_any(request)
+    if err is not None:
+        return err
+    rec = _cloud_find_record(user, request.match_info["fid"])
     if not rec:
         return _miniapp_err(404, "not_found", "Файл не найден (возможно, уже удалён).")
+    try:
+        body = await request.json()
+    except Exception:
+        return _miniapp_err(400, "bad_json", "Ожидался JSON.")
+    password = str((body or {}).get("password") or "")
+    if not password:
+        return _miniapp_err(400, "no_password", "Введите пароль Сейфа.")
     if AESGCM is None:
         return _miniapp_err(503, "no_crypto",
-                            "На сервере нет библиотеки шифрования — "
-                            "перенесите файл в Сейф через чат (кнопка 🔐).")
-    if not _vault_auth_valid(user):
-        return _miniapp_err(
-            409, "no_safe",
-            "Сначала настройте Сейф в чате бота: ☁️ Облако → 📤 Загрузить в "
-            "Сейф — задайте пароль и 3 секретных вопроса. После этого перенос "
-            "из веб-облака заработает.")
-    password = str(body.get("password") or "")
-    if not password:
-        return _miniapp_err(401, "need_password", "Введите пароль Сейфа.")
+                            "Шифрование недоступно на сервере (нет cryptography).")
+    if not isinstance(getattr(user, "vault_auth", None), dict) or \
+            not (user.vault_auth.get("verifier")):
+        return _miniapp_err(409, "no_safe_password",
+                            "Сначала задайте пароль Сейфа в чате бота: "
+                            "☁️ Облако → 🔐 Сейф — и загрузите/перенесите файл там.")
     if not _vault_check_safe_password(user, password):
-        return _miniapp_err(401, "bad_password", "Неверный пароль Сейфа.")
-    if int(rec.get("size") or 0) > _VAULT_WEB_MAX_BYTES:
         return _miniapp_err(
-            413, "too_big",
-            "Файл больше 20 МБ — в Сейф из веб-облака такие не перенести. "
-            "Загрузите его в Сейф через чат (до 2 ГБ).")
-    data = await _miniapp_fetch_file_bytes(rec, _VAULT_WEB_MAX_BYTES)
-    if data is None:
-        return _miniapp_err(502, "download_failed",
-                            "Не удалось скачать файл из хранилища.")
-    name = str(rec.get("name") or "file")
-    mime = str(rec.get("mime") or "application/octet-stream")
-    meta = {"name": name[:120], "mime": mime, "ts": rec.get("ts") or ""}
-    # DVF1-контейнер (совместим с выдачей в чате) + свои соль/верификатор
-    # для записи vault_files (проверка пароля без скачивания).
-    salt = os.urandom(16)
-    nonce = os.urandom(12)
-    key = _vault_derive_key(password, salt, VAULT_KDF_ITERS)
-    header = json.dumps(meta, ensure_ascii=False).encode("utf-8")
-    plaintext = header + b"\x00" + data
-    try:
-        ct = AESGCM(key).encrypt(nonce, plaintext, VAULT_MAGIC + bytes([VAULT_VERSION]))
-    except Exception as e:
-        logger.error(f"to_vault: шифрование не удалось: {e}")
-        return _miniapp_err(500, "encrypt_failed", "Шифрование не удалось, файл не тронут.")
-    container = (VAULT_MAGIC + bytes([VAULT_VERSION])
-                 + VAULT_KDF_ITERS.to_bytes(4, "big") + salt + nonce + ct)
-    app = _MINIAPP_PTB_APP
-    if app is None:
-        return _miniapp_err(503, "no_bot", "Бот ещё запускается — попробуйте через минуту.")
-    sent = await _storage_upload_document(
-        _MiniappCtx(app.bot), container,
-        filename=f"vault_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{rec.get('id', 'f')}.bin",
-        caption="🔐 Сейф: зашифрованный файл (открыть без пароля невозможно).",
-        user=user)
-    if not sent:
-        return _miniapp_err(502, "upload_failed",
-                            "Telegram не принял шифр в хранилище. Файл не тронут.")
-    vrec = {
-        "id": _vault_gen_id(user),
-        "kind": str(rec.get("kind") or "document"), "mime": mime,
-        "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
-        "size_orig": int(rec.get("size") or len(data)),
-        "size_enc": len(container),
-        "salt": salt.hex(),
-        "verifier": _vault_verifier(key).hex(),
-        "iters": int(VAULT_KDF_ITERS),
-        "nonce": nonce.hex(),
-        "msg_id": int(sent.get("message_id") or 0),
-        "file_id": sent.get("file_id"),
-        "channel_id": sent.get("channel_id"),
-        "label": name[:80],
-        "cat": str(rec.get("cat") or ""),
-    }
-    # Оригинал: стираем из канала и из базы облака (как cloud_del).
-    channel_id = rec.get("channel_id") or get_storage_channel_id()
-    if channel_id and rec.get("msg_id"):
-        try:
-            await app.bot.delete_message(chat_id=int(channel_id),
-                                         message_id=int(rec["msg_id"]))
-        except Exception:
-            pass
-    user.cloud_files = [f for f in (getattr(user, "cloud_files", []) or [])
-                        if not (isinstance(f, dict) and f.get("id") == rec.get("id"))]
-    user.vault_files = [f for f in (getattr(user, "vault_files", []) or [])
-                        if isinstance(f, dict)]
-    user.vault_files.append(vrec)
+            403, "bad_password",
+            "Неверный пароль Сейфа. Подсказка: это НЕ веб-пароль из 7 цифр — "
+            "пароль Сейфа вы придумывали, когда загружали файлы в 🔐 Сейф.")
+    if rec.get("seal_state") == "run":
+        return _miniapp_err(409, "busy", "Этот файл уже переносится — подождите.")
+    size = int(rec.get("size") or 0)
+    if size > VAULT_MTPROTO_MAX_BYTES:
+        return _miniapp_err(413, "too_big",
+                            f"Файл больше {_fmt_bytes(VAULT_MTPROTO_MAX_BYTES)} — "
+                            "такой не примет даже MTProto Telegram.")
+    plain_mode = (_user_vault_channel(user) is not None and _vault_channel_plain(user))
+    if not plain_mode and not (rec.get("msg_id") or rec.get("file_id")):
+        return _miniapp_err(404, "no_source",
+                            "Источник файла недоступен (сообщение удалено из канала?).")
+    rec["seal_state"] = "run"
+    rec["seal_ts"] = time.time()
+    rec.pop("seal_err", None)
     save_user(user)
-    _stat_bump("vault_upload")
-    logger.info(f"to_vault: {uid} перенёс «{name}» в Сейф ({len(container)} байт шифра)")
-    return web.json_response({
-        "vault": _miniapp_vault_out(vrec),
-        "file": _miniapp_rec_out(rec, user),
-    })
+    asyncio.create_task(_miniapp_seal_to_vault_task(user, rec, password))
+    return web.json_response({"ok": True, "seal": "run"})
 
 
-async def _safe_json(request):
-    """Аккуратное чтение JSON-тела (None — не JSON)."""
+async def _miniapp_seal_to_vault_task(user, rec, password):
+    """Фон переноса веб-файла в Сейф: скачать → зашифровать (или «без
+    шифра» для личного канала в режиме plain) → залить → записать в
+    vault_files → стереть оригинал из облака и канала. Пользователь видит
+    прогресс флажком seal у файла в мини-аппе."""
+    app = _MINIAPP_PTB_APP
+    fid = str(rec.get("id") or "")
+    name = str(rec.get("name") or "файл")
+    kind = str(rec.get("kind") or "document")
+    mime = str(rec.get("mime") or "")
+    size = int(rec.get("size") or 0)
+    plain_mode = (_user_vault_channel(user) is not None and _vault_channel_plain(user))
     try:
-        return await request.json()
-    except Exception:
-        return None
+        # 1) Скачиваем оригинал.
+        payload = None
+        doc = None
+        doc_size = size
+        client = None
+        if app is not None and rec.get("file_id") and 0 < size <= VAULT_MAX_FILE_BYTES:
+            try:
+                tg_file = await app.bot.get_file(rec["file_id"])
+                payload = bytes(await tg_file.download_as_bytearray())
+            except Exception as e:
+                logger.warning(f"web→safe: Bot API не отдал файл ({e}); пробую MTProto")
+        if payload is None:
+            client = await _mt_client()
+            if client is None:
+                raise RuntimeError(
+                    "MTProto недоступен (" + (_MT_LAST_ERR or "не подключён")
+                    + ") — файлы больше 20 МБ переносятся только с ним. "
+                      "Попробуйте позже или перенесите через чат.")
+            channel_id = rec.get("channel_id") or get_storage_channel_id()
+            if not channel_id or not rec.get("msg_id"):
+                raise RuntimeError("источник файла недоступен (нет канала/сообщения)")
+            _m, doc = await _mt_fetch_document(client, int(channel_id), int(rec["msg_id"]))
+            if doc is None:
+                raise RuntimeError("в сообщении канала нет файла")
+            doc_size = int(getattr(doc, "size", 0) or size or 0)
+        if not _dvf2_disk_ok(doc_size + 4 * 1024 * 1024):
+            raise RuntimeError("мало свободного места на диске сервера — "
+                               "попробуйте позже")
+        job = _dvf2_make_job_dir()
+        try:
+            # 2) Шифруем (потоково, в ОЗУ ≤1 МБ) или готовим «как есть».
+            if plain_mode:
+                tmp_out = os.path.join(job, "plain.bin")
+            else:
+                enc = _Dvf2Encryptor(password, {
+                    "n": name, "k": kind, "m": mime,
+                    "t": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    "sz": size or doc_size,
+                }, os.path.join(job, "container.bin"))
+                tmp_out = os.path.join(job, "container.bin")
+            if payload is not None:
+                if plain_mode:
+                    with open(tmp_out, "wb") as fh:
+                        fh.write(payload)
+                    out_size = len(payload)
+                else:
+                    enc.push(payload)
+                    out_size = enc.finish()
+                payload = b""
+            else:
+                if plain_mode:
+                    with open(tmp_out, "wb") as fh:
+                        await _mt_download_stream(client, doc, doc_size, fh.write)
+                    out_size = os.path.getsize(tmp_out)
+                else:
+                    await _mt_download_stream(client, doc, doc_size, enc.push)
+                    out_size = enc.finish()
+            # 3) Заливаем результат в канал.
+            _cap = ("🔐 Сейф: перенесено из Веб-облака (открыть без пароля "
+                    "невозможно).") if not plain_mode else \
+                   "☁️ Перенесено из Веб-облака (режим без шифра)."
+            _fn = (f"vault_{datetime.now().strftime('%Y%m%d_%H%M%S')}.bin"
+                   if not plain_mode else _dvf2_safe_name(name))
+            up = None
+            if out_size <= (49 * 1024 * 1024 - 1024 * 1024):
+                with open(tmp_out, "rb") as fh:
+                    out_bytes = fh.read()
+                try:
+                    if app is None:
+                        raise RuntimeError("бот ещё не поднялся")
+                    up = await _storage_upload_document(
+                        _MiniappCtx(app.bot), out_bytes, filename=_fn,
+                        caption=_cap, user=user)
+                finally:
+                    out_bytes = b""
+                if up is None and _TELETHON_OK and BOT_TOKEN:
+                    up = await _mt_upload_container(
+                        client or await _mt_client(), tmp_out, out_size,
+                        caption=_cap, filename=_fn, user=user)
+            else:
+                _c = client or await _mt_client()
+                if _c is None:
+                    raise RuntimeError("MTProto недоступен для заливки шифра")
+                up = await _mt_upload_container(
+                    _c, tmp_out, out_size, caption=_cap, filename=_fn, user=user)
+            if not up:
+                raise RuntimeError("канал не принял файл — проверьте, что бот "
+                                   "администратор хранилища")
+            # 4) Запись в Сейф.
+            new_rec = {
+                "id": _vault_gen_id(user),
+                "kind": kind, "mime": mime,
+                "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "size_orig": size or out_size,
+                "size_enc": int(up.get("size", 0) or out_size),
+                "msg_id": int(up.get("message_id", 0)),
+                "file_id": up.get("file_id"),
+                "channel_id": up.get("channel_id"),
+            }
+            if plain_mode:
+                new_rec["name"] = name[:120]
+                new_rec["plain"] = True
+            else:
+                new_rec.update({
+                    "salt": enc.salt_hex(), "verifier": enc.verifier_hex(),
+                    "iters": enc.iters, "nonce": enc.np_hex(), "dvf2": True,
+                })
+            user.vault_files = [f for f in (getattr(user, "vault_files", []) or [])
+                                if isinstance(f, dict)]
+            user.vault_files.append(new_rec)
+            _stat_bump("vault_upload")
+            # 5) Оригинал: стираем сообщение из канала и запись из облака.
+            if app is not None and rec.get("msg_id"):
+                try:
+                    await app.bot.delete_message(
+                        chat_id=int(rec.get("channel_id") or get_storage_channel_id()),
+                        message_id=int(rec["msg_id"]))
+                except Exception:
+                    pass
+            user.cloud_files = [f for f in (getattr(user, "cloud_files", []) or [])
+                                if not (isinstance(f, dict) and f.get("id") == fid)]
+            save_user(user)
+            logger.info(f"web→safe: файл «{name}» ({_fmt_bytes(size)}) перенесён "
+                        f"в Сейф пользователя {getattr(user, 'user_id', '?')}"
+                        + (" (без шифра)" if plain_mode else ""))
+        finally:
+            try:
+                _shutil.rmtree(job, ignore_errors=True)
+            except Exception:
+                pass
+        # Немедленный слив базы в канал-БД (событие Сейфа).
+        try:
+            if app is not None:
+                await _cdb_flush(_MiniappCtx(app.bot), force=True, reason="веб→сейф")
+        except Exception as e:
+            logger.warning(f"web→safe: слив базы не удался: {e}")
+    except Exception as e:
+        rec["seal_state"] = "err"
+        rec["seal_err"] = str(e)
+        save_user(user)
+        logger.error(f"web→safe: перенос не удался ({getattr(user, 'user_id', '?')}): {e}")
 
 
 def mount_miniapp_routes(app):
@@ -11771,10 +11969,12 @@ def mount_miniapp_routes(app):
     # ВОЛНА 22.29: мультивыбор — собранный ZIP из выбранных + распаковка ZIP
     app.router.add_post("/api/files/zip_selected", miniapp_files_zip_selected)
     app.router.add_post("/api/files/unzip", miniapp_files_unzip)
-    # ВОЛНА 22.30: Сейф в мини-аппе — список/выдача по паролю/перенос в Сейф
-    app.router.add_get("/api/vault/list", miniapp_vault_list)
-    app.router.add_post("/api/vault/download", miniapp_vault_download)
-    app.router.add_post("/api/files/to_vault", miniapp_files_to_vault)
+    # ВОЛНА 22.30: скачивание по галочкам (одноразовая ссылка вместо blob)
+    # и перенос файла из веба в 🔐 Сейф с шифрованием.
+    app.router.add_post("/api/files/prep_download", miniapp_files_prep_download)
+    app.router.add_get("/api/files/dl_status/{job}", miniapp_dl_status)
+    app.router.add_get("/api/dl/{token}", miniapp_dl_token)
+    app.router.add_post("/api/files/{fid}/to_safe", miniapp_files_to_safe)
 
 
 async def cloud_exit_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -11947,9 +12147,13 @@ async def cloud_mv_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return MAIN_MENU
     size = int(rec.get("size", 0) or 0)
     if size > VAULT_MAX_FILE_BYTES:
+        # ВОЛНА 22.30: больше не тупик — большой файл переносится из веба
+        # (мини-апп → ⋮ у файла → «🔐 В Сейф»), там MTProto-поток.
         await query.answer(
-            f"Файл больше {_fmt_bytes(VAULT_MAX_FILE_BYTES)} — Telegram не даёт "
-            "ботам скачивать такие файлы, перенести в Сейф честно невозможно.",
+            f"Этот файл больше {_fmt_bytes(VAULT_MAX_FILE_BYTES)} — в чате я не "
+            "могу его скачать. Но перенос есть в ВЕБЕ: откройте мини-апп "
+            "(«☁️ DEVO+») → тапните файл → «🔐 Перенести в Сейф» — там он "
+            "зашифруется и уедет в Сейф.",
             show_alert=True,
         )
         return MAIN_MENU
@@ -15090,9 +15294,8 @@ def get_vault_menu_keyboard():
         # ВОЛНА 22.20: «🔗 Моё облако» — НАСТРОЙКА САМОГО ПОЛЬЗОВАТЕЛЯ:
         # свой приватный канал как личное хранилище (без панели разработчика).
         [InlineKeyboardButton("🔗 Моё облако", callback_data="vault_cloud")],
-        # ВОЛНА 22.29/22.30: веб-вход в Веб-облако без Telegram — по паролю
-        # Сейфа (с 22.30 пароль Сейфа = пароль веб-входа).
-        [InlineKeyboardButton("🌐 Веб-вход (пароль Сейфа)", callback_data="web_password_menu")],
+        # ВОЛНА 22.29: веб-пароль для входа в Веб-облако без Telegram.
+        [InlineKeyboardButton("🔑 Веб-пароль", callback_data="web_password_menu")],
         # ВОЛНА 9: восстановление и управление вопросами — прямо в меню Сейфа.
         [InlineKeyboardButton("🔑 Забыл пароль (восстановить)", callback_data="vault_rec")],
         [InlineKeyboardButton("❓ Сменить секретные вопросы", callback_data="vault_qs")],
@@ -15419,64 +15622,55 @@ async def vault_cloud_add_cb(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # ==================================
 
 def _web_password_text(user) -> str:
-    """ВОЛНА 22.30: пароль веб-облака = ПАРОЛЬ СЕЙФА (по просьбе пользователя).
-    Отдельного «веб-пароля» больше не создаём: вход в веб-облако принимает
-    тот же пароль, что открывает Сейф; смена — в Сейфе или по 3 вопросам."""
-    has_safe = _vault_auth_valid(user)
-    status = (
-        "✅ Сейф настроен: ваш пароль Сейфа уже работает для входа в "
-        "веб-облако."
-        if has_safe else
-        "❌ Сейф ещё не настроен — откройте ☁️ Облако → 🔐 Сейф и задайте "
-        "пароль (он же станет паролем веб-облака)."
-    )
+    has_pw = isinstance(getattr(user, "web_password_hash", None), dict)
+    when = str(getattr(user, "web_password_set_at", "") or "")
+    if has_pw:
+        status = f"✅ Пароль задан{f' ({when[:16]})' if when else ''}.\n" \
+                 f"🆔 Ваш логин — Telegram ID: <code>{user.user_id}</code>"
+    else:
+        status = ("❌ Пароль не задан — вход в веб-облако по паролю "
+                  "пока закрыт.")
     return (
-        "🌐 <b>Веб-вход в DEVO+ Облако</b>\n\n"
+        "🔑 <b>Веб-пароль</b>\n\n"
+        "Вход в 🌐 Веб-облако (мини-апп «DEVO+ Облако») — без Telegram и без "
+        "VPN.\n\n"
         f"{status}\n\n"
-        "Как это работает:\n"
-        "• В Telegram: откройте мини-апп кнопкой меню «☁️ DEVO+» (или "
-        "☁️ Облако → 🌐 Веб-облако) — вход пройдёт сам, ничего вводить "
-        "не нужно.\n"
-        "• В обычном браузере (без Telegram, без VPN): на странице "
-        "веб-облака введите свой Telegram ID и ПАРОЛЬ СЕЙФА.\n"
-        "• Сменить пароль — в Сейфе (🔐), или восстановите доступ по СВОИМ "
-        "3 секретным вопросам («🔑 Забыл пароль») — веб-вход изменится "
-        "вместе с паролем Сейфа.\n\n"
-        "Требования к паролю: минимум 7 символов. 5 неверных попыток "
-        "веб-входа подряд — пауза на 10 минут.\n\n"
-        "💡 <b>Совет по надёжности:</b> лучше создать СВОЙ частный канал и "
-        "добавить бота администратором с правом «Публикация сообщений», "
-        "затем подключить его через ☁️ Облако → 🔗 Моё облако. Тогда файлы "
-        "лежат только в ВАШЕМ канале — это ваше собственное хранилище, и "
-        "данные надёжнее."
+        "Требования: РОВНО 7 ЦИФР (например, 7042583).\n\n"
+        "❗️ Это ОДИН пароль сразу для всего: веб-облака в браузере И мини-аппа "
+        "в Telegram — запоминать два не нужно. Сам пароль нигде не хранится — "
+        "только его «отпечаток» (PBKDF2, 200 000 раундов). 5 неверных попыток "
+        "подряд — пауза на 10 минут.\n\n"
+        "Вход: откройте веб-облако и введите свой Telegram ID (виден выше) "
+        "и этот пароль. Пароль Сейфа — отдельный, он не меняется здесь."
     )
 
 
 def _web_password_kb(user):
-    rows = [
-        [InlineKeyboardButton("🔐 Открыть Сейф", callback_data="vault_menu")],
-        [InlineKeyboardButton("🔗 Моё облако (свой канал)", callback_data="vault_cloud")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="cloud_menu")],
-    ]
+    has_pw = isinstance(getattr(user, "web_password_hash", None), dict)
+    rows = []
+    if has_pw:
+        rows.append([InlineKeyboardButton("🔁 Сменить пароль", callback_data="web_pw_change")])
+        rows.append([InlineKeyboardButton("🗑 Удалить пароль", callback_data="web_pw_delete")])
+    else:
+        rows.append([InlineKeyboardButton("➕ Задать пароль", callback_data="web_pw_set")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="cloud_menu")])
     return InlineKeyboardMarkup(rows)
 
 
 def _web_pw_validate(password: str) -> "str | None":
     """None — пароль годен; иначе текст ошибки (для пользователя).
-    ВОЛНА 22.30: минимум 7 символов (по просьбе пользователя), буква и цифра."""
-    if not password or len(password) < 7:
-        return "Пароль слишком короткий — минимум 7 символов. Придумайте другой:"
-    if not re.search(r"[A-Za-zА-Яа-яЁё]", password):
-        return "В пароле должна быть хотя бы одна буква. Придумайте другой:"
-    if not re.search(r"\d", password):
-        return "В пароле должна быть хотя бы одна цифра. Придумайте другой:"
+    ВОЛНА 22.30 (по просьбе пользователя): пароль — РОВНО 7 ЦИФР (раньше
+    было «минимум 8 символов, буква и цифра»). Старые пароли, заданные по
+    прежнему правилу, продолжают работать — _web_check_password длину не
+    проверяет. Пароль один и для веб-облака, и для мини-аппа."""
+    if not password or not re.fullmatch(r"\d{7}", password or ""):
+        return ("Пароль должен быть РОВНО 7 ЦИФР (например, 7042583). "
+                "Придумайте другой:")
     return None
 
 
 async def web_password_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Экран «🌐 Веб-вход»: пароль веб-облака = пароль Сейфа (22.30).
-    Ссылку на хостинг НЕ даём — вход через кнопку меню бота или по адресу
-    веб-облака, который открывает сам разработчик."""
+    """Экран «🔑 Веб-пароль»: статус + Задать/Сменить/Удалить."""
     query = update.callback_query
     try:
         await query.answer()
@@ -15488,6 +15682,21 @@ async def web_password_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYP
             await query.answer("Сначала зарегистрируйтесь — /start", show_alert=True)
         except Exception:
             pass
+        return MAIN_MENU
+    if not MINIAPP_URL:
+        # Честно: без адреса веб-облака пароль задавать некуда.
+        try:
+            await query.edit_message_text(
+                "🌐 Разработчик не настроил адрес веб-облака, задать пароль нельзя.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("⬅️ Назад", callback_data="cloud_menu")]]),
+            )
+        except Exception:
+            try:
+                await query.message.reply_text(
+                    "🌐 Разработчик не настроил адрес веб-облака, задать пароль нельзя.")
+            except Exception:
+                pass
         return MAIN_MENU
     try:
         await query.edit_message_text(
@@ -15525,7 +15734,9 @@ async def web_pw_set_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await query.edit_message_text(
             "🔐 Придумайте веб-пароль и пришлите его следующим сообщением.\n\n"
-            "Требования: минимум 7 символов, хотя бы одна буква и одна цифра.\n"
+            "Требования: РОВНО 7 ЦИФР (например, 7042583).\n"
+            "❗️ Пароль один и для веб-облака, и для мини-аппа — «синхронизировать» "
+            "ничего не нужно.\n"
             "Сообщение с паролем я удалю из чата после сохранения.\n\n"
             "«отмена» — выйти без изменений.")
     except Exception:
@@ -15555,8 +15766,9 @@ async def web_pw_change_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["web_pw_mode"] = "set"
         try:
             await query.edit_message_text(
-                "🔐 Пароль ещё не задан. Пришлите новый пароль одним "
-                "сообщением (минимум 7 символов, буква и цифра).")
+                "🔐 Пароль ещё не задан. Пришлите новым сообщением РОВНО 7 ЦИФР "
+                "(например, 7042583) — он будет работать и в веб-облаке, "
+                "и в мини-аппе.")
         except Exception:
             pass
         return WEB_PW_ENTER
@@ -15623,17 +15835,16 @@ async def web_pw_old_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return WEB_PW_ENTER_OLD
     context.user_data["web_pw_mode"] = "change"
     await update.message.reply_text(
-        "✅ Старый пароль верный.\n\nШаг 2 из 2: пришлите НОВЫЙ пароль "
-        "(минимум 7 символов, хотя бы одна буква и одна цифра). "
+        "✅ Старый пароль верный.\n\nШаг 2 из 2: пришлите НОВЫЙ пароль — "
+        "РОВНО 7 ЦИФР (например, 7042583). "
         "Сообщение я удалю из чата.")
     return WEB_PW_ENTER
 
 
 async def web_pw_enter_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Сохранение нового веб-пароля (состояние WEB_PW_ENTER).
-    Валидации: ≥7 символов (22.30), буква и цифра. Сообщение пользователя
-    удаляется. Ссылку на хостинг НЕ показываем (просьба пользователя): вход
-    — через кнопку меню бота или по адресу веб-облака."""
+    ВАЖНО (22.30): валидация — РОВНО 7 ЦИФР. Пароль работает и в веб-облаке,
+    и в мини-аппе (это ОДИН web_password_hash). Сообщение удаляется."""
     user = get_user(str(update.effective_user.id))
     if not user:
         return MAIN_MENU
@@ -15658,16 +15869,25 @@ async def web_pw_enter_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("web_pw_mode", None)
     logger.info(f"web_password: пользователь {user.user_id} "
                 f"{'сменил' if _mode == 'change' else 'задал'} веб-пароль")
-    # ВОЛНА 22.30: ссылку на хостинг НЕ даём (просьба пользователя) —
-    # вход через кнопку меню бота или по адресу веб-облака разработчика.
+    # ВОЛНА 22.30: адрес облака больше НЕ печатаем текстом (просьба
+    # пользователя: «пользователю не нужно давать ссылку на Render, где бот») —
+    # только кнопка WebApp: она открывает приложение, не показывая адрес.
+    _kb = None
+    if MINIAPP_URL:
+        try:
+            from telegram import WebAppInfo as _WaInfo
+            _kb = InlineKeyboardMarkup([[InlineKeyboardButton(
+                "🌐 Открыть веб-облако", web_app=_WaInfo(url=MINIAPP_URL))]])
+        except Exception:
+            _kb = None
     await update.message.reply_text(
-        "✅ Веб-пароль сохранён.\n\n"
-        "Вход: мини-апп «☁️ DEVO+» кнопкой меню бота — вход пройдёт сам, "
-        "или на странице веб-облака в обычном браузере:\n"
+        "✅ Веб-пароль сохранён!\n\n"
         f"🆔 Логин — ваш Telegram ID: <code>{user.user_id}</code>\n"
-        "🔑 Пароль — тот, что вы сейчас задали (а если настроен Сейф — "
-        "используется пароль Сейфа).",
+        "🔑 Пароль — те самые 7 цифр. Он ОДИН для всего: мини-аппа «☁️ DEVO+» "
+        "в Telegram и веб-облака в браузере.\n\n"
+        "Открыть облако — кнопкой ниже или кнопкой меню бота «☁️ DEVO+».",
         parse_mode=ParseMode.HTML,
+        reply_markup=_kb,
     )
     return MAIN_MENU
 
@@ -25696,19 +25916,28 @@ def _fuzzy_menu_target(low: str) -> "str | None":
 
 def _more_menu_kb(user, context):
     """Клавиатура «📋 Ещё»: скрытые кнопки (перемещённые через настройки)
-    + «🤒 Я болел(а)» (22.30) + «🎂 ДР одноклассников». Соответствие
-    «номер → кнопка» живёт в context.user_data['more_map']
+    + «🎂 ДР одноклассников» + «🤒 Я болел(а)» (22.30: добавлена сюда
+    ПОСТОЯННО — по просьбе пользователя; если кнопка ещё и скрыта из
+    главного меню, в списке скрытых она НЕ дублируется).
+    Соответствие «номер → кнопка» живёт в context.user_data['more_map']
     (callback_data ограничен 64 байтами)."""
     hidden = [b for b in (getattr(user, 'hidden_buttons', []) or [])
               if isinstance(b, str) and b]
     more_map = {}
     rows = []
+    # ВОЛНА 22.30: постоянная кнопка «🤒 Я болел(а)» — ДЗ и объявления
+    # за дни болезни, теперь доступна и из «Ещё».
+    rows.append([InlineKeyboardButton("🤒 Я болел(а)", callback_data="more_run_sick")])
+    more_map["sick"] = "🤒 Я болел(а)"
+    # ВОЛНА 22.31: «🧹 Дежурные» — утренний случайный дежурный + полный список.
+    rows.append([InlineKeyboardButton("🧹 Дежурные", callback_data="more_duty")])
     if hidden:
         for i, name in enumerate(hidden[:40]):
+            # «Я болел(а)» уже стоит выше постоянной строкой — не дублируем.
+            if name == "🤒 Я болел(а)":
+                continue
             more_map[str(i)] = name
             rows.append([InlineKeyboardButton(name, callback_data=f"more_run_{i}")])
-    # ВОЛНА 22.30: «Я болел(а)» — по просьбе пользователя живёт и в «Ещё».
-    rows.append([InlineKeyboardButton("🤒 Я болел(а)", callback_data="more_run_sick")])
     rows.append([InlineKeyboardButton("🎂 ДР одноклассников", callback_data="bd_list")])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_to_main")])
     context.user_data["more_map"] = more_map
@@ -25717,19 +25946,15 @@ def _more_menu_kb(user, context):
 
 def _more_menu_text(hidden_count: int) -> str:
     text = "📋 <b>Ещё</b>\n\n"
+    text += "🤒 Я болел(а) — вся домашка и объявления класса за дни болезни.\n"
+    text += "🧹 Дежурные — кто дежурит сегодня и полный список по порядку.\n"
     if hidden_count:
         text += (
-            "Здесь кнопки, которые вы скрыли из главного меню. Вернуть или "
-            "спрятать другие: ⚙️ Настройки → «👁 Скрыть/показать кнопки» — "
-            "скрытая кнопка автоматически переезжает сюда.\n\n"
+            "\nЗдесь также кнопки, которые вы скрыли из главного меню. "
+            "Вернуть или спрятать другие: ⚙️ Настройки → «👁 Скрыть/показать "
+            "кнопки» — скрытая кнопка автоматически переезжает сюда.\n"
         )
-    else:
-        text += (
-            "Сюда можно переместить любую кнопку главного меню: ⚙️ Настройки "
-            "→ «👁 Скрыть/показать кнопки» — скрытая кнопка переедет сюда, "
-            "меню станет чище.\n\n"
-        )
-    text += "🎂 ДР одноклассников — все дни рождения от ближайшего к позднему."
+    text += "\n🎂 ДР одноклассников — все дни рождения от ближайшего к позднему."
     return text
 
 
@@ -25772,12 +25997,7 @@ async def more_run_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user:
         return MAIN_MENU
     more_map = context.user_data.get("more_map") or {}
-    raw_key = query.data.replace("more_run_", "", 1)
-    # ВОЛНА 22.30: фиксированные пункты «Ещё» вне скрытых кнопок.
-    if raw_key == "sick":
-        name = "🤒 Я болел(а)"
-    else:
-        name = more_map.get(raw_key)
+    name = more_map.get(query.data.replace("more_run_", "", 1))
     if not name:
         kb, hidden_count = _more_menu_kb(user, context)
         try:
@@ -33809,13 +34029,15 @@ async def timer_edit_time_save(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 # ==================================
-# === ВОЛНА 22.28: ПОМОДОРО-ТАЙМЕР («в таймере добавь помодоро таймер») ===
+# === ВОЛНА 22.28: ТАЙМЕР «УЧЁБА С ПЕРЕРЫВАМИ» (бывш. «помодоро») ===
 # ==================================
-# Сессия = цепочка фаз «работа → короткий перерыв → … → длинный перерыв →
-# 🎉 конец сессии». Хранится в POMODORO_FILE (в канале-БД — переживает
-# рестарт: тикер сам продолжает прерванные фазы). Управление — колбэки
-# pomo_* БЕЗ ConversationHandler: кнопки помодоро не ломают текущий FSM,
-# из handle_callback возвращается None (остаться в текущем состоянии).
+# 22.30: переименован по просьбе пользователя («переназови помодоро таймер,
+# я ничего в нем не понимаю») и объясняется простыми словами: бот чередует
+# «учёбу» и «отдых», сам сообщает, когда время сменить. Сессия = цепочка
+# фаз «учёба → короткий отдых → … → большой отдых → 🎉 конец». Хранится в
+# POMODORO_FILE (в канале-БД — переживает рестарт: тикер сам продолжает
+# прерванные фазы). Управление — колбэки pomo_* БЕЗ ConversationHandler:
+# кнопки не ломают текущий FSM, из handle_callback возвращается None.
 
 _POMO_DEFAULTS = {"work": 25, "brk": 5, "long": 15, "cycles": 4}
 _POMO_CHOICES = {
@@ -33871,23 +34093,23 @@ def _pomo_menu_text(sess, cfg, tz=3):
             _left = max(0, int((_ends - _now_local).total_seconds() // 60))
         except (TypeError, ValueError):
             _left = None
-        _ph = {'work': '▶️ УЧУСЬ', 'break': '☕️ ОТДЫХАЮ',
-               'long': '🛌 БОЛЬШОЙ ОТДЫХ'}.get(sess.get('phase'), sess.get('phase'))
+        _ph = {'work': '📚 учёба', 'break': '☕️ отдых',
+               'long': '🏖 большой отдых'}.get(sess.get('phase'), sess.get('phase'))
         _left_line = f" · осталось ≈{_left} мин" if _left is not None else ""
-        return (f"📚 Таймер учёбы — ИДЁТ\n\n"
+        return (f"📚 Учёба с перерывами\n\n"
                 f"Сейчас: {_ph}{_left_line}\n"
-                f"🔄 Круг: {sess.get('cycle_done', 0)} из {sess.get('cycles', 4)} пройдено\n"
-                f"⚙️ Учусь {sess.get('work')} мин → отдых {sess.get('brk')} мин\n\n"
-                "Фазы меняются сами — бот сам напишет, когда отдыхать, "
-                "а когда снова садиться за учёбу.")
-    return (f"📚 Таймер учёбы\n\n"
-            "Как это работает:\n"
-            f"1️⃣ УЧИТЕСЬ {cfg['work']} минут — бот молчит и ждёт.\n"
-            f"2️⃣ Когда время вышло — бот пишет: ОТДЫХАЙТЕ {cfg['brk']} минут.\n"
-            f"3️⃣ Так {cfg['cycles']} круга подряд, а потом большой отдых "
-            f"{cfg['long']} минут.\n\n"
-            "Бот сам говорит, когда учиться, а когда отдыхать — от вас "
-            "ничего нажимать не нужно. Жмите «▶️ Старт» и начинайте.")
+                f"🔁 Круг: {sess.get('cycle_done', 0)} из {sess.get('cycles', 4)} пройдено\n"
+                f"⚙️ {sess.get('work')}/{sess.get('brk')}/{sess.get('long')} мин\n\n"
+                "Бот сам напишет, когда пора отдыхать и когда садиться за учёбу. "
+                "Остановить — кнопкой ниже или «⏹» под сообщением.")
+    return (f"📚 Учёба с перерывами\n\n"
+            "Как это работает: бот чередует учёбу и отдых и сам сообщает о "
+            "смене.\n"
+            f"• 📚 учитесь {cfg['work']} мин\n"
+            f"• ☕️ отдыхаете {cfg['brk']} мин\n"
+            f"• так {cfg['cycles']} круга, потом 🏖 большой отдых {cfg['long']} мин\n\n"
+            "Можно просто нажать «▶️ Начать» — настройки уже хорошие "
+            "(25/5/15 мин · 4 круга), а менять их необязательно.")
 
 
 def _pomo_menu_kb(sess, cfg):
@@ -33897,15 +34119,15 @@ def _pomo_menu_kb(sess, cfg):
                      InlineKeyboardButton("⏹ Остановить", callback_data="pomo_stop")])
     else:
         rows.append([InlineKeyboardButton(
-            f"▶️ Старт ({cfg['work']}/{cfg['brk']} · {cfg['cycles']} цикла)",
+            f"▶️ Начать ({cfg['work']} мин учёбы / {cfg['brk']} мин отдыха)",
             callback_data="pomo_start_def")])
-        rows.append([InlineKeyboardButton("⚙️ Настроить", callback_data="pomo_setup")])
+        rows.append([InlineKeyboardButton("⚙️ Изменить время", callback_data="pomo_setup")])
     rows.append([InlineKeyboardButton("⬅️ Назад к таймерам", callback_data="pomo_back")])
     return InlineKeyboardMarkup(rows)
 
 
 async def pomo_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """«🍅 Помодоро» в меню таймеров: статус сессии или настройка+старт."""
+    """«📚 Учёба с перерывами» в меню таймеров: статус сессии или настройка+старт."""
     query = update.callback_query
     try:
         await query.answer()
@@ -33926,15 +34148,15 @@ async def pomo_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def _pomo_setup_kb(cfg):
-    _names = {"work": "▶️ Учусь (мин)", "brk": "☕️ Отдых (мин)",
-              "long": "🛌 Большой отдых (мин)", "cycles": "🔄 Кругов"}
+    _names = {"work": "📚 Учёба", "brk": "☕️ Отдых",
+              "long": "🏖 Большой отдых", "cycles": "🔁 Кругов"}
     rows = []
     for key in ("work", "brk", "long", "cycles"):
         rows.append([InlineKeyboardButton(
             f"{_names[key]}: {v}{'✅' if int(cfg[key]) == v else ''}",
             callback_data=f"pomo_{key[0] if key != 'cycles' else 'c'}_{v}")
             for v in _POMO_CHOICES[key]])
-    rows.append([InlineKeyboardButton("▶️ Старт с этими настройками",
+    rows.append([InlineKeyboardButton("▶️ Начать с этими настройками",
                                       callback_data="pomo_start_cfg")])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="pomo_menu")])
     return InlineKeyboardMarkup(rows)
@@ -33947,12 +34169,12 @@ async def pomo_setup_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
     cfg = _pomo_cfg_from_user_data(context)
-    _txt = ("⚙️ Настройка таймера учёбы\n\n"
-            "• ▶️ Учусь — сколько учиться за один круг\n"
-            "• ☕️ Отдых — сколько отдыхать после круга\n"
-            "• 🔄 Кругов — сколько кругов подряд\n"
-            "• 🛌 Большой отдых — отдых после всех кругов\n\n"
-            "Выберите значения (✅ — текущий выбор):")
+    _txt = ("⚙️ Настройка: учёба с перерывами\n\n"
+            "Выберите время (✅ — ваш текущий выбор):\n"
+            "📚 Учёба — сколько занимаетесь без перерыва\n"
+            "☕️ Отдых — короткая пауза после каждого круга\n"
+            "🏖 Большой отдых — после всех кругов\n"
+            "🔁 Кругов — сколько раз повторить «учёба + отдых»")
     try:
         await query.edit_message_text(_txt, reply_markup=_pomo_setup_kb(cfg))
     except Exception:
@@ -33976,12 +34198,12 @@ async def pomo_pick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cfg = _pomo_cfg_from_user_data(context)
     cfg[key] = _val
     context.user_data['pomo_cfg'] = cfg
-    _txt = ("⚙️ Настройка таймера учёбы\n\n"
-            "• ▶️ Учусь — сколько учиться за один круг\n"
-            "• ☕️ Отдых — сколько отдыхать после круга\n"
-            "• 🔄 Кругов — сколько кругов подряд\n"
-            "• 🛌 Большой отдых — отдых после всех кругов\n\n"
-            "Выберите значения (✅ — текущий выбор):")
+    _txt = ("⚙️ Настройка: учёба с перерывами\n\n"
+            "Выберите время (✅ — ваш текущий выбор):\n"
+            "📚 Учёба — сколько занимаетесь без перерыва\n"
+            "☕️ Отдых — короткая пауза после каждого круга\n"
+            "🏖 Большой отдых — после всех кругов\n"
+            "🔁 Кругов — сколько раз повторить «учёба + отдых»")
     try:
         await query.edit_message_text(_txt, reply_markup=_pomo_setup_kb(cfg))
     except Exception:
@@ -34022,12 +34244,12 @@ async def pomo_start_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
     sessions[uid] = sess
     save_data(POMODORO_FILE, sessions)
-    _txt = (f"📚 Таймер учёбы запущен!\n\n"
-            f"▶️ Сейчас УЧИТЕСЬ {sess['work']} минут — бот молчит.\n"
-            f"☕️ Потом отдохнёте {sess['brk']} минут — бот напишет.\n"
-            f"🔄 Кругов: {sess['cycles']} · после них большой отдых {sess['long']} мин\n"
-            f"⏰ Конец круга в {sess['ends'][11:]}\n\n"
-            f"Садитесь за учёбу — об отдыхе бот напомнит сам.")
+    _txt = (f"🚀 Поехали! Учёба с перерывами началась.\n\n"
+            f"📚 Сейчас учёба: {sess['work']} мин\n"
+            f"☕️ Потом отдых: {sess['brk']} мин\n"
+            f"🔁 Кругов: {sess['cycles']} · в конце 🏖 большой отдых {sess['long']} мин\n"
+            f"⏰ Эта учёба закончится в {sess['ends'][11:]}\n\n"
+            f"Бот сам напишет, когда пора отдыхать. Телефон можно отложить!")
     try:
         await query.edit_message_text(_txt, reply_markup=_pomo_phase_kb())
     except Exception:
@@ -34050,12 +34272,12 @@ async def pomo_stop_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sessions[uid] = sess
         save_data(POMODORO_FILE, sessions)
         _n_done = int(sess.get('cycle_done', 0) or 0)
-        _txt = (f"⏹ Таймер учёбы остановлен.\nПройдено кругов: {_n_done} из "
+        _txt = (f"⏹ Остановлено.\nУспели пройти кругов: {_n_done} из "
                 f"{sess.get('cycles', 4)}.")
         _kb = InlineKeyboardMarkup([[InlineKeyboardButton(
             "▶️ Запустить заново", callback_data="pomo_menu")]])
     else:
-        _txt = "Активной помодоро-сессии нет."
+        _txt = "Сейчас ничего не идёт — вы и не запускали. 🙂"
     try:
         await query.edit_message_text(_txt, reply_markup=_kb)
     except Exception:
@@ -34128,11 +34350,13 @@ async def _tick_send_pomodoro(bot):
                 try:
                     await bot.send_message(
                         chat_id=int(uid),
-                        text=(f"🎉 Таймер учёбы завершён! Отличная работа: "
-                              f"{s.get('cycle_done', 0)} кругов.\n\n"
-                              f"Запустить новую — «⏰ Таймер» → «📚 Таймер учёбы»."),
+                        text=(f"🎉 Готово! Все круги пройдены: "
+                              f"{s.get('cycle_done', 0)} из {s.get('cycles', 4)}. "
+                              f"Отличная работа!\n\n"
+                              f"Запустить ещё раз — «⏰ Таймер» → «📚 Учёба с "
+                              f"перерывами»."),
                         reply_markup=InlineKeyboardMarkup([[
-                            InlineKeyboardButton("📚 Таймер учёбы",
+                            InlineKeyboardButton("📚 Учёба с перерывами",
                                                  callback_data="pomo_menu")]]))
                 except Exception as e:
                     logger.error(f"tick/pomodoro: завершение {uid}: {e}")
@@ -34147,15 +34371,18 @@ async def _tick_send_pomodoro(bot):
             sessions[uid] = s
             changed = True
             if nxt == 'break':
-                _msg = (f"☕️ Круг {s['cycle_done']} из {s.get('cycles', 4)} закончен!\n\n"
-                        f"ОТДЫХАЙТЕ {dur} мин — отойдите от учёбы.")
+                _msg = (f"☕️ Перерыв! Круг {s['cycle_done']}/{s.get('cycles', 4)} "
+                        f"готов.\n\n"
+                        f"Отдохните {dur} мин — встаньте, разомнитесь. "
+                        f"Бот позовёт возвращаться.")
             elif nxt == 'long':
-                _msg = (f"🛌 Большой отдых {dur} мин — все "
-                        f"{s['cycle_done']} круга из {s.get('cycles', 4)} сделаны!")
+                _msg = (f"🏖 Большой отдых {dur} мин — все "
+                        f"{s['cycle_done']}/{s.get('cycles', 4)} круга сделаны! "
+                        f"Заслужили.")
             else:
-                _msg = (f"☕️ Отдых окончен — за учёбу!\n\n"
-                        f"▶️ УЧИТЕСЬ {dur} мин (круг "
-                        f"{s['cycle_done'] + 1} из {s.get('cycles', 4)}).")
+                _msg = (f"📚 Отдых окончен — за учёбу!\n\n"
+                        f"Круг {s['cycle_done'] + 1} из {s.get('cycles', 4)}: "
+                        f"{dur} мин занятий.")
             _msg += f"\n⏰ до {s['ends'][11:]}"
             try:
                 await bot.send_message(chat_id=int(uid), text=_msg,
@@ -34170,6 +34397,948 @@ async def _tick_send_pomodoro(bot):
             save_data(POMODORO_FILE, sessions)
         except Exception as e:
             logger.error(f"tick/pomodoro: final save failed: {e}")
+
+
+# =====================================================
+# === ВОЛНА 22.31: ДЕЖУРНЫЕ («🧹 Дежурные») ===
+# =====================================================
+# Просьба пользователя: «Каждый день утром (с пн по пт — дни выбирает админ,
+# может выбрать и другие) выбирается случайный дежурный (или дежурные —
+# сколько в день, тоже решает админ). Ему приходит «Вы сегодня дежурный»,
+# всем классом — «Сегодня дежурный — Имя». В «📋 Ещё» — кнопка «🧹 Дежурные»
+# с ПОЛНЫМ списком. Когда список заканчивается — перемешивается заново.
+# Админ может сказать, что дежурный заболел: замещает следующий из очереди,
+# заболевший идёт в конец списка».
+#
+# КАК УСТРОЕНО (честно и по-простому):
+#   • DUTY_FILE (duty.json) — состояние по классам, лежит в канале-БД:
+#     рестарт/деплой не сбивает расписание и очередь.
+#   • Каждое утро в заданное админом время тикер берёт следующих людей
+#     ИЗ ОЧЕРЕДИ (она перемешана случайно). Очередь кончилась —
+#     перемешиваем всех заново (но не ставим вчерашнего дежурного первым).
+#   • Дежурному — личное «Вы сегодня дежурный», классу — объявление,
+#     админам — копия с кнопками «🤒 Дежурный болеет» и «🔄 Заменить».
+#   • «Болеет»: место заболевшего занимает следующий из очереди,
+#     заболевший идёт в КОНЕЦ списка (когда все перебывают — снова микс).
+#   • Время считается по часовому поясу создателя класса (расписание
+#     школы у него). «Не беспокоить» эти сообщения НЕ глушит — это
+#     объявление класса, а не развлекательное уведомление.
+
+DUTY_DAY_NAMES = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+DUTY_MAX_PER_DAY = 3          # сколько дежурных в день можно выбрать (1..3)
+DUTY_PRESET_TIMES = ["06:00", "06:30", "07:00", "07:30",
+                     "08:00", "08:30", "09:00"]
+
+
+def _duty_state():
+    state = load_data(DUTY_FILE, {})
+    return state if isinstance(state, dict) else {}
+
+
+def _duty_save_state(state):
+    try:
+        save_data(DUTY_FILE, state)
+    except Exception as e:
+        logger.error(f"duty: save failed: {e}")
+
+
+def _duty_cfg(state, class_obj):
+    """Конфиг класса с честными дефолтами (выкл, 07:30, пн–пт, 1 дежурный)."""
+    cc = class_obj.class_code
+    cfg = state.get(cc)
+    if not isinstance(cfg, dict):
+        cfg = {}
+        state[cc] = cfg
+    cfg.setdefault("enabled", False)
+    cfg.setdefault("time", "07:30")
+    cfg.setdefault("days", [0, 1, 2, 3, 4])   # пн–пт
+    cfg.setdefault("per_day", 1)
+    cfg.setdefault("queue", [])               # очередь: первый — следующий
+    cfg.setdefault("today", {})               # {"date","duty":[],"sent":bool}
+    cfg.setdefault("last_duty", [])
+    return cfg
+
+
+def _duty_participants(class_obj):
+    """Участники дежурств: ученики класса, кроме заблокированных."""
+    try:
+        blocked = set(class_obj.blocked_users or [])
+    except Exception:
+        blocked = set()
+    return [str(s) for s in (class_obj.students or []) if str(s) not in blocked]
+
+
+def _duty_esc(text):
+    """Экранирование для ParseMode.HTML (в тексте кнопок НЕ используется)."""
+    return (str(text).replace("&", "&amp;")
+            .replace("<", "&lt;").replace(">", "&gt;"))
+
+
+def _duty_name(uid):
+    u = get_user(str(uid))
+    if u and getattr(u, "first_name", ""):
+        return str(u.first_name).strip() or "Ученик"
+    return "Ученик"
+
+
+def _duty_names(uids):
+    return ", ".join(_duty_esc(_duty_name(u)) for u in uids)
+
+
+def _duty_is_admin(user, class_obj):
+    return class_obj is not None and (
+        str(getattr(user, "user_id", "")) == str(class_obj.creator_id)
+        or str(getattr(user, "user_id", "")) in set(map(str, class_obj.admins or [])))
+
+
+def _duty_class_admin(class_obj):
+    """Создатель класса (его часовой пояс задаёт «утро»); если его профиль
+    удалён — первый доступный админ; совсем никого — None."""
+    if class_obj is None:
+        return None
+    for cand in [class_obj.creator_id] + list(class_obj.admins or []):
+        u = get_user(str(cand))
+        if u:
+            return u
+    return None
+
+
+def _duty_shuffle_queue(participants, avoid_first=None):
+    """Фишер–Йетс. Если первым выпал вчерашний дежурный — меняем его
+    с кем-то другим, чтобы два дня подряд не дежурил один и тот же."""
+    pool = list(participants)
+    random.shuffle(pool)
+    if avoid_first and len(pool) > 1 and pool[0] == str(avoid_first):
+        swap = random.randrange(1, len(pool))
+        pool[0], pool[swap] = pool[swap], pool[0]
+    return pool
+
+
+def _duty_snap(cfg):
+    """Снимок конфига для сравнения «изменилось ли» (json-канонично)."""
+    return json.dumps(cfg, sort_keys=True, ensure_ascii=False)
+
+
+def _duty_is_duty_day(cfg, local_now):
+    try:
+        days = set(int(d) for d in (cfg.get("days") or []))
+    except Exception:
+        days = {0, 1, 2, 3, 4}
+    return int(local_now.weekday()) in days
+
+
+def _duty_ensure_today(cfg, local_now, participants):
+    """Гарантирует: cfg['today'] — про СЕГОДНЯ, и в нём есть дежурные.
+    Новая дата -> сброс; дежурные берутся из головы очереди; кончилась —
+    перемешиваем заново. Дублей внутри одного дня не бывает."""
+    today = cfg.get("today") if isinstance(cfg.get("today"), dict) else {}
+    dstr = local_now.strftime("%Y-%m-%d")
+    if today.get("date") != dstr:
+        today = {"date": dstr, "duty": [], "sent": False}
+        cfg["today"] = today
+    try:
+        want = max(1, min(DUTY_MAX_PER_DAY, int(cfg.get("per_day") or 1)))
+    except Exception:
+        want = 1
+    if not today.get("duty"):
+        alive = set(participants)
+        queue = [u for u in (cfg.get("queue") or []) if u in alive]
+        picked = []
+        guard = 0
+        while len(picked) < want and guard < 10:
+            guard += 1
+            reshuffled = False
+            if not queue:
+                avoid = picked[-1] if picked else (
+                    (cfg.get("last_duty") or [None])[-1])
+                queue = _duty_shuffle_queue(participants, avoid_first=avoid)
+                reshuffled = True
+            while queue and len(picked) < want:
+                cand = queue.pop(0)
+                if cand not in picked:
+                    picked.append(cand)
+            if not queue and len(picked) < want:
+                if reshuffled:
+                    break   # даже свежий микс не помог: участников меньше,
+                            # чем дежурных в день — дежурят все, кто есть
+                # очередь кончилась, но микс ещё не делали — продолжаем:
+                # следующая итерация перемешает список заново
+        cfg["queue"] = queue
+        today["duty"] = picked
+    return today
+
+
+async def _duty_announce(bot, class_obj, cfg, replaced_note=""):
+    """Утренний анонс: дежурному — лично, классу — объявление, админам —
+    копия с кнопками «🤒 Дежурный болеет» / «🔄 Заменить». Возвращает True,
+    если хотя бы одно сообщение ушло."""
+    today = cfg.get("today") or {}
+    duty_uids = [str(u) for u in (today.get("duty") or []) if get_user(str(u))]
+    if not duty_uids:
+        return False
+    duty_set = set(duty_uids)
+    names = _duty_names(duty_uids)
+    base = (f"🧹 <b>Сегодня дежурный — {names}</b>!\n"
+            f"Полный список дежурных: 📋 Ещё → 🧹 Дежурные.")
+    if replaced_note:
+        base += "\n\n" + replaced_note
+    admin_ids = [str(a) for a in dict.fromkeys(
+        [class_obj.creator_id] + list(class_obj.admins or []))]
+    admin_set = set(admin_ids)
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🤒 Дежурный болеет", callback_data="duty_sick")],
+        [InlineKeyboardButton("🔄 Заменить другим", callback_data="duty_replace")],
+    ])
+    hint = ("\n\nВы админ класса: если дежурный заболел — нажмите кнопку ниже, "
+            "его место займёт следующий из списка, а заболевший встанет в конец.")
+    sent = 0
+    for uid in _duty_participants(class_obj):
+        if uid in admin_set:
+            continue          # админам — отдельная копия с кнопками
+        u = get_user(uid)
+        if not u:
+            continue
+        text = ("🧹 <b>Вы сегодня дежурный!</b>\n\nВесь класс уже получил "
+                "объявление. Полный список дежурных: 📋 Ещё → 🧹 Дежурные."
+                ) if uid in duty_set else base
+        try:
+            await bot.send_message(chat_id=int(uid), text=text,
+                                   parse_mode=ParseMode.HTML)
+            sent += 1
+        except Exception as e:
+            logger.warning(f"duty: send to {uid}: {e}")
+    for aid in admin_ids:
+        u = get_user(aid)
+        if not u:
+            continue
+        if aid in duty_set:
+            text = (f"🧹 <b>Вы сегодня дежурный!</b>\n\n{base}{hint}")
+        else:
+            text = base + hint
+        try:
+            await bot.send_message(chat_id=int(aid), text=text,
+                                   reply_markup=kb, parse_mode=ParseMode.HTML)
+            sent += 1
+        except Exception as e:
+            logger.warning(f"duty: send to admin {aid}: {e}")
+    return sent > 0
+
+
+async def _tick_send_duty(bot):
+    """Часть тикера (22.31): утренние анонсы дежурных по классам.
+    Каждый класс — своё время и дни (по поясу создателя). Дублей нет:
+    флаг sent в DUTY_FILE ставится ДО отправки (атомарно для тика), а
+    «догоны» после сна хостинга честны: до 6 часов — шлём, позже — уже нет."""
+    state = _duty_state()
+    if not state:
+        return
+    changed = False
+    for cc, cfg in list(state.items()):
+        try:
+            if not isinstance(cfg, dict) or not cfg.get("enabled"):
+                continue
+            class_obj = get_class_by_code(cc)
+            if not class_obj:
+                continue
+            admin_u = None
+            for cand in [class_obj.creator_id] + list(class_obj.admins or []):
+                au = get_user(str(cand))
+                if au:
+                    admin_u = au
+                    break
+            if admin_u is None:
+                continue
+            local_now = _user_local_now(admin_u)
+            if not _duty_is_duty_day(cfg, local_now):
+                continue
+            participants = _duty_participants(class_obj)
+            if not participants:
+                continue
+            snap = _duty_snap(cfg)
+            today = _duty_ensure_today(cfg, local_now, participants)
+            if _duty_snap(cfg) != snap:
+                changed = True               # новый день/собрана очередь
+            if today.get("sent"):
+                continue
+            try:
+                th, tm = str(cfg.get("time") or "07:30").split(":")[:2]
+                tmin = int(th) * 60 + int(tm)
+            except Exception:
+                tmin = 7 * 60 + 30
+            nowmin = local_now.hour * 60 + local_now.minute
+            diff = nowmin - tmin
+            if diff < 0:
+                continue                     # утро ещё не наступило
+            today["sent"] = True             # пометка ДО отправки — без дублей
+            changed = True
+            if diff > 6 * 60:
+                # проспали больше 6 часов (хостинг спал) — днём будить класс
+                # «добрым утром» нечестно; дежурные видны в 📋 Ещё → 🧹
+                logger.info(f"tick/duty: {cc}: слот пропущен (опоздание {diff} мин)")
+                continue
+            ok = await _duty_announce(bot, class_obj, cfg)
+            cfg["last_duty"] = list(today.get("duty") or [])
+            logger.info(f"tick/duty: {cc} -> {today.get('duty')} (sent={ok})")
+        except Exception as e:
+            logger.error(f"tick/duty: {cc}: {e}")
+    if changed:
+        _duty_save_state(state)
+
+
+async def _duty_reassign_perform(bot, class_obj, cfg, sick_uid, reason_sick):
+    """«🤒 Дежурный болеет»: место заболевшего занимает следующий из очереди,
+    заболевший идёт в КОНЕЦ списка. Классу — честное объявление о замене."""
+    participants = _duty_participants(class_obj)
+    today = cfg.get("today") or {}
+    duty = [str(u) for u in (today.get("duty") or [])]
+    if str(sick_uid) not in duty:
+        return False, "Этот человек сегодня не дежурит."
+    alive = set(participants)
+    queue = [u for u in (cfg.get("queue") or []) if u in alive and u not in duty]
+    replacement = None
+    if queue:
+        replacement = queue.pop(0)
+    else:
+        pool = [u for u in participants
+                if u not in duty and u != str(sick_uid)]
+        if pool:
+            fresh = _duty_shuffle_queue(pool)
+            replacement = fresh[0]
+            queue = fresh[1:]
+    if replacement is None:
+        return False, ("Заменить некому: кроме заболевшего, в классе нет других "
+                       "участников. Пригласите одноклассников — и появится замена.")
+    duty[duty.index(str(sick_uid))] = replacement
+    queue.append(str(sick_uid))              # заболевший — в конец списка
+    cfg["queue"] = queue
+    today["duty"] = duty
+    old_name = _duty_esc(_duty_name(sick_uid))
+    new_name = _duty_esc(_duty_name(replacement))
+    reason = "болеет" if reason_sick else "заменён(а)"
+    note = (f"🔄 <b>Замена дежурного:</b> вместо {old_name} сегодня дежурит "
+            f"{new_name} ({old_name} {reason} — и встаёт в конец списка).")
+    ok = await _duty_announce(bot, class_obj, cfg, replaced_note=note)
+    today["sent"] = True
+    cfg["last_duty"] = list(duty)
+    return ok, note
+
+
+def _duty_menu_text(class_obj, cfg, viewer_is_admin):
+    """Текст меню «🧹 Дежурные»: сегодняшние + ПОЛНЫЙ список по порядку."""
+    lines = ["🧹 <b>Дежурные</b>\n"]
+    if not cfg.get("enabled"):
+        lines.append("Дежурства в классе пока <b>не включены</b>.")
+        if viewer_is_admin:
+            lines.append("\nВключить и настроить: кнопка «⚙️ Настройки» ниже. "
+                         "Как включите — каждое утро в выбранное время бот будет "
+                         "объявлять случайного дежурного.")
+        else:
+            lines.append("Попросите админа класса включить их: ☁️ меню класса → "
+                         "⚙️ Настройки класса → «🧹 Дежурные».")
+        return "\n".join(lines)
+    local_admin = _duty_class_admin(class_obj)
+    local_now = _user_local_now(local_admin) if local_admin else _now_utc()
+    today = cfg.get("today") or {}
+    dstr = local_now.strftime("%Y-%m-%d")
+    duty_today = [str(u) for u in (today.get("duty") or [])] \
+        if today.get("date") == dstr else []
+    lines.append("📌 <b>Сегодня:</b> "
+                 + (_duty_names(duty_today) if duty_today else "— ещё не выбран"
+                    if today.get("date") == dstr else "— не дежурим"))
+    try:
+        days = sorted(int(d) for d in (cfg.get("days") or []))
+    except Exception:
+        days = [0, 1, 2, 3, 4]
+    days_txt = ", ".join(DUTY_DAY_NAMES[d] for d in days if 0 <= d <= 6) or "—"
+    lines.append(f"⏰ Расписание: {days_txt} в {cfg.get('time') or '07:30'} "
+                 f"(по поясу создателя класса)")
+    lines.append(f"👥 Дежурных в день: {cfg.get('per_day') or 1}")
+    # Полный список: сегодняшние + остаток очереди (по порядку дежурств).
+    alive = set(_duty_participants(class_obj))
+    order = duty_today + [u for u in (cfg.get("queue") or []) if u in alive]
+    lines.append(f"\n📋 <b>Полный список (по порядку):</b>")
+    for i, uid in enumerate(order, 1):
+        mark = " 🧹 (сегодня)" if uid in set(duty_today) else ""
+        lines.append(f"{i}. {_duty_esc(_duty_name(uid))}{mark}")
+    if not order:
+        lines.append("пока пусто — список соберётся перед первым дежурством")
+    lines.append("\n<i>Как это работает: список перемешан случайно; каждый "
+                 "день дежурят следующие в нём. Когда все перебывают — список "
+                 "перемешивается заново. Если дежурный заболел, админ жмёт "
+                 "«🤒 Дежурный болеет» — его место занимает следующий, "
+                 "заболевший встанет в конец.</i>")
+    return "\n".join(lines)
+
+
+def _duty_menu_kb(viewer_is_admin):
+    rows = []
+    if viewer_is_admin:
+        rows.append([InlineKeyboardButton("⚙️ Настройки", callback_data="duty_settings")])
+    rows.append([InlineKeyboardButton("🔄 Обновить", callback_data="duty_menu")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="more_menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def duty_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """«🧹 Дежурные» из «📋 Ещё»: сегодняшние + полный список. Видят все."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    uid = str(query.from_user.id)
+    user = get_user(uid)
+    if not user:
+        return MAIN_MENU
+    class_obj = get_class_by_user(uid)
+    if not class_obj:
+        try:
+            await query.edit_message_text(
+                "🧹 Дежурные — функция для класса. Сначала создайте класс или "
+                "присоединитесь к нему, потом возвращайтесь.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("⬅️ Назад", callback_data="more_menu")]]),
+            )
+        except Exception:
+            pass
+        return None
+    state = _duty_state()
+    is_new = class_obj.class_code not in state
+    cfg = _duty_cfg(state, class_obj)
+    if is_new:
+        _duty_save_state(state)      # фиксируем дефолты (один раз)
+    txt = _duty_menu_text(class_obj, cfg, _duty_is_admin(user, class_obj))
+    kb = _duty_menu_kb(_duty_is_admin(user, class_obj))
+    try:
+        await query.edit_message_text(txt, reply_markup=kb, parse_mode=ParseMode.HTML)
+    except Exception:
+        try:
+            await context.bot.send_message(chat_id=int(uid), text=txt,
+                                           reply_markup=kb, parse_mode=ParseMode.HTML)
+        except Exception as e:
+            logger.warning(f"duty_menu_cb: send failed: {e}")
+    return None
+
+
+def _duty_settings_text(class_obj, cfg):
+    en = bool(cfg.get("enabled"))
+    try:
+        days = sorted(int(d) for d in (cfg.get("days") or []))
+    except Exception:
+        days = [0, 1, 2, 3, 4]
+    days_txt = ", ".join(DUTY_DAY_NAMES[d] for d in days if 0 <= d <= 6) or "—"
+    lines = [
+        "⚙️ <b>Настройки дежурных</b>\n",
+        f"Статус: {'✅ включены' if en else '❌ выключены'}",
+        f"⏰ Время утреннего сообщения: <b>{cfg.get('time') or '07:30'}</b> "
+        "(по часовому поясу создателя класса)",
+        f"📅 Дни: <b>{days_txt}</b>",
+        f"👥 Дежурных в день: <b>{cfg.get('per_day') or 1}</b>",
+        "\n<i>Каждый день в это время бот объявляет случайных дежурных — "
+        "по очереди из перемешанного списка. Когда все перебывают, список "
+        "перемешивается заново. Дежурному приходит личное сообщение, классу — "
+        "объявление, вам (админам) — копия с кнопкой «🤒 Дежурный болеет».</i>",
+    ]
+    return "\n".join(lines)
+
+
+def _duty_settings_kb(cfg):
+    en = bool(cfg.get("enabled"))
+    rows = [
+        [InlineKeyboardButton("⏸ Выключить" if en else "▶️ Включить",
+                              callback_data="duty_toggle")],
+        [InlineKeyboardButton(f"⏰ Время: {cfg.get('time') or '07:30'}",
+                              callback_data="duty_time")],
+        [InlineKeyboardButton("📅 Дни недели", callback_data="duty_days")],
+        [InlineKeyboardButton(f"👥 Дежурных в день: {cfg.get('per_day') or 1}",
+                              callback_data="duty_count")],
+        [InlineKeyboardButton("🔀 Пересобрать список", callback_data="duty_regen")],
+        [InlineKeyboardButton("🔄 Заменить/выбрать сегодняшнего",
+                              callback_data="duty_replace")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="duty_menu")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+async def duty_settings_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Экран «⚙️ Настройки дежурных» — только админам класса."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    uid = str(query.from_user.id)
+    user = get_user(uid)
+    class_obj = get_class_by_user(uid)
+    if not user or not class_obj:
+        return None
+    if not _duty_is_admin(user, class_obj):
+        try:
+            await query.answer("Настраивать дежурства может только админ класса.",
+                               show_alert=True)
+        except Exception:
+            pass
+        return None
+    state = _duty_state()
+    is_new = class_obj.class_code not in state
+    cfg = _duty_cfg(state, class_obj)
+    if is_new:
+        _duty_save_state(state)
+    txt = _duty_settings_text(class_obj, cfg)
+    kb = _duty_settings_kb(cfg)
+    try:
+        await query.edit_message_text(txt, reply_markup=kb, parse_mode=ParseMode.HTML)
+    except Exception:
+        await context.bot.send_message(chat_id=int(uid), text=txt, reply_markup=kb,
+                                       parse_mode=ParseMode.HTML)
+    return None
+
+
+async def duty_toggle_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """▶️/⏸ включение дежурств. При включении сразу собираем очередь,
+    чтобы утром первого дня уже был из кого выбирать."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    uid = str(query.from_user.id)
+    user = get_user(uid)
+    class_obj = get_class_by_user(uid)
+    if not user or not class_obj or not _duty_is_admin(user, class_obj):
+        return None
+    state = _duty_state()
+    cfg = _duty_cfg(state, class_obj)
+    cfg["enabled"] = not bool(cfg.get("enabled"))
+    if cfg["enabled"]:
+        participants = _duty_participants(class_obj)
+        if not cfg.get("queue"):
+            cfg["queue"] = _duty_shuffle_queue(participants)
+        _duty_ensure_today(cfg, _user_local_now(user), participants)
+    _duty_save_state(state)
+    txt = _duty_settings_text(class_obj, cfg)
+    try:
+        await query.edit_message_text(txt, reply_markup=_duty_settings_kb(cfg),
+                                      parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
+    return None
+
+
+async def duty_time_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выбор времени утреннего сообщения: пресеты + «✍️ Своё» (FSM)."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    uid = str(query.from_user.id)
+    user = get_user(uid)
+    class_obj = get_class_by_user(uid)
+    if not user or not class_obj or not _duty_is_admin(user, class_obj):
+        return None
+    state = _duty_state()
+    cfg = _duty_cfg(state, class_obj)
+    cur = cfg.get("time") or "07:30"
+    rows = []
+    preset_row = []
+    for t in DUTY_PRESET_TIMES:
+        preset_row.append(InlineKeyboardButton(
+            f"{'✅ ' if t == cur else ''}{t}", callback_data=f"duty_time_p_{t}"))
+    rows.append(preset_row)
+    rows.append([InlineKeyboardButton("✍️ Своё время", callback_data="duty_time_custom")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="duty_settings")])
+    try:
+        await query.edit_message_text(
+            "⏰ <b>Во сколько утром присылать «Сегодня дежурный — …»?</b>\n\n"
+            "Время по часовому поясу создателя класса. ✅ — текущий выбор.",
+            reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
+    return None
+
+
+async def duty_time_preset_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    t = query.data.replace("duty_time_p_", "", 1)
+    if not re.fullmatch(r"\d{2}:\d{2}", t or ""):
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        return None
+    uid = str(query.from_user.id)
+    user = get_user(uid)
+    class_obj = get_class_by_user(uid)
+    if not user or not class_obj or not _duty_is_admin(user, class_obj):
+        try:
+            await query.answer("Только для админов класса.", show_alert=True)
+        except Exception:
+            pass
+        return None
+    state = _duty_state()
+    cfg = _duty_cfg(state, class_obj)
+    cfg["time"] = t
+    _duty_save_state(state)
+    try:
+        await query.answer(f"✅ Время: {t}", show_alert=False)
+    except Exception:
+        pass
+    txt = _duty_settings_text(class_obj, cfg)
+    try:
+        await query.edit_message_text(txt, reply_markup=_duty_settings_kb(cfg),
+                                      parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
+    return None
+
+
+async def duty_time_custom_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """«✍️ Своё время» — FSM-состояние DUTY_WAIT_TIME."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    uid = str(query.from_user.id)
+    user = get_user(uid)
+    class_obj = get_class_by_user(uid)
+    if not user or not class_obj or not _duty_is_admin(user, class_obj):
+        return None
+    context.user_data["duty_time_custom"] = True
+    await query.message.reply_text(
+        "⏰ Пришлите время в формате ЧЧ:ММ, например 07:45 — в это время "
+        "каждое утро будет приходить объявление дежурных.\n\n"
+        "«❌ Отмена» — выйти без сохранения.")
+    return DUTY_WAIT_TIME
+
+
+async def duty_time_custom_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Сохранение своего времени (состояние DUTY_WAIT_TIME)."""
+    user = get_user(str(update.effective_user.id))
+    if not user:
+        return MAIN_MENU
+    class_obj = get_class_by_user(str(user.user_id))
+    context.user_data.pop("duty_time_custom", None)
+    if not class_obj or not _duty_is_admin(user, class_obj):
+        await update.message.reply_text("Настраивать дежурства может только админ класса.")
+        return MAIN_MENU
+    minutes = _parse_hhmm_minutes((update.message.text or "").strip())
+    if minutes is None:
+        await update.message.reply_text(
+            "Не похоже на время. Пришлите ЧЧ:ММ, например 07:45 "
+            "(или «отмена» — выйти).")
+        return DUTY_WAIT_TIME
+    hhmm = f"{minutes // 60:02d}:{minutes % 60:02d}"
+    state = _duty_state()
+    cfg = _duty_cfg(state, class_obj)
+    cfg["time"] = hhmm
+    _duty_save_state(state)
+    await update.message.reply_text(
+        f"✅ Готово: объявление дежурных будет приходить в {hhmm}.",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🧹 Открыть «Дежурные»", callback_data="duty_menu")]]),
+    )
+    return MAIN_MENU
+
+
+async def duty_days_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Тогглы дней недели (по умолчанию пн–пт; можно включить и выходные)."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    uid = str(query.from_user.id)
+    user = get_user(uid)
+    class_obj = get_class_by_user(uid)
+    if not user or not class_obj or not _duty_is_admin(user, class_obj):
+        return None
+    state = _duty_state()
+    cfg = _duty_cfg(state, class_obj)
+    try:
+        days = set(int(d) for d in (cfg.get("days") or []))
+    except Exception:
+        days = {0, 1, 2, 3, 4}
+    row1 = [InlineKeyboardButton(
+        f"{'✅' if d in days else '▫️'} {DUTY_DAY_NAMES[d]}",
+        callback_data=f"duty_day_{d}") for d in range(0, 4)]
+    row2 = [InlineKeyboardButton(
+        f"{'✅' if d in days else '▫️'} {DUTY_DAY_NAMES[d]}",
+        callback_data=f"duty_day_{d}") for d in range(4, 7)]
+    if not days:
+        rows = [row1, row2,
+                [InlineKeyboardButton("⬅️ Назад", callback_data="duty_settings")]]
+    else:
+        rows = [row1, row2,
+                [InlineKeyboardButton("✅ Готово", callback_data="duty_settings")]]
+    txt = ("📅 <b>В какие дни объявлять дежурных?</b>\n\n"
+           "По умолчанию — понедельник–пятница. Выходные можно включить "
+           "или выключить здесь же. Должен остаться хотя бы один день.")
+    try:
+        await query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(rows),
+                                      parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
+    return None
+
+
+async def duty_day_toggle_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    uid = str(query.from_user.id)
+    user = get_user(uid)
+    class_obj = get_class_by_user(uid)
+    if not user or not class_obj or not _duty_is_admin(user, class_obj):
+        return None
+    try:
+        day = int(query.data.replace("duty_day_", "", 1))
+    except Exception:
+        return None
+    if not (0 <= day <= 6):
+        return None
+    state = _duty_state()
+    cfg = _duty_cfg(state, class_obj)
+    try:
+        days = set(int(d) for d in (cfg.get("days") or []))
+    except Exception:
+        days = {0, 1, 2, 3, 4}
+    if day in days:
+        if len(days) > 1:
+            days.discard(day)
+    else:
+        days.add(day)
+    cfg["days"] = sorted(days)
+    _duty_save_state(state)
+    # перерисовываем экран дней (тот же текст, новые галочки)
+    row1 = [InlineKeyboardButton(
+        f"{'✅' if d in days else '▫️'} {DUTY_DAY_NAMES[d]}",
+        callback_data=f"duty_day_{d}") for d in range(0, 4)]
+    row2 = [InlineKeyboardButton(
+        f"{'✅' if d in days else '▫️'} {DUTY_DAY_NAMES[d]}",
+        callback_data=f"duty_day_{d}") for d in range(4, 7)]
+    rows = [row1, row2, [InlineKeyboardButton("✅ Готово", callback_data="duty_settings")]]
+    try:
+        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(rows))
+    except Exception:
+        pass
+    return None
+
+
+async def duty_count_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Сколько дежурных в день: 1..DUTY_MAX_PER_DAY («или дежурные»)."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    uid = str(query.from_user.id)
+    user = get_user(uid)
+    class_obj = get_class_by_user(uid)
+    if not user or not class_obj or not _duty_is_admin(user, class_obj):
+        return None
+    state = _duty_state()
+    cfg = _duty_cfg(state, class_obj)
+    cur = max(1, min(DUTY_MAX_PER_DAY, int(cfg.get("per_day") or 1)))
+    rows = [[InlineKeyboardButton(f"{'✅ ' if n == cur else ''}{n}",
+                                  callback_data=f"duty_count_p_{n}")
+             for n in range(1, DUTY_MAX_PER_DAY + 1)],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="duty_settings")]]
+    try:
+        await query.edit_message_text(
+            "👥 <b>Сколько человек дежурит каждый день?</b>\n\n"
+            "Можно одного, можно сразу несколько — всех выберет случай "
+            "из очереди. ✅ — текущий выбор.",
+            reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
+    return None
+
+
+async def duty_count_pick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    uid = str(query.from_user.id)
+    user = get_user(uid)
+    class_obj = get_class_by_user(uid)
+    if not user or not class_obj or not _duty_is_admin(user, class_obj):
+        return None
+    try:
+        n = int(query.data.replace("duty_count_p_", "", 1))
+    except Exception:
+        return None
+    if not (1 <= n <= DUTY_MAX_PER_DAY):
+        return None
+    state = _duty_state()
+    cfg = _duty_cfg(state, class_obj)
+    cfg["per_day"] = n
+    _duty_save_state(state)
+    txt = _duty_settings_text(class_obj, cfg)
+    try:
+        await query.edit_message_text(txt, reply_markup=_duty_settings_kb(cfg),
+                                      parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
+    return None
+
+
+async def duty_regen_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """🔀 Пересобрать список: очередь перемешивается сейчас (сегодняшние
+    дежурные не трогаются — их замена отдельно через «🔄 Заменить»)."""
+    query = update.callback_query
+    uid = str(query.from_user.id)
+    user = get_user(uid)
+    class_obj = get_class_by_user(uid)
+    if not user or not class_obj or not _duty_is_admin(user, class_obj):
+        try:
+            await query.answer("Только для админов класса.", show_alert=True)
+        except Exception:
+            pass
+        return None
+    participants = _duty_participants(class_obj)
+    if not participants:
+        try:
+            await query.answer("В классе пока нет участников.", show_alert=True)
+        except Exception:
+            pass
+        return None
+    state = _duty_state()
+    cfg = _duty_cfg(state, class_obj)
+    avoid = (cfg.get("last_duty") or [None])[-1]
+    cfg["queue"] = _duty_shuffle_queue(participants, avoid_first=avoid)
+    _duty_save_state(state)
+    try:
+        await query.answer("🔀 Список перемешан заново", show_alert=False)
+    except Exception:
+        pass
+    txt = _duty_settings_text(class_obj, cfg)
+    try:
+        await query.edit_message_text(txt, reply_markup=_duty_settings_kb(cfg),
+                                      parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
+    return None
+
+
+async def duty_replace_cb(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                          mode="replace"):
+    """Выбор, кого заменить/назначить. Если дежурные на сегодня уже есть —
+    показываем их (кнопки «болеет»/«заменить»); если ещё нет — можно
+    назначить любого участника класса вручную («это выбирает админ»)."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    uid = str(query.from_user.id)
+    user = get_user(uid)
+    class_obj = get_class_by_user(uid)
+    if not user or not class_obj or not _duty_is_admin(user, class_obj):
+        return None
+    state = _duty_state()
+    cfg = _duty_cfg(state, class_obj)
+    local_now = _user_local_now(_duty_class_admin(class_obj) or user)
+    participants = _duty_participants(class_obj)
+    today = _duty_ensure_today(cfg, local_now, participants)
+    _duty_save_state(state)
+    duty_today = [str(u) for u in (today.get("duty") or [])]
+    if mode == "sick":
+        title = "🤒 <b>Кто заболел?</b>"
+        prefix, cbp = "🤒", "duty_go_s_"
+    else:
+        title = "🔄 <b>Кого заменить или кого назначить?</b>"
+        prefix, cbp = "🔄", "duty_go_r_"
+    rows = []
+    if duty_today:
+        for du in duty_today:
+            rows.append([InlineKeyboardButton(f"{prefix} {_duty_name(du)}",
+                                              callback_data=f"{cbp}{du}")])
+    else:
+        # Дежурные ещё не выбраны (рано утром/не тот день) — админ может
+        # назначить дежурного на сегодня вручную из всех участников.
+        for p in participants[:40]:
+            rows.append([InlineKeyboardButton(f"🧹 {_duty_name(p)}",
+                                              callback_data=f"duty_go_t_{p}")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="duty_settings")])
+    note = ("\n\nНажмите на дежурного — его место займёт следующий из списка, "
+            "а он встанет в конец." if duty_today else
+            "\n\nДежурные на сегодня ещё не выбраны — нажмите на участника, "
+            "чтобы назначить его дежурным (класс получит объявление).")
+    try:
+        await query.edit_message_text(title + note,
+                                      reply_markup=InlineKeyboardMarkup(rows),
+                                      parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
+    return None
+
+
+async def duty_sick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопка «🤒 Дежурный болеет» из утреннего анонса."""
+    return await duty_replace_cb(update, context, mode="sick")
+
+
+async def duty_go_cb(update: Update, context: ContextTypes.DEFAULT_TYPE, mode):
+    """Применение замены/назначения: sick (болеет), replace (другая причина),
+    set (назначить вручную, когда дежурных ещё нет)."""
+    query = update.callback_query
+    try:
+        await query.answer()          # сразу гасим «часики» на кнопке
+    except Exception:
+        pass
+    uid = str(query.from_user.id)
+    user = get_user(uid)
+    class_obj = get_class_by_user(uid)
+    if not user or not class_obj or not _duty_is_admin(user, class_obj):
+        return None
+    target = query.data.rsplit("_", 1)[-1]
+    state = _duty_state()
+    cfg = _duty_cfg(state, class_obj)
+    local_now = _user_local_now(_duty_class_admin(class_obj) or user)
+    participants = _duty_participants(class_obj)
+    today = _duty_ensure_today(cfg, local_now, participants)
+    if mode == "set":
+        if target not in participants:
+            try:
+                await context.bot.send_message(
+                    chat_id=int(uid),
+                    text="Этот участник больше не в классе — обновите список.")
+            except Exception:
+                pass
+            return None
+        today["duty"] = [target]
+        cfg["queue"] = [u for u in (cfg.get("queue") or []) if u != target]
+        _duty_save_state(state)
+        note = (f"🧹 Админ назначил дежурным на сегодня: "
+                f"<b>{_duty_esc(_duty_name(target))}</b>.")
+        await _duty_announce(context.bot, class_obj, cfg, replaced_note=note)
+        today["sent"] = True
+        cfg["last_duty"] = list(today.get("duty") or [])
+        _duty_save_state(state)
+        return None
+    ok, msg = await _duty_reassign_perform(
+        context.bot, class_obj, cfg, target, reason_sick=(mode == "sick"))
+    _duty_save_state(state)
+    if not ok:
+        # query уже отвечен — честный текст отправим отдельным сообщением
+        try:
+            await context.bot.send_message(chat_id=int(uid), text=f"🤒 {msg}")
+        except Exception:
+            pass
+        return None
+    txt = _duty_settings_text(class_obj, cfg)
+    try:
+        await query.edit_message_text(txt, reply_markup=_duty_settings_kb(cfg),
+                                      parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
+    return None
 
 
 # === ВОЛНА 22.27/22.28: возрастной гейт 13+ ===
@@ -34645,6 +35814,40 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await pomo_skip_cb(update, context)
     elif data == "pomo_back":
         return await timer_back_cb(update, context)
+
+    # === ВОЛНА 22.31: ДЕЖУРНЫЕ (duty_*) — без смены FSM-состояния ===
+    if data in ("more_duty", "duty_menu"):
+        return await duty_menu_cb(update, context)
+    elif data == "duty_settings":
+        return await duty_settings_cb(update, context)
+    elif data == "duty_toggle":
+        return await duty_toggle_cb(update, context)
+    elif data == "duty_time":
+        return await duty_time_cb(update, context)
+    elif data.startswith("duty_time_p_"):
+        return await duty_time_preset_cb(update, context)
+    elif data == "duty_time_custom":
+        return await duty_time_custom_start(update, context)
+    elif data == "duty_days":
+        return await duty_days_cb(update, context)
+    elif data.startswith("duty_day_"):
+        return await duty_day_toggle_cb(update, context)
+    elif data == "duty_count":
+        return await duty_count_cb(update, context)
+    elif data.startswith("duty_count_p_"):
+        return await duty_count_pick_cb(update, context)
+    elif data == "duty_regen":
+        return await duty_regen_cb(update, context)
+    elif data == "duty_replace":
+        return await duty_replace_cb(update, context, mode="replace")
+    elif data == "duty_sick":
+        return await duty_sick_cb(update, context)
+    elif data.startswith("duty_go_s_"):
+        return await duty_go_cb(update, context, mode="sick")
+    elif data.startswith("duty_go_r_"):
+        return await duty_go_cb(update, context, mode="replace")
+    elif data.startswith("duty_go_t_"):
+        return await duty_go_cb(update, context, mode="set")
 
     if data == "change_time":
         return await change_time_start(update, context)
@@ -40093,6 +41296,13 @@ async def _unified_notification_tick_locked(context):
         logger.error(f"unified_tick: pomodoro crashed: {e}")
         await _notify_dev_error(bot, "Тикер: блок помодоро", e)
 
+    # 1++) ВОЛНА 22.31: утренние анонсы дежурных (по классам, без дублей).
+    try:
+        await _tick_send_duty(bot)
+    except Exception as e:
+        logger.error(f"unified_tick: duty crashed: {e}")
+        await _notify_dev_error(bot, "Тикер: блок дежурных", e)
+
     # 1-минус) ВОЛНА 20: фоновый догрев MTProto (не блокирует тик — задача
     # в фоне; если клиент уже поднят или Telethon нет — мгновенный выход).
     try:
@@ -41569,6 +42779,11 @@ def main():
             ],
             SICK_WAIT_TO: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, sick_to_save),
+                CallbackQueryHandler(handle_callback),
+            ],
+            # ВОЛНА 22.31: «🧹 Дежурные» — ввод своего времени ЧЧ:ММ.
+            DUTY_WAIT_TIME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, duty_time_custom_save),
                 CallbackQueryHandler(handle_callback),
             ],
             # ВОЛНА 22.27: правка напоминаний из «📋 Мои напоминания».
