@@ -3538,7 +3538,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.31"
+BOT_BUILD = "22.32"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -10455,7 +10455,9 @@ async function loadFiles(silent) {
       kind: String(f.kind || 'document'),
       size: +f.size || 0,
       ts: String(f.ts || ''),
-      vault: !!f.vault
+      vault: !!f.vault,
+      safe: !!f.safe,
+      plain: !!f.plain
     }));
 
     CONN.bot = String(data.bot || CONN.bot || '');
@@ -10831,6 +10833,31 @@ async function saveFileName() {
 let VAULT_PW = '';
 let VAULT_SERVER_UNLOCKED = false;
 
+// 22.32: файлы, ожидающие пароль Сейфа (шифрование включено, как в чате)
+let PENDING_UPLOAD_FILES = [];
+
+// 22.32: нужен ли пароль Сейфа перед загрузкой. «Без шифра» (личный канал,
+// настройки → 🔓) — не нужен; иначе как в чате: всё под паролем.
+function needSafePwForUpload() {
+  const st = STORAGE_STATE;
+
+  if (st && st.encrypt === false) return false;
+
+  return !VAULT_PW && !VAULT_SERVER_UNLOCKED;
+}
+
+// 22.32: тихо обновляем статус хранилища (режим шифрования) для проверки
+function refreshStorageInfo() {
+  apiJson('/api/storage').then(function (d) {
+    STORAGE_STATE = d || null;
+
+    if (d) {
+      CONN.bot = String(d.bot || CONN.bot || '');
+      CONN.build = String(d.build || CONN.build || '');
+    }
+  }).catch(function () {});
+}
+
 function vaultHeaders(extra) {
   const h = authHeaders(extra);
 
@@ -10856,6 +10883,12 @@ function closeSafeModal(e) {
   if (m) m.classList.remove('open');
 
   document.body.classList.remove('modal-open');
+
+  // 22.32: окно ждало пароль для ЗАГРУЗКИ — закрыто без пароля → отменяем
+  if (PENDING_UPLOAD_FILES.length && !VAULT_PW && !VAULT_SERVER_UNLOCKED) {
+    PENDING_UPLOAD_FILES = [];
+    showToast('Загрузка отменена — нужен пароль Сейфа');
+  }
 }
 
 async function loadSafeStatus() {
@@ -10900,6 +10933,18 @@ async function unlockSafe() {
     showToast('🔒 Сейф разблокирован');
 
     closeSafeModal();
+
+    // 22.32: ждали пароль для загрузки → продолжаем сразу
+    if (PENDING_UPLOAD_FILES.length) {
+      const fl = PENDING_UPLOAD_FILES;
+
+      PENDING_UPLOAD_FILES = [];
+
+      proceedUpload(fl);
+
+      return;
+    }
+
     loadFiles(true);
   } catch (e) {
     showToast(cloudErrText(e));
@@ -11388,15 +11433,51 @@ function skipAllNames() {
 function startActualUpload() {
   if (!pendingFiles.length) return;
 
+  // 22.32: шифрование включено и Сейф заперт — сначала пароль (как в чате)
+  if (needSafePwForUpload()) {
+    PENDING_UPLOAD_FILES = pendingFiles.slice();
+
+    showToast('🔒 Файлы шифруются паролем Сейфа — введите пароль');
+
+    openSafeModal();
+
+    return;
+  }
+
   proceedUpload(pendingFiles);
 }
 
-function uploadFiles(fileList) {
+async function uploadFiles(fileList) {
   const files = Array.from(fileList);
 
   if (!files.length || isUploading) return;
 
-  // НИЧЕГО НЕ СПРАШИВАЕМ: сразу загружаем файлы с оригинальными именами
+  // 22.32: узнаём режим хранилища ДО загрузки (шифрование вкл/выкл)
+  if (!STORAGE_STATE || typeof STORAGE_STATE.encrypt === 'undefined') {
+    try {
+      const d = await apiJson('/api/storage');
+
+      STORAGE_STATE = d || null;
+
+      if (d) {
+        CONN.bot = String(d.bot || CONN.bot || '');
+        CONN.build = String(d.build || CONN.build || '');
+      }
+    } catch (e) {}
+  }
+
+  // НИЧЕГО НЕ СПРАШИВАЕМ про имена — сразу грузим оригинальные имена.
+  // ЕСЛИ включено шифрование и Сейф заперт — сначала пароль Сейфа (22.32):
+  if (needSafePwForUpload()) {
+    PENDING_UPLOAD_FILES = files;
+
+    showToast('🔒 Файлы шифруются паролем Сейфа — введите пароль');
+
+    openSafeModal();
+
+    return;
+  }
+
   proceedUpload(files);
 }
 
@@ -11550,9 +11631,11 @@ function sendChunk(uploadId, index, blobPart, onLoaded) {
 async function uploadOneFile(file, reportBytes) {
   const upName = String(file.uploadName || file.name || 'file.bin').slice(0, 120);
 
+  // 22.32: пароль Сейфа идёт с init/complete (X-Vault-Password) — файл
+  // сервер зашифрует им и положит в Сейф, как загрузки из чата
   const initData = await apiJson('/api/upload/init', {
     method: 'POST',
-    headers: authHeaders({ 'Content-Type': 'application/json' }),
+    headers: vaultHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({
       name: upName,
       size: +file.size || 0,
@@ -11606,7 +11689,7 @@ async function uploadOneFile(file, reportBytes) {
 
   const done = await apiJson('/api/upload/complete', {
     method: 'POST',
-    headers: authHeaders({ 'Content-Type': 'application/json' }),
+    headers: vaultHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({ uploadId })
   });
 
@@ -11669,7 +11752,13 @@ async function uploadEngine(bar) {
   if (squareStop) squareStop.style.display = 'none';
   if (checkmark) checkmark.classList.add('show');
 
-  document.getElementById('downloadText').textContent = 'Успешно загружено!';
+  document.getElementById('downloadText').textContent = added.some((r) => r.vault)
+    ? 'Успешно! 🔒 Зашифровано и в Сейфе'
+    : 'Успешно загружено!';
+
+  if (added.some((r) => r.vault)) {
+    showToast('🔒 Зашифровано паролем Сейфа и сохранено — видно и в чате, и здесь');
+  }
 
   playSoundDirectly(selectedSoundId);
   flashScreen();
@@ -11681,7 +11770,9 @@ async function uploadEngine(bar) {
       kind: rec.kind,
       size: +rec.size || 0,
       ts: rec.ts || '',
-      vault: !!rec.vault
+      vault: !!rec.vault,
+      safe: !!rec.safe,
+      plain: !!rec.plain
     });
   });
 
@@ -11733,6 +11824,7 @@ if (!IS_TELEGRAM) {
       .then(function (r) {
         if (r.ok) {
           loadFiles();
+          refreshStorageInfo();
         } else {
           localStorage.removeItem('devo_web_token');
           WEB_TOKEN = '';
@@ -11747,6 +11839,8 @@ if (!IS_TELEGRAM) {
   }
 } else {
   loadFiles().then(function (ok) {
+    refreshStorageInfo();
+
     if (!ok) {
       setTimeout(function () {
         loadFiles(true);
@@ -12653,8 +12747,183 @@ async def miniapp_files_from_safe(request):
     return web.json_response({"file": _miniapp_rec_out(new_rec), "ok": True})
 
 
+# --- ВОЛНА 22.32: ЗАГРУЗКИ МИНИ-АППА ШИФРУЮТСЯ КАК В ЧАТЕ ---
+# Раньше файл из веба уходил в канал КАК ЕСТЬ и попадал в cloud_files
+# («Старые файлы — без шифра» в чате), а файл из чата — ВСЕГДА в Сейф.
+# Отсюда жалоба: «добавил через облако в боте — нет в мини-аппе; добавил
+# в мини-аппе — нет в моих файлах». Теперь у веба и чата ОДНО ПРАВИЛО: если
+# режим «без шифра» не включён (настройки 🔗 Моё облако), загрузка из
+# мини-аппа ШИФРУЕТСЯ паролем Сейфа (DVF1 ≤20 МБ / DVF2 до 2 ГБ, исходник
+# уже лежит временным файлом на диске — качать из канала не нужно) и
+# попадает в ТОТ ЖЕ user.vault_files: список в чате и в мини-аппе
+# совпадает байт-в-байт, незашифрованных копий не остаётся.
+
+
+async def _miniapp_encrypt_local_to_safe(user, src_path, size, name, kind,
+                                         mime, password):
+    """ВОЛНА 22.32: локальный исходник (временный .part файл загрузки) →
+    шифрованный контейнер в канале-хранилище → запись Сейфа (vault_files).
+    ≤20 МБ — DVF1 в ОЗУ (_vault_pack), больше — DVF2 потоково
+    (_Dvf2Encryptor, ОЗУ ~1 МБ), заливка Bot API ≤48 МБ, иначе MTProto.
+    Бросает RuntimeError с человеческой причиной; запись НЕ добавляет."""
+    app = _MINIAPP_PTB_APP
+    if app is None:
+        raise RuntimeError("Бот ещё запускается — попробуйте через минуту.")
+    meta = {
+        "n": name, "k": kind, "m": mime,
+        "t": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "sz": size,
+    }
+    if size <= VAULT_MAX_FILE_BYTES:
+        # DVF1: контейнер целиком в ОЗУ
+        with open(src_path, "rb") as fh:
+            payload = fh.read()
+        container = await asyncio.to_thread(_vault_pack, password, payload, meta)
+        payload = b""
+        salt_hex = container[9:25].hex()
+        nonce_hex = container[25:37].hex()
+        iters = int.from_bytes(container[5:9], "big")
+        key = _vault_derive_key(password, bytes.fromhex(salt_hex), iters)
+        verifier_hex = _vault_verifier(key).hex()
+        _vfn = f"vault_{datetime.now().strftime('%Y%m%d_%H%M%S')}_w.bin"
+        up = await _storage_upload_document(
+            _MiniappCtx(app.bot), container, filename=_vfn,
+            caption="🔐 Сейф: зашифрованный файл (открыть без пароля невозможно).",
+            user=user)
+        if up is None and _TELETHON_OK and BOT_TOKEN:
+            _mtc = await _mt_client()
+            if _mtc is not None:
+                _updir = _tempfile.mkdtemp(prefix="dvf1_up_")
+                try:
+                    _uppath = os.path.join(_updir, "c.bin")
+                    with open(_uppath, "wb") as _ufh:
+                        _ufh.write(container)
+                    up = await _mt_upload_container(
+                        _mtc, _uppath, len(container),
+                        caption="🔐 Сейф: зашифрованный файл.", filename=_vfn,
+                        user=user)
+                finally:
+                    _shutil.rmtree(_updir, ignore_errors=True)
+        if not up:
+            raise RuntimeError("Telegram не принял шифр — проверьте, что бот "
+                               "администратор канала-хранилища.")
+        return {
+            "id": _vault_gen_id(user), "kind": kind, "mime": mime,
+            "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "size_orig": size, "size_enc": int(up.get("size", 0) or 0),
+            "salt": salt_hex, "verifier": verifier_hex, "iters": iters,
+            "nonce": nonce_hex, "msg_id": int(up.get("message_id", 0)),
+            "file_id": up.get("file_id"), "channel_id": up.get("channel_id"),
+            "label": name[:120],
+            "cat": _vault_cat_by_kind(kind, mime), "tags": [],
+            "src": "web",
+        }
+    # DVF2: потоково из локального файла (ОЗУ ~1 МБ кусок)
+    if not _dvf2_disk_ok(size):
+        raise RuntimeError("Мало свободного места на диске сервера.")
+    job = _dvf2_make_job_dir()
+    try:
+        tmp_enc = os.path.join(job, "container.bin")
+        enc = _Dvf2Encryptor(password, meta, tmp_enc)
+        enc_total = 0
+        try:
+            with open(src_path, "rb") as fh:
+                while True:
+                    chunk = fh.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    enc.push(chunk)
+            enc_total = enc.finish()
+        except Exception:
+            enc.abort()
+            raise
+        _vfn = f"vault_{datetime.now().strftime('%Y%m%d_%H%M%S')}_w.bin"
+        if enc_total <= (49 * 1024 * 1024 - 1024 * 1024):
+            with open(tmp_enc, "rb") as fh:
+                enc_bytes = fh.read()
+            try:
+                up = await _storage_upload_document(
+                    _MiniappCtx(app.bot), enc_bytes, filename=_vfn,
+                    caption="🔐 Сейф: зашифрованный файл.", user=user)
+            finally:
+                enc_bytes = b""
+            if up is None:
+                mtc = await _mt_client()
+                if mtc is not None:
+                    up = await _mt_upload_container(
+                        mtc, tmp_enc, enc_total,
+                        caption="🔐 Сейф: зашифрованный файл.", filename=_vfn,
+                        user=user)
+        else:
+            client = await _mt_client()
+            if client is None:
+                raise RuntimeError("Большие файлы требуют MTProto: "
+                                   + (_MT_LAST_ERR or "недоступен"))
+            up = await _mt_upload_container(
+                client, tmp_enc, enc_total,
+                caption="🔐 Сейф: зашифрованный файл.", filename=_vfn,
+                user=user)
+        if not up:
+            raise RuntimeError("Telegram не принял шифр — проверьте, что бот "
+                               "администратор канала-хранилища.")
+        return {
+            "id": _vault_gen_id(user), "kind": kind, "mime": mime,
+            "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "size_orig": size, "size_enc": enc_total,
+            "salt": enc.salt_hex(), "verifier": enc.verifier_hex(),
+            "iters": enc.iters, "nonce": enc.np_hex(),
+            "msg_id": int(up.get("message_id", 0)),
+            "file_id": up.get("file_id"), "channel_id": up.get("channel_id"),
+            "dvf2": True, "label": name[:120],
+            "cat": _vault_cat_by_kind(kind, mime), "tags": [],
+            "src": "web",
+        }
+    finally:
+        _shutil.rmtree(job, ignore_errors=True)
+
+
+def _miniapp_vault_pw_from(request, body, upload_sess=None):
+    """ВОЛНА 22.32: пароль Сейфа для загрузки — тело запроса → заголовок
+    X-Vault-Password → сессия загрузки → веб-сессия (RAM)."""
+    if isinstance(body, dict):
+        pw = str(body.get("password") or "")
+        if pw:
+            return pw
+    pw = request.headers.get("X-Vault-Password") or ""
+    if pw:
+        return pw
+    if isinstance(upload_sess, dict):
+        pw = str(upload_sess.get("vault_pw") or "")
+        if pw:
+            return pw
+    return _miniapp_vault_pw_from_request(request)
+
+
+def _miniapp_vault_pw_guard(user, password):
+    """ВОЛНА 22.32: проверка пароля Сейфа перед шифрованием загрузки.
+    None — пароль не задан (нужен 423); web.Response — ошибка (403/400/503);
+    True — пароль принят (или создаётся новый при первом файле)."""
+    if not password:
+        return None
+    if not _vault_kdf_available():
+        return _miniapp_err(503, "no_crypto",
+                            "На сервере нет библиотеки cryptography — "
+                            "шифрование недоступно.")
+    ok = _miniapp_vault_pw_verify(user, password)
+    if ok is False:
+        return _miniapp_err(403, "wrong_password", "Пароль Сейфа не подходит.")
+    if ok is None and len(password) < VAULT_MIN_PASSWORD:
+        return _miniapp_err(400, "weak_password",
+                            f"Пароль Сейфа слишком короткий — минимум "
+                            f"{VAULT_MIN_PASSWORD} символов.")
+    return True
+
+
 async def miniapp_upload_init(request):
-    """Старт загрузки: проверяем лимиты, создаём сессию + временный файл."""
+    """Старт загрузки: проверяем лимиты, создаём сессию + временный файл.
+    ВОЛНА 22.32: если включено шифрование (всё, кроме «без шифра» личного
+    канала) — ТРЕБУЕМ пароль Сейфа СРАЗУ (423), пока ни байта не пришло:
+    незашифрованная копия не попадёт ни в канал, ни на диск сессии."""
     user, uid, err = await _api_get_user_any(request)
     if err is not None:
         return err
@@ -12675,8 +12944,27 @@ async def miniapp_upload_init(request):
             413, "too_big",
             f"Файл больше {_fmt_bytes(VAULT_MTPROTO_MAX_BYTES)} — Telegram не "
             "пропускает даже через MTProto. Разделите файл на части.")
+    # ВОЛНА 22.32: режим хранения — как в чате. «Без шифра» ТОЛЬКО при
+    # подключённом личном канале с включённым режимом; иначе — шифруем.
+    plain_mode = (_user_vault_channel(user) is not None
+                  and _vault_channel_plain(user))
+    vault_pw = None
+    if not plain_mode:
+        vault_pw = _miniapp_vault_pw_from(request, body)
+        guard = _miniapp_vault_pw_guard(user, vault_pw)
+        if guard is None:
+            return _miniapp_err(
+                423, "safe_locked",
+                "🔒 Файлы шифруются паролем Сейфа (как в чате). Введите пароль "
+                "Сейфа — и загрузка продолжится уже зашифрованной.")
+        if guard is not True:
+            return guard
     files = [f for f in (getattr(user, "cloud_files", []) or []) if isinstance(f, dict)]
     limit = get_price('cloud_max_files', 50)
+    if not plain_mode:
+        # в Сейфе учитываем ВЕСЬ список пользователя (как в чате)
+        files = files + [f for f in (getattr(user, "vault_files", []) or [])
+                         if isinstance(f, dict)]
     if len(files) >= limit:
         return _miniapp_err(
             409, "limit",
@@ -12689,8 +12977,18 @@ async def miniapp_upload_init(request):
     _MINIAPP_UPLOADS[upload_id] = {
         "path": path, "name": name, "mime": mime, "size": size,
         "uid": uid, "received": 0, "ts": time.time(),
+        # ВОЛНА 22.32: пароль проверен — держим его только в RAM сессии
+        # загрузки (до complete), в базу не пишем никогда.
+        "vault_pw": vault_pw or "",
+        "plain": plain_mode,
     }
-    return web.json_response({"uploadId": upload_id, "chunkSize": _MINIAPP_CHUNK})
+    # пароль пригодится и следующим операциям веб-сессии (RAM)
+    if vault_pw:
+        sess = _miniapp_session_of(request)
+        if sess is not None:
+            sess["vault_pw"] = vault_pw
+    return web.json_response({"uploadId": upload_id, "chunkSize": _MINIAPP_CHUNK,
+                              "encrypt": not plain_mode})
 
 
 async def miniapp_upload_chunk(request):
@@ -12754,7 +13052,11 @@ async def miniapp_upload_complete(request):
     """Файл собран: отправляем его В КАНАЛ КАК ДОКУМЕНТ (без сжатия!) и
     дописываем запись в ОСНОВНУЮ базу пользователя.
     ≤49 МБ — Bot API (_storage_upload_document, личный канал приоритетнее),
-    больше — MTProto (_mt_upload_container, до 2 ГБ)."""
+    больше — MTProto (_mt_upload_container, до 2 ГБ).
+    ВОЛНА 22.32: при включённом шифровании (как в чате) файл из веба
+    ШИФРУЕТСЯ паролем Сейфа (DVF1/DVF2 прямо с диска) и попадает в ТОТ ЖЕ
+    Сейф, что и загрузки из чата: user.vault_files. Незашифрованных копий
+    нигде не остаётся — временный .part стирается в finally."""
     user, uid, err = await _api_get_user_any(request)
     if err is not None:
         return err
@@ -12775,6 +13077,44 @@ async def miniapp_upload_complete(request):
                 f"Получено {s['received']} из {s['size']} байт — загрузка не завершена.")
         name = s["name"]
         size = s["size"]
+        # === ВОЛНА 22.32: ШИФРОВАННАЯ ЗАГРУЗКА (режим по умолчанию) ===
+        if not s.get("plain"):
+            vault_pw = _miniapp_vault_pw_from(request, body, upload_sess=s)
+            guard = _miniapp_vault_pw_guard(user, vault_pw)
+            if guard is None:
+                return _miniapp_err(
+                    423, "safe_locked",
+                    "🔒 Введите пароль Сейфа — файлы из веба шифруются им "
+                    "(как в чате).")
+            if guard is not True:
+                return guard
+            kind = _miniapp_kind_from(s["mime"], name)
+            try:
+                new_rec = await _miniapp_encrypt_local_to_safe(
+                    user, s["path"], size, name[:120], kind,
+                    s["mime"], vault_pw)
+            except RuntimeError as e:
+                return _miniapp_err(502, "upload_failed", str(e))
+            except Exception as e:
+                logger.error(f"miniapp upload encrypt: {e}")
+                return _miniapp_err(
+                    502, "upload_failed",
+                    f"Не удалось зашифровать файл ({e}). Попробуйте ещё раз.")
+            user.vault_files = [f for f in (getattr(user, "vault_files", []) or [])
+                                if isinstance(f, dict)]
+            user.vault_files.append(new_rec)
+            if vault_pw:
+                sess = _miniapp_session_of(request)
+                if sess is not None:
+                    sess["vault_pw"] = vault_pw
+            save_user(user)
+            logger.info(f"miniapp upload: файл пользователя {uid} "
+                        "зашифрован и сохранён в Сейф")
+            return web.json_response({
+                "file": _miniapp_safe_rec_out(len(user.vault_files), new_rec),
+                "safe": True,
+            })
+        # === режим «БЕЗ ШИФРА» (личный канал) — прежний путь, облако ===
         app = _MINIAPP_PTB_APP
         sent = None
         if size <= STORAGE_MAX_FILE_BYTES:
@@ -12851,13 +13191,21 @@ async def miniapp_storage_get(request):
             added = str((getattr(user, "vault_channel", None) or {}).get("added") or "")
         except Exception:
             added = ""
+    # ВОЛНА 22.32: клиент должен ЗНАТЬ режим заранее —
+    # encrypt=True → загрузки шифруются паролем Сейфа (как в чате),
+    # unlocked=True → пароль уже в RAM веб-сессии (можно не спрашивать).
+    plain_mode = (vc is not None and _vault_channel_plain(user))
+    sess = _miniapp_session_of(request)
     return web.json_response({
         "connected": bool(vc),
         "id": int(vc[0]) if vc else None,
         "title": vc[1] if vc else "",
         "added": added,
         # ВОЛНА 22.25: режим «файлы БЕЗ шифрования» (только с личным каналом).
-        "plain": _vault_channel_plain(user),
+        "plain": bool(plain_mode),
+        # ВОЛНА 22.32: шифрование ВКЛЮЧЕНО (всё, что не «без шифра»).
+        "encrypt": not plain_mode,
+        "unlocked": bool(sess and sess.get("vault_pw")),
         "has_general": bool(get_cloud_channel_ids()),
         # ВОЛНА 22.26: видимое подтверждение связи с ботом.
         "build": BOT_BUILD,
