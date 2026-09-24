@@ -2485,7 +2485,9 @@ async function loadFiles(silent) {
       kind: String(f.kind || 'document'),
       size: +f.size || 0,
       ts: String(f.ts || ''),
-      vault: !!f.vault
+      vault: !!f.vault,
+      safe: !!f.safe,
+      plain: !!f.plain
     }));
 
     CONN.bot = String(data.bot || CONN.bot || '');
@@ -2861,6 +2863,31 @@ async function saveFileName() {
 let VAULT_PW = '';
 let VAULT_SERVER_UNLOCKED = false;
 
+// 22.32: файлы, ожидающие пароль Сейфа (шифрование включено, как в чате)
+let PENDING_UPLOAD_FILES = [];
+
+// 22.32: нужен ли пароль Сейфа перед загрузкой. «Без шифра» (личный канал,
+// настройки → 🔓) — не нужен; иначе как в чате: всё под паролем.
+function needSafePwForUpload() {
+  const st = STORAGE_STATE;
+
+  if (st && st.encrypt === false) return false;
+
+  return !VAULT_PW && !VAULT_SERVER_UNLOCKED;
+}
+
+// 22.32: тихо обновляем статус хранилища (режим шифрования) для проверки
+function refreshStorageInfo() {
+  apiJson('/api/storage').then(function (d) {
+    STORAGE_STATE = d || null;
+
+    if (d) {
+      CONN.bot = String(d.bot || CONN.bot || '');
+      CONN.build = String(d.build || CONN.build || '');
+    }
+  }).catch(function () {});
+}
+
 function vaultHeaders(extra) {
   const h = authHeaders(extra);
 
@@ -2886,6 +2913,12 @@ function closeSafeModal(e) {
   if (m) m.classList.remove('open');
 
   document.body.classList.remove('modal-open');
+
+  // 22.32: окно ждало пароль для ЗАГРУЗКИ — закрыто без пароля → отменяем
+  if (PENDING_UPLOAD_FILES.length && !VAULT_PW && !VAULT_SERVER_UNLOCKED) {
+    PENDING_UPLOAD_FILES = [];
+    showToast('Загрузка отменена — нужен пароль Сейфа');
+  }
 }
 
 async function loadSafeStatus() {
@@ -2930,6 +2963,18 @@ async function unlockSafe() {
     showToast('🔒 Сейф разблокирован');
 
     closeSafeModal();
+
+    // 22.32: ждали пароль для загрузки → продолжаем сразу
+    if (PENDING_UPLOAD_FILES.length) {
+      const fl = PENDING_UPLOAD_FILES;
+
+      PENDING_UPLOAD_FILES = [];
+
+      proceedUpload(fl);
+
+      return;
+    }
+
     loadFiles(true);
   } catch (e) {
     showToast(cloudErrText(e));
@@ -3418,15 +3463,51 @@ function skipAllNames() {
 function startActualUpload() {
   if (!pendingFiles.length) return;
 
+  // 22.32: шифрование включено и Сейф заперт — сначала пароль (как в чате)
+  if (needSafePwForUpload()) {
+    PENDING_UPLOAD_FILES = pendingFiles.slice();
+
+    showToast('🔒 Файлы шифруются паролем Сейфа — введите пароль');
+
+    openSafeModal();
+
+    return;
+  }
+
   proceedUpload(pendingFiles);
 }
 
-function uploadFiles(fileList) {
+async function uploadFiles(fileList) {
   const files = Array.from(fileList);
 
   if (!files.length || isUploading) return;
 
-  // НИЧЕГО НЕ СПРАШИВАЕМ: сразу загружаем файлы с оригинальными именами
+  // 22.32: узнаём режим хранилища ДО загрузки (шифрование вкл/выкл)
+  if (!STORAGE_STATE || typeof STORAGE_STATE.encrypt === 'undefined') {
+    try {
+      const d = await apiJson('/api/storage');
+
+      STORAGE_STATE = d || null;
+
+      if (d) {
+        CONN.bot = String(d.bot || CONN.bot || '');
+        CONN.build = String(d.build || CONN.build || '');
+      }
+    } catch (e) {}
+  }
+
+  // НИЧЕГО НЕ СПРАШИВАЕМ про имена — сразу грузим оригинальные имена.
+  // ЕСЛИ включено шифрование и Сейф заперт — сначала пароль Сейфа (22.32):
+  if (needSafePwForUpload()) {
+    PENDING_UPLOAD_FILES = files;
+
+    showToast('🔒 Файлы шифруются паролем Сейфа — введите пароль');
+
+    openSafeModal();
+
+    return;
+  }
+
   proceedUpload(files);
 }
 
@@ -3580,9 +3661,11 @@ function sendChunk(uploadId, index, blobPart, onLoaded) {
 async function uploadOneFile(file, reportBytes) {
   const upName = String(file.uploadName || file.name || 'file.bin').slice(0, 120);
 
+  // 22.32: пароль Сейфа идёт с init/complete (X-Vault-Password) — файл
+  // сервер зашифрует им и положит в Сейф, как загрузки из чата
   const initData = await apiJson('/api/upload/init', {
     method: 'POST',
-    headers: authHeaders({ 'Content-Type': 'application/json' }),
+    headers: vaultHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({
       name: upName,
       size: +file.size || 0,
@@ -3636,7 +3719,7 @@ async function uploadOneFile(file, reportBytes) {
 
   const done = await apiJson('/api/upload/complete', {
     method: 'POST',
-    headers: authHeaders({ 'Content-Type': 'application/json' }),
+    headers: vaultHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({ uploadId })
   });
 
@@ -3699,7 +3782,13 @@ async function uploadEngine(bar) {
   if (squareStop) squareStop.style.display = 'none';
   if (checkmark) checkmark.classList.add('show');
 
-  document.getElementById('downloadText').textContent = 'Успешно загружено!';
+  document.getElementById('downloadText').textContent = added.some((r) => r.vault)
+    ? 'Успешно! 🔒 Зашифровано и в Сейфе'
+    : 'Успешно загружено!';
+
+  if (added.some((r) => r.vault)) {
+    showToast('🔒 Зашифровано паролем Сейфа и сохранено — видно и в чате, и здесь');
+  }
 
   playSoundDirectly(selectedSoundId);
   flashScreen();
@@ -3711,7 +3800,9 @@ async function uploadEngine(bar) {
       kind: rec.kind,
       size: +rec.size || 0,
       ts: rec.ts || '',
-      vault: !!rec.vault
+      vault: !!rec.vault,
+      safe: !!rec.safe,
+      plain: !!rec.plain
     });
   });
 
@@ -3763,6 +3854,7 @@ if (!IS_TELEGRAM) {
       .then(function (r) {
         if (r.ok) {
           loadFiles();
+          refreshStorageInfo();
         } else {
           localStorage.removeItem('devo_web_token');
           WEB_TOKEN = '';
@@ -3777,6 +3869,8 @@ if (!IS_TELEGRAM) {
   }
 } else {
   loadFiles().then(function (ok) {
+    refreshStorageInfo();
+
     if (!ok) {
       setTimeout(function () {
         loadFiles(true);
