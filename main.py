@@ -3538,7 +3538,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.32"
+BOT_BUILD = "22.34"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -7176,8 +7176,10 @@ def get_cloud_menu_keyboard(user=None):
 
     • «🔐 Сейф» — первый пункт (шифрованное хранилище);
     • «📤 Загрузить в Сейф» — новая загрузка идёт ТОЛЬКО через шифрование;
-    • «🗂 Старые файлы» — появляется ТОЛЬКО если остались незашифрованные
-      файлы прежних версий (их можно выдать, за-ZIP-ить или перенести в Сейф)."""
+    • «📁 Файлы без шифра» — появляется ТОЛЬКО если есть незашифрованные файлы
+      (ВОЛНА 22.33: прежнее «🗂 Старые файлы» переименовано — сюда попадают и
+      загрузки из мини-аппа при выключенном шифровании, и файлы прежних
+      версий; их можно выдать, за-ZIP-ить или перенести в Сейф)."""
     legacy = 0
     if user is not None:
         legacy = len([f for f in (getattr(user, "cloud_files", []) or []) if isinstance(f, dict)])
@@ -7191,8 +7193,12 @@ def get_cloud_menu_keyboard(user=None):
         [InlineKeyboardButton("🔑 Веб-пароль", callback_data="web_password_menu")],
     ]
     if legacy:
+        # ВОЛНА 22.33: «Старые файлы» → «Файлы без шифра». Файл, загруженный
+        # в мини-аппе при выключенном шифровании, лежит ИМЕННО здесь — старое
+        # название («старые») сбивало с толку: пользователь искал его в
+        # «📦 Мои файлы» (Сейф) и решал, что синхронизация сломана.
         rows.append([InlineKeyboardButton(
-            f"🗂 Старые файлы ({legacy}) — без шифра", callback_data="cloud_files")])
+            f"📁 Файлы без шифра ({legacy})", callback_data="cloud_files")])
     if MINIAPP_URL:
         # ВОЛНА 22.19 (C.4): веб-облако (Mini App) — открывается прямо в
         # Telegram. Кнопка появляется ТОЛЬКО если задан MINIAPP_URL (env):
@@ -7231,12 +7237,14 @@ def get_cloud_files_keyboard(user):
 def _cloud_files_text(user):
     files = [f for f in (getattr(user, "cloud_files", []) or []) if isinstance(f, dict)]
     if not files:
-        return ("🗂 Старых незашифрованных файлов нет — всё в Сейфе 👍\n\n"
+        return ("📁 Незашифрованных файлов нет — всё в Сейфе 👍\n\n"
                 "Новые файлы загружайте так: ☁️ Облако → 📤 Загрузить в Сейф.")
     limit = get_price('cloud_max_files', 50)
     total = sum(int(f.get("size", 0) or 0) for f in files)
     shown = files[:30]
-    lines = [f"🗂 СТАРЫЕ файлы без шифра ({len(files)}/{limit} • {_fmt_bytes(total)}):", ""]
+    # ВОЛНА 22.33: заголовок без слова «СТАРЫЕ» — раздел общий и для файлов
+    # прежних версий, и для загрузок из мини-аппа (режим «без шифра»).
+    lines = [f"📁 ФАЙЛЫ БЕЗ ШИФРА ({len(files)}/{limit} • {_fmt_bytes(total)}):", ""]
     for rec in shown:
         # ВОЛНА 22.21: 🔒 — файл отмечен в Веб-облаке (Mini App) как Vault
         # (отдельная папка просмотра, НЕ шифрование Сейфа).
@@ -7250,6 +7258,13 @@ def _cloud_files_text(user):
     if any(isinstance(f, dict) and f.get("va") for f in files):
         lines.append("🔒 — файлы, отмеченные «Vault» в 🌐 Веб-облаке (Mini App): "
                      "это их отдельная папка просмотра, шифрованием Сейфа она не является.")
+    # ВОЛНА 22.33: подсказка про синхронизацию с мини-аппом (режим без шифра).
+    if _user_vault_channel(user) is not None and _vault_channel_plain(user):
+        lines.append("")
+        lines.append("🌐 В этот список попадают и файлы, загруженные в мини-аппе "
+                     "при выключенном шифровании. Включите шифрование — новые "
+                     "загрузки из веба будут попадать в Сейф («📦 Мои файлы»), "
+                     "как из чата.")
     return "\n".join(lines)
 
 
@@ -8141,6 +8156,10 @@ MINIAPP_HTML = r"""<!DOCTYPE html>
   user-select: none;
 }
 
+.hidden {
+  display: none !important;
+}
+
 input,
 textarea {
   user-select: text;
@@ -8165,6 +8184,18 @@ body {
   -moz-osx-font-smoothing: grayscale;
 }
 
+/* Плавное переключение темы: класс на 600 мс включает переход цветов у всех элементов */
+html.theme-anim body,
+html.theme-anim body * {
+  transition:
+    background-color 0.45s cubic-bezier(0.4, 0, 0.2, 1),
+    background 0.45s cubic-bezier(0.4, 0, 0.2, 1),
+    color 0.45s cubic-bezier(0.4, 0, 0.2, 1),
+    border-color 0.45s cubic-bezier(0.4, 0, 0.2, 1),
+    fill 0.45s cubic-bezier(0.4, 0, 0.2, 1),
+    stroke 0.45s cubic-bezier(0.4, 0, 0.2, 1) !important;
+}
+
 button {
   touch-action: manipulation;
 }
@@ -8174,26 +8205,27 @@ body.modal-open {
   touch-action: none;
 }
 
+/* Вспышка при успешной загрузке: только opacity на статичных радиальных градиентах —
+   без mix-blend-mode, blur и transform-анимаций, чтобы не грузить GPU на телефонах */
 .theme-flash {
   position: fixed;
   inset: 0;
   z-index: 999;
   pointer-events: none;
   opacity: 0;
-  mix-blend-mode: screen;
   will-change: opacity;
 }
 
 .theme-flash.active {
-  animation: themeFlash 1.1s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  animation: themeFlash 0.9s cubic-bezier(0.16, 1, 0.3, 1) forwards;
 }
 
 @keyframes themeFlash {
-  0% { opacity: 0; filter: brightness(1); }
-  15% { opacity: 0.55; filter: brightness(1.4); }
-  40% { opacity: 0.35; filter: brightness(1.2); }
-  70% { opacity: 0.45; filter: brightness(1.3); }
-  100% { opacity: 0; filter: brightness(1); }
+  0% { opacity: 0; }
+  18% { opacity: 0.5; }
+  45% { opacity: 0.3; }
+  70% { opacity: 0.4; }
+  100% { opacity: 0; }
 }
 
 .theme-flash::before,
@@ -8201,38 +8233,23 @@ body.modal-open {
   content: '';
   position: absolute;
   border-radius: 50%;
-  filter: blur(80px);
-  will-change: transform;
+  will-change: opacity;
 }
 
 .theme-flash::before {
   width: 70vw;
   height: 70vw;
-  background: var(--blob-1);
   top: 10%;
   left: -10%;
-  animation: flashMove1 1.1s ease-out forwards;
+  background: radial-gradient(closest-side, var(--blob-1), transparent 72%);
 }
 
 .theme-flash::after {
   width: 75vw;
   height: 75vw;
-  background: var(--blob-2);
   bottom: 10%;
   right: -10%;
-  animation: flashMove2 1.1s ease-out forwards;
-}
-
-@keyframes flashMove1 {
-  0% { transform: scale(0.6); opacity: 0; }
-  30% { transform: scale(1.15); opacity: 0.8; }
-  100% { transform: scale(1.4); opacity: 0; }
-}
-
-@keyframes flashMove2 {
-  0% { transform: scale(0.6); opacity: 0; }
-  30% { transform: scale(1.15); opacity: 0.8; }
-  100% { transform: scale(1.4); opacity: 0; }
+  background: radial-gradient(closest-side, var(--blob-2), transparent 72%);
 }
 
 .bg-blobs-container {
@@ -8248,30 +8265,44 @@ body.modal-open {
   will-change: opacity;
 }
 
+/* Блоб-обёртка двигается через transform (дёшево для GPU),
+   а blur висит на статичном внутреннем слое — текстура размытия не пересчитывается каждый кадр */
 .blob {
   position: absolute;
   border-radius: 50%;
-  filter: blur(90px);
   opacity: 0.65;
   will-change: transform;
   transform: translateZ(0);
-  transition: transform 3s cubic-bezier(0.25, 1, 0.5, 1);
+}
+
+.blob-core {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  filter: blur(90px);
+  will-change: filter;
 }
 
 .blob-1 {
   width: 320px;
   height: 320px;
-  background: var(--blob-1);
   top: 20%;
   left: 10%;
+}
+
+.blob-1 .blob-core {
+  background: var(--blob-1);
 }
 
 .blob-2 {
   width: 360px;
   height: 360px;
-  background: var(--blob-2);
   bottom: 20%;
   right: 10%;
+}
+
+.blob-2 .blob-core {
+  background: var(--blob-2);
 }
 
 .main-wrapper {
@@ -9060,13 +9091,14 @@ body.modal-open {
 }
 </style>
 </head>
+
 <body>
 
 <div class="theme-flash" id="themeFlash"></div>
 
 <div class="bg-blobs-container" id="bgBlobs">
-  <div class="blob blob-1" id="blob1"></div>
-  <div class="blob blob-2" id="blob2"></div>
+  <div class="blob blob-1" id="blob1"><div class="blob-core"></div></div>
+  <div class="blob blob-2" id="blob2"><div class="blob-core"></div></div>
 </div>
 
 <div id="toastContainer" style="position:fixed;bottom:24px;left:50%;transform:translateX(-50%);z-index:150;display:flex;flex-direction:column;align-items:center;gap:8px;pointer-events:none;width:100%;max-width:400px;padding:0 16px"></div>
@@ -9086,18 +9118,23 @@ body.modal-open {
     </div>
 
     <div style="display:flex;flex-direction:column;gap:8px">
+      <button class="sound-item-btn" onclick="viewCurrentFile()">
+        <span>Посмотреть файл</span>
+        <i data-lucide="eye" style="width:18px;height:18px"></i>
+      </button>
+
       <button class="sound-item-btn" onclick="saveFileName()">
         <span>Сохранить имя</span>
         <i data-lucide="check" style="width:18px;height:18px"></i>
       </button>
 
       <button class="sound-item-btn" id="modalToSafeBtn" onclick="toSafeCurrentFile()">
-        <span>🔐 Переместить в Сейф</span>
+        <span>Переместить в Сейф</span>
         <i data-lucide="lock" style="width:18px;height:18px"></i>
       </button>
 
       <button class="sound-item-btn" id="modalFromSafeBtn" onclick="fromSafeCurrentFile()" style="display:none">
-        <span>🔓 Достать из Сейфа</span>
+        <span>Достать из Сейфа</span>
         <i data-lucide="lock-open" style="width:18px;height:18px"></i>
       </button>
 
@@ -9120,7 +9157,9 @@ body.modal-open {
       <div class="sheet-handle"></div>
     </div>
 
-    <h3 style="font-weight:900;font-size:20px;margin-bottom:4px">🔒 Сейф</h3>
+    <h3 style="font-weight:900;font-size:20px;margin-bottom:4px;display:flex;align-items:center;gap:8px">
+      <i data-lucide="lock" style="width:20px;height:20px"></i>Сейф
+    </h3>
     <p id="safeStatusLine" style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:14px;line-height:1.5">Загружаю…</p>
 
     <div style="margin-bottom:14px">
@@ -9149,6 +9188,50 @@ body.modal-open {
       Пароль Сейфа нужен, чтобы скачать зашифрованный файл или переместить файл в Сейф из веб-облака.
       Пароль держится только в памяти страницы и никогда не сохраняется.
     </p>
+  </div>
+</div>
+
+<div id="uploadModal" class="modal-overlay" onclick="closeUploadModal(event)">
+  <div class="modal-card" onclick="event.stopPropagation()">
+    <div class="sheet-handle-area">
+      <div class="sheet-handle"></div>
+    </div>
+
+    <h3 style="font-weight:900;font-size:20px;margin-bottom:4px">Добавление файлов</h3>
+    <p id="uploadModalInfo" style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:10px;word-break:break-word"></p>
+
+    <div id="uploadFileList" style="display:none;padding:10px 12px;background:var(--card-bg);border:1px solid var(--border-color);border-radius:12px;margin-bottom:14px;font-size:12px;font-weight:600;color:var(--subtext-color);max-height:140px;overflow-y:auto"></div>
+
+    <div id="uploadPassRow" style="display:none;margin-bottom:14px">
+      <label style="font-size:11px;font-weight:800;color:var(--subtext-color);text-transform:uppercase;letter-spacing:0.04em">Пароль шифрования</label>
+      <input type="password" id="uploadPassword" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;margin-top:4px;outline:none;font-size:15px" placeholder="Пароль из бота">
+    </div>
+
+    <p id="uploadPlainHint" style="display:none;font-size:12px;font-weight:600;color:var(--subtext-color);margin-bottom:14px;line-height:1.5">
+      В боте включён режим «Без шифрования» — пароль не нужен, файлы будут загружены как есть.
+    </p>
+
+    <div style="display:flex;flex-direction:column;gap:8px">
+      <button class="sound-item-btn" id="uploadAddBtn" onclick="pickUploadFiles()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
+        <span>Добавить файл</span>
+        <i data-lucide="plus" style="width:18px;height:18px"></i>
+      </button>
+
+      <button class="sound-item-btn hidden" id="uploadSendBtn" onclick="confirmUploadFiles()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
+        <span>Отправить</span>
+        <i data-lucide="send" style="width:18px;height:18px"></i>
+      </button>
+
+      <button class="sound-item-btn hidden" id="uploadMoreBtn" onclick="addMoreUploadFiles()">
+        <span>Добавить ещё</span>
+        <i data-lucide="file-plus" style="width:18px;height:18px"></i>
+      </button>
+
+      <button class="sound-item-btn" onclick="closeUploadModal()">
+        <span>Закрыть</span>
+        <i data-lucide="x" style="width:18px;height:18px"></i>
+      </button>
+    </div>
   </div>
 </div>
 
@@ -9362,12 +9445,13 @@ body.modal-open {
     </div>
 
     <p style="font-size:11px;font-weight:600;color:var(--subtext-color);margin-top:12px;line-height:1.5">
-      Пароль задаётся в боте через ☁️ Облако → «🔑 Веб-пароль».
+      Пароль задаётся в боте через «Облако» → «Веб-пароль».
       Логин — ваш Telegram ID.
       5 неверных попыток — пауза 10 минут.
     </p>
   </div>
 </div>
+
 
 <div class="main-wrapper">
 
@@ -9514,7 +9598,7 @@ body.modal-open {
           </div>
           <div class="settings-item-label">
             Звук уведомления
-            <small id="soundCurrentLabel">Apple Pay Double-Chime</small>
+            <small id="soundCurrentLabel">Double Chime</small>
           </div>
           <i data-lucide="chevron-right" style="width:16px;height:16px;color:var(--subtext-color);flex-shrink:0"></i>
         </button>
@@ -9571,9 +9655,6 @@ body.modal-open {
     </button>
     <button class="chip" data-filter="document" onclick="setFilter('document')">
       <i data-lucide="file-text" style="width:16px;height:16px"></i>
-    </button>
-    <button class="chip" data-filter="vault" onclick="setFilter('vault')">
-      <i data-lucide="lock" style="width:16px;height:16px"></i>
     </button>
   </div>
 
@@ -9676,12 +9757,15 @@ body.modal-open {
       <span id="selCountNum">0</span>
     </div>
 
-    <button class="sel-btn" onclick="zipSelected()" title="В ZIP">📦</button>
-    <button class="sel-btn hidden" id="unzipBtn" onclick="unzipSelected()" title="Распаковать">🗂</button>
-    <button class="sel-btn danger" onclick="deleteSelected()" title="Удалить">🗑</button>
+    <button class="sel-btn" onclick="downloadSelected()" title="Скачать"><i data-lucide="download" style="width:17px;height:17px"></i></button>
+    <button class="sel-btn" onclick="zipSelected()" title="В ZIP"><i data-lucide="package" style="width:17px;height:17px"></i></button>
+    <button class="sel-btn hidden" id="unzipBtn" onclick="unzipSelected()" title="Распаковать"><i data-lucide="folder-open" style="width:17px;height:17px"></i></button>
+    <button class="sel-btn danger" onclick="deleteSelected()" title="Удалить"><i data-lucide="trash-2" style="width:17px;height:17px"></i></button>
     <button class="sel-btn done" onclick="toggleSelectMode()">Готово</button>
   </div>
 </div>
+
+
 
 <script>
 function safeIcons() {
@@ -9854,45 +9938,68 @@ function updateBlobsVisibility() {
   if (blobsLabel) blobsLabel.textContent = blobsEnabled ? 'Включен' : 'Выключен';
 }
 
-let blobTimer = null;
+// Живой фон на requestAnimationFrame: кадры идут в такт экрану (60/90/120 Гц),
+// без setInterval и CSS-переходов — поэтому анимация плавная на ProMotion/ high refresh
+let blobRafId = null;
+let blobLastTs = 0;
+let blobTime = Math.random() * 500;
 
-function moveBlobsRandomly() {
-  if (!blobsEnabled) return;
+const BLOB_PHASES = [0, 1].map(() =>
+  Array.from({ length: 7 }, () => Math.random() * Math.PI * 2)
+);
+
+function blobOffset(i, t) {
+  const p = BLOB_PHASES[i];
+
+  const x =
+    Math.sin(t * 0.90 + p[0]) * 0.55 +
+    Math.sin(t * 0.47 + p[1]) * 0.30 +
+    Math.sin(t * 1.63 + p[2]) * 0.15;
+
+  const y =
+    Math.cos(t * 0.78 + p[3]) * 0.55 +
+    Math.sin(t * 0.53 + p[4]) * 0.30 +
+    Math.cos(t * 1.31 + p[5]) * 0.15;
+
+  const s = 1 + Math.sin(t * 0.62 + p[6]) * 0.16;
+
+  return { x: x, y: y, s: s };
+}
+
+function blobLoop(ts) {
+  blobRafId = requestAnimationFrame(blobLoop);
+
+  if (!blobLastTs) blobLastTs = ts;
+
+  const dt = Math.min(0.06, (ts - blobLastTs) / 1000);
+  blobLastTs = ts;
 
   const b1 = document.getElementById('blob1');
   const b2 = document.getElementById('blob2');
-  if (!b1 || !b2) return;
 
-  const widthRange = window.innerWidth * 0.45;
-  const heightRange = window.innerHeight * 0.45;
+  if (!blobsEnabled || document.hidden || !b1 || !b2) return;
 
-  const randX1 = (Math.random() - 0.5) * widthRange;
-  const randY1 = (Math.random() - 0.5) * heightRange;
-  const scale1 = 0.75 + Math.random() * 0.5;
+  const speed = parseInt(blobIdleSpeed) || 5;
+  // Степенная кривая: на низких значениях — медленно и плавно, на максимуме — заметно быстрее (было 0.64, стало ~1.4)
+  blobTime += dt * (0.04 + Math.pow(speed, 1.35) * 0.06);
 
-  const randX2 = (Math.random() - 0.5) * widthRange;
-  const randY2 = (Math.random() - 0.5) * heightRange;
-  const scale2 = 0.75 + Math.random() * 0.5;
+  const w = window.innerWidth * 0.22;
+  const h = window.innerHeight * 0.22;
 
-  b1.style.transform = `translate(${randX1}px, ${randY1}px) scale(${scale1}) translateZ(0)`;
-  b2.style.transform = `translate(${randX2}px, ${randY2}px) scale(${scale2}) translateZ(0)`;
+  [b1, b2].forEach((el, i) => {
+    const o = blobOffset(i, blobTime);
+
+    el.style.transform =
+      'translate(' + (o.x * w).toFixed(2) + 'px, ' + (o.y * h).toFixed(2) + 'px) ' +
+      'scale(' + o.s.toFixed(3) + ') translateZ(0)';
+  });
 }
 
 function startBlobAnimation() {
-  if (blobTimer) clearInterval(blobTimer);
+  if (blobRafId) cancelAnimationFrame(blobRafId);
 
-  moveBlobsRandomly();
-
-  const speed = parseInt(blobIdleSpeed) || 5;
-  const intervalMs = Math.max(800, 3200 - (speed * 240));
-
-  const b1 = document.getElementById('blob1');
-  const b2 = document.getElementById('blob2');
-
-  if (b1) b1.style.transition = `transform ${intervalMs / 1000 * 1.25}s cubic-bezier(0.25, 1, 0.5, 1)`;
-  if (b2) b2.style.transition = `transform ${intervalMs / 1000 * 1.25}s cubic-bezier(0.25, 1, 0.5, 1)`;
-
-  blobTimer = setInterval(moveBlobsRandomly, intervalMs);
+  blobLastTs = 0;
+  blobRafId = requestAnimationFrame(blobLoop);
 }
 
 function changeBlobSpeed(val) {
@@ -9901,11 +10008,19 @@ function changeBlobSpeed(val) {
 
   const label = document.getElementById('speedValueLabel');
   if (label) label.textContent = val + 'x';
-
-  startBlobAnimation();
 }
 
+let themeAnimTimer = null;
+
 function setTheme(theme) {
+  // Плавный переход цветов: включаем класс-аниматор, убираем через 600 мс
+  const root = document.documentElement;
+
+  root.classList.add('theme-anim');
+
+  if (themeAnimTimer) clearTimeout(themeAnimTimer);
+  themeAnimTimer = setTimeout(() => root.classList.remove('theme-anim'), 600);
+
   applyTheme(theme);
 }
 
@@ -9936,7 +10051,7 @@ function unlockAudio(e) {
 const SOUND_PROFILES = [
   {
     id: 1,
-    name: '1. Apple Pay Double-Chime',
+    name: '1. Double Chime',
     fn: (ctx, now) => {
       const o1 = ctx.createOscillator();
       const g1 = ctx.createGain();
@@ -10013,28 +10128,7 @@ const SOUND_PROFILES = [
   },
   {
     id: 4,
-    name: '4. Sci-Fi Pulse',
-    fn: (ctx, now) => {
-      const o = ctx.createOscillator();
-      const g = ctx.createGain();
-
-      o.type = 'triangle';
-      o.frequency.setValueAtTime(440, now);
-      o.frequency.exponentialRampToValueAtTime(880, now + 0.15);
-
-      g.gain.setValueAtTime(0.25, now);
-      g.gain.exponentialRampToValueAtTime(0.0001, now + 0.3);
-
-      o.connect(g);
-      g.connect(ctx.destination);
-
-      o.start(now);
-      o.stop(now + 0.35);
-    }
-  },
-  {
-    id: 5,
-    name: '5. Harmonic Tri-Tone',
+    name: '4. Harmonic Tri-Tone',
     fn: (ctx, now) => {
       [659.25, 830.61, 987.77].forEach((f, i) => {
         const o = ctx.createOscillator();
@@ -10057,6 +10151,12 @@ const SOUND_PROFILES = [
 ];
 
 let selectedSoundId = parseInt(localStorage.getItem('devo_sound_id') || '1');
+
+// Звук №4 удалён — сбрасываем сохранённые старые id (4 «Sci-Fi Pulse», 5 бывший)
+if (!SOUND_PROFILES.some((s) => s.id === selectedSoundId)) {
+  selectedSoundId = 1;
+  localStorage.setItem('devo_sound_id', '1');
+}
 
 function playSoundDirectly(id) {
   try {
@@ -10109,7 +10209,7 @@ function updateSoundLabel() {
   if (!label) return;
 
   const item = SOUND_PROFILES.find((s) => s.id === Number(selectedSoundId));
-  label.textContent = item ? item.name.replace(/^\d+\.\s*/, '') : 'Apple Pay Double-Chime';
+  label.textContent = item ? item.name.replace(/^\d+\.\s*/, '') : 'Double Chime';
 }
 
 function handleSoundSelect(e, id) {
@@ -10350,7 +10450,9 @@ async function zipSelected() {
       });
 
       renderAll();
-      showToast('✅ Архив создан: ' + data.file.name);
+
+      showToast('📦 Архив готов, скачиваю…');
+      downloadFileById(data.file.id, data.file.name, +data.file.size || 0);
     }
   } catch (e) {
     showToast(cloudErrText(e));
@@ -10455,13 +10557,14 @@ async function loadFiles(silent) {
       kind: String(f.kind || 'document'),
       size: +f.size || 0,
       ts: String(f.ts || ''),
-      vault: !!f.vault,
-      safe: !!f.safe,
-      plain: !!f.plain
+      vault: !!f.vault
     }));
 
     CONN.bot = String(data.bot || CONN.bot || '');
     CONN.build = String(data.build || CONN.build || '');
+
+    if (typeof data.plain === 'boolean') STORAGE_ENCRYPTED = !data.plain;
+    else if (ALL_FILES.some((f) => f.vault)) STORAGE_ENCRYPTED = true;
 
     LAST_ERR = null;
     LAST_SYNC = Date.now();
@@ -10558,15 +10661,51 @@ let nameMode = 'each';
 let clickTimer = null;
 let clickCount = 0;
 
+/* Эмодзи заменены на SVG-иконки Lucide: showToast превращает эмодзи в строке в <i data-lucide> */
+const TOAST_ICON_MAP = {
+  '📦': 'package',
+  '🗂': 'folder-open',
+  '🗑': 'trash-2',
+  '✅': 'check',
+  '🔒': 'lock',
+  '🔐': 'lock',
+  '🔓': 'lock-open',
+  '📥': 'download',
+  '📤': 'upload',
+  '📂': 'folder-open',
+  '⏹': 'square',
+  '⚙️': 'settings',
+  '⚙': 'settings',
+  '⚠️': 'alert-triangle',
+  '⚠': 'alert-triangle',
+  '📲': 'share',
+  '✨': 'sparkles',
+  '🎉': 'party-popper'
+};
+
+const TOAST_EMOJI_RE = /(📦|🗂|🗑|✅|🔒|🔐|🔓|📥|📤|📂|⏹|⚙️|⚙|⚠️|⚠|📲|✨|🎉)/g;
+
 function showToast(text) {
   const c = document.getElementById('toastContainer');
 
   const t = document.createElement('div');
   t.className = 'toast-msg';
   t.style.cssText = 'background:var(--btn-bg);color:var(--btn-text);font-size:14px;font-weight:700;padding:12px 20px;border-radius:9999px;box-shadow:0 10px 25px rgba(0,0,0,.25);text-align:center';
-  t.textContent = text;
+
+  t.innerHTML = String(text)
+    .split(TOAST_EMOJI_RE)
+    .map((p) => {
+      const icon = TOAST_ICON_MAP[p];
+
+      return icon
+        ? '<i data-lucide="' + icon + '" style="width:15px;height:15px;vertical-align:-2px;margin:0 5px 0 1px"></i>'
+        : escapeHtml(p);
+    })
+    .join('');
 
   c.appendChild(t);
+
+  safeIcons();
 
   setTimeout(() => t.remove(), 3500);
 }
@@ -10606,8 +10745,7 @@ function iconFor(kind) {
 function applyFilters() {
   let list = [...ALL_FILES];
 
-  if (FILTER === 'vault') list = list.filter((f) => f.vault === true);
-  else if (FILTER !== 'all') list = list.filter((f) => f.kind === FILTER && !f.vault);
+  if (FILTER !== 'all') list = list.filter((f) => f.kind === FILTER && !f.vault);
 
   if (SEARCH.trim()) {
     const q = SEARCH.trim().toLowerCase();
@@ -10832,31 +10970,7 @@ async function saveFileName() {
 
 let VAULT_PW = '';
 let VAULT_SERVER_UNLOCKED = false;
-
-// 22.32: файлы, ожидающие пароль Сейфа (шифрование включено, как в чате)
-let PENDING_UPLOAD_FILES = [];
-
-// 22.32: нужен ли пароль Сейфа перед загрузкой. «Без шифра» (личный канал,
-// настройки → 🔓) — не нужен; иначе как в чате: всё под паролем.
-function needSafePwForUpload() {
-  const st = STORAGE_STATE;
-
-  if (st && st.encrypt === false) return false;
-
-  return !VAULT_PW && !VAULT_SERVER_UNLOCKED;
-}
-
-// 22.32: тихо обновляем статус хранилища (режим шифрования) для проверки
-function refreshStorageInfo() {
-  apiJson('/api/storage').then(function (d) {
-    STORAGE_STATE = d || null;
-
-    if (d) {
-      CONN.bot = String(d.bot || CONN.bot || '');
-      CONN.build = String(d.build || CONN.build || '');
-    }
-  }).catch(function () {});
-}
+let PENDING_FILE_ACTION = null; // отложенное «посмотреть файл» после ввода пароля Сейфа
 
 function vaultHeaders(extra) {
   const h = authHeaders(extra);
@@ -10879,16 +10993,12 @@ function openSafeModal() {
 function closeSafeModal(e) {
   if (e) e.stopPropagation();
 
+  PENDING_FILE_ACTION = null;
+
   const m = document.getElementById('safeModal');
   if (m) m.classList.remove('open');
 
   document.body.classList.remove('modal-open');
-
-  // 22.32: окно ждало пароль для ЗАГРУЗКИ — закрыто без пароля → отменяем
-  if (PENDING_UPLOAD_FILES.length && !VAULT_PW && !VAULT_SERVER_UNLOCKED) {
-    PENDING_UPLOAD_FILES = [];
-    showToast('Загрузка отменена — нужен пароль Сейфа');
-  }
 }
 
 async function loadSafeStatus() {
@@ -10926,6 +11036,9 @@ async function unlockSafe() {
       body: JSON.stringify({ password: pw })
     });
 
+    const pending = PENDING_FILE_ACTION;
+    PENDING_FILE_ACTION = null;
+
     VAULT_PW = pw;
 
     if (input) input.value = '';
@@ -10933,19 +11046,11 @@ async function unlockSafe() {
     showToast('🔒 Сейф разблокирован');
 
     closeSafeModal();
-
-    // 22.32: ждали пароль для загрузки → продолжаем сразу
-    if (PENDING_UPLOAD_FILES.length) {
-      const fl = PENDING_UPLOAD_FILES;
-
-      PENDING_UPLOAD_FILES = [];
-
-      proceedUpload(fl);
-
-      return;
-    }
-
     loadFiles(true);
+
+    if (pending && pending.type === 'view') {
+      setTimeout(() => openFileViewer(pending.id), 300);
+    }
   } catch (e) {
     showToast(cloudErrText(e));
   }
@@ -11038,6 +11143,161 @@ async function fromSafeCurrentFile() {
   }
 }
 
+
+/* ===== Скачивание на телефоне =====
+   Обычная ссылка через tg.openLink не работает: внешний браузер теряет заголовки
+   авторизации и пароля Сейфа. Поэтому качаем файл сами (fetch с заголовками),
+   а на телефоне открываем системное меню «Поделиться» → «Сохранить в Файлы/Фото». */
+
+const IS_MOBILE = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent || '') || (navigator.maxTouchPoints || 0) > 1;
+const BIG_FILE_LIMIT = 1024 * 1024 * 1024; // файлы больше 1 ГБ не влезают в память телефона — открываем ссылку в браузере
+
+function guessMime(name) {
+  const n = String(name || '').toLowerCase();
+  const ext = n.indexOf('.') >= 0 ? n.slice(n.lastIndexOf('.') + 1) : n;
+  const map = {
+    jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif',
+    webp: 'image/webp', bmp: 'image/bmp', svg: 'image/svg+xml', heic: 'image/heic', heif: 'image/heif',
+    mp4: 'video/mp4', mov: 'video/quicktime', webm: 'video/webm', mkv: 'video/x-matroska', avi: 'video/x-msvideo', '3gp': 'video/3gpp',
+    mp3: 'audio/mpeg', wav: 'audio/wav', ogg: 'audio/ogg', oga: 'audio/ogg', m4a: 'audio/mp4', aac: 'audio/aac', flac: 'audio/flac',
+    pdf: 'application/pdf', zip: 'application/zip', rar: 'application/vnd.rar', '7z': 'application/x-7z-compressed',
+    txt: 'text/plain', csv: 'text/csv', json: 'application/json',
+    doc: 'application/msword',
+    docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    xls: 'application/vnd.ms-excel',
+    xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    ppt: 'application/vnd.ms-powerpoint',
+    pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation'
+  };
+
+  return map[ext] || 'application/octet-stream';
+}
+
+function openExternalLink(abs) {
+  if (IS_TELEGRAM && tg && tg.openLink) tg.openLink(abs);
+  else window.open(abs, '_blank', 'noopener');
+}
+
+// Качаем файл сами, с заголовками авторизации и паролем Сейфа
+async function fetchFileBlob(absUrl, name) {
+  const r = await fetch(absUrl, { headers: vaultHeaders() });
+
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+
+  const type = r.headers.get('content-type') || guessMime(name);
+  const total = +r.headers.get('content-length') || 0;
+
+  if (!r.body || !r.body.getReader || !total) return await r.blob();
+
+  const reader = r.body.getReader();
+  const chunks = [];
+  let got = 0;
+  let lastPct = -1;
+
+  for (;;) {
+    const part = await reader.read();
+
+    if (part.done) break;
+
+    chunks.push(part.value);
+    got += part.value.length;
+
+    const pct = Math.floor((got / total) * 100);
+
+    if (pct >= lastPct + 20 && pct < 100) {
+      lastPct = pct;
+      showToast('📥 Скачиваю… ' + pct + '%');
+    }
+  }
+
+  return new Blob(chunks, { type: type });
+}
+
+// Сохраняем на телефон: меню «Поделиться» → «Сохранить в Файлы / Сохранить фото», иначе прямое скачивание
+async function saveBlobToPhone(blob, name) {
+  let file;
+
+  try {
+    file = new File([blob], name, { type: blob.type || guessMime(name), lastModified: Date.now() });
+  } catch (e) {
+    file = null;
+  }
+
+  if (IS_MOBILE && file && navigator.canShare && navigator.canShare({ files: [file] })) {
+    try {
+      await navigator.share({ files: [file], title: name });
+      return true;
+    } catch (e) {
+      if (e && e.name === 'AbortError') return true; // пользователь закрыл меню — файл уже выбран им
+    }
+  }
+
+  try {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+
+    a.href = url;
+    a.download = name;
+    a.rel = 'noopener';
+
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+async function downloadFileById(id, name, size) {
+  showToast('📥 Готовлю скачивание…');
+
+  try {
+    const data = await apiJson('/api/files/' + encodeURIComponent(id) + '/link', {
+      headers: vaultHeaders()
+    });
+
+    const abs = new URL(data.url, location.origin).href;
+
+    if ((+size || 0) > BIG_FILE_LIMIT) {
+      openExternalLink(abs);
+      showToast('Файл больше 1 ГБ — открыл ссылку в браузере');
+      return;
+    }
+
+    let blob = null;
+
+    try {
+      blob = await fetchFileBlob(abs, name);
+    } catch (err) {
+      blob = null;
+    }
+
+    if (blob) {
+      const ok = await saveBlobToPhone(blob, name || 'file');
+
+      if (ok) {
+        showToast('✅ Готово');
+        return;
+      }
+    }
+
+    openExternalLink(abs);
+    showToast('Открыл ссылку в браузере — если файл не скачался, нажмите на неё там');
+  } catch (e) {
+    if (e.code === 'safe_locked') {
+      VAULT_PW = '';
+      VAULT_SERVER_UNLOCKED = false;
+      openSafeModal();
+    }
+
+    showToast('Ошибка скачивания: ' + cloudErrText(e));
+  }
+}
+
 async function downloadCurrentFile() {
   const f = ALL_FILES.find((x) => x.id === activeEditingFileId);
 
@@ -11047,10 +11307,86 @@ async function downloadCurrentFile() {
 
   if (f.vault && !VAULT_PW && !ensureSafeUnlocked()) return;
 
-  showToast('📥 Готовлю скачивание…');
+  downloadFileById(f.id, f.name, f.size);
+}
+
+async function downloadSelected() {
+  if (!selectedIds.size) {
+    showToast('Сначала выберите файлы');
+    return;
+  }
+
+  if (selectedIds.size === 1) {
+    const f = ALL_FILES.find((x) => x.id === [...selectedIds][0]);
+
+    if (!f) return;
+
+    if (f.vault && !VAULT_PW && !ensureSafeUnlocked()) return;
+
+    downloadFileById(f.id, f.name, f.size);
+
+    return;
+  }
+
+  showToast('📦 Собираю архив…');
 
   try {
-    const data = await apiJson('/api/files/' + encodeURIComponent(f.id) + '/link', {
+    const data = await apiJson('/api/files/zip_selected', {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ ids: [...selectedIds] })
+    });
+
+    if (data.file) {
+      ALL_FILES.unshift({
+        id: data.file.id,
+        name: data.file.name,
+        kind: data.file.kind,
+        size: +data.file.size || 0,
+        ts: data.file.ts || '',
+        vault: !!data.file.vault
+      });
+
+      renderAll();
+
+      showToast('📦 Архив готов: ' + data.file.name);
+      downloadFileById(data.file.id, data.file.name, +data.file.size || 0);
+    }
+  } catch (e) {
+    showToast(cloudErrText(e));
+  }
+}
+
+function viewCurrentFile() {
+  const f = ALL_FILES.find((x) => x.id === activeEditingFileId);
+
+  if (!f) return;
+
+  const needPw = f.vault || STORAGE_ENCRYPTED === true;
+
+  closeEditModal();
+
+  if (needPw && !VAULT_PW && !VAULT_SERVER_UNLOCKED) {
+    PENDING_FILE_ACTION = { type: 'view', id: f.id };
+
+    showToast('🔒 Введите пароль Сейфа');
+    openSafeModal();
+
+    return;
+  }
+
+  openFileViewer(f.id);
+}
+
+async function openFileViewer(id) {
+  const f = ALL_FILES.find((x) => x.id === id);
+
+  if (!f) return;
+
+  showToast('📂 Открываю файл…');
+
+  try {
+    const data = await apiJson('/api/files/' + encodeURIComponent(id) + '/link', {
       headers: vaultHeaders()
     });
 
@@ -11059,25 +11395,19 @@ async function downloadCurrentFile() {
     if (IS_TELEGRAM && tg && tg.openLink) {
       tg.openLink(abs);
     } else {
-      const a = document.createElement('a');
-      a.href = abs;
-      a.download = f.name || 'file';
-      a.rel = 'noopener';
-
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
+      window.open(abs, '_blank', 'noopener');
     }
-
-    showToast('Скачивание началось');
   } catch (e) {
     if (e.code === 'safe_locked') {
       VAULT_PW = '';
       VAULT_SERVER_UNLOCKED = false;
+
+      PENDING_FILE_ACTION = { type: 'view', id: id };
+
       openSafeModal();
     }
 
-    showToast('Ошибка скачивания: ' + cloudErrText(e));
+    showToast('Не удалось открыть: ' + cloudErrText(e));
   }
 }
 
@@ -11098,121 +11428,6 @@ async function deleteCurrentFile() {
   }
 
   closeEditModal();
-}
-
-/* ===== Хранилище («Моё облако») — волна 22.23: реальное API бота ===== */
-async function loadStorageStatus() {
-  const box = document.getElementById('storageStatus');
-  box.textContent = 'Загружаю…';
-  try {
-    renderStorage(await apiJson('/api/storage'));
-  } catch (e) {
-    const t = cloudErrText(e); // 22.24: честная причина, не «нет связи с облаком»
-    box.textContent = '⚠️ ' + t;
-    if (e && (e.code === 'unauthorized' || e.code === 'not_registered')) showAuthCard(t);
-  }
-}
-
-let STORAGE_STATE = null; // 22.25: последний статус хранилища (для togglePlain)
-
-function renderStorage(d) {
-  const box = document.getElementById('storageStatus');
-  const offBtn = document.getElementById('storageOffBtn');
-  const connLabel = document.querySelector('#storageConnectBtn span');
-  const plainBtn = document.getElementById('storagePlainBtn');
-  STORAGE_STATE = d || null;
-  // 22.26: сервер подтверждает связь — честная строка «связь с ботом».
-  // Если сборка/имя не пришли (старый сервер) — строки нет, честно.
-  if (d) {
-    CONN.bot = String(d.bot || CONN.bot || '');
-    CONN.build = String(d.build || CONN.build || '');
-  }
-  var ident = (CONN.bot || CONN.build)
-    ? '<br><span style="font-size:11px;color:var(--subtext-color)">связь с ботом: '
-      + (CONN.bot ? '<b style="color:var(--text-color)">@' + escapeHtml(CONN.bot) + '</b>' : '')
-      + (CONN.bot && CONN.build ? ' • ' : '')
-      + (CONN.build ? 'сборка ' + escapeHtml(CONN.build) : '')
-      + '</span>'
-    : '';
-  if (d.connected) {
-    box.innerHTML = '✅ Ваш канал: <b style="color:var(--text-color)">' + escapeHtml(d.title || '') + '</b>'
-      + '<br><span style="font-size:11px">подключён ' + escapeHtml(d.added || '') + ' — новые загрузки уходят только в него</span>'
-      + ident;
-    offBtn.style.display = '';
-    connLabel.textContent = 'Заменить канал';
-    // 22.25: честное состояние шифрования для личного канала.
-    if (plainBtn) {
-      plainBtn.style.display = '';
-      const pl = document.getElementById('storagePlainLabel');
-      if (pl) pl.textContent = d.plain
-        ? '🔓 Шифрование ВЫКЛ — включить шифрование'
-        : '🔒 Файлы под шифром — хранить БЕЗ шифра';
-    }
-  } else {
-    box.innerHTML = (d.has_general
-      ? '☁️ Сейчас файлы уходят в общее хранилище бота. Подключите свой приватный канал — и они будут лежать только у вас.'
-      : '⚠️ Хранилище не настроено — загрузки будут неудачными. Подключите свой канал ниже.') + ident;
-    offBtn.style.display = 'none';
-    connLabel.textContent = 'Подключить канал';
-    if (plainBtn) plainBtn.style.display = 'none';
-  }
-}
-
-/* 22.25: переключатель «хранить файлы БЕЗ шифрования» — только для личного
-   канала. В общем хранилище бота незашифрованные файлы Сейфа не хранятся. */
-async function togglePlain() {
-  const btn = document.getElementById('storagePlainBtn');
-  btn.disabled = true;
-  try {
-    const cur = !!(STORAGE_STATE && STORAGE_STATE.plain);
-    const d = await apiJson('/api/storage/plain', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ plain: !cur }) });
-    renderStorage(d);
-    showToast(d.plain
-      ? '🔓 Новые файлы будут храниться БЕЗ шифра'
-      : '🔒 Шифрование включено — файлы снова под паролем');
-  } catch (e) {
-    showToast('❌ ' + cloudErrText(e));
-  } finally { btn.disabled = false; }
-}
-
-async function connectStorage() {
-  const v = document.getElementById('storageInput').value.trim();
-  if (!v) { showToast('Введите @имя или -100…id канала'); return; }
-  const btn = document.getElementById('storageConnectBtn');
-  btn.disabled = true;
-  try {
-    const d = await apiJson('/api/storage/connect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ channel: v }) });
-    document.getElementById('storageInput').value = '';
-    renderStorage(d);
-    showToast('✅ Канал «' + d.title + '» подключён');
-    /* 22.30: сразу обновляем список — файлы теперь лягут в новый канал и в чате */
-    loadFiles(true);
-  } catch (e) {
-    showToast('❌ ' + e.message);
-  } finally { btn.disabled = false; }
-}
-
-async function disconnectStorage() {
-  try {
-    const d = await apiJson('/api/storage/disconnect', { method: 'POST' });
-    renderStorage(d);
-    showToast('🗑 Личный канал отключён');
-    loadFiles(true);
-  } catch (e) {
-    showToast('❌ ' + e.message);
-  }
-}
-
-function openStorageModal() {
-  document.getElementById('storageModal').classList.add('open');
-  document.body.classList.add('modal-open');
-  loadStorageStatus();
-}
-
-function closeStorageModal(e) {
-  if (e) e.stopPropagation();
-  document.getElementById('storageModal').classList.remove('open');
-  document.body.classList.remove('modal-open');
 }
 
 function onSearch() {
@@ -11294,7 +11509,8 @@ document.addEventListener('pointerdown', (e) => {
 function handleDropZoneClick(e) {
   if (isUploading) return;
 
-  document.getElementById('fileInput').click();
+  // Сначала окно загрузки (пароль/список файлов), выбор файлов — кнопкой «Добавить файл»
+  openUploadModal();
 }
 
 function handleLoaderClick(e) {
@@ -11346,25 +11562,47 @@ function cancelUpload() {
 }
 
 function openNameChoiceModal() {
-  startActualUpload();
+  if (pendingFiles.length < 2) {
+    startActualUpload();
+    return;
+  }
+
+  const c = document.getElementById('nameChoiceCount');
+  if (c) c.textContent = pendingFiles.length;
+
+  openModalEl('nameChoiceModal');
 }
 
 function closeNameChoiceModal(e) {
   if (e) e.stopPropagation();
 
-  const modal = document.getElementById('nameChoiceModal');
-  if (modal) modal.classList.remove('open');
-
-  document.body.classList.remove('modal-open');
+  pendingFiles = [];
+  closeModalEl('nameChoiceModal');
 }
 
 function chooseNameMode(mode) {
-  closeNameChoiceModal();
-  startActualUpload();
+  closeModalEl('nameChoiceModal');
+
+  if (mode === 'album') openAlbumModal();
+  else if (mode === 'each') openNameModal();
+  else startActualUpload();
 }
 
 function openAlbumModal() {
-  startActualUpload();
+  if (pendingFiles.length < 2) {
+    startActualUpload();
+    return;
+  }
+
+  const c = document.getElementById('albumModalCounter');
+  if (c) c.textContent = 'Файлов: ' + pendingFiles.length;
+
+  const inp = document.getElementById('albumModalInput');
+  if (inp) inp.value = '';
+
+  renderAlbumPreview('');
+
+  openModalEl('albumModal');
 }
 
 function renderAlbumPreview(baseName) {
@@ -11391,94 +11629,399 @@ function renderAlbumPreview(baseName) {
 function closeAlbumModal(e) {
   if (e) e.stopPropagation();
 
-  const modal = document.getElementById('albumModal');
-  if (modal) modal.classList.remove('open');
-
-  document.body.classList.remove('modal-open');
+  closeModalEl('albumModal');
+  openNameChoiceModal(); // «Отмена» — возвращаемся к выбору способа имён
 }
 
 function confirmAlbumName() {
-  closeAlbumModal();
+  const inp = document.getElementById('albumModalInput');
+  const base = (inp && inp.value.trim()) || 'Альбом';
+
+  const extOf = (f) => {
+    const n = String(f.name || '');
+    const i = n.lastIndexOf('.');
+
+    return i > 0 ? n.slice(i) : '';
+  };
+
+  pendingFiles = pendingFiles.map((f, i) =>
+    Object.assign({}, f, { uploadName: (base + ' ' + (i + 1) + extOf(f)).slice(0, 120) })
+  );
+
+  closeModalEl('albumModal');
   startActualUpload();
 }
 
+let nameEditIndex = 0;
+
 function openNameModal() {
+  nameEditIndex = 0;
+
+  pendingFiles.forEach((f) => {
+    try { delete f._customName; } catch (e) {}
+  });
+
+  showNameModal();
+}
+
+function showNameModal() {
+  const f = pendingFiles[nameEditIndex];
+
+  if (!f) {
+    applyCustomNames();
+    return;
+  }
+
+  const counter = document.getElementById('nameModalCounter');
+  if (counter) counter.textContent = 'Файл ' + (nameEditIndex + 1) + ' из ' + pendingFiles.length;
+
+  const orig = document.getElementById('nameModalOriginal');
+  if (orig) orig.textContent = 'Текущее имя: ' + (f.name || '');
+
+  const inp = document.getElementById('nameModalInput');
+  if (inp) inp.value = '';
+
+  openModalEl('nameModal');
+}
+
+function confirmNameAndNext() {
+  const inp = document.getElementById('nameModalInput');
+  const v = inp ? inp.value.trim() : '';
+
+  if (v) {
+    try { pendingFiles[nameEditIndex]._customName = v.slice(0, 120); } catch (e) {}
+  }
+
+  if (inp) inp.value = '';
+
+  nextNameStep();
+}
+
+function skipNameAndNext() {
+  nextNameStep();
+}
+
+function skipAllNames() {
+  closeModalEl('nameModal');
+  applyCustomNames();
+}
+
+function nextNameStep() {
+  closeModalEl('nameModal');
+
+  nameEditIndex++;
+
+  if (nameEditIndex < pendingFiles.length) {
+    setTimeout(showNameModal, 140);
+  } else {
+    applyCustomNames();
+  }
+}
+
+function applyCustomNames() {
+  pendingFiles = pendingFiles.map((f) =>
+    f._customName ? Object.assign({}, f, { uploadName: f._customName }) : f
+  );
+
   startActualUpload();
 }
 
 function closeNameModal(e) {
   if (e) e.stopPropagation();
 
-  const modal = document.getElementById('nameModal');
-  if (modal) modal.classList.remove('open');
-
-  document.body.classList.remove('modal-open');
-}
-
-function confirmNameAndNext() {
-  closeNameModal();
-  startActualUpload();
-}
-
-function skipNameAndNext() {
-  closeNameModal();
-  startActualUpload();
-}
-
-function skipAllNames() {
-  closeNameModal();
-  startActualUpload();
+  closeModalEl('nameModal');
+  applyCustomNames(); // что успели ввести — применится, остальные с оригинальными именами
 }
 
 function startActualUpload() {
   if (!pendingFiles.length) return;
 
-  // 22.32: шифрование включено и Сейф заперт — сначала пароль (как в чате)
-  if (needSafePwForUpload()) {
-    PENDING_UPLOAD_FILES = pendingFiles.slice();
-
-    showToast('🔒 Файлы шифруются паролем Сейфа — введите пароль');
-
-    openSafeModal();
-
-    return;
-  }
-
   proceedUpload(pendingFiles);
 }
 
-async function uploadFiles(fileList) {
+let STORAGE_ENCRYPTED = null; // true — в боте включено шифрование, false — «без шифрования», null — неизвестно
+
+function passwordRequired() {
+  return STORAGE_ENCRYPTED === true || ALL_FILES.some((f) => f.vault);
+}
+
+async function detectStorageMode() {
+  if (STORAGE_ENCRYPTED !== null) return;
+
+  const urls = ['/api/storage/plain', '/api/storage/settings', '/api/storage'];
+
+  for (const u of urls) {
+    try {
+      const r = await fetch(u, { headers: authHeaders() });
+      if (!r.ok) continue;
+
+      const d = await r.json();
+
+      if (typeof d.plain === 'boolean') { STORAGE_ENCRYPTED = !d.plain; return; }
+      if (typeof d.encrypted === 'boolean') { STORAGE_ENCRYPTED = d.encrypted; return; }
+      if (typeof d.encryption === 'boolean') { STORAGE_ENCRYPTED = d.encryption; return; }
+    } catch (e) {}
+  }
+}
+
+/* ===== Модалка «Хранилище» ===== */
+
+let STORAGE_PLAIN = null; // null — неизвестно, true — «без шифрования», false — шифрование включено
+
+async function loadStorageStatus() {
+  const box = document.getElementById('storageStatus');
+  const plainBtn = document.getElementById('storagePlainBtn');
+  const plainLabel = document.getElementById('storagePlainLabel');
+  const offBtn = document.getElementById('storageOffBtn');
+  const input = document.getElementById('storageInput');
+
+  if (box) box.textContent = 'Загружаю…';
+
+  try {
+    const d = await apiJson('/api/storage');
+
+    const channel = d.channel || d.storage || '';
+    const connected = !!d.connected || !!channel;
+
+    if (box) {
+      box.textContent = connected
+        ? 'Подключён канал: ' + channel
+        : 'Канал не подключён — файлы хранятся в облаке бота';
+    }
+
+    if (offBtn) offBtn.style.display = connected ? '' : 'none';
+    if (input && channel && !input.value) input.value = channel;
+
+    if (typeof d.plain === 'boolean') {
+      STORAGE_PLAIN = d.plain;
+      STORAGE_ENCRYPTED = !d.plain;
+    }
+
+    if (plainBtn && STORAGE_PLAIN !== null) {
+      plainBtn.style.display = '';
+
+      if (plainLabel) {
+        plainLabel.textContent = STORAGE_PLAIN
+          ? 'Шифрование файлов: выключено'
+          : 'Шифрование файлов: включено';
+      }
+    }
+  } catch (e) {
+    if (box) box.textContent = 'Не удалось получить статус хранилища';
+    if (plainBtn) plainBtn.style.display = 'none';
+    if (offBtn) offBtn.style.display = 'none';
+  }
+}
+
+function openStorageModal() {
+  openModalEl('storageModal');
+  loadStorageStatus();
+}
+
+function closeStorageModal(e) {
+  if (e) e.stopPropagation();
+
+  closeModalEl('storageModal');
+}
+
+async function togglePlain() {
+  const next = !(STORAGE_PLAIN === true);
+
+  try {
+    const d = await apiJson('/api/storage/plain', {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ plain: next })
+    });
+
+    STORAGE_PLAIN = typeof d.plain === 'boolean' ? d.plain : next;
+    STORAGE_ENCRYPTED = !STORAGE_PLAIN;
+
+    const plainLabel = document.getElementById('storagePlainLabel');
+
+    if (plainLabel) {
+      plainLabel.textContent = STORAGE_PLAIN
+        ? 'Шифрование файлов: выключено'
+        : 'Шифрование файлов: включено';
+    }
+
+    showToast(STORAGE_PLAIN ? 'Режим «без шифрования» включён' : 'Шифрование включено');
+  } catch (e) {
+    showToast(cloudErrText(e));
+  }
+}
+
+async function connectStorage() {
+  const input = document.getElementById('storageInput');
+  const channel = input ? input.value.trim() : '';
+
+  if (!channel) {
+    showToast('Введите @имя или ID канала');
+    return;
+  }
+
+  showToast('Подключаю канал…');
+
+  try {
+    await apiJson('/api/storage/connect', {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ channel: channel })
+    });
+
+    showToast('Канал подключен');
+    loadStorageStatus();
+  } catch (e) {
+    showToast(cloudErrText(e));
+  }
+}
+
+async function disconnectStorage() {
+  try {
+    await apiJson('/api/storage/disconnect', { method: 'POST', headers: authHeaders() });
+
+    showToast('Канал отключён');
+    loadStorageStatus();
+  } catch (e) {
+    showToast(cloudErrText(e));
+  }
+}
+
+function openModalEl(id) {
+  const m = document.getElementById(id);
+  if (!m) return;
+
+  m.classList.add('open');
+  document.body.classList.add('modal-open');
+}
+
+function closeModalEl(id) {
+  const m = document.getElementById(id);
+  if (m) m.classList.remove('open');
+
+  if (!document.querySelector('.modal-overlay.open')) {
+    document.body.classList.remove('modal-open');
+  }
+}
+
+function refreshUploadModal() {
+  const info = document.getElementById('uploadModalInfo');
+  const list = document.getElementById('uploadFileList');
+  const addBtn = document.getElementById('uploadAddBtn');
+  const sendBtn = document.getElementById('uploadSendBtn');
+  const moreBtn = document.getElementById('uploadMoreBtn');
+  const passRow = document.getElementById('uploadPassRow');
+  const plainHint = document.getElementById('uploadPlainHint');
+  const passInput = document.getElementById('uploadPassword');
+
+  const has = pendingFiles.length > 0;
+  const needPw = passwordRequired();
+
+  if (info) {
+    info.textContent = !has
+      ? 'Файлы ещё не выбраны — нажмите «Добавить файл» или перетащите их в облако'
+      : pendingFiles.length === 1
+        ? (pendingFiles[0].name || 'файл')
+        : 'Выбрано файлов: ' + pendingFiles.length;
+  }
+
+  if (list) {
+    if (!has) {
+      list.style.display = 'none';
+      list.innerHTML = '';
+    } else {
+      const rows = pendingFiles.slice(0, 5).map((f, i) =>
+        '<div style="display:flex;justify-content:space-between;gap:10px;padding:2px 0">' +
+        '<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + escapeHtml(f.name || ('файл ' + (i + 1))) + '</span>' +
+        '<span style="opacity:.6;flex-shrink:0">' + fmtSize(f.size) + '</span></div>'
+      ).join('');
+
+      const more = pendingFiles.length > 5
+        ? '<div style="opacity:.6;padding-top:2px">… и ещё ' + (pendingFiles.length - 5) + '</div>'
+        : '';
+
+      list.innerHTML = rows + more;
+      list.style.display = 'block';
+    }
+  }
+
+  if (addBtn) addBtn.classList.toggle('hidden', has);
+  if (sendBtn) sendBtn.classList.toggle('hidden', !has);
+  if (moreBtn) moreBtn.classList.toggle('hidden', !has);
+
+  if (passRow) passRow.style.display = needPw ? 'block' : 'none';
+  if (plainHint) plainHint.style.display = (!needPw && STORAGE_ENCRYPTED === false) ? 'block' : 'none';
+  if (passInput && !passInput.value) passInput.value = (needPw && VAULT_PW) ? VAULT_PW : '';
+}
+
+function openUploadModal() {
+  refreshUploadModal();
+  openModalEl('uploadModal');
+}
+
+function closeUploadModal(e) {
+  if (e) e.stopPropagation();
+
+  pendingFiles = [];
+  pickerAppend = false;
+
+  closeModalEl('uploadModal');
+}
+
+function confirmUploadFiles() {
+  const passInput = document.getElementById('uploadPassword');
+
+  if (passwordRequired()) {
+    const pw = (passInput && passInput.value) || '';
+
+    if (!pw) {
+      showToast('Введите пароль шифрования');
+      return;
+    }
+
+    VAULT_PW = pw;
+  }
+
+  if (passInput) passInput.value = '';
+
+  closeModalEl('uploadModal');
+
+  if (pendingFiles.length > 1) {
+    openNameChoiceModal(); // много файлов — спросить: альбом / по одному / пропустить
+  } else {
+    startActualUpload();
+  }
+}
+
+let pickerAppend = false;
+
+function pickUploadFiles() {
+  pickerAppend = false;
+  document.getElementById('fileInput').click();
+}
+
+function addMoreUploadFiles() {
+  pickerAppend = true;
+  document.getElementById('fileInput').click();
+}
+
+function uploadFiles(fileList) {
   const files = Array.from(fileList);
 
   if (!files.length || isUploading) return;
 
-  // 22.32: узнаём режим хранилища ДО загрузки (шифрование вкл/выкл)
-  if (!STORAGE_STATE || typeof STORAGE_STATE.encrypt === 'undefined') {
-    try {
-      const d = await apiJson('/api/storage');
+  const modalOpen = !!(document.getElementById('uploadModal') || {}).classList &&
+    document.getElementById('uploadModal').classList.contains('open');
 
-      STORAGE_STATE = d || null;
-
-      if (d) {
-        CONN.bot = String(d.bot || CONN.bot || '');
-        CONN.build = String(d.build || CONN.build || '');
-      }
-    } catch (e) {}
+  if (pickerAppend && modalOpen) {
+    pendingFiles = pendingFiles.concat(files);
+    refreshUploadModal();
+  } else {
+    pendingFiles = files;
+    openUploadModal();
   }
 
-  // НИЧЕГО НЕ СПРАШИВАЕМ про имена — сразу грузим оригинальные имена.
-  // ЕСЛИ включено шифрование и Сейф заперт — сначала пароль Сейфа (22.32):
-  if (needSafePwForUpload()) {
-    PENDING_UPLOAD_FILES = files;
-
-    showToast('🔒 Файлы шифруются паролем Сейфа — введите пароль');
-
-    openSafeModal();
-
-    return;
-  }
-
-  proceedUpload(files);
+  pickerAppend = false;
 }
 
 function proceedUpload(files) {
@@ -11584,7 +12127,7 @@ function sendChunk(uploadId, index, blobPart, onLoaded) {
       '/api/upload/chunk?uploadId=' + encodeURIComponent(uploadId) + '&index=' + index
     );
 
-    const headers = authHeaders();
+    const headers = vaultHeaders();
 
     for (const k in headers) {
       try {
@@ -11631,8 +12174,6 @@ function sendChunk(uploadId, index, blobPart, onLoaded) {
 async function uploadOneFile(file, reportBytes) {
   const upName = String(file.uploadName || file.name || 'file.bin').slice(0, 120);
 
-  // 22.32: пароль Сейфа идёт с init/complete (X-Vault-Password) — файл
-  // сервер зашифрует им и положит в Сейф, как загрузки из чата
   const initData = await apiJson('/api/upload/init', {
     method: 'POST',
     headers: vaultHeaders({ 'Content-Type': 'application/json' }),
@@ -11734,12 +12275,27 @@ async function uploadEngine(bar) {
   }
 
   if (failed) {
-    showToast(
-      'Ошибка загрузки: ' + failed.message +
-      (added.length ? ' (что успело — уже сохранено)' : '')
-    );
+    const msg = String(failed.message || '');
+    const needPass = (failed.code === 'safe_locked') ||
+      /safe_locked|пароль|password/i.test(msg);
+
+    const retryFiles = needPass ? uploadQueue.slice(added.length) : [];
 
     resetUploadUI(bar, checkmark, squareStop);
+
+    if (needPass) {
+      STORAGE_ENCRYPTED = true;
+      pendingFiles = retryFiles;
+
+      showToast('🔒 Введите пароль шифрования');
+
+      openUploadModal();
+    } else {
+      showToast(
+        'Ошибка загрузки: ' + msg +
+        (added.length ? ' (что успело — уже сохранено)' : '')
+      );
+    }
 
     return;
   }
@@ -11752,16 +12308,15 @@ async function uploadEngine(bar) {
   if (squareStop) squareStop.style.display = 'none';
   if (checkmark) checkmark.classList.add('show');
 
-  document.getElementById('downloadText').textContent = added.some((r) => r.vault)
-    ? 'Успешно! 🔒 Зашифровано и в Сейфе'
-    : 'Успешно загружено!';
-
-  if (added.some((r) => r.vault)) {
-    showToast('🔒 Зашифровано паролем Сейфа и сохранено — видно и в чате, и здесь');
-  }
+  document.getElementById('downloadText').textContent = 'Успешно загружено!';
 
   playSoundDirectly(selectedSoundId);
   flashScreen();
+
+  // ВОЛНА 22.34: честный фидбек — файл зашифрован (попал в Сейф) или «как есть»
+  const anySafe = added.some((r) => r && r.vault);
+
+  showToast(anySafe ? '✅ Успешно! 🔒 Зашифровано и в Сейфе' : '✅ Загружено');
 
   added.forEach((rec) => {
     ALL_FILES.unshift({
@@ -11770,9 +12325,7 @@ async function uploadEngine(bar) {
       kind: rec.kind,
       size: +rec.size || 0,
       ts: rec.ts || '',
-      vault: !!rec.vault,
-      safe: !!rec.safe,
-      plain: !!rec.plain
+      vault: !!rec.vault
     });
   });
 
@@ -11817,6 +12370,7 @@ renderSoundMenu();
 updateSoundLabel();
 setSort('date-desc');
 renderAll();
+detectStorageMode();
 
 if (!IS_TELEGRAM) {
   if (WEB_TOKEN) {
@@ -11824,7 +12378,6 @@ if (!IS_TELEGRAM) {
       .then(function (r) {
         if (r.ok) {
           loadFiles();
-          refreshStorageInfo();
         } else {
           localStorage.removeItem('devo_web_token');
           WEB_TOKEN = '';
@@ -11839,8 +12392,6 @@ if (!IS_TELEGRAM) {
   }
 } else {
   loadFiles().then(function (ok) {
-    refreshStorageInfo();
-
     if (!ok) {
       setTimeout(function () {
         loadFiles(true);
@@ -11903,11 +12454,16 @@ async def miniapp_files_get(request):
     safe_total = sum(int(f.get("size_orig", 0) or 0) for f in safe_files)
     out = [_miniapp_rec_out(f) for f in files]
     out += [_miniapp_safe_rec_out(i, rec) for i, rec in enumerate(safe_files, start=1)]
+    # ВОЛНА 22.34: режим хранения в ответе списка — клиент сразу знает,
+    # спрашивать ли пароль Сейфа в окне загрузки (без лишнего 423).
+    plain_mode = (_user_vault_channel(user) is not None
+                  and _vault_channel_plain(user))
     return web.json_response({
         "files": out,
         "stats": {"count": len(out), "size": total + safe_total},
         "safe_count": len(safe_files),
         "limit": get_price('cloud_max_files', 50),
+        "plain": bool(plain_mode),
         # ВОЛНА 22.26: сервер сам подтверждает связь — кем и чем отвечает.
         "build": BOT_BUILD,
         "bot": _miniapp_bot_username(),
@@ -12749,7 +13305,7 @@ async def miniapp_files_from_safe(request):
 
 # --- ВОЛНА 22.32: ЗАГРУЗКИ МИНИ-АППА ШИФРУЮТСЯ КАК В ЧАТЕ ---
 # Раньше файл из веба уходил в канал КАК ЕСТЬ и попадал в cloud_files
-# («Старые файлы — без шифра» в чате), а файл из чата — ВСЕГДА в Сейф.
+# («Файлы без шифра» в чате, волна 22.33), а файл из чата — ВСЕГДА в Сейф.
 # Отсюда жалоба: «добавил через облако в боте — нет в мини-аппе; добавил
 # в мини-аппе — нет в моих файлах». Теперь у веба и чата ОДНО ПРАВИЛО: если
 # режим «без шифра» не включён (настройки 🔗 Моё облако), загрузка из
