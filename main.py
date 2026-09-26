@@ -3558,7 +3558,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.35"
+BOT_BUILD = "22.36"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -6239,6 +6239,22 @@ async def _pub_send(channel_id, coro_factory):
                     if attempt == 2:
                         raise
                     await asyncio.sleep(ra + 1.5)
+                except TGBadRequest as e:
+                    # ВОЛНА 22.36: медленный режим канала (CHAT_SLOWMODE_DELAY)
+                    # приходит как BadRequest, а НЕ как RetryAfter — раньше он
+                    # ронял публикацию навсегда, и пользователь видел «бот не
+                    # админ канала» при пакетной загрузке. Теперь честная пауза
+                    # и повтор; остальные BadRequest — наружу сразу.
+                    _msg = str(getattr(e, "message", "") or "")
+                    _slow = "slow mode" in _msg.lower() or "slowmode" in _msg.lower() \
+                        or "too many requests" in _msg.lower()
+                    if not _slow or attempt == 2:
+                        raise
+                    st["pause_until"] = time.time() + 12.0
+                    last_err = e
+                    logger.warning(
+                        f"pub-gate: канал {channel_id} в slow mode — пауза 12 с")
+                    await asyncio.sleep(12.0)
             raise last_err or RuntimeError("pub-gate: исчерпаны попытки")
         finally:
             st["lock"].release()
@@ -6247,7 +6263,7 @@ async def _pub_send(channel_id, coro_factory):
 
 
 async def _storage_upload_document(context, data: bytes, filename: str, caption: str = "",
-                                   channel_id=None, user=None):
+                                   channel_id=None, user=None, data_path=None):
     """Загружает документ в канал-хранилище.
 
     НОВОЕ (волна 7): если channel_id не задан явно — грузим по КРУГУ во все
@@ -6257,7 +6273,18 @@ async def _storage_upload_document(context, data: bytes, filename: str, caption:
     ВОЛНА 22.35: каждая публикация идёт через «шлагбаум» _pub_send — не чаще
     пары сообщений в минуту НА КАНАЛ и с честной паузой по RetryAfter, иначе
     при массовых загрузках Telegram ограничивает/блокирует канал.
+    ВОЛНА 22.36: data_path — читать файл с диска В МОМЕНТ публикации (под
+    шлагбаумом): раньше каждый complete читал свой файл в ОЗУ ДО очереди,
+    и пачка больших файлов съедала гигабайты ОЗУ сразу (до OOM на Render),
+    из-за чего пакетная загрузка падала, а по одной — работала.
     Возвращает ({"message_id", "file_id", "size", "channel_id", "queue_pos"}) или None."""
+
+    def _payload_bytes():
+        if data_path:
+            with open(data_path, "rb") as _fh:
+                return _fh.read()
+        return data
+
     if channel_id:
         targets = [int(channel_id)]
     else:
@@ -6277,12 +6304,13 @@ async def _storage_upload_document(context, data: bytes, filename: str, caption:
             targets = cloud_ids[rr % len(cloud_ids):] + cloud_ids[:rr % len(cloud_ids)]
     for idx, ch in enumerate(targets):
         try:
-            # ВОЛНА 22.35: публикация через «шлагбаум» — очередь на канал
+            # ВОЛНА 22.35: публикация через «шлагбаум» — очередь на канал;
+            # ВОЛНА 22.36: чтение данных происходит ВНУТРИ гейта (по очереди)
             sent, queue_pos = await _pub_send(
                 ch,
                 lambda ch=ch: context.bot.send_document(
                     chat_id=ch,
-                    document=InputFile(data, filename=filename or "file.bin"),
+                    document=InputFile(_payload_bytes(), filename=filename or "file.bin"),
                     caption=(caption or "")[:1024] or None,
                 ),
             )
@@ -6299,10 +6327,19 @@ async def _storage_upload_document(context, data: bytes, filename: str, caption:
                         save_storage_config(cfg_rr)
                     except Exception:
                         pass
+            _size_out = int(getattr(doc, "file_size", 0) or 0)
+            if not _size_out:
+                # ВОЛНА 22.36: в режиме data_path данные читаются под гейтом —
+                # размер берём с диска (len(data) на None падал раньше)
+                try:
+                    _size_out = (os.path.getsize(data_path) if data_path
+                                 else len(data or b""))
+                except Exception:
+                    _size_out = 0
             return {
                 "message_id": sent.message_id,
                 "file_id": getattr(doc, "file_id", None),
-                "size": int(getattr(doc, "file_size", 0) or len(data) or 0),
+                "size": _size_out,
                 "channel_id": ch,
                 "queue_pos": queue_pos,
             }
@@ -7115,13 +7152,14 @@ def _zip_bytes_for(name: str, data: bytes) -> bytes:
     """ВОЛНА 8/9: бот САМ заворачивает файл в ZIP (по кнопке пользователя).
 
     Архивация всегда БЕЗ потерь (это важно: пользователь просил «без потери
-    качества»). ВОЛНА 9: метод сжатия поднят до ZIP_LZMA — это ТОТ ЖЕ
-    алгоритм, что внутри 7-Zip (LZMA), жмёт заметно сильнее DEFLATE и тоже
-    восстанавливает файл байт-в-байт. Честная физика: фото/видео/музыка уже
-    сжаты своими форматами — им LZMA почти ничего не даст (но и не испортит);
-    тексты, документы и код сжимаются в разы."""
+    качества»). ВОЛНА 22.36: метод сжатия DEFLATED вместо ZIP_LZMA — LZMA
+    внутри ZIP НЕ понимают Windows Explorer и большинство мобильных
+    архиваторов, они честно рапортуют «архив/контейнер повреждён», хотя
+    архив цел. DEFLATE открывается ВЕЗДЕ и так же восстанавливает файл
+    байт-в-байт; для уже сжатых форматов (фото/видео/музыка) разница в
+    размере минимальна."""
     buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_LZMA) as zf:
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         zf.writestr(name or "file.bin", data)
     return buf.getvalue()
 
@@ -7351,11 +7389,11 @@ def _cloud_files_text(user):
         # ВОЛНА 22.21: 🔒 — файл отмечен в Веб-облаке (Mini App) как Vault
         # (отдельная папка просмотра, НЕ шифрование Сейфа).
         _mv = "🔒 " if rec.get("va") else ""
-        lines.append(f"• {_mv}{rec.get('name', '?')} — {_fmt_bytes(rec.get('size', 0))} ({rec.get('ts', '')})")
+        lines.append(f"• {_mv}{rec.get('name', '?')} — {_fmt_bytes(rec.get('size', 0))} ({_rec_ts_display(rec)})")
     if len(files) > len(shown):
         lines.append(f"…и ещё {len(files) - len(shown)} шт.")
     lines.append("")
-    lines.append("📥 — выдать файл; 📦 — за-ZIP-ить (LZMA, без потерь); "
+    lines.append("📥 — выдать файл; 📦 — за-ZIP-ить (открывается везде, без потерь); "
                  "🔐 — перенести в Сейф (зашифрую и удалю оригинал); 🗑 — удалить.")
     if any(isinstance(f, dict) and f.get("va") for f in files):
         lines.append("🔒 — файлы, отмеченные «Vault» в 🌐 Веб-облаке (Mini App): "
@@ -7492,6 +7530,15 @@ async def cloud_upload_receive(update: Update, context: ContextTypes.DEFAULT_TYP
             "Чтобы выйти — нажмите «⬅️ Назад в меню»."
         )
         return CLOUD_UPLOAD_WAIT
+    # ВОЛНА 22.36: честная подсказка про качество (раз за разом спрашивали,
+    # «почему съедается качество»): Telegram сжимает медиа ещё НА ТЕЛЕФОНЕ,
+    # до бота — фотку из галереи «как фото» бот получает уже сжатой.
+    if getattr(msg, "photo", None) or getattr(msg, "video", None):
+        await msg.reply_text(
+            "💡 Совет: Telegram сжал это медиа ещё на телефоне — бот получил "
+            "уже сжатую копию и сохраняет её без дальнейших потерь. Чтобы "
+            "хранить ОРИГИНАЛ без потери качества — отправляйте фото/видео "
+            "как ФАЙЛ (📎 «Файл» в меню вложений) или через мини-апп.")
 
     # === АЛЬБОМ / ПАЧКА ===
     mgid = getattr(msg, "media_group_id", None)
@@ -7588,7 +7635,7 @@ async def _cloud_upload_items(update: Update, context: ContextTypes.DEFAULT_TYPE
             "file_id": new_file_id,
             "size": item["size"],
             "mime": item.get("mime", ""),
-            "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "ts": _file_ts_now(), "tss": datetime.now().strftime("%Y-%m-%d %H:%M"),
             # ВОЛНА 7: в каком именно канале лежит файл (каналов несколько).
             "channel_id": channel_id,
         }
@@ -7968,19 +8015,61 @@ async def _api_get_user_any(request):
     return await _miniapp_user_from_request(request)
 
 
+# === ВОЛНА 22.36: ВРЕМЯ ФАЙЛОВ ===
+# Раньше ts хранился строкой «YYYY-MM-DD HH:MM» по СЕРВЕРНЫМ часам (UTC):
+# у пользователя в Москве все файлы отставали на 3 часа. Теперь новые записи
+# хранят EPOCH-секунды (ts) + дублирующую строку для старых мест (tss), а
+# мини-апп рисует время в часовом поясе ТЕЛЕФОНА. Старые записи (строки)
+# остаются читаемыми: _ts_human понимает оба формата.
+def _file_ts_now():
+    """EPOCH-секунды добавления файла (записи cloud_files/vault_files)."""
+    return int(time.time())
+
+
+def _ts_human(v):
+    """Человекочитаемое время записи: epoch (по МСК) или строка
+    «YYYY-MM-DD HH:MM» (старые записи) → «DD.MM.YYYY HH:MM»."""
+    if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0:
+        try:
+            dt = datetime.utcfromtimestamp(float(v)) + timedelta(hours=3)
+            return dt.strftime("%d.%m.%Y %H:%M")
+        except Exception:
+            return ""
+    s = str(v or "").strip()
+    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})", s)
+    if m:
+        return f"{m[3]}.{m[2]}.{m[1]} {m[4]}:{m[5]}"
+    return s
+
+
+def _rec_ts_display(rec):
+    """Время файла для показа В ЧАТЕ: tss → ts (epoch → МСК, строка → как есть)."""
+    if not isinstance(rec, dict):
+        return ""
+    v = rec.get("tss") or rec.get("ts")
+    return _ts_human(v)
+
+
 def _miniapp_rec_out(rec):
     """Запись cloud_files → JSON для мини-аппа (те же поля, что были в макете:
     id/name/kind/size/ts/vault).
     ВОЛНА 22.30: флаг vault больше НЕ косметика из веба — он теперь значит
     «файл лежит в Сейфе» (такие файлы приходят отдельными записями из
     user.vault_files). Старый косметический флаг rec["va"] больше не отдаётся,
-    чтобы галочки из прошлой версии не попадали в фильтр «Сейф»."""
+    чтобы галочки из прошлой версии не попадали в фильтр «Сейф».
+    ВОЛНА 22.36: ts отдаётся КАК ЕСТЬ (epoch у новых записей — клиент рисует
+    локальное время телефона; старые строки парсятся как UTC)."""
+    _ts = rec.get("ts")
+    if isinstance(_ts, (int, float)) and not isinstance(_ts, bool):
+        pass  # epoch — отдаём число
+    else:
+        _ts = str(_ts or "")
     return {
         "id": str(rec.get("id") or ""),
         "name": str(rec.get("name") or "файл"),
         "kind": str(rec.get("kind") or "document"),
         "size": int(rec.get("size") or 0),
-        "ts": str(rec.get("ts") or ""),
+        "ts": _ts,
         "vault": False,
     }
 
@@ -7996,12 +8085,17 @@ def _miniapp_safe_rec_out(idx, rec):
         name = str(rec.get("name") or label or f"Файл #{idx}")
     else:
         name = label if label else f"Файл #{idx}"
+    _ts = rec.get("ts")
+    if isinstance(_ts, (int, float)) and not isinstance(_ts, bool):
+        pass  # ВОЛНА 22.36: epoch — отдаём число, клиент покажет локальное время
+    else:
+        _ts = str(_ts or "")
     return {
         "id": "v_" + str(rec.get("id") or ""),
         "name": name,
         "kind": str(rec.get("kind") or "document"),
         "size": int(rec.get("size_orig") or 0),
-        "ts": str(rec.get("ts") or ""),
+        "ts": _ts,
         "vault": True,
         "safe": True,     # явный признак «лежит в Сейфе (зашифрован)»
         "plain": bool(rec.get("plain")),  # режим «без шифрования» (личный канал)
@@ -8058,15 +8152,46 @@ def _miniapp_kind_from(mime, name):
     return "document"
 
 
-def _miniapp_content_disposition(name):
-    """RFC 5987: ascii-имя + filename* с UTF-8 (кириллица в скачивании)."""
+def _miniapp_content_disposition(name, inline=False):
+    """RFC 5987: ascii-имя + filename* с UTF-8 (кириллица в скачивании).
+    ВОЛНА 22.36: inline — для ПРОСМОТРА (браузер открывает фото/видео/аудио
+    и PDF вместо скачивания), attachment — для скачивания."""
     try:
         from urllib.parse import quote
         safe = (name or "file").replace("\\", "_").replace('"', "'").replace("\r", "").replace("\n", "")
         ascii_name = safe.encode("ascii", "replace").decode("ascii")
-        return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(safe)}"
+        _kind = "inline" if inline else "attachment"
+        return f"{_kind}; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(safe)}"
     except Exception:
-        return "attachment"
+        return "inline" if inline else "attachment"
+
+
+_KIND_FALLBACK_MIME = {
+    "photo": "image/jpeg",
+    "video": "video/mp4",
+    "audio": "audio/mpeg",
+}
+
+
+def _serve_mime_for(rec, name):
+    """ВОЛНА 22.36: честный Content-Type при выдаче файла. Раньше всё отдавалось
+    как application/octet-stream + attachment — браузер не мог ПОКАЗАТЬ файл
+    («просмотр не открывается»), а фото/видео в галерее телефона выглядели
+    битыми. Порядок: mime записи → mimetypes по имени → по kind."""
+    m = str((rec or {}).get("mime") or "").strip().lower()
+    if "/" in m:
+        return m
+    try:
+        import mimetypes as _mt_mime
+        g, _ = _mt_mime.guess_type(str(name or ""))
+        if g:
+            return g
+    except Exception:
+        pass
+    kind = str((rec or {}).get("kind") or "")
+    if str(name or "").lower().endswith(".zip"):
+        return "application/zip"
+    return _KIND_FALLBACK_MIME.get(kind, "application/octet-stream")
 
 
 def _miniapp_cleanup_uploads():
@@ -8904,7 +9029,12 @@ body.modal-open {
   -webkit-backdrop-filter: blur(9px) saturate(150%);
 }
 
-/* Modal card */
+/* Modal card.
+   ВОЛНА 22.36 (фикс «не пролистнуть ни вверх ни вниз»): карточка могла быть
+   ВЫШЕ экрана телефона, а прокрутки у неё не было — нижние кнопки (удалить,
+   «не будет», пароль) были недоступны, а оверлей блокировал скролл страницы
+   (overflow:hidden + touch-action:none). Теперь карточка НЕ выше экрана и
+   при переполнении прокручивается ВНУТРИ себя — дизайн не изменился. */
 .modal-card {
   background: var(--card-bg);
   border: 1px solid var(--border-color);
@@ -8914,6 +9044,10 @@ body.modal-open {
   padding: 14px 22px 32px 22px;
   width: 100%;
   max-width: 560px;
+  max-height: calc(100vh - 24px);
+  overflow-y: auto;
+  overflow-x: hidden;
+  -webkit-overflow-scrolling: touch;
   box-shadow: 0 -10px 40px rgba(0, 0, 0, 0.25);
   transform: translateY(100%);
   /* ease-snap вместо ease-spring: у пружины перелёт > 100% — карточку
@@ -10755,6 +10889,7 @@ async function webLogin() {
       showToast('Вход выполнен');
 
       loadFiles();
+      resumePendingUploads();
     } else {
       showToast(data.message || ('Не удалось войти (HTTP ' + r.status + ')'));
     }
@@ -10842,6 +10977,7 @@ async function zipSelected() {
         kind: data.file.kind,
         size: +data.file.size || 0,
         ts: data.file.ts || '',
+        tsNum: tsToNum(data.file.ts),
         vault: !!data.file.vault
       });
 
@@ -10952,8 +11088,10 @@ async function loadFiles(silent) {
       name: String(f.name || 'файл'),
       kind: String(f.kind || 'document'),
       size: +f.size || 0,
-      ts: String(f.ts || ''),
-      vault: !!f.vault
+      ts: f.ts === undefined || f.ts === null ? '' : f.ts,
+      tsNum: tsToNum(f.ts),
+      vault: !!f.vault,
+      plain: !!f.plain
     }));
 
     CONN.bot = String(data.bot || CONN.bot || '');
@@ -11136,28 +11274,38 @@ function fmtSize(n) {
 }
 
 /* Дата и ВРЕМЯ добавления файла: «25.09.2025 18:30».
-   Понимает ISO-строки, «YYYY-MM-DD HH:MM», unix-секунды/мс */
+   Понимает epoch-секунды/мс (ВОЛНА 22.36 — новый формат от сервера) и старые
+   строки. Старые строки «YYYY-MM-DD HH:MM» сервер писал по UTC — теперь
+   интерпретируем их как UTC и переводим в локальное время телефона (раньше
+   показывались «неправильные» часы, отстававшие на часовой пояс). */
 function fmtDateTime(ts) {
-  const s = String(ts || '').trim();
+  const s = String(ts === undefined || ts === null ? '' : ts).trim();
 
   if (!s) return '';
+
+  if (/^\d{10}$/.test(s)) return fmtDateTime(new Date(+s * 1000).getTime());
+  if (/^\d{13}$/.test(s)) {
+    const d0 = new Date(+s);
+    const p0 = (x) => String(x).padStart(2, '0');
+    return `${p0(d0.getDate())}.${p0(d0.getMonth() + 1)}.${d0.getFullYear()} ${p0(d0.getHours())}:${p0(d0.getMinutes())}`;
+  }
 
   const iso = s.match(/^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2}))?/);
 
   if (iso) {
-    return iso[4]
-      ? `${iso[3]}.${iso[2]}.${iso[1]} ${iso[4]}:${iso[5]}`
-      : `${iso[3]}.${iso[2]}.${iso[1]}`;
+    /* старый формат сервера — БЕЗ зоны: это UTC, показываем локально */
+    if (iso[4]) {
+      const d1 = new Date(Date.UTC(+iso[1], +iso[2] - 1, +iso[3], +iso[4], +iso[5]));
+      const p1 = (x) => String(x).padStart(2, '0');
+      return `${p1(d1.getDate())}.${p1(d1.getMonth() + 1)}.${d1.getFullYear()} ${p1(d1.getHours())}:${p1(d1.getMinutes())}`;
+    }
+    return `${iso[3]}.${iso[2]}.${iso[1]}`;
   }
 
   let d;
 
-  if (/^\d{10}$/.test(s)) d = new Date(+s * 1000);
-  else if (/^\d{13}$/.test(s)) d = new Date(+s);
-  else {
-    d = new Date(s);
-    if (isNaN(d)) return s.slice(0, 10);
-  }
+  d = new Date(s);
+  if (isNaN(d)) return s.slice(0, 10);
 
   const p = (x) => String(x).padStart(2, '0');
 
@@ -11176,7 +11324,9 @@ function iconFor(kind) {
 function applyFilters() {
   let list = [...ALL_FILES];
 
-  if (FILTER !== 'all') list = list.filter((f) => f.kind === FILTER && !f.vault);
+  /* ВОЛНА 22.36: фильтры больше НЕ прячут файлы Сейфа — раньше «Музыка»/
+     «Фото» выглядели пустыми, хотя файлы были (они лежали зашифрованными). */
+  if (FILTER !== 'all') list = list.filter((f) => f.kind === FILTER);
 
   if (SEARCH.trim()) {
     const q = SEARCH.trim().toLowerCase();
@@ -11190,8 +11340,9 @@ function applyFilters() {
     let vb;
 
     if (key === 'date') {
-      va = a.ts || '';
-      vb = b.ts || '';
+      /* ВОЛНА 22.36: сортировка по числовому времени (epoch), а не строкой */
+      va = a.tsNum || 0;
+      vb = b.tsNum || 0;
     } else if (key === 'name') {
       va = (a.name || '').toLowerCase();
       vb = (b.name || '').toLowerCase();
@@ -11207,6 +11358,34 @@ function applyFilters() {
   });
 
   return list;
+}
+
+/* ВОЛНА 22.36: числовое время записи (epoch-секунды) для сортировки.
+   Новые записи — число; старые строки «YYYY-MM-DD HH:MM» — UTC (как их
+   писал сервер). Неизвестное — 0 (вниз списка при сортировке по дате). */
+function tsToNum(ts) {
+  if (ts === undefined || ts === null) return 0;
+
+  if (typeof ts === 'number' && isFinite(ts)) {
+    return ts > 1e12 ? Math.floor(ts / 1000) : Math.floor(ts);
+  }
+
+  const s = String(ts).trim();
+
+  if (!s) return 0;
+
+  if (/^\d{10}$/.test(s)) return +s;
+  if (/^\d{13}$/.test(s)) return Math.floor(+s / 1000);
+
+  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2}))?/);
+
+  if (m) {
+    return Math.floor(Date.UTC(+m[1], +m[2] - 1, +m[3], +(m[4] || 0), +(m[5] || 0)) / 1000);
+  }
+
+  const d = new Date(s);
+
+  return isNaN(d) ? 0 : Math.floor(d.getTime() / 1000);
 }
 
 function renderAll() {
@@ -11314,6 +11493,16 @@ modalCard.addEventListener('touchstart', (e) => {
 
 modalCard.addEventListener('touchmove', (e) => {
   if (!isDraggingModal) return;
+
+  /* ВОЛНА 22.36: если карточка переполнена и прокручивается — НЕ перехватываем
+     вертикальный жест: отдаём его внутренней прокрутке (иначе жест тащил
+     карточку вниз, а контент не листался — «не пролистнуть ни вверх ни вниз»). */
+  if (modalCard.scrollHeight > modalCard.clientHeight + 4) {
+    isDraggingModal = false;
+    modalCard.style.transition = '';
+    modalCard.style.transform = '';
+    return;
+  }
 
   touchCurrentY = e.touches[0].clientY;
 
@@ -11484,6 +11673,10 @@ async function unlockSafe() {
 
     if (pending && pending.type === 'view') {
       setTimeout(() => openFileViewer(pending.id), 350);
+    } else if (pending && pending.type === 'download') {
+      const df = ALL_FILES.find((x) => x.id === pending.id);
+
+      if (df) setTimeout(() => downloadFileById(df.id, df.name, df.size), 350);
     }
   } catch (e) {
     showToast(cloudErrText(e));
@@ -11536,13 +11729,9 @@ async function toSafeCurrentFile() {
 
     loadFiles(true);
   } catch (e) {
-    if (e.code === 'safe_locked') {
-      VAULT_PW = '';
-      VAULT_SERVER_UNLOCKED = false;
-      openSafeModal();
+    if (!handleSafeAuthError(e)) {
+      showToast(cloudErrText(e));
     }
-
-    showToast(cloudErrText(e));
   }
 }
 
@@ -11567,13 +11756,9 @@ async function fromSafeCurrentFile() {
 
     loadFiles(true);
   } catch (e) {
-    if (e.code === 'safe_locked') {
-      VAULT_PW = '';
-      VAULT_SERVER_UNLOCKED = false;
-      openSafeModal();
+    if (!handleSafeAuthError(e)) {
+      showToast(cloudErrText(e));
     }
-
-    showToast(cloudErrText(e));
   }
 }
 
@@ -11678,6 +11863,26 @@ async function saveBlobToPhone(blob, name) {
   }
 }
 
+/* ВОЛНА 22.36: единая реакция на 423/403 от Сейфа — сбрасываем пароль и
+   честно просим ввести заново (раньше при «неправильном пароле» просмотр
+   молча не открывался — «ввожу пароль, а файл не открывается»). */
+function handleSafeAuthError(e, pendingType, pendingId) {
+  if (e && (e.code === 'safe_locked' || e.code === 'wrong_password')) {
+    VAULT_PW = '';
+    VAULT_SERVER_UNLOCKED = false;
+
+    if (pendingType) PENDING_FILE_ACTION = { type: pendingType, id: pendingId };
+
+    if ((e.code === 'wrong_password')) showToast('🔒 Пароль не подходит — введите заново');
+
+    openSafeModal();
+
+    return true;
+  }
+
+  return false;
+}
+
 async function downloadFileById(id, name, size) {
   showToast('📥 Готовлю скачивание…');
 
@@ -11694,7 +11899,34 @@ async function downloadFileById(id, name, size) {
       return;
     }
 
+    /* ВОЛНА 22.36 (скачивание «в ТГ и в галерею»): порядок действий в
+       Telegram на телефоне:
+       1) системное меню «Поделиться» с файлом — оттуда файл сохраняется
+          в галерею/файлы одним касанием;
+       2) если шаринг недоступен — открываем одноразовую ссылку в браузере:
+          там файл скачивается сам (attachment) в «Загрузки»/галерею.
+       Blob-режим оставлен для обычного браузера (вне Telegram). */
     let blob = null;
+
+    if (IS_TELEGRAM && IS_MOBILE) {
+      let shared = false;
+
+      try {
+        blob = await fetchFileBlob(abs, name);
+        shared = await saveBlobToPhone(blob, name || 'file');
+      } catch (err) {
+        shared = false;
+      }
+
+      if (shared) {
+        showToast('✅ Готово — файл в галерее/загрузках');
+        return;
+      }
+
+      openExternalLink(abs);
+      showToast('📥 Открыл ссылку — файл скачается в браузере (в галерею)');
+      return;
+    }
 
     try {
       blob = await fetchFileBlob(abs, name);
@@ -11714,13 +11946,9 @@ async function downloadFileById(id, name, size) {
     openExternalLink(abs);
     showToast('Открыл ссылку в браузере — если файл не скачался, нажмите на неё там');
   } catch (e) {
-    if (e.code === 'safe_locked') {
-      VAULT_PW = '';
-      VAULT_SERVER_UNLOCKED = false;
-      openSafeModal();
+    if (!handleSafeAuthError(e)) {
+      showToast('Ошибка скачивания: ' + cloudErrText(e));
     }
-
-    showToast('Ошибка скачивания: ' + cloudErrText(e));
   }
 }
 
@@ -11731,7 +11959,14 @@ async function downloadCurrentFile() {
 
   if (!f) return;
 
-  if (f.vault && !f.plain && !VAULT_PW && !ensureSafeUnlocked()) return;
+  if (f.vault && !f.plain && !VAULT_PW && !VAULT_SERVER_UNLOCKED) {
+    PENDING_FILE_ACTION = { type: 'download', id: f.id };
+
+    showToast('🔒 Введите пароль Сейфа');
+    openSafeModal();
+
+    return;
+  }
 
   downloadFileById(f.id, f.name, f.size);
 }
@@ -11756,13 +11991,9 @@ async function sendCurrentFileToChat() {
 
     showToast('📲 Файл в чате бота — откройте и сохраните в галерею');
   } catch (e) {
-    if (e.code === 'safe_locked') {
-      VAULT_PW = '';
-      VAULT_SERVER_UNLOCKED = false;
-      openSafeModal();
+    if (!handleSafeAuthError(e)) {
+      showToast('Не удалось: ' + cloudErrText(e));
     }
-
-    showToast('Не удалось: ' + cloudErrText(e));
   }
 }
 
@@ -11777,7 +12008,14 @@ async function downloadSelected() {
 
     if (!f) return;
 
-    if (f.vault && !f.plain && !VAULT_PW && !ensureSafeUnlocked()) return;
+    if (f.vault && !f.plain && !VAULT_PW && !VAULT_SERVER_UNLOCKED) {
+      PENDING_FILE_ACTION = { type: 'download', id: f.id };
+
+      showToast('🔒 Введите пароль Сейфа');
+      openSafeModal();
+
+      return;
+    }
 
     downloadFileById(f.id, f.name, f.size);
 
@@ -11800,6 +12038,7 @@ async function downloadSelected() {
         kind: data.file.kind,
         size: +data.file.size || 0,
         ts: data.file.ts || '',
+        tsNum: tsToNum(data.file.ts),
         vault: !!data.file.vault
       });
 
@@ -11845,7 +12084,10 @@ async function openFileViewer(id) {
   showToast('📂 Открываю файл…');
 
   try {
-    const data = await apiJson('/api/files/' + encodeURIComponent(id) + '/link', {
+    /* ВОЛНА 22.36: disp=inline — сервер отдаёт файл с честным Content-Type
+       и «inline», поэтому браузер ОТКРЫВАЕТ фото/видео/аудио/PDF, а не молча
+       скачивает (раньше «при просмотре не открывалось, что там должно быть»). */
+    const data = await apiJson('/api/files/' + encodeURIComponent(id) + '/link?disp=inline', {
       headers: vaultHeaders()
     });
 
@@ -11857,16 +12099,9 @@ async function openFileViewer(id) {
       window.open(abs, '_blank', 'noopener');
     }
   } catch (e) {
-    if (e.code === 'safe_locked') {
-      VAULT_PW = '';
-      VAULT_SERVER_UNLOCKED = false;
-
-      PENDING_FILE_ACTION = { type: 'view', id: id };
-
-      openSafeModal();
+    if (!handleSafeAuthError(e, 'view', id)) {
+      showToast('Не удалось открыть: ' + cloudErrText(e));
     }
-
-    showToast('Не удалось открыть: ' + cloudErrText(e));
   }
 }
 
@@ -12217,7 +12452,7 @@ function passwordRequired() {
 async function detectStorageMode() {
   if (STORAGE_ENCRYPTED !== null) return;
 
-  const urls = ['/api/storage/plain', '/api/storage/settings', '/api/storage'];
+  const urls = ['/api/storage', '/api/storage/plain', '/api/storage/settings'];
 
   for (const u of urls) {
     try {
@@ -12387,6 +12622,10 @@ function openModalEl(id) {
 
   m.classList.add('open');
   document.body.classList.add('modal-open');
+
+  /* ВОЛНА 22.36: на время модалки останавливаем анимацию блобов — RAF-цикл
+     под backdrop-filter сильно ест GPU и «лагает» при нажатии на файл */
+  try { stopBlobAnimation(); } catch (e) {}
 }
 
 function closeModalEl(id) {
@@ -12398,8 +12637,22 @@ function closeModalEl(id) {
 
   if (!document.querySelector('.modal-overlay.open')) {
     document.body.classList.remove('modal-open');
+
+    try { startBlobAnimation(); } catch (e) {}
   }
 }
+
+/* ВОЛНА 22.36: страховка «залипшего» modal-open. Если после сбоя в анимации/
+   JS ни одна модалка не открыта, а блокировка скролла на body осталась —
+   страница навсегда перестаёт пролистываться (ни вверх, ни вниз). Раз в
+   секунду снимаем блокировку, если она не нужна. */
+setInterval(function () {
+  if (document.body.classList.contains('modal-open') &&
+      !document.querySelector('.modal-overlay.open')) {
+    document.body.classList.remove('modal-open');
+    try { startBlobAnimation(); } catch (e) {}
+  }
+}, 1000);
 
 function refreshUploadModal() {
   const info = document.getElementById('uploadModalInfo');
@@ -12454,6 +12707,26 @@ function refreshUploadModal() {
 function openUploadModal() {
   refreshUploadModal();
   openModalEl('uploadModal');
+
+  /* ВОЛНА 22.36: сверяем режим шифрования КАЖДЫЙ раз при открытии окна:
+     раньше флаг брался один раз при старте страницы — если в боте включили
+     шифрование, а мини-апп не знал (или наоборот), пароль не спрашивался. */
+  refreshStorageFlags();
+}
+
+async function refreshStorageFlags() {
+  try {
+    const d = await apiJson('/api/storage');
+
+    if (typeof d.plain === 'boolean') {
+      STORAGE_PLAIN = d.plain;
+      STORAGE_ENCRYPTED = !d.plain;
+    }
+
+    if (typeof d.connected === 'boolean') updateDevRecBanner(d.connected);
+
+    refreshUploadModal();
+  } catch (e) {}
 }
 
 function closeUploadModal(e) {
@@ -12483,8 +12756,13 @@ function confirmUploadFiles() {
 
   closeModalEl('uploadModal');
 
+  /* ВОЛНА 22.36: имя файла при отправлении — спрашиваем ВСЕГДА (и для одного
+     файла тоже): раньше окно имени показывалось только для пачки, и одинокий
+     файл уходил с исходным именем без вопроса. */
   if (pendingFiles.length > 1) {
     openNameChoiceModal();
+  } else if (pendingFiles.length === 1) {
+    openNameModal();
   } else {
     startActualUpload();
   }
@@ -12521,13 +12799,38 @@ function uploadFiles(fileList) {
   pickerAppend = false;
 }
 
-function proceedUpload(files) {
+function proceedUpload(files, opts) {
   if (!files.length) return;
+
+  const isResume = !!(opts && opts.resume);
 
   isUploading = true;
   isPaused = false;
   uploadAbortFlag = false;
   uploadQueue = files.slice();
+
+  /* ВОЛНА 22.36: сохраняем файлы в IndexedDB для докачки после закрытия
+     мини-аппа (файлы из resume-очереди уже сохранены — не дублируем). */
+  if (!isResume) {
+    for (const f of uploadQueue) {
+      if (f._entryKey) continue;
+
+      if ((+f.size || 0) > UPQ_MAX_PERSIST) {
+        f._entryKey = '';
+        continue;
+      }
+
+      const k = 'up_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+
+      f._entryKey = k;
+
+      upqPut({
+        k: k, blob: f, name: f.name, uploadName: f.uploadName || f.name,
+        size: +f.size || 0, mime: f.type || '', uploadId: '', index: 0,
+        added: Date.now()
+      });
+    }
+  }
 
   const initial = document.getElementById('initialState');
   const filenameEl = document.getElementById('uploadFilename');
@@ -12643,15 +12946,28 @@ function sendChunk(uploadId, index, blobPart, onLoaded) {
     xhr.onload = () => {
       uploadXhr = null;
 
-      if (xhr.status >= 200 && xhr.status < 300) return resolve();
+      if (xhr.status >= 200 && xhr.status < 300) {
+        let resp = {};
+
+        try { resp = JSON.parse(xhr.responseText); } catch (e) {}
+
+        return resolve(resp);
+      }
 
       let msg = 'HTTP ' + xhr.status;
+      let code = '';
 
       try {
-        msg = JSON.parse(xhr.responseText).message || msg;
+        const j = JSON.parse(xhr.responseText);
+
+        msg = j.message || msg;
+        code = String(j.error || '');
       } catch (e) {}
 
-      reject(new Error(msg));
+      const err = new Error(msg);
+
+      err.code = code;
+      reject(err);
     };
 
     xhr.onerror = () => {
@@ -12668,23 +12984,152 @@ function sendChunk(uploadId, index, blobPart, onLoaded) {
   });
 }
 
+/* === ВОЛНА 22.36: ДОКАЧКА ПОСЛЕ ЗАКРЫТИЯ МИНИ-АППА (IndexedDB) ===
+   Каждый файл сохраняется в IndexedDB ДО старта, после каждого куска
+   обновляется позиция. Если мини-апп закрыли посреди загрузки — при
+   следующем открытии очередь подхватывается и грузится дальше. */
+let UPQ_DB = null;
+const UPQ_MAX_PERSIST = 300 * 1024 * 1024; /* больше 300 МБ в IDB не кладём */
+
+function upqOpen() {
+  return new Promise((resolve) => {
+    if (UPQ_DB) return resolve(UPQ_DB);
+
+    try {
+      const req = indexedDB.open('devo_upq', 1);
+
+      req.onupgradeneeded = () => {
+        try { req.result.createObjectStore('q', { keyPath: 'k' }); } catch (e) {}
+      };
+      req.onsuccess = () => { UPQ_DB = req.result; resolve(UPQ_DB); };
+      req.onerror = () => resolve(null);
+      req.onblocked = () => resolve(null);
+    } catch (e) { resolve(null); }
+  });
+}
+
+async function upqPut(entry) {
+  const db = await upqOpen();
+
+  if (!db) return;
+
+  try {
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction('q', 'readwrite');
+
+      tx.objectStore('q').put(entry);
+      tx.oncomplete = resolve;
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error);
+    });
+  } catch (e) {}
+}
+
+async function upqDel(k) {
+  const db = await upqOpen();
+
+  if (!db || !k) return;
+
+  try {
+    const tx = db.transaction('q', 'readwrite');
+
+    tx.objectStore('q').delete(k);
+  } catch (e) {}
+}
+
+async function upqAll() {
+  const db = await upqOpen();
+
+  if (!db) return [];
+
+  try {
+    return await new Promise((resolve) => {
+      const out = [];
+      const tx = db.transaction('q', 'readonly');
+      const req = tx.objectStore('q').openCursor();
+
+      req.onsuccess = () => {
+        const cur = req.result;
+
+        if (cur) {
+          out.push(cur.value);
+          cur.continue();
+        } else {
+          resolve(out.sort((a, b) => (a.added || 0) - (b.added || 0)));
+        }
+      };
+      req.onerror = () => resolve(out);
+    });
+  } catch (e) { return []; }
+}
+
+let RESUMING = false;
+
+async function resumePendingUploads() {
+  if (isUploading || RESUMING) return;
+
+  let entries = [];
+
+  try { entries = await upqAll(); } catch (e) {}
+
+  if (!entries.length) return;
+
+  RESUMING = true;
+
+  showToast('⏳ Продолжаю прерванную загрузку: ' + entries.length + ' файл(ов)');
+
+  const files = [];
+
+  for (const e of entries) {
+    try {
+      const f = new File([e.blob], e.name || 'file.bin', { type: e.mime || '' });
+
+      f.uploadName = e.uploadName || e.name;
+      f._entryKey = e.k;
+      f._resumeId = e.uploadId || '';
+      f._resumeIndex = e.index || 0;
+      files.push(f);
+    } catch (err) { upqDel(e.k); }
+  }
+
+  if (files.length) proceedUpload(files, { resume: true });
+
+  RESUMING = false;
+}
+
 async function uploadOneFile(file, reportBytes) {
   const upName = String(file.uploadName || file.name || 'file.bin').slice(0, 120);
+  const key = file._entryKey || null;
 
-  const initData = await apiJson('/api/upload/init', {
-    method: 'POST',
-    headers: vaultHeaders({ 'Content-Type': 'application/json' }),
-    body: JSON.stringify({
-      name: upName,
-      size: +file.size || 0,
-      mime: file.type || ''
-    })
-  });
+  let uploadId = file._resumeId || '';
+  let index = file._resumeIndex || 0;
 
-  const uploadId = initData.uploadId;
+  if (uploadId) {
+    /* ВОЛНА 22.36: продолжаем ПОСЛЕ закрытия мини-аппа */
+    file._resumeId = '';
+  } else {
+    const initData = await apiJson('/api/upload/init', {
+      method: 'POST',
+      headers: vaultHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({
+        name: upName,
+        size: +file.size || 0,
+        mime: file.type || ''
+      })
+    });
 
-  let offset = 0;
-  let index = 0;
+    uploadId = initData.uploadId;
+  }
+
+  if (key) {
+    upqPut({
+      k: key, blob: file, name: file.name, uploadName: upName,
+      size: +file.size || 0, mime: file.type || '',
+      uploadId: uploadId, index: index, added: Date.now()
+    });
+  }
+
+  let offset = index * CHUNK_SIZE;
 
   while (offset < file.size) {
     while (isPaused && !uploadAbortFlag) await sleepMs(150);
@@ -12696,22 +13141,52 @@ async function uploadOneFile(file, reportBytes) {
         body: JSON.stringify({ uploadId })
       }).catch(() => {});
 
+      if (key) upqDel(key);
+
       throw new Error('aborted');
     }
 
     const end = Math.min(offset + CHUNK_SIZE, file.size);
 
     let lastErr = null;
+    let resp = null;
 
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
-        await sendChunk(uploadId, index, file.slice(offset, end), (n) => reportBytes(offset + n));
+        resp = await sendChunk(uploadId, index, file.slice(offset, end),
+          (n) => reportBytes(offset + n));
 
         lastErr = null;
 
         break;
       } catch (err) {
         if (err && err.message === 'aborted') throw err;
+
+        /* при докачке сервер мог забыть сессию (6 ч TTL) — начинаем файл
+           заново: исходник сохранён в IndexedDB */
+        if (err && err.code === 'session_not_found' && key) {
+          try {
+            const initData = await apiJson('/api/upload/init', {
+              method: 'POST',
+              headers: vaultHeaders({ 'Content-Type': 'application/json' }),
+              body: JSON.stringify({
+                name: upName,
+                size: +file.size || 0,
+                mime: file.type || ''
+              })
+            });
+
+            uploadId = initData.uploadId;
+            index = 0;
+            offset = 0;
+            lastErr = null;
+
+            break;
+          } catch (e2) {
+            lastErr = e2;
+            break;
+          }
+        }
 
         lastErr = err;
 
@@ -12721,15 +13196,48 @@ async function uploadOneFile(file, reportBytes) {
 
     if (lastErr) throw lastErr;
 
-    offset = end;
-    index++;
+    /* синхронизация с сервером: received — сколько байт он реально имеет */
+    const srv = Math.min(+((resp && resp.received) || end), +file.size || end);
+
+    index = Math.ceil(srv / CHUNK_SIZE);
+    offset = index * CHUNK_SIZE;
+
+    if (key) {
+      upqPut({
+        k: key, blob: file, name: file.name, uploadName: upName,
+        size: +file.size || 0, mime: file.type || '',
+        uploadId: uploadId, index: index, added: Date.now()
+      });
+    }
   }
 
-  const done = await apiJson('/api/upload/complete', {
-    method: 'POST',
-    headers: vaultHeaders({ 'Content-Type': 'application/json' }),
-    body: JSON.stringify({ uploadId })
-  });
+  /* complete — одна повторная попытка (сеть/503) */
+  let done = null;
+  let cErr = null;
+
+  for (let a = 0; a < 2; a++) {
+    try {
+      done = await apiJson('/api/upload/complete', {
+        method: 'POST',
+        headers: vaultHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ uploadId })
+      });
+
+      cErr = null;
+
+      break;
+    } catch (e) {
+      if (e.message === 'aborted') throw e;
+
+      cErr = e;
+
+      if (!a) await sleepMs(2500);
+    }
+  }
+
+  if (cErr) throw cErr;
+
+  if (key) upqDel(key);
 
   return done.file;
 }
@@ -12742,10 +13250,13 @@ async function uploadEngine(bar) {
 
   let doneBytes = 0;
   const added = [];
-  let failed = null;
+  const failedFiles = [];
 
+  /* ВОЛНА 22.36: ошибка ОДНОГО файла больше не роняет всю пачку — грузим
+     дальше, итог честно показываем в конце (раньше пачка обрывалась с
+     пугающей «бот не админ канала», хотя по одному всё грузилось). */
   for (const file of uploadQueue.slice()) {
-    if (uploadAbortFlag || failed) break;
+    if (uploadAbortFlag) break;
 
     try {
       const rec = await uploadOneFile(file, (cur) => {
@@ -12753,30 +13264,34 @@ async function uploadEngine(bar) {
       });
 
       if (rec) added.push(rec);
-
-      doneBytes += (+file.size || 0);
-
-      setUploadPct((doneBytes / totalBytes) * 100, bar);
     } catch (e) {
       if (e.message === 'aborted' || uploadAbortFlag) break;
 
-      failed = e;
-
-      break;
+      failedFiles.push({ file: file, e: e });
     }
+
+    doneBytes += (+file.size || 0);
+
+    setUploadPct((doneBytes / totalBytes) * 100, bar);
   }
 
   if (uploadAbortFlag) {
+    /* отмена — стираем очередь докачки (пользователь сам отменил) */
+    for (const f of uploadQueue) {
+      if (f._entryKey) upqDel(f._entryKey);
+    }
+
     resetUploadUI(bar, checkmark, squareStop);
     return;
   }
 
-  if (failed) {
-    const msg = String(failed.message || '');
-    const needPass = (failed.code === 'safe_locked') ||
+  if (failedFiles.length) {
+    const first = failedFiles[0].e || new Error('');
+    const msg = String(first.message || '');
+    const needPass = (first.code === 'safe_locked') ||
       /safe_locked|пароль|password/i.test(msg);
 
-    const retryFiles = needPass ? uploadQueue.slice(added.length) : [];
+    const retryFiles = needPass ? failedFiles.map((x) => x.file) : [];
 
     resetUploadUI(bar, checkmark, squareStop);
 
@@ -12789,8 +13304,9 @@ async function uploadEngine(bar) {
       openUploadModal();
     } else {
       showToast(
-        'Ошибка загрузки: ' + msg +
-        (added.length ? ' (что успело — уже сохранено)' : '')
+        '⚠️ Не удалось: ' + failedFiles.length + ' из ' +
+        (added.length + failedFiles.length) + ' — ' + msg.slice(0, 90) +
+        (added.length ? ' (остальное сохранено)' : '')
       );
     }
 
@@ -12894,6 +13410,7 @@ if (!IS_TELEGRAM) {
       .then(function (r) {
         if (r.ok) {
           loadFiles();
+          resumePendingUploads();
         } else {
           localStorage.removeItem('devo_web_token');
           WEB_TOKEN = '';
@@ -12915,6 +13432,9 @@ if (!IS_TELEGRAM) {
         loadFiles(true);
       }, 4000);
     }
+
+    /* ВОЛНА 22.36: докачка прерванных загрузок после открытия мини-аппа */
+    setTimeout(resumePendingUploads, 800);
   });
 }
 
@@ -13149,11 +13669,57 @@ def _miniapp_vault_pw_pick(user, candidates):
     return cands[-1]
 
 
-async def _miniapp_serve_file(request, user, rec, where, pw_override=None):
+# === ВОЛНА 22.36: скачивание МИМО сообщения ===
+def _mt_doc_location(rec):
+    """InputDocumentFileLocation из mt_doc записи (сохранён при загрузке) или
+    None. Позволяет качать документ ПОСЛЕ удаления его сообщения из канала
+    (кнопка «Скрыть»): Telegram хранит файлы независимо от сообщений."""
+    md = rec.get("mt_doc") if isinstance(rec, dict) else None
+    if not isinstance(md, dict):
+        return None
+    try:
+        from telethon.tl.types import InputDocumentFileLocation as _IDFL
+        import base64 as _b64
+        ref = _b64.b64decode(str(md.get("ref") or ""))
+        if not int(md.get("id") or 0):
+            return None
+        # thumb_size обязателен в telethon — пустая строка (не миниатюра)
+        return _IDFL(int(md.get("id") or 0), int(md.get("ah") or 0), ref, "")
+    except Exception:
+        return None
+
+
+async def _mt_doc_for_rec(client, rec):
+    """(message|None, doc|location, size) для скачивания записи rec.
+    Порядок: сообщение в канале (как раньше) → если не вышло (скрыто кнопкой
+    «Скрыть», удалено) — по сохранённому расположению mt_doc."""
+    channel_id = (rec or {}).get("channel_id") or get_storage_channel_id()
+    if channel_id and (rec or {}).get("msg_id"):
+        try:
+            _m, doc = await _mt_fetch_document(client, int(channel_id),
+                                               int(rec["msg_id"]))
+            if doc is not None:
+                return _m, doc, int(getattr(doc, "size", 0) or 0)
+        except Exception as e:
+            logger.warning(f"mt_doc_for_rec: по сообщению не вышло ({e}); "
+                           "пробую по расположению mt_doc")
+    loc = _mt_doc_location(rec)
+    if loc is not None:
+        size = int(rec.get("size_enc") or rec.get("size_orig")
+                   or rec.get("size") or 0)
+        return None, loc, size
+    return None, None, 0
+
+
+async def _miniapp_serve_file(request, user, rec, where, pw_override=None,
+                              inline=False):
     """ВОЛНА 22.30: отдаёт файл ПОТОКОМ (Cloud: Bot API ≤20 МБ / MTProto до
     2 ГБ; Сейф: расшифровка на лету — нужен пароль). Стриминг вместо «всё в
     blob»: 2 ГБ не съедают ОЗУ телефона, WebView Telegram качает честно.
-    pw_override — пароль Сейфа, вшитый в одноразовую ссылку (/api/dl/token)."""
+    pw_override — пароль Сейфа, вшитый в одноразовую ссылку (/api/dl/token).
+    ВОЛНА 22.36: inline=True — просмотр (Content-Disposition: inline и
+    ЧЕСТНЫЙ Content-Type — браузер открывает фото/видео/аудио/PDF), иначе —
+    скачивание. mime вычисляет _serve_mime_for."""
     if where == "safe":
         if rec.get("plain"):
             # режим «без шифрования» (личный канал): имя хранится открыто
@@ -13185,13 +13751,14 @@ async def _miniapp_serve_file(request, user, rec, where, pw_override=None):
                 name = str(meta.get("n") or rec.get("label") or "file")
                 return web.Response(
                     body=payload,
-                    content_type="application/octet-stream",
+                    content_type=_serve_mime_for(rec, name),
                     headers={
-                        "Content-Disposition": _miniapp_content_disposition(name),
+                        "Content-Disposition": _miniapp_content_disposition(name, inline),
                         "Cache-Control": "no-store",
                     })
             # DVF2 (>20 МБ): поток MTProto → _Dvf2Decryptor → клиент
-            return await _miniapp_stream_dvf2(request, user, rec, password)
+            return await _miniapp_stream_dvf2(request, user, rec, password,
+                                              inline=inline)
     else:
         cloud_like = rec
         name = str(cloud_like.get("name") or "file")
@@ -13206,9 +13773,9 @@ async def _miniapp_serve_file(request, user, rec, where, pw_override=None):
             buf = await tg_file.download_as_bytearray()
             return web.Response(
                 body=bytes(buf),
-                content_type="application/octet-stream",
+                content_type=_serve_mime_for(cloud_like, name),
                 headers={
-                    "Content-Disposition": _miniapp_content_disposition(name),
+                    "Content-Disposition": _miniapp_content_disposition(name, inline),
                     "Cache-Control": "no-store",
                 })
         except Exception as e:
@@ -13228,17 +13795,17 @@ async def _miniapp_serve_file(request, user, rec, where, pw_override=None):
                             "Источник файла недоступен (нет канала/сообщения).")
     tmppath = os.path.join(_miniapp_tmpdir(), f"dl_{cloud_like.get('id', 'x')}_{os.getpid()}.part")
     try:
-        _msg, doc = await _mt_fetch_document(client, int(channel_id), int(cloud_like["msg_id"]))
+        _msg, doc, _dsz = await _mt_doc_for_rec(client, cloud_like)
         if doc is None:
             raise RuntimeError("в сообщении канала нет документа")
-        doc_size = int(getattr(doc, "size", 0) or size or 0)
+        doc_size = int(_dsz or getattr(doc, "size", 0) or size or 0)
         with open(tmppath, "wb") as sink_file:
             await _mt_download_stream(
                 client, doc, doc_size,
                 lambda chunk: sink_file.write(chunk))
         response = web.StreamResponse(status=200, headers={
-            "Content-Type": "application/octet-stream",
-            "Content-Disposition": _miniapp_content_disposition(name),
+            "Content-Type": _serve_mime_for(cloud_like, name),
+            "Content-Disposition": _miniapp_content_disposition(name, inline),
             "Cache-Control": "no-store",
         })
         if doc_size:
@@ -13285,7 +13852,7 @@ async def _miniapp_fetch_container_bytes(user, rec):
     client = await _mt_client()
     if client is None:
         raise RuntimeError("MTProto не подключён: " + (_MT_LAST_ERR or "недоступен"))
-    _msg, doc = await _mt_fetch_document(client, int(channel_id), int(rec["msg_id"]))
+    _msg, doc, _dsz = await _mt_doc_for_rec(client, rec)
     if doc is None:
         raise RuntimeError("в сообщении канала нет документа")
     buf = bytearray()
@@ -13293,15 +13860,17 @@ async def _miniapp_fetch_container_bytes(user, rec):
     async def _sink(chunk):
         buf.extend(chunk)
 
-    await _mt_download_stream(client, doc, int(getattr(doc, "size", 0) or 0), _sink)
+    await _mt_download_stream(client, doc, int(_dsz or getattr(doc, "size", 0) or 0), _sink)
     return bytes(buf)
 
 
-async def _miniapp_stream_dvf2(request, user, rec, password, to_file=False):
+async def _miniapp_stream_dvf2(request, user, rec, password, to_file=False,
+                               inline=False):
     """ВОЛНА 22.30: потоковая выдача/расшифровка DVF2 (>20 МБ, до 2 ГБ).
     to_file=False → StreamResponse клиенту (скачивание из Сейфа);
     to_file=(путь) → расшифровка во временный файл (достать из Сейфа в облако).
-    Возвращает Response или (мета, размер_оригинала)."""
+    Возвращает Response или (мета, размер_оригинала).
+    ВОЛНА 22.36: inline — просмотр (Content-Disposition: inline + mime)."""
     client = await _mt_client()
     if client is None:
         return _miniapp_err(
@@ -13313,10 +13882,10 @@ async def _miniapp_stream_dvf2(request, user, rec, password, to_file=False):
         return _miniapp_err(404, "no_source",
                             "Контейнер Сейфа недоступен (нет канала/сообщения).")
     try:
-        _msg, doc = await _mt_fetch_document(client, int(channel_id), int(rec["msg_id"]))
+        _msg, doc, _dsz = await _mt_doc_for_rec(client, rec)
         if doc is None:
             raise RuntimeError("в сообщении канала нет документа")
-        doc_size = int(getattr(doc, "size", 0) or rec.get("size_enc") or 0)
+        doc_size = int(_dsz or getattr(doc, "size", 0) or rec.get("size_enc") or 0)
         dec = _Dvf2Decryptor(password)
         meta_holder = {}
 
@@ -13343,8 +13912,8 @@ async def _miniapp_stream_dvf2(request, user, rec, password, to_file=False):
         else:
             name = str(rec.get("label") or "file")
             response = web.StreamResponse(status=200, headers={
-                "Content-Type": "application/octet-stream",
-                "Content-Disposition": _miniapp_content_disposition(name),
+                "Content-Type": _serve_mime_for(rec, name),
+                "Content-Disposition": _miniapp_content_disposition(name, inline),
                 "Cache-Control": "no-store",
             })
             if rec.get("size_orig"):
@@ -13418,9 +13987,12 @@ async def miniapp_files_link(request):
     for k in [k for k, v in _MINIAPP_DL_TOKENS.items() if v.get("exp", 0) < now]:
         _MINIAPP_DL_TOKENS.pop(k, None)
     token = secrets.token_urlsafe(24)
+    # ВОЛНА 22.36: ?disp=inline — токен для ПРОСМОТРА (браузер покажет файл,
+    # а не скачает). Всё остальное — честное скачивание (attachment).
+    disp = "inline" if str(request.query.get("disp") or "") == "inline" else "attachment"
     _MINIAPP_DL_TOKENS[token] = {
         "uid": str(uid), "fid": str(request.match_info["fid"]),
-        "exp": now + _MINIAPP_DL_TTL, "pw": pw_embed,
+        "exp": now + _MINIAPP_DL_TTL, "pw": pw_embed, "disp": disp,
     }
     return web.json_response({"url": "/api/dl/" + token, "expires_in": _MINIAPP_DL_TTL})
 
@@ -13441,7 +14013,8 @@ async def miniapp_dl_token(request):
     if not rec:
         return _miniapp_err(404, "not_found", "Файл не найден (возможно, уже удалён).")
     return await _miniapp_serve_file(request, user, rec, where,
-                                     pw_override=t.get("pw"))
+                                     pw_override=t.get("pw"),
+                                     inline=(t.get("disp") == "inline"))
 
 
 # --- ВОЛНА 22.30: СЕЙФ В ВЕБЕ — разблокировка и НАСТОЯЩИЕ переводы ---
@@ -13622,7 +14195,7 @@ async def miniapp_files_to_safe(request):
                                     "Telegram не принял файл в хранилище.")
             new_rec = {
                 "id": _vault_gen_id(user), "kind": kind, "mime": mime,
-                "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "ts": _file_ts_now(), "tss": datetime.now().strftime("%Y-%m-%d %H:%M"),
                 "size_orig": size, "size_enc": int(up.get("size", 0) or 0),
                 "msg_id": int(up.get("message_id", 0)),
                 "file_id": up.get("file_id"), "channel_id": up.get("channel_id"),
@@ -13666,7 +14239,7 @@ async def miniapp_files_to_safe(request):
                                     "администратор канала-хранилища.")
             new_rec = {
                 "id": _vault_gen_id(user), "kind": kind, "mime": mime,
-                "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "ts": _file_ts_now(), "tss": datetime.now().strftime("%Y-%m-%d %H:%M"),
                 "size_orig": size, "size_enc": int(up.get("size", 0) or 0),
                 "salt": salt_hex, "verifier": verifier_hex, "iters": iters,
                 "nonce": nonce_hex, "msg_id": int(up.get("message_id", 0)),
@@ -13733,7 +14306,7 @@ async def miniapp_files_to_safe(request):
                                         "администратор канала-хранилища.")
                 new_rec = {
                     "id": _vault_gen_id(user), "kind": kind, "mime": mime,
-                    "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    "ts": _file_ts_now(), "tss": datetime.now().strftime("%Y-%m-%d %H:%M"),
                     "size_orig": size, "size_enc": enc_total,
                     "salt": enc.salt_hex(), "verifier": enc.verifier_hex(),
                     "iters": enc.iters, "nonce": enc.np_hex(),
@@ -13856,7 +14429,7 @@ async def miniapp_files_from_safe(request):
         "id": _cloud_gen_file_id(user), "name": name[:120], "kind": kind,
         "msg_id": int(up.get("message_id", 0)), "file_id": up.get("file_id"),
         "size": int(up.get("size", 0) or 0), "mime": mime,
-        "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "ts": _file_ts_now(), "tss": datetime.now().strftime("%Y-%m-%d %H:%M"),
         "channel_id": up.get("channel_id"), "src": "web",
     }
     user.cloud_files.append(new_rec)
@@ -14056,7 +14629,7 @@ async def _miniapp_encrypt_local_to_safe(user, src_path, size, name, kind,
                                "администратор канала-хранилища.")
         return {
             "id": _vault_gen_id(user), "kind": kind, "mime": mime,
-            "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "ts": _file_ts_now(), "tss": datetime.now().strftime("%Y-%m-%d %H:%M"),
             "size_orig": size, "size_enc": int(up.get("size", 0) or 0),
             "salt": salt_hex, "verifier": verifier_hex, "iters": iters,
             "nonce": nonce_hex, "msg_id": int(up.get("message_id", 0)),
@@ -14115,7 +14688,7 @@ async def _miniapp_encrypt_local_to_safe(user, src_path, size, name, kind,
                                "администратор канала-хранилища.")
         return {
             "id": _vault_gen_id(user), "kind": kind, "mime": mime,
-            "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "ts": _file_ts_now(), "tss": datetime.now().strftime("%Y-%m-%d %H:%M"),
             "size_orig": size, "size_enc": enc_total,
             "salt": enc.salt_hex(), "verifier": enc.verifier_hex(),
             "iters": enc.iters, "nonce": enc.np_hex(),
@@ -14127,6 +14700,85 @@ async def _miniapp_encrypt_local_to_safe(user, src_path, size, name, kind,
         }
     finally:
         _shutil.rmtree(job, ignore_errors=True)
+
+
+# --- ВОЛНА 22.36: КНОПКА «Скрыть» ПОД ФАЙЛАМИ ИЗ МИНИ-АППА ---
+# Пользователь: «под файлом, который отправил мини-апп, должно быть сообщение
+# «скрыть»; при нажатии файл скрывается из чата». После загрузки бот отправляет
+# в канал следом небольшое сообщение с кнопкой «🙈 Скрыть»: нажатие удаляет
+# ИЗ КАНАЛА сообщение с файлом и само сообщение-подсказку (в облаке файл
+# остаётся — скачивание работает по file_id, а для MTProto хранится mt_doc).
+async def _miniapp_send_hide_button(app, channel_id, rec, name):
+    """Следом за файлом шлёт в канал кнопку «Скрыть». Возвращает message_id
+    сообщения-подсказки (или 0 — отправить не удалось)."""
+    try:
+        if app is None or not channel_id or not isinstance(rec, dict):
+            return 0
+        fid = str(rec.get("id") or "")
+        if not fid:
+            return 0
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🙈 Скрыть", callback_data=f"fhide_{fid}")
+        ]])
+        sent, _qp = await _pub_send(
+            int(channel_id),
+            lambda: app.bot.send_message(
+                chat_id=int(channel_id),
+                text=("🙈 «%s» — скрыть файл из канала?\nФайл ОСТАНЕТСЯ в вашем "
+                      "облаке — скроется только из чата." % str(name or "файл")[:60]),
+                reply_markup=kb),
+        )
+        return int(getattr(sent, "message_id", 0) or 0)
+    except Exception as e:
+        logger.warning(f"miniapp hide-button: не отправилось ({e})")
+        return 0
+
+
+async def miniapp_hide_file_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопка «🙈 Скрыть» под файлом из мини-аппа: удаляет сообщение файла и
+    сообщение-подсказку из канала. Владелец файла — тот, кто грузил; нажать
+    может любой админ канала, но удаляем только если файл наш."""
+    query = update.callback_query
+    uid = str(query.from_user.id)
+    fid = str(query.data or "").replace("fhide_", "", 1)
+    user = get_user(uid)
+    rec, where = _miniapp_find_any(user, fid) if user else (None, None)
+    if not rec:
+        try:
+            await query.answer("Файл не найден — возможно, уже скрыт или удалён.")
+        except Exception:
+            pass
+        return MAIN_MENU
+    ch = int(rec.get("channel_id") or 0)
+    msg_id = int(rec.get("msg_id") or 0)
+    hide_id = int(rec.get("hide_msg") or 0)
+    deleted = 0
+    if ch:
+        app = _MINIAPP_PTB_APP
+        bot = getattr(app, "bot", None) if app is not None else None
+        if bot is not None:
+            for mid in (msg_id, hide_id):
+                if mid:
+                    try:
+                        await bot.delete_message(chat_id=ch, message_id=mid)
+                        deleted += 1
+                    except Exception:
+                        pass
+    try:
+        if deleted:
+            await query.answer("🙈 Скрыто из канала — в облаке файл остался.")
+        else:
+            await query.answer("Не удалось удалить сообщение (нет прав или уже скрыто).",
+                               show_alert=True)
+    except Exception:
+        pass
+    if deleted and user is not None:
+        if where == "safe":
+            rec["hide_msg"] = 0
+        else:
+            rec["hide_msg"] = 0
+        save_user(user)
+    return MAIN_MENU
 
 
 def _miniapp_vault_pw_from(request, body, upload_sess=None):
@@ -14365,6 +15017,13 @@ async def miniapp_upload_complete(request):
                 sess = _miniapp_session_of(request)
                 if sess is not None:
                     sess["vault_pw"] = vault_pw
+            # ВОЛНА 22.36: кнопка «Скрыть» и для зашифрованных загрузок
+            try:
+                new_rec["hide_msg"] = await _miniapp_send_hide_button(
+                    _MINIAPP_PTB_APP, int(new_rec.get("channel_id") or 0),
+                    new_rec, name)
+            except Exception:
+                pass
             save_user(user)
             logger.info(f"miniapp upload: файл пользователя {uid} "
                         "зашифрован и сохранён в Сейф")
@@ -14379,11 +15038,11 @@ async def miniapp_upload_complete(request):
             if app is None:
                 return _miniapp_err(503, "no_bot",
                                     "Бот ещё не завершил запуск — попробуйте через минуту.")
-            with open(s["path"], "rb") as f:
-                data = f.read()
+            # ВОЛНА 22.36: читаем файл с диска ПОД шлагбаумом (data_path) —
+            # пачка файлов больше не держит все данные в ОЗУ одновременно.
             sent = await _storage_upload_document(
-                _MiniappCtx(app.bot), data, filename=name,
-                caption=name[:100], user=user)
+                _MiniappCtx(app.bot), None, filename=name,
+                caption=name[:100], user=user, data_path=s["path"])
         else:
             client = await _mt_client()
             if client is None:
@@ -14407,13 +15066,23 @@ async def miniapp_upload_complete(request):
             "file_id": sent.get("file_id"),
             "size": size,
             "mime": s["mime"],
-            "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "ts": _file_ts_now(), "tss": datetime.now().strftime("%Y-%m-%d %H:%M"),
             "channel_id": sent.get("channel_id"),
             "src": "web",  # загружено через Веб-облако
         }
+        # ВОЛНА 22.36: расположение документа для скачивания МИМО сообщения
+        # (после «Скрыть» сообщение в канале удалено, а файл должен качаться).
+        _md = sent.get("mt_doc")
+        if isinstance(_md, dict):
+            rec["mt_doc"] = _md
         user.cloud_files = [f for f in (getattr(user, "cloud_files", []) or [])
                             if isinstance(f, dict)]
         user.cloud_files.append(rec)
+        save_user(user)
+        # ВОЛНА 22.36: под файлом в канале — кнопка «Скрыть» (уборка чата;
+        # файл остаётся в облаке и качается по file_id/mt_doc).
+        rec["hide_msg"] = await _miniapp_send_hide_button(
+            app, int(sent.get("channel_id") or 0), rec, name)
         save_user(user)
         # ВОЛНА 22.35: позиция в очереди публикаций канала (1 = печатали сразу)
         out = _miniapp_rec_out(rec)
@@ -14793,7 +15462,7 @@ async def _miniapp_upload_bytes(user, data: bytes, name: str, mime: str):
         "file_id": sent.get("file_id"),
         "size": len(data),
         "mime": mime,
-        "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "ts": _file_ts_now(), "tss": datetime.now().strftime("%Y-%m-%d %H:%M"),
         "channel_id": sent.get("channel_id"),
         "src": "web",
     }
@@ -15662,7 +16331,7 @@ async def _storage_channel_post_handler(update: Update, context: ContextTypes.DE
             "file_id": item["file_id"],
             "size": item["size"],
             "mime": item.get("mime", ""),
-            "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "ts": _file_ts_now(), "tss": datetime.now().strftime("%Y-%m-%d %H:%M"),
             "channel_id": int(chat_id),
             "big": True,
         }
@@ -17625,12 +18294,27 @@ async def _mt_upload_container(client, path, size, caption, filename=None,
             # чтобы массовые загрузки из веба не упёрлись в лимиты Telegram.
             sent, queue_pos = await _pub_send(ch, _send_file)
             doc = getattr(sent, "document", None)
+            # ВОЛНА 22.36: сохраняем расположение документа (id/access_hash/
+            # file_reference) — скачивание работает МИМО сообщения, даже если
+            # пользователь скрыл его из канала кнопкой «Скрыть».
+            _mt_doc = None
+            try:
+                if doc is not None and int(getattr(doc, "id", 0) or 0):
+                    import base64 as _b64
+                    _mt_doc = {
+                        "id": int(doc.id),
+                        "ah": int(getattr(doc, "access_hash", 0) or 0),
+                        "ref": _b64.b64encode(bytes(getattr(doc, "file_reference", b"") or b"")).decode("ascii"),
+                    }
+            except Exception:
+                _mt_doc = None
             return {
                 "message_id": int(getattr(sent, "id", 0) or 0),
                 "file_id": None,
                 "size": int(getattr(doc, "size", 0) or size or 0),
                 "channel_id": ch,
                 "queue_pos": queue_pos,
+                "mt_doc": _mt_doc,
             }
         except Exception as e:
             logger.error(f"mtproto: заливка контейнера в канал {ch} не удалась: {e}")
@@ -18014,7 +18698,7 @@ async def _vault_seal_item_mtproto_once(msg, context, user, item, password,
         rec = {
             "id": _vault_gen_id(user),
             "kind": kind, "mime": mime,
-            "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "ts": _file_ts_now(), "tss": datetime.now().strftime("%Y-%m-%d %H:%M"),
             "size_orig": size or doc_size,
             "size_enc": int(up.get("size", 0) or enc_total),
             "salt": enc.salt_hex(),
@@ -18377,7 +19061,7 @@ def get_vault_files_keyboard(user):
             title = f"{label[:30]} • {_fmt_bytes(rec.get('size_orig', 0))}"
         else:
             title = (f"Файл #{idx} • {_fmt_bytes(rec.get('size_orig', 0))} • "
-                     f"{str(rec.get('ts', ''))[:10]}")
+                     f"{_rec_ts_display(rec)[:10]}")
         kb.append([
             InlineKeyboardButton(f"📥 {title}", callback_data=f"vault_get_{rec.get('id')}"),
             # ВОЛНА 13: 🔎 — карточка с ПОЛНЫМ названием (кнопка «⬅️ Свернуть»
@@ -18421,8 +19105,8 @@ def _vault_files_text(user):
         _plain_mark = " 🔓 без шифра" if rec.get("plain") else ""
         lines.append(
             f"{head}{_fmt_bytes(rec.get('size_orig', 0))} "
-            + (f", {rec.get('ts', '')}" if rec.get("plain") else
-               f"(в шифре {_fmt_bytes(rec.get('size_enc', 0))}), {rec.get('ts', '')}")
+            + (f", {_rec_ts_display(rec)}" if rec.get("plain") else
+               f"(в шифре {_fmt_bytes(rec.get('size_enc', 0))}), {_rec_ts_display(rec)}")
             + _plain_mark
             + (f"  {_cat}" if _cat else "")
             + (f"\n   {_tags}" if _tags else "")
@@ -21073,7 +21757,7 @@ async def vault_show_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
            if rec.get("plain") else
            f"(в шифре {_fmt_bytes(rec.get('size_enc', 0))})"))
     lines.append(
-        f"📅 Добавлено: {rec.get('ts', '')} • 🧩 тип: {_vault_kind_label(rec.get('kind'))}")
+        f"📅 Добавлено: {_rec_ts_display(rec)} • 🧩 тип: {_vault_kind_label(rec.get('kind'))}")
     lines.append("")
     # ВОЛНА 22.25: честный блок про хранение — зависит от режима файла.
     if rec.get("plain"):
@@ -21568,7 +22252,7 @@ async def _vault_encrypt_batch(msg, context, user, password):
                 "id": _vault_gen_id(user),
                 "kind": item.get("kind", "document"),
                 "mime": item.get("mime", ""),
-                "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "ts": _file_ts_now(), "tss": datetime.now().strftime("%Y-%m-%d %H:%M"),
                 "size_orig": int(item.get("size", 0) or 0),
                 "size_enc": int(up.get("size", 0) or 0),
                 "salt": salt_hex,
@@ -21896,7 +22580,7 @@ async def _vault_plain_item_mtproto_once(msg, context, user, item,
     rec = {
         "id": _vault_gen_id(user),
         "kind": kind, "mime": mime,
-        "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "ts": _file_ts_now(), "tss": datetime.now().strftime("%Y-%m-%d %H:%M"),
         "size_orig": size or int(up.get("size", 0) or 0),
         "size_enc": int(up.get("size", 0) or 0),
         "msg_id": int(up.get("message_id", 0)),
@@ -22031,7 +22715,7 @@ async def _vault_plain_upload(msg, context, user, note=""):
                 "id": _vault_gen_id(user),
                 "kind": item.get("kind", "document"),
                 "mime": item.get("mime", ""),
-                "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "ts": _file_ts_now(), "tss": datetime.now().strftime("%Y-%m-%d %H:%M"),
                 "size_orig": int(item.get("size", 0) or 0),
                 "size_enc": int(up.get("size", 0) or 0),
                 "msg_id": int(up.get("message_id", 0)),
@@ -37672,7 +38356,10 @@ async def _duty_announce(bot, class_obj, selected, sick_note=None):
     «🤒 Я заболел(а)», всем — «Сегодня дежурный: …» (у админов — кнопки
     «заболел» на каждого дежурного). sick_note — если это замена болевшего.
     ВОЛНА 22.35: если selected — СТРОКИ-имена (свой график), рассылаем
-    только текст «Сегодня дежурят: …» без личных сообщений и кнопок."""
+    текст «Сегодня дежурят: …» без личных сообщений.
+    ВОЛНА 22.36: в режиме имён админы получают копию с кнопками
+    «🤒 заболел(а)» / «🚫 не будет» на каждого дежурного — нажатие передаёт
+    дежурство следующему по списку, а заболевший уходит в конец списка."""
     if selected and all(isinstance(i, str) and not i.isdigit() for i in selected):
         names = ", ".join(str(i) for i in selected) if selected else "—"
         members = [str(m) for m in dict.fromkeys(
@@ -37680,13 +38367,24 @@ async def _duty_announce(bot, class_obj, selected, sick_note=None):
             [str(m) for m in (class_obj.admins or [])])]
         blocked = set(str(b) for b in (class_obj.blocked_users or []))
         members = [m for m in members if m not in blocked and get_user(m)]
+        # ВОЛНА 22.36: админам — кнопки замены по индексу в списке дежурных
+        admin_rows = []
+        for i, nm in enumerate(selected):
+            admin_rows.append([
+                InlineKeyboardButton(f"🤒 {str(nm)[:20]} — заболел(а)",
+                                     callback_data=f"duty_cns_{i}"),
+                InlineKeyboardButton(f"🚫 не будет", callback_data=f"duty_cnn_{i}"),
+            ])
+        admin_kb = InlineKeyboardMarkup(admin_rows) if admin_rows else None
         for uid in members:
+            is_admin = str(uid) in [str(a) for a in (class_obj.admins or [])]
             try:
                 await bot.send_message(
                     chat_id=int(uid),
                     text=("🕐 <b>Сегодня дежурят: " + names + "</b>\n"
                           + (sick_note if sick_note else "")).rstrip(),
-                    parse_mode=ParseMode.HTML)
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=admin_kb if is_admin else None)
             except Exception as e:
                 logger.error(f"duty announce(names): send failed {uid}: {e}")
         return
@@ -37714,10 +38412,18 @@ async def _duty_announce(bot, class_obj, selected, sick_note=None):
             is_admin = str(uid) in [str(a) for a in (class_obj.admins or [])]
             kb = None
             if is_admin and selected:
-                rows = [[InlineKeyboardButton(
-                    f"🤒 {_duty_member_name(i)} — заболел(а)",
-                    callback_data=f"duty_sick_uid_{i}")] for i in selected
-                    if str(i) != str(uid)]
+                # ВОЛНА 22.36: у админа на каждого дежурного ДВЕ кнопки —
+                # «заболел(а)» и «не будет» (обе передают дежурство дальше)
+                rows = []
+                for i in selected:
+                    if str(i) == str(uid):
+                        continue
+                    _nm = _duty_member_name(i)
+                    rows.append([InlineKeyboardButton(
+                        f"🤒 {_nm} — заболел(а)",
+                        callback_data=f"duty_sick_uid_{i}"),
+                        InlineKeyboardButton("🚫 не будет",
+                                             callback_data=f"duty_skip_uid_{i}")])
                 if rows:
                     kb = InlineKeyboardMarkup(rows)
             await bot.send_message(
@@ -38798,10 +39504,12 @@ async def duty_list_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def duty_sick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Кнопка «🤒 Заболел(а)» под утренним сообщением.
-    duty_sick — сам дежурный; duty_sick_uid_{id} — админ отмечает больного.
-    Заболевшего заменяет следующий из очереди, заболевший идёт в конец."""
+    duty_sick — сам дежурный; duty_sick_uid_{id} — админ отмечает больного;
+    duty_skip_uid_{id} — админ отмечает «не будет» (ВОЛНА 22.36), логика та же:
+    заболевшего/отсутствующего заменяет следующий из очереди, он — в конец."""
     query = update.callback_query
     uid = str(query.from_user.id)
+    _skip_mode = query.data.startswith("duty_skip_uid_")
     class_obj = get_class_by_user(uid)
     if not class_obj or not getattr(class_obj, "duty_enabled", False):
         try:
@@ -38821,6 +39529,15 @@ async def duty_sick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_admin:
             try:
                 await query.answer("Отмечать заболевших могут только админы.",
+                                   show_alert=True)
+            except Exception:
+                pass
+            return MAIN_MENU
+    elif query.data.startswith("duty_skip_uid_"):
+        sick_uid = query.data.replace("duty_skip_uid_", "", 1)
+        if not is_admin:
+            try:
+                await query.answer("Отмечать «не будет» могут только админы.",
                                    show_alert=True)
             except Exception:
                 pass
@@ -38854,10 +39571,13 @@ async def duty_sick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     candidate = _duty_reassign_sick(class_obj, sick_uid, occ)
     save_class(class_obj)
     _log_admin_action(uid, class_obj.class_code,
-                      f"Дежурные: {_duty_member_name(sick_uid)} заболел(а)"
+                      ("Дежурные: " if not _skip_mode else "Дежурные (не будет): ")
+                      + f"{_duty_member_name(sick_uid)}"
                       + (f", замена — {_duty_member_name(candidate)}" if candidate else ""))
     try:
-        await query.answer("Поправляйтесь! Дежурство передано.")
+        await query.answer("Поправляйтесь! Дежурство передано."
+                           if not _skip_mode
+                           else "Хорошо, дежурство передано следующему.")
     except Exception:
         pass
     # заболевшему
@@ -38865,7 +39585,10 @@ async def duty_sick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(
             chat_id=int(sick_uid),
             text=("🤒 Поправляйтесь!\n\nДежурство сегодня передано дальше, "
-                  "а вы вернётесь в конец очереди — отдохните и выздоравливайте."))
+                  "а вы вернётесь в конец очереди — отдохните и выздоравливайте.")
+            if not _skip_mode else
+            ("📅 Дежурство сегодня передано следующему.\n\n"
+             "Вы вернётесь в конец списка дежурных."))
     except Exception:
         pass
     # новому дежурному
@@ -38884,9 +39607,14 @@ async def duty_sick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
     # объявление классу
     names = ", ".join(_duty_member_name(i) for i in ids) if ids else "—"
-    note = (f"🤒 {_duty_member_name(sick_uid)} заболел(а) — "
-            + (f"заменяет {_duty_member_name(candidate)}."
-               if candidate else "замены сегодня нет."))
+    if _skip_mode:
+        note = (f"🚫 {_duty_member_name(sick_uid)} сегодня не придёт — "
+                + (f"дежурит {_duty_member_name(candidate)}."
+                   if candidate else "замены сегодня нет."))
+    else:
+        note = (f"🤒 {_duty_member_name(sick_uid)} заболел(а) — "
+                + (f"заменяет {_duty_member_name(candidate)}."
+                   if candidate else "замены сегодня нет."))
     members = [str(m) for m in dict.fromkeys(
         [str(m) for m in (class_obj.students or [])] +
         [str(m) for m in (class_obj.admins or [])])]
@@ -38901,6 +39629,114 @@ async def duty_sick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode=ParseMode.HTML)
         except Exception:
             pass
+    return MAIN_MENU
+
+
+# === ВОЛНА 22.36: замена в СВОЁМ графике (имена) — «заболел(а)» / «не будет» ===
+def _duty_custom_replace(class_obj, occ, idx, reason="sick"):
+    """Свой график: дежурный с индексом idx выбывает из сегодняшних
+    («заболел(а)»/«не будет»). Возвращает (sick_name, new_name|None) или None.
+    Правила пользователя: дежурство переходит СЛЕДУЮЩЕМУ ПО СПИСКУ, а выбывший
+    уходит В КОНЕЦ списка (новый порядок сохраняется в duty_custom.names —
+    дальше бот дежурит по обновлённому списку, и план на сегодня подправлен)."""
+    dc = getattr(class_obj, "duty_custom", None)
+    today = getattr(class_obj, "duty_today", None)
+    if not isinstance(dc, dict) or not isinstance(today, dict) \
+            or today.get("date") != occ:
+        return None
+    names = [str(n) for n in (today.get("names") or [])]
+    if idx < 0 or idx >= len(names):
+        return None
+    sick = names.pop(idx)
+    order = [str(n).strip() for n in (dc.get("names") or []) if str(n).strip()]
+    if sick in order:
+        order = [n for n in order if n != sick]
+        order.append(sick)  # выбывший — В КОНЕЦ списка
+    new_name = None
+    pool = [n for n in order if n not in names]
+    if pool:
+        new_name = pool[0]      # следующий по обновлённому списку
+        names.append(new_name)
+    today["names"] = names
+    # план на сегодня тоже подправляем (если дата задана в плане)
+    plan = dc.get("plan") if isinstance(dc.get("plan"), dict) else {}
+    if occ in plan and isinstance(plan[occ], list):
+        plan[occ] = [n for n in plan[occ] if n != sick]
+        if new_name and new_name not in plan[occ]:
+            plan[occ].append(new_name)
+    dc["names"] = order
+    dc["plan"] = plan
+    class_obj.duty_custom = dc
+    return sick, new_name
+
+
+async def duty_custom_mark_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.36: кнопки «🤒 заболел(а)» / «🚫 не будет» под утренним
+    сообщением в режиме СВОЕГО графика (имена): duty_cns_{idx} / duty_cnn_{idx}.
+    Дежурство переходит следующему по списку, выбывший — в конец списка;
+    классу уходит обновлённое объявление, у админов — свежие кнопки."""
+    query = update.callback_query
+    uid = str(query.from_user.id)
+    skip_mode = query.data.startswith("duty_cnn_")
+    class_obj = get_class_by_user(uid)
+    if not class_obj or not getattr(class_obj, "duty_enabled", False):
+        try:
+            await query.answer("Дежурные в вашем классе выключены.", show_alert=True)
+        except Exception:
+            pass
+        return MAIN_MENU
+    if not _duty_is_admin(uid, class_obj):
+        try:
+            await query.answer("Отмечать могут только админы класса.",
+                               show_alert=True)
+        except Exception:
+            pass
+        return MAIN_MENU
+    tz = _duty_tz(class_obj)
+    local_now = _now_utc() + timedelta(hours=tz)
+    occ = local_now.strftime("%Y-%m-%d")
+    try:
+        idx = int(query.data.rsplit("_", 1)[1])
+    except Exception:
+        idx = -1
+    res = _duty_custom_replace(class_obj, occ, idx)
+    if not res:
+        try:
+            await query.answer("Список уже изменился — это уведомление устарело.",
+                               show_alert=True)
+        except Exception:
+            pass
+        return MAIN_MENU
+    sick, new_name = res
+    save_class(class_obj)
+    _log_admin_action(uid, class_obj.class_code,
+                      ("Дежурные (не будет): " if skip_mode else "Дежурные: ")
+                      + f"{sick}"
+                      + (f", замена — {new_name}" if new_name else ""))
+    try:
+        await query.answer("Дежурство передано следующему по списку.")
+    except Exception:
+        pass
+    try:
+        await context.bot.send_message(
+            chat_id=int(uid),
+            text=("📋 Список обновлён: «%s» в конце списка.\nСегодня дежурят: %s"
+                  % (sick, ", ".join(str(n) for n in
+                     (getattr(class_obj, "duty_today", {}) or {}).get("names") or ["—"]))))
+    except Exception:
+        pass
+    today_names = [str(n) for n in
+                   (getattr(class_obj, "duty_today", {}) or {}).get("names") or []]
+    if skip_mode:
+        note = (f"🚫 {escape_html(sick)} сегодня не придёт — "
+                + (f"дежурит {escape_html(new_name)}." if new_name
+                   else "замены сегодня нет."))
+    else:
+        note = (f"🤒 {escape_html(sick)} заболел(а) — "
+                + (f"заменяет {escape_html(new_name)}." if new_name
+                   else "замены сегодня нет."))
+    if today_names:
+        await _duty_announce(context.bot, class_obj, today_names, sick_note=note)
     return MAIN_MENU
 
 
@@ -39751,8 +40587,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # и пункт «🤒 Я болел(а)» из «Ещё» (тот же поток, что у кнопки меню).
     elif data == "duty_list":
         return await duty_list_cb(update, context)
-    elif data == "duty_sick" or data.startswith("duty_sick_uid_"):
+    elif data == "duty_sick" or data.startswith("duty_sick_uid_") \
+            or data.startswith("duty_skip_uid_"):
         return await duty_sick_cb(update, context)
+    elif data.startswith("fhide_"):
+        # ВОЛНА 22.36: кнопка «🙈 Скрыть» под файлом, отправленным мини-аппом
+        return await miniapp_hide_file_cb(update, context)
+    elif data.startswith("duty_cns_") or data.startswith("duty_cnn_"):
+        # ВОЛНА 22.36: «заболел(а)»/«не будет» для СВОЕГО графика (имена)
+        return await duty_custom_mark_cb(update, context)
     elif data == "more_sick":
         query_duty = update.callback_query
         _user_more = get_user(str(query_duty.from_user.id))
