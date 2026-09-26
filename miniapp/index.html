@@ -1065,10 +1065,10 @@ body.modal-open {
   opacity: 1;
 }
 
-/* === ВОЛНА 22.37: ПИЛЮЛЯ-ПРОГРЕСС СНИЗУ ЭКРАНА (стадион) ===
-   Небольшая «таблетка» в правом нижнем углу: во время загрузки/скачивания
-   показывает общий процент. Нажатие раскрывает список активных передач.
-   Центральный круговой прогресс в зоне загрузки удалён (просил пользователь). */
+/* === ВОЛНА 22.37/22.38: ПИЛЮЛЯ-ПРОГРЕСС СНИЗУ ЭКРАНА (стадион) ===
+   22.38: пилюля показывает ТОЛЬКО скачивания/синхронизации; ЗАГРУЗКИ
+   файлов вернулись В ЦЕНТР экрана (индикатор #uploadCenter). Тап по пилюле
+   раскрывает список передач с плавной анимацией, размытым фоном и SVG-иконками. */
 #transferPill {
   position: fixed;
   right: 14px;
@@ -1117,25 +1117,169 @@ body.modal-open {
   text-overflow: ellipsis;
 }
 
+/* ВОЛНА 22.38: размытый фон под раскрытой панелью передач */
+#transferScrim {
+  position: fixed;
+  inset: 0;
+  z-index: 91;
+  background: rgba(0, 0, 0, 0.28);
+  -webkit-backdrop-filter: blur(12px);
+  backdrop-filter: blur(12px);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.3s var(--ease-smooth);
+}
+
+#transferScrim.open {
+  opacity: 1;
+  pointer-events: auto;
+}
+
 #transferPanel {
   position: fixed;
   right: 14px;
   left: 14px;
   bottom: calc(16px + env(safe-area-inset-bottom, 0px));
-  z-index: 91;
+  z-index: 92;
   background: var(--card-bg);
+  background: color-mix(in srgb, var(--card-bg) 84%, transparent);
+  -webkit-backdrop-filter: blur(20px);
+  backdrop-filter: blur(20px);
   border: 1px solid var(--border-color);
   border-radius: 24px;
   box-shadow: 0 16px 44px rgba(0, 0, 0, 0.3);
   padding: 14px;
-  display: none;
+  display: block;
   max-height: 46vh;
   overflow-y: auto;
   -webkit-overflow-scrolling: touch;
   overscroll-behavior: contain;
+  opacity: 0;
+  transform: translateY(32px) scale(0.96);
+  pointer-events: none;
+  transition: opacity 0.28s var(--ease-smooth),
+              transform 0.45s var(--ease-spring);
 }
 
-#transferPanel.open { display: block; }
+#transferPanel.open {
+  opacity: 1;
+  transform: translateY(0) scale(1);
+  pointer-events: auto;
+}
+
+/* ВОЛНА 22.38: ЦЕНТРАЛЬНЫЙ индикатор ЗАГРУЗКИ файлов — вернули посередине
+   экрана (круговой кольцо как в оригинальном дизайне), пока пилюля осталась
+   для скачиваний */
+#uploadCenter {
+  position: fixed;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%) scale(0.9);
+  z-index: 95;
+  display: none;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 22px 28px;
+  border-radius: 26px;
+  background: var(--card-bg);
+  background: color-mix(in srgb, var(--card-bg) 92%, transparent);
+  -webkit-backdrop-filter: blur(16px);
+  backdrop-filter: blur(16px);
+  border: 1px solid var(--border-color);
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.35);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.3s var(--ease-smooth),
+              transform 0.45s var(--ease-spring);
+  max-width: 80vw;
+}
+
+#uploadCenter.visible {
+  display: flex;
+  opacity: 1;
+  transform: translate(-50%, -50%) scale(1);
+}
+
+#uploadCenter .uc-ring {
+  width: 58px;
+  height: 58px;
+  position: relative;
+}
+
+#uploadCenter .uc-ring > svg:first-child {
+  width: 58px;
+  height: 58px;
+  transform: rotate(-90deg);
+}
+
+#uploadCenter circle.uc-bg {
+  stroke: var(--loader-bg);
+  stroke-width: 6;
+  fill: none;
+}
+
+#uploadCenter circle.uc-bar {
+  stroke: var(--loader-bar);
+  stroke-width: 6;
+  fill: none;
+  stroke-dasharray: 157;
+  stroke-dashoffset: 157;
+  stroke-linecap: round;
+  transition: stroke-dashoffset 0.15s linear;
+}
+
+#uploadCenter .uc-pct {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 900;
+  color: var(--text-color);
+  font-variant-numeric: tabular-nums;
+}
+
+#uploadCenter .uc-name {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--subtext-color);
+  max-width: 210px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: center;
+}
+
+#uploadCenter .uc-cancel {
+  border: none;
+  background: var(--btn-bg);
+  color: var(--btn-text);
+  font-family: 'Nunito', sans-serif;
+  font-size: 11px;
+  font-weight: 900;
+  padding: 8px 18px;
+  border-radius: 9999px;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+#uploadCenter .uc-cancel:active { transform: scale(0.94); }
+
+/* SVG-иконки строк панели передач (22.38: вместо эмодзи) */
+.tp-ico {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  display: block;
+}
+
+.tp-ico svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
 
 .tp-row { margin-bottom: 12px; }
 .tp-row:last-child { margin-bottom: 2px; }
@@ -1491,8 +1635,8 @@ body.modal-open {
 
 #musicArt {
   width: 100%;
-  max-width: 300px;
-  max-height: 300px;
+  max-width: 320px;
+  max-height: 320px;
   aspect-ratio: 1 / 1;
   border-radius: 36px;
   overflow: hidden;
@@ -1513,6 +1657,20 @@ body.modal-open {
   width: 100%;
   height: 100%;
   object-fit: cover;
+}
+
+/* ВОЛНА 22.38: фолбэк-обложка — SVG пользователя (нота на тёмном фоне)
+   когда во встроенных метаданных аудио нет картинки */
+#musicArt .mm-fb {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+}
+
+#musicArt .mm-fb svg {
+  width: 100%;
+  height: 100%;
+  display: block;
 }
 
 #musicArtIcon { font-size: 84px; z-index: 1; }
@@ -1593,7 +1751,7 @@ body.modal-open {
 #musicModal .mm-btn:active { transform: scale(0.92); }
 
 #musicPlayBtn {
-  width: 68px; height: 68px;
+  width: 72px; height: 72px;
   border-radius: 9999px;
   background: #fff;
   color: #000;
@@ -2511,8 +2669,12 @@ body.modal-open {
 
 </div>
 
-<!-- ВОЛНА 22.37: пилюля-прогресс снизу (стадион): загрузки и скачивания.
-     Тап по пилюле раскрывает список активных передач -->
+<!-- ВОЛНА 22.37/22.38: пилюля-прогресс снизу (стадион) — СКАЧИВАНИЯ.
+     Загрузки файлов показываются ЦЕНТРАЛЬНЫМ индикатором (#uploadCenter).
+     Тап по пилюле раскрывает список передач (плавная анимация, размытый фон,
+     SVG-иконки) -->
+<div id="transferScrim" onclick="toggleTransferPanel(event)"></div>
+
 <div id="transferPill" onclick="toggleTransferPanel(event)">
   <span class="tp-spin"></span>
   <span id="tpLabel">Загрузка…</span>
@@ -2521,9 +2683,25 @@ body.modal-open {
 <div id="transferPanel" onclick="event.stopPropagation()">
   <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
     <div style="font-weight:900;font-size:14px;color:var(--text-color)">Передачи</div>
-    <button class="tp-cancel" onclick="toggleTransferPanel(event)" style="width:26px;height:26px">✕</button>
+    <button class="tp-cancel" onclick="toggleTransferPanel(event)" style="width:26px;height:26px" aria-label="Закрыть">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" style="width:12px;height:12px;display:block;margin:0 auto"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+    </button>
   </div>
   <div id="tpRows"></div>
+</div>
+
+<!-- ВОЛНА 22.38: ЦЕНТРАЛЬНЫЙ индикатор ЗАГРУЗКИ файлов (вернули посередине
+     экрана по просьбе пользователя); для скачиваний — пилюля снизу -->
+<div id="uploadCenter">
+  <div class="uc-ring">
+    <svg viewBox="0 0 60 60">
+      <circle class="uc-bg" cx="30" cy="30" r="25"></circle>
+      <circle class="uc-bar" id="ucBar" cx="30" cy="30" r="25"></circle>
+    </svg>
+    <div class="uc-pct" id="ucPct">0%</div>
+  </div>
+  <div class="uc-name" id="ucName">Загрузка…</div>
+  <button class="uc-cancel" onclick="ucCancel(event)">Отмена</button>
 </div>
 
 <div id="selectionBar">
@@ -5281,9 +5459,22 @@ function addMoreUploadFiles() {
 }
 
 function uploadFiles(fileList) {
-  const files = Array.from(fileList);
+  let files = Array.from(fileList);
 
   if (!files.length || isUploading) return;
+
+  /* ВОЛНА 22.38: пустые файлы (0 Б) не грузим вообще — «такого не должно
+     быть» (раньше они доходили до сервера и портами 0-байтовые записи) */
+  const empty = files.filter((f) => !+f.size);
+
+  if (empty.length) {
+    showToast('⚠️ Пустых файлов (0 Б): ' + empty.length +
+      ' — пропущены. Перекачайте их заново.');
+  }
+
+  files = files.filter((f) => +f.size);
+
+  if (!files.length) return;
 
   const modalOpen = !!(document.getElementById('uploadModal') || {}).classList &&
     document.getElementById('uploadModal').classList.contains('open');
@@ -5299,10 +5490,11 @@ function uploadFiles(fileList) {
   pickerAppend = false;
 }
 
-/* === ВОЛНА 22.37: РЕЕСТР ПЕРЕДАЧ (пилюля снизу справа) ===
-   Все загрузки и скачивания показываются одной маленькой пилюлей-«стадионом»
-   внизу экрана; тап раскрывает список активных передач. Центральный
-   круговой прогресс больше не используется (просил пользователь). */
+/* === ВОЛНА 22.37/22.38: РЕЕСТР ПЕРЕДАЧ ===
+   22.38: ЗАГРУЗКИ файлов показываются ЦЕНТРАЛЬНЫМ индикатором #uploadCenter
+   (вернули посередине экрана), СКАЧИВАНИЯ и синхронизации — маленькой пилюлей
+   снизу справа; тап раскрывает список передач (плавная анимация, размытый
+   фон, SVG-иконки). */
 const TRANSFERS = new Map();
 let _tpSeq = 0;
 let _tpRenderRaf = 0;
@@ -5364,6 +5556,11 @@ function tpPct(t) {
   return Math.min(99, Math.floor((t.got / t.size) * 100));
 }
 
+/* SVG-иконки строк панели (22.38: вместо эмодзи — просил пользователь) */
+const TP_ICO_UP = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5"/><path d="m5 12 7-7 7 7"/></svg>';
+const TP_ICO_DOWN = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14"/><path d="m19 12-7 7-7-7"/></svg>';
+const TP_ICO_OK = '<svg viewBox="0 0 24 24" fill="none" stroke="#22c55e" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>';
+
 function tpRender() {
   if (_tpRenderRaf) return;
   _tpRenderRaf = requestAnimationFrame(() => {
@@ -5373,47 +5570,91 @@ function tpRender() {
     const label = document.getElementById('tpLabel');
     const panel = document.getElementById('transferPanel');
     const rows = document.getElementById('tpRows');
+    const scrim = document.getElementById('transferScrim');
+    const uc = document.getElementById('uploadCenter');
 
     if (!pill || !label || !panel || !rows) return;
 
     if (!TRANSFERS.size) {
       pill.classList.remove('visible');
       panel.classList.remove('open');
+      if (scrim) scrim.classList.remove('open');
+      if (uc) uc.classList.remove('visible');
       return;
     }
 
-    let sumGot = 0;
-    let sumSize = 0;
+    let upGot = 0, upSize = 0, downGot = 0, downSize = 0;
+    let upsActive = 0, downsActive = 0, upCur = null;
 
     TRANSFERS.forEach((t) => {
-      sumGot += t.done ? (t.size || t.got) : t.got;
-      sumSize += t.size || 0;
+      const got = t.done ? (t.size || t.got) : t.got;
+
+      if (t.kind === 'up') {
+        upGot += got;
+        upSize += t.size || 0;
+
+        if (!t.done) {
+          upsActive++;
+
+          if (!upCur) upCur = t;
+        }
+      } else {
+        downGot += got;
+        downSize += t.size || 0;
+
+        if (!t.done) downsActive++;
+      }
     });
 
-    const overall = sumSize ? Math.min(100, Math.round((sumGot / sumSize) * 100)) : 0;
-    const ups = [...TRANSFERS.values()].filter((t) => t.kind === 'up' && !t.done).length;
-    const downs = [...TRANSFERS.values()].filter((t) => t.kind === 'down' && !t.done).length;
+    /* --- ЦЕНТРАЛЬНЫЙ индикатор ЗАГРУЗКИ (22.38: вернули посередине) --- */
+    if (uc) {
+      if (upsActive) {
+        const pct = upSize ? Math.min(99, Math.floor((upGot / upSize) * 100)) : 0;
+        const bar = document.getElementById('ucBar');
+        const pctEl = document.getElementById('ucPct');
+        const nameEl = document.getElementById('ucName');
 
-    label.textContent = (ups && downs) ? `↕ ${overall}%`
-      : ups ? `Загрузка ${overall}%`
-      : downs ? `Скачивание ${overall}%`
-      : `Готово ${overall}%`;
+        if (bar) bar.style.strokeDashoffset = String(157 - 157 * pct / 100);
+        if (pctEl) pctEl.textContent = pct + '%';
+        if (nameEl && upCur) nameEl.textContent = upCur.name || 'Загрузка…';
 
-    pill.classList.add('visible');
+        uc.classList.add('visible');
+      } else {
+        uc.classList.remove('visible');
+      }
+    }
+
+    /* --- ПИЛЮЛЯ СНИЗУ — только СКАЧИВАНИЯ/синхронизации (22.38) --- */
+    if (!downSize && !downsActive) {
+      pill.classList.remove('visible');
+      if (!panel.classList.contains('open') && scrim) {
+        scrim.classList.remove('open');
+      }
+    } else {
+      const overall = downSize ? Math.min(100, Math.round((downGot / downSize) * 100)) : 0;
+
+      label.textContent = downsActive ? `Скачивание ${overall}%` : `Готово ${overall}%`;
+
+      pill.classList.add('visible');
+    }
 
     let html = '';
 
     TRANSFERS.forEach((t, id) => {
       const pct = tpPct(t);
-      const icon = t.kind === 'down' ? '⬇️' : '⬆️';
+      const ico = t.kind === 'down' ? TP_ICO_DOWN : TP_ICO_UP;
+      const icoHtml = t.done ? TP_ICO_OK
+        : `<span class="tp-ico" style="color:var(--subtext-color)">${ico}</span>`;
 
       html += '<div class="tp-row' + (t.done ? ' tp-done' : '') + '">' +
         '<div class="tp-row-top">' +
-        '<span>' + icon + '</span>' +
+        icoHtml +
         '<span class="tp-name">' + escapeHtml(t.name) + '</span>' +
         '<span>' + (t.done ? '✓' : pct + '%') + '</span>' +
         (t.done || t.kind !== 'up' ? '' :
-          '<button class="tp-cancel" onclick="tpCancelTransfer(\'' + id + '\')">✕</button>') +
+          '<button class="tp-cancel" onclick="tpCancelTransfer(\'' + id + '\')">' +
+          '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.2" stroke-linecap="round" style="width:10px;height:10px;display:block;margin:0 auto"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>' +
+          '</button>') +
         '</div>' +
         '<div class="tp-track"><div class="tp-fill" style="width:' + pct + '%"></div></div>' +
         '</div>';
@@ -5434,10 +5675,36 @@ function toggleTransferPanel(e) {
   if (e) e.stopPropagation();
 
   const panel = document.getElementById('transferPanel');
+  const scrim = document.getElementById('transferScrim');
 
   if (panel) {
     panel.classList.toggle('open');
+
+    if (scrim) scrim.classList.toggle('open', panel.classList.contains('open'));
+
     tpRender();
+  }
+}
+
+/* ВОЛНА 22.38: отмена текущей загрузки из центрального индикатора */
+function ucCancel(e) {
+  if (e) e.stopPropagation();
+
+  let cancelled = false;
+
+  TRANSFERS.forEach((t, id) => {
+    if (cancelled || t.done || t.kind !== 'up') return;
+
+    if (typeof t.cancel === 'function') t.cancel();
+    else tpDrop(id);
+
+    cancelled = true;
+  });
+
+  if (!cancelled) {
+    const uc = document.getElementById('uploadCenter');
+
+    if (uc) uc.classList.remove('visible');
   }
 }
 
@@ -6635,6 +6902,17 @@ let mPlaying = false;
 let mInterval = null;
 let mMeta = null;   /* {title, artist, coverUrl} */
 
+/* ВОЛНА 22.38: обложка-фолбэк — SVG пользователя (нота на тёмном фоне),
+   если во встроенных метаданных аудио (ID3 APIC) нет картинки */
+const M_FALLBACK_COVER_SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 500 500" width="100%" height="100%">' +
+  '<rect width="500" height="500" rx="32" fill="#121318" />' +
+  '<g fill="none" stroke="#5c6079" stroke-width="12" stroke-linecap="round" stroke-linejoin="round">' +
+  '<path d="M 270 160 V 290" />' +
+  '<path d="M 270 160 C 310 160, 330 180, 330 200" />' +
+  '<circle cx="230" cy="300" r="40" fill="#5c6079" />' +
+  '</g>' +
+  '</svg>';
+
 const M_PALETTES = [
   { grad: 'linear-gradient(135deg, #4285f4, #9b72f2)', bg: '#0b1120', glow: '#4285f4' },
   { grad: 'linear-gradient(135deg, #f4a142, #f442a1)', bg: '#200e13', glow: '#f4a142' },
@@ -6783,8 +7061,9 @@ function mApplyMeta() {
   document.getElementById('musicArtist').textContent =
     (mMeta && mMeta.artist) || 'DEVO+ Облако';
 
-  /* обложка: из аудио пользователя, иначе — градиент по имени файла */
-  art.querySelectorAll('img').forEach((i) => i.remove());
+  /* обложка: из аудио пользователя (ID3 APIC); если её нет — SVG-иконка
+     ноты на тёмном фоне (прислана пользователем, ВОЛНА 22.38) */
+  art.querySelectorAll('img, .mm-fb').forEach((i) => i.remove());
 
   if (mMeta && mMeta.coverUrl) {
     const img = document.createElement('img');
@@ -6792,14 +7071,19 @@ function mApplyMeta() {
     img.src = mMeta.coverUrl;
     art.appendChild(img);
     icon.style.display = 'none';
+    art.style.background = '#121318';
   } else {
-    icon.style.display = 'block';
-    icon.textContent = '🎵';
+    icon.style.display = 'none';
+
+    const fb = document.createElement('div');
+
+    fb.className = 'mm-fb';
+    fb.innerHTML = M_FALLBACK_COVER_SVG;
+    art.appendChild(fb);
+    art.style.background = '#121318';
   }
 
   const pal = (mMeta && mMeta.palette) || M_PALETTES[0];
-
-  if (!mMeta || !mMeta.coverUrl) art.style.background = pal.grad;
 
   document.getElementById('musicModal').style.background = pal.bg;
   document.getElementById('musicGlow').style.background = pal.glow;
