@@ -11,6 +11,7 @@ import secrets  # ВОЛНА 22.29: токены веб-сессий (token_urls
 import time
 import threading
 import zipfile
+import collections  # ВОЛНА 22.35: окно очереди публикаций в канал (deque)
 from datetime import datetime, timedelta, timezone, time as dt_time, date
 import asyncio
 try:
@@ -514,6 +515,11 @@ WEB_PW_ENTER_OLD = 151     # смена веб-пароля: сначала СТ
 DND_WAIT_TIME = 152        # «🌙 Не беспокоить»: ввод времени «со скольки»/«до скольки»
 SICK_WAIT_FROM = 153       # «🤒 Я болел(а)»: дата начала (ГГГГ-ММ-ДД)
 SICK_WAIT_TO = 154         # «🤒 Я болел(а)»: дата конца (ГГГГ-ММ-ДД)
+
+# ВОЛНА 22.35: СВОЙ график дежурств — админ присылает список имён
+# (ИИ строит ротацию) либо список с датами (ИИ раскладывает по датам).
+DUTY_CUSTOM_AI = 155       # ждём список имён для ИИ-составления графика
+DUTY_CUSTOM_DATES = 156    # ждём список «дата — имена» (числа дежурств)
 
 # ВОЛНА 22.4: «🎙 Пульт» удалён ПОЛНОСТЬЮ по решению пользователя — кнопки,
 # состояний (бывшие 126–131), хендлеров и хранилищ стилей больше нет.
@@ -2768,6 +2774,11 @@ class Class:
         self.duty_excluded = []          # временно вне ротации
         self.duty_today = None           # {"date": "YYYY-MM-DD", "ids": [uid,…]}
         self.duty_last_date = None       # дата последнего утреннего объявления (антидубль)
+        # ВОЛНА 22.35: СВОЙ график дежурств — имена БЕЗ привязки к ТГ-аккаунтам.
+        # {"names": [...], "plan": {"YYYY-MM-DD": ["Имя", …], …}} или None.
+        # Утром бот просто присылает имена из плана («сегодня дежурит тот или
+        # такоже»); план строит ИИ по списку, либо админ присылает даты сам.
+        self.duty_custom = None
 
     def to_dict(self):
         return {
@@ -2798,6 +2809,8 @@ class Class:
             'duty_excluded': list(getattr(self, 'duty_excluded', []) or []),
             'duty_today': getattr(self, 'duty_today', None),
             'duty_last_date': getattr(self, 'duty_last_date', None),
+            # ВОЛНА 22.35: свой график (имена без ТГ-аккаунтов)
+            'duty_custom': getattr(self, 'duty_custom', None),
         }
 
     @classmethod
@@ -2818,6 +2831,13 @@ class Class:
             class_obj.duty_excluded = []
         if not isinstance(getattr(class_obj, 'duty_today', None), dict):
             class_obj.duty_today = None
+        # ВОЛНА 22.35: свой график — старые классы без поля не падают.
+        dc = getattr(class_obj, 'duty_custom', None)
+        if not isinstance(dc, dict) or not isinstance(dc.get('plan', {}), dict):
+            class_obj.duty_custom = None if not isinstance(dc, dict) else {
+                'names': [str(n)[:60] for n in (dc.get('names') or [])][:200],
+                'plan': {},
+            }
         try:
             class_obj.duty_count = max(1, min(3, int(getattr(class_obj, 'duty_count', 1) or 1)))
         except (TypeError, ValueError):
@@ -3538,7 +3558,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.34"
+BOT_BUILD = "22.35"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -6152,6 +6172,80 @@ async def _storage_check_channel(context, channel_id):
     return True, None, chat.title or ""
 
 
+# --- ВОЛНА 22.35: «ШЛАГБАУМ» ПУБЛИКАЦИЙ В КАНАЛ (защита от блокировки) ---
+# Telegram ограничивает частые посты в один канал (~20/мин, дальше RetryAfter,
+# при систематическом шторме — блокировка канала). Мини-апп позволяет грузить
+# много файлов сразу, поэтому ЛЮБАЯ публикация в канал-хранилище идёт через
+# очередь: не чаще _PUB_MIN_GAP между постами, не больше _PUB_WINDOW_MAX в
+# скользящем окне, RetryAfter — честная пауза всего канала + один повтор.
+_PUB_GATES = {}          # channel_id -> {"lock", "wins", "pause_until", "waiters"}
+_PUB_MIN_GAP = 2.6       # минимальная пауза между постами в ОДИН канал, сек
+_PUB_WINDOW = 62.0       # скользящее окно, сек
+_PUB_WINDOW_MAX = 20     # максимум постов в окно (с запасом ниже лимита ТГ)
+
+
+def _pub_gate_state(channel_id):
+    st = _PUB_GATES.get(int(channel_id))
+    if st is None:
+        st = {"lock": asyncio.Lock(), "wins": collections.deque(),
+              "pause_until": 0.0, "waiters": 0}
+        _PUB_GATES[int(channel_id)] = st
+    return st
+
+
+async def _pub_send(channel_id, coro_factory):
+    """Публикует сообщение в канал через очередь (см. блок выше).
+    coro_factory — функция без аргументов, создающая coroutine отправки
+    (вызывается заново на каждый попытки, чтобы не переиспользовать корутину).
+    Возвращает результат отправки; поле _queue_pos вНаружу отдаёт отдельным
+    возвратом через атрибут результата — проще: возвращаем (result, queue_pos)."""
+    st = _pub_gate_state(channel_id)
+    st["waiters"] += 1
+    queue_pos = st["waiters"]
+    try:
+        await st["lock"].acquire()
+        try:
+            last_err = None
+            for attempt in (1, 2):
+                # 1) пауза канала после RetryAfter
+                while True:
+                    now = time.time()
+                    if now >= st["pause_until"]:
+                        break
+                    await asyncio.sleep(min(5.0, st["pause_until"] - now) + 0.05)
+                # 2) скользящее окно + минимальный зазор
+                while True:
+                    now = time.time()
+                    while st["wins"] and now - st["wins"][0] > _PUB_WINDOW:
+                        st["wins"].popleft()
+                    if len(st["wins"]) >= _PUB_WINDOW_MAX:
+                        await asyncio.sleep(max(0.2, st["wins"][0] + _PUB_WINDOW - now))
+                        continue
+                    if st["wins"] and now - st["wins"][-1] < _PUB_MIN_GAP:
+                        await asyncio.sleep(_PUB_MIN_GAP - (now - st["wins"][-1]))
+                        continue
+                    break
+                # 3) сама отправка
+                try:
+                    result = await coro_factory()
+                    st["wins"].append(time.time())
+                    return result, queue_pos
+                except TGRetryAfter as e:
+                    ra = float(getattr(e, "retry_after", 5) or 5)
+                    st["pause_until"] = time.time() + ra + 1.5
+                    last_err = e
+                    logger.warning(
+                        f"pub-gate: канал {channel_id} попросил паузу {ra} с")
+                    if attempt == 2:
+                        raise
+                    await asyncio.sleep(ra + 1.5)
+            raise last_err or RuntimeError("pub-gate: исчерпаны попытки")
+        finally:
+            st["lock"].release()
+    finally:
+        st["waiters"] = max(0, st["waiters"] - 1)
+
+
 async def _storage_upload_document(context, data: bytes, filename: str, caption: str = "",
                                    channel_id=None, user=None):
     """Загружает документ в канал-хранилище.
@@ -6160,7 +6254,10 @@ async def _storage_upload_document(context, data: bytes, filename: str, caption:
     cloud-каналы (указатель cloud_rr в конфиге), при ошибке пробуем следующий.
     ВОЛНА 22.20: если у user подключён ЛИЧНЫЙ канал («🔗 Моё облако») и
     channel_id не задан явно — шифр уходит ТОЛЬКО в него, минуя общие каналы.
-    Возвращает ({"message_id", "file_id", "size", "channel_id"}) или None."""
+    ВОЛНА 22.35: каждая публикация идёт через «шлагбаум» _pub_send — не чаще
+    пары сообщений в минуту НА КАНАЛ и с честной паузой по RetryAfter, иначе
+    при массовых загрузках Telegram ограничивает/блокирует канал.
+    Возвращает ({"message_id", "file_id", "size", "channel_id", "queue_pos"}) или None."""
     if channel_id:
         targets = [int(channel_id)]
     else:
@@ -6180,10 +6277,14 @@ async def _storage_upload_document(context, data: bytes, filename: str, caption:
             targets = cloud_ids[rr % len(cloud_ids):] + cloud_ids[:rr % len(cloud_ids)]
     for idx, ch in enumerate(targets):
         try:
-            sent = await context.bot.send_document(
-                chat_id=ch,
-                document=InputFile(data, filename=filename or "file.bin"),
-                caption=(caption or "")[:1024] or None,
+            # ВОЛНА 22.35: публикация через «шлагбаум» — очередь на канал
+            sent, queue_pos = await _pub_send(
+                ch,
+                lambda ch=ch: context.bot.send_document(
+                    chat_id=ch,
+                    document=InputFile(data, filename=filename or "file.bin"),
+                    caption=(caption or "")[:1024] or None,
+                ),
             )
             doc = getattr(sent, "document", None)
             # Продвигаем указатель круговой загрузки (только общий путь).
@@ -6203,6 +6304,7 @@ async def _storage_upload_document(context, data: bytes, filename: str, caption:
                 "file_id": getattr(doc, "file_id", None),
                 "size": int(getattr(doc, "file_size", 0) or len(data) or 0),
                 "channel_id": ch,
+                "queue_pos": queue_pos,
             }
         except Exception as e:
             logger.error(f"storage: загрузка документа в канал {ch} не удалась: {e}")
@@ -7990,6 +8092,10 @@ MINIAPP_HTML = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
 <title>DEVO+ Облако</title>
 
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="dns-prefetch" href="https://unpkg.com">
+
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <script>
 (function () {
@@ -8088,64 +8194,89 @@ MINIAPP_HTML = r"""<!DOCTYPE html>
 <script src="https://unpkg.com/lucide@latest"></script>
 
 <style>
+/* ============================================================
+   МАКСИМАЛЬНАЯ ПЛАВНОСТЬ
+   ============================================================ */
+
+/* Плавная смена темы через View Transitions (см. applyTheme в JS):
+   старый кадр снимается в текстуру и растворяется в новый — смена цветов
+   идёт на композиторе, БЕЗ пересчёта стилей страницы каждый кадр.
+   Анимация CSS-переменных через @property пересчитывала ВСЮ страницу
+   каждый кадр и лагала на телефонах — заменено. */
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation-duration: 0.3s;
+  animation-timing-function: cubic-bezier(0.25, 1, 0.5, 1);
+}
+
 :root {
   --bg-color: #f8f9fa;
   --bg-gradient: none;
   --text-color: #0d0d0d;
-  --card-bg: rgba(255, 255, 255, 0.8);
-  --card-active: rgba(240, 242, 245, 0.9);
-  --stat-bg: rgba(255, 255, 255, 0.8);
+  --card-bg: #ffffff;
+  --card-active: #f0f2f5;
+  --stat-bg: #ffffff;
   --btn-bg: #000000;
   --btn-text: #ffffff;
-  --border-color: rgba(226, 232, 240, 0.85);
+  --border-color: #e2e8f0;
   --subtext-color: #64748b;
-  --drop-bg: rgba(241, 245, 249, 0.7);
-  --drop-active: rgba(226, 232, 240, 0.85);
+  --drop-bg: #f1f5f9;
+  --drop-active: #e2e8f0;
   --dropdown-bg: #ffffff;
   --loader-bg: #cbd5e1;
   --loader-bar: #000000;
   --blob-1: #60a5fa;
   --blob-2: #c084fc;
+  --overlay-bg: rgba(255, 255, 255, 0.42);
+
+  --ease-ultra: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-smooth: cubic-bezier(0.25, 1, 0.5, 1);
+  --ease-snap: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-in-out: cubic-bezier(0.4, 0, 0.2, 1);
+  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
 }
 
 [data-theme="dark"] {
   --bg-color: #121212;
   --bg-gradient: none;
   --text-color: #ffffff;
-  --card-bg: rgba(30, 30, 32, 0.8);
-  --card-active: rgba(42, 42, 45, 0.9);
-  --stat-bg: rgba(24, 24, 26, 0.8);
+  --card-bg: #1e1e20;
+  --card-active: #2a2a2d;
+  --stat-bg: #18181a;
   --btn-bg: #ffffff;
   --btn-text: #000000;
-  --border-color: rgba(46, 46, 50, 0.85);
+  --border-color: #2e2e32;
   --subtext-color: #aaaaaa;
-  --drop-bg: rgba(34, 34, 37, 0.7);
-  --drop-active: rgba(44, 44, 48, 0.85);
+  --drop-bg: #222225;
+  --drop-active: #2c2c30;
   --dropdown-bg: #1e1e20;
   --loader-bg: #444448;
   --loader-bar: #ffffff;
   --blob-1: #3b82f6;
   --blob-2: #9333ea;
+  --overlay-bg: rgba(10, 12, 18, 0.55);
 }
 
 [data-theme="custom"] {
   --bg-color: var(--custom-bg1, #4f46e5);
   --bg-gradient: linear-gradient(var(--custom-angle, 135deg), var(--custom-bg1, #4f46e5), var(--custom-bg2, #9333ea));
   --text-color: #ffffff;
-  --card-bg: rgba(255, 255, 255, 0.18);
-  --card-active: rgba(255, 255, 255, 0.28);
-  --stat-bg: rgba(255, 255, 255, 0.15);
+  --card-bg: rgba(0, 0, 0, 0.55);
+  --card-active: rgba(0, 0, 0, 0.65);
+  --stat-bg: rgba(0, 0, 0, 0.55);
   --btn-bg: var(--custom-btn-bg, #ffffff);
   --btn-text: var(--custom-btn-text, #000000);
   --border-color: rgba(255, 255, 255, 0.3);
-  --subtext-color: rgba(255, 255, 255, 0.8);
-  --drop-bg: rgba(255, 255, 255, 0.12);
-  --drop-active: rgba(255, 255, 255, 0.22);
-  --dropdown-bg: #1e1e20;
-  --loader-bg: rgba(255, 255, 255, 0.3);
+  --subtext-color: rgba(255, 255, 255, 0.85);
+  --drop-bg: rgba(0, 0, 0, 0.5);
+  --drop-active: rgba(0, 0, 0, 0.6);
+  --dropdown-bg: rgba(30, 30, 32, 0.98);
+  --loader-bg: rgba(255, 255, 255, 0.5);
   --loader-bar: var(--custom-btn-bg, #ffffff);
   --blob-1: var(--custom-bg1, #4f46e5);
   --blob-2: var(--custom-bg2, #9333ea);
+  --overlay-bg: rgba(0, 0, 0, 0.45);
+  --overlay-bg: color-mix(in srgb, var(--bg-color) 45%, transparent);
 }
 
 * {
@@ -8178,26 +8309,16 @@ body {
   background: var(--bg-gradient, var(--bg-color));
   background-color: var(--bg-color);
   color: var(--text-color);
-  transition: background-color 0.35s cubic-bezier(0.25, 1, 0.5, 1), color 0.35s cubic-bezier(0.25, 1, 0.5, 1);
   position: relative;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-}
-
-/* Плавное переключение темы: класс на 600 мс включает переход цветов у всех элементов */
-html.theme-anim body,
-html.theme-anim body * {
-  transition:
-    background-color 0.45s cubic-bezier(0.4, 0, 0.2, 1),
-    background 0.45s cubic-bezier(0.4, 0, 0.2, 1),
-    color 0.45s cubic-bezier(0.4, 0, 0.2, 1),
-    border-color 0.45s cubic-bezier(0.4, 0, 0.2, 1),
-    fill 0.45s cubic-bezier(0.4, 0, 0.2, 1),
-    stroke 0.45s cubic-bezier(0.4, 0, 0.2, 1) !important;
+  overscroll-behavior-y: contain;
 }
 
 button {
   touch-action: manipulation;
+  -webkit-user-select: none;
+  user-select: none;
 }
 
 body.modal-open {
@@ -8205,8 +8326,6 @@ body.modal-open {
   touch-action: none;
 }
 
-/* Вспышка при успешной загрузке: только opacity на статичных радиальных градиентах —
-   без mix-blend-mode, blur и transform-анимаций, чтобы не грузить GPU на телефонах */
 .theme-flash {
   position: fixed;
   inset: 0;
@@ -8214,17 +8333,18 @@ body.modal-open {
   pointer-events: none;
   opacity: 0;
   will-change: opacity;
+  
 }
 
 .theme-flash.active {
-  animation: themeFlash 0.9s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  animation: themeFlash 1.2s var(--ease-ultra) forwards;
 }
 
 @keyframes themeFlash {
   0% { opacity: 0; }
-  18% { opacity: 0.5; }
-  45% { opacity: 0.3; }
-  70% { opacity: 0.4; }
+  15% { opacity: 0.4; }
+  40% { opacity: 0.25; }
+  65% { opacity: 0.35; }
   100% { opacity: 0; }
 }
 
@@ -8233,7 +8353,8 @@ body.modal-open {
   content: '';
   position: absolute;
   border-radius: 50%;
-  will-change: opacity;
+  will-change: opacity, transform;
+  
 }
 
 .theme-flash::before {
@@ -8261,48 +8382,46 @@ body.modal-open {
   z-index: 0;
   pointer-events: none;
   overflow: hidden;
-  transition: opacity 0.5s ease;
+  transition: opacity 0.8s var(--ease-smooth);
   will-change: opacity;
+  contain: layout style paint;
 }
 
-/* Блоб-обёртка двигается через transform (дёшево для GPU),
-   а blur висит на статичном внутреннем слое — текстура размытия не пересчитывается каждый кадр */
 .blob {
   position: absolute;
   border-radius: 50%;
-  opacity: 0.65;
+  opacity: 0.75;
   will-change: transform;
-  transform: translateZ(0);
 }
 
+/* Мягкий радиальный градиент вместо filter: blur(90px) —
+   выглядит так же, но в разы дешевле для GPU */
 .blob-core {
   position: absolute;
   inset: 0;
   border-radius: 50%;
-  filter: blur(90px);
-  will-change: filter;
 }
 
 .blob-1 {
-  width: 320px;
-  height: 320px;
+  width: 360px;
+  height: 360px;
   top: 20%;
   left: 10%;
 }
 
 .blob-1 .blob-core {
-  background: var(--blob-1);
+  background: radial-gradient(closest-side, var(--blob-1), transparent 72%);
 }
 
 .blob-2 {
-  width: 360px;
-  height: 360px;
+  width: 400px;
+  height: 400px;
   bottom: 20%;
   right: 10%;
 }
 
 .blob-2 .blob-core {
-  background: var(--blob-2);
+  background: radial-gradient(closest-side, var(--blob-2), transparent 72%);
 }
 
 .main-wrapper {
@@ -8323,36 +8442,40 @@ body.modal-open {
   color: var(--text-color);
   font-size: 32px;
   line-height: 1;
-  transition: color 0.35s ease;
 }
 
 .toast-msg {
-  animation: fadeInOut 3.5s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  animation: fadeInOut 4s var(--ease-ultra) forwards;
   will-change: transform, opacity;
+  
+
 }
 
 @keyframes fadeInOut {
-  0% { opacity: 0; transform: translateY(15px); }
-  15% { opacity: 1; transform: translateY(0); }
-  85% { opacity: 1; transform: translateY(0); }
-  100% { opacity: 0; transform: translateY(10px); }
+  0% { opacity: 0; transform: translateY(20px) scale(0.95); }
+  12% { opacity: 1; transform: translateY(0) scale(1); }
+  88% { opacity: 1; transform: translateY(0) scale(1); }
+  100% { opacity: 0; transform: translateY(8px) scale(0.98); }
 }
 
+/* Виртуализация на уровне КАРТОЧКИ, а не всего списка:
+   offscreen-карточки не рендерятся, оценка высоты одной карточки точна —
+   скроллбар не прыгает (контейнерная оценка 500px давала скачки при прокрутке) */
 .file-card {
   background: var(--card-bg);
   border: 1px solid var(--border-color);
   border-radius: 20px;
   cursor: pointer;
-  backdrop-filter: blur(14px);
-  -webkit-backdrop-filter: blur(14px);
   padding: 12px 14px;
-  transition: transform 0.18s cubic-bezier(0.2, 0.8, 0.2, 1), background 0.35s ease, border-color 0.35s ease;
-  will-change: transform;
-  transform: translateZ(0);
+  transition: transform 0.18s var(--ease-spring);
+  contain: layout style;
+  content-visibility: auto;
+  contain-intrinsic-size: auto 72px;
+  touch-action: manipulation;
 }
 
 .file-card:active {
-  transform: scale(0.98) translateZ(0);
+  transform: scale(0.97);
   background: var(--card-active);
 }
 
@@ -8365,8 +8488,6 @@ body.modal-open {
   display: flex;
   align-items: center;
   justify-content: center;
-  transition: background 0.35s ease, color 0.35s ease;
-  will-change: background-color, color;
 }
 
 .action-btn {
@@ -8380,14 +8501,13 @@ body.modal-open {
   color: var(--btn-text);
   border: none;
   cursor: pointer;
-  transition: transform 0.16s cubic-bezier(0.2, 0.8, 0.2, 1), background 0.35s ease, color 0.35s ease;
-  will-change: transform;
-  transform: translateZ(0);
+  transition: transform 0.15s var(--ease-spring);
+  touch-action: manipulation;
 }
 
 .action-btn:active {
-  transform: scale(0.92) translateZ(0);
-  opacity: 0.8;
+  transform: scale(0.88);
+  opacity: 0.85;
 }
 
 .chip {
@@ -8399,21 +8519,18 @@ body.modal-open {
   font-size: 14px;
   border: 1px solid var(--border-color);
   cursor: pointer;
-  backdrop-filter: blur(10px);
-  -webkit-backdrop-filter: blur(10px);
-  transition: transform 0.16s cubic-bezier(0.2, 0.8, 0.2, 1), background 0.35s ease, color 0.35s ease, border-color 0.35s ease;
+  transition: transform 0.15s var(--ease-spring);
   white-space: nowrap;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   gap: 6px;
   flex-shrink: 0;
-  will-change: transform;
-  transform: translateZ(0);
+  touch-action: manipulation;
 }
 
 .chip:active {
-  transform: scale(0.95) translateZ(0);
+  transform: scale(0.93);
 }
 
 .chip.active {
@@ -8441,11 +8558,8 @@ body.modal-open {
   position: relative;
   border: 1.5px solid var(--border-color);
   background: var(--card-bg);
-  backdrop-filter: blur(10px);
-  -webkit-backdrop-filter: blur(10px);
   border-radius: 9999px;
   padding: 8px 16px 8px 40px;
-  transition: border-color 0.35s ease, background 0.35s ease;
 }
 
 .search-box input {
@@ -8477,16 +8591,13 @@ body.modal-open {
   justify-content: center;
   min-height: 110px;
   position: relative;
-  backdrop-filter: blur(10px);
-  -webkit-backdrop-filter: blur(10px);
-  transition: transform 0.18s cubic-bezier(0.2, 0.8, 0.2, 1), background 0.35s ease;
+  transition: transform 0.2s var(--ease-spring);
   margin-bottom: 12px;
-  will-change: transform;
-  transform: translateZ(0);
+  touch-action: manipulation;
 }
 
 .drop-zone:active {
-  transform: scale(0.99) translateZ(0);
+  transform: scale(0.98);
   background: var(--drop-active);
 }
 
@@ -8506,6 +8617,7 @@ body.modal-open {
   text-align: center;
   display: none;
   word-break: break-word;
+
 }
 
 .download-progress-wrap {
@@ -8515,7 +8627,7 @@ body.modal-open {
   justify-content: center;
   gap: 8px;
   opacity: 0;
-  transition: opacity 0.35s ease;
+  transition: opacity 0.5s var(--ease-smooth);
 }
 
 .download-progress-wrap.active {
@@ -8531,6 +8643,7 @@ body.modal-open {
   align-items: center;
   justify-content: center;
   cursor: pointer;
+  
 }
 
 .drop-loader svg {
@@ -8555,7 +8668,7 @@ body.modal-open {
   stroke-dasharray: 157;
   stroke-dashoffset: 157;
   stroke-linecap: round;
-  transition: stroke-dashoffset 0.2s linear, stroke 0.35s ease;
+  transition: stroke-dashoffset 0.15s linear;
 }
 
 .drop-loader circle.bar.success {
@@ -8570,13 +8683,14 @@ body.modal-open {
   left: 0;
   pointer-events: none;
   opacity: 0;
-  transition: opacity 0.25s ease;
+  transition: opacity 0.4s var(--ease-smooth);
+  
 }
 
 .checkmark-svg path {
   stroke-dasharray: 60;
   stroke-dashoffset: 60;
-  transition: stroke-dashoffset 0.5s cubic-bezier(0.65, 0, 0.35, 1);
+  transition: stroke-dashoffset 0.7s var(--ease-ultra);
 }
 
 .checkmark-svg.show {
@@ -8593,13 +8707,14 @@ body.modal-open {
   background: var(--btn-bg);
   border-radius: 4px;
   position: absolute;
-  transition: transform 0.3s ease, opacity 0.3s ease;
+  transition: transform 0.3s var(--ease-smooth), opacity 0.3s var(--ease-smooth);
 }
 
 .download-text {
   font-weight: 800;
   font-size: 13px;
   color: var(--subtext-color);
+
 }
 
 .files-container {
@@ -8613,31 +8728,32 @@ body.modal-open {
   display: none;
 }
 
+/* Dropdown */
 .dropdown-menu {
   position: absolute;
   top: calc(100% + 10px);
   right: 0;
-  background: var(--card-bg);
+  background: var(--dropdown-bg);
   border: 1px solid var(--border-color);
   border-radius: 20px;
-  box-shadow: 0 15px 35px rgba(0, 0, 0, 0.18);
+  box-shadow: 0 15px 35px rgba(0, 0, 0, 0.25);
   padding: 10px;
   min-width: 260px;
   z-index: 30;
   opacity: 0;
   pointer-events: none;
-  transform: translateY(-8px) scale(0.96) translateZ(0);
-  transition: transform 0.22s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.18s ease, background 0.35s ease;
+  transform: translateY(-12px) scale(0.94);
+  transition: transform 0.35s var(--ease-spring), opacity 0.3s var(--ease-smooth);
   transform-origin: top right;
-  backdrop-filter: blur(14px);
-  -webkit-backdrop-filter: blur(14px);
   will-change: transform, opacity;
+
+  contain: layout style;
 }
 
 .dropdown-menu.open {
   opacity: 1;
   pointer-events: auto;
-  transform: translateY(0) scale(1) translateZ(0);
+  transform: translateY(0) scale(1);
 }
 
 .sound-item-btn {
@@ -8657,9 +8773,8 @@ body.modal-open {
   justify-content: space-between;
   gap: 10px;
   margin-bottom: 6px;
-  transition: transform 0.16s ease, background-color 0.35s ease, color 0.35s ease, border-color 0.35s ease;
-  will-change: transform;
-  transform: translateZ(0);
+  transition: transform 0.15s var(--ease-spring);
+  touch-action: manipulation;
 }
 
 .sound-item-btn:last-child {
@@ -8667,7 +8782,7 @@ body.modal-open {
 }
 
 .sound-item-btn:active {
-  transform: scale(0.98) translateZ(0);
+  transform: scale(0.97);
 }
 
 .sound-item-btn.active-sound {
@@ -8685,6 +8800,7 @@ body.modal-open {
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
+  
 }
 
 .check-circle-icon svg {
@@ -8724,6 +8840,8 @@ body.modal-open {
   border: 2px solid var(--border-color);
   overflow: hidden;
   cursor: pointer;
+  
+  transition: border-color 0.4s var(--ease-ultra);
 }
 
 .color-picker-wrap input[type="color"] {
@@ -8737,32 +8855,56 @@ body.modal-open {
   background: none;
 }
 
+/* Modal overlay.
+   Никакой анимации opacity: пока прозрачность оверлея < 1, движок считает его
+   backdrop-root'ом и blur «не видит» страницу — размытие включалось рывком
+   в самом конце fade-in. Вместо этого с первого кадра плавно разгоняется сам
+   радиус blur (0 -> 14px), а подложка проявляется через background-color. */
 .modal-overlay {
   position: fixed;
   top: 0;
   left: 0;
   right: 0;
   bottom: 0;
-  background: rgba(0, 0, 0, 0.5);
-  backdrop-filter: blur(8px);
-  -webkit-backdrop-filter: blur(8px);
+  background: transparent;
   z-index: 100;
   display: flex;
   align-items: flex-end;
   justify-content: center;
-  opacity: 0;
   pointer-events: none;
-  transition: opacity 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+  visibility: hidden;
+  overflow: hidden;
   overscroll-behavior: contain;
   touch-action: none;
-  will-change: opacity;
+  backdrop-filter: blur(0px) saturate(100%);
+  -webkit-backdrop-filter: blur(0px) saturate(100%);
+  transition:
+    backdrop-filter 0.4s var(--ease-smooth),
+    -webkit-backdrop-filter 0.4s var(--ease-smooth),
+    background-color 0.35s var(--ease-smooth),
+    visibility 0s linear 0.45s;
 }
 
 .modal-overlay.open {
-  opacity: 1;
   pointer-events: auto;
+  visibility: visible;
+  background: var(--overlay-bg, rgba(0, 0, 0, 0.5));
+  backdrop-filter: blur(14px) saturate(160%);
+  -webkit-backdrop-filter: blur(14px) saturate(160%);
+  transition:
+    backdrop-filter 0.4s var(--ease-smooth),
+    -webkit-backdrop-filter 0.4s var(--ease-smooth),
+    background-color 0.35s var(--ease-smooth),
+    visibility 0s;
 }
 
+/* Слабые устройства: меньший радиус — анимация blur заметно дешевле */
+.low-end .modal-overlay.open {
+  backdrop-filter: blur(9px) saturate(150%);
+  -webkit-backdrop-filter: blur(9px) saturate(150%);
+}
+
+/* Modal card */
 .modal-card {
   background: var(--card-bg);
   border: 1px solid var(--border-color);
@@ -8773,17 +8915,18 @@ body.modal-open {
   width: 100%;
   max-width: 560px;
   box-shadow: 0 -10px 40px rgba(0, 0, 0, 0.25);
-  transform: translateY(100%) translateZ(0);
-  transition: transform 0.28s cubic-bezier(0.16, 1, 0.3, 1);
+  transform: translateY(100%);
+  /* ease-snap вместо ease-spring: у пружины перелёт > 100% — карточку
+     подбрасывало выше финальной позиции и было видно её нижний край */
+  transition: transform 0.42s var(--ease-snap);
   will-change: transform;
-  backdrop-filter: blur(20px);
-  -webkit-backdrop-filter: blur(20px);
   overscroll-behavior: contain;
   touch-action: pan-y;
+  contain: layout style;
 }
 
 .modal-overlay.open .modal-card {
-  transform: translateY(0) translateZ(0);
+  transform: translateY(0);
 }
 
 .sheet-handle-area {
@@ -8792,6 +8935,7 @@ body.modal-open {
   cursor: grab;
   display: flex;
   justify-content: center;
+  touch-action: pan-y;
 }
 
 .sheet-handle {
@@ -8813,17 +8957,26 @@ body.modal-open {
   color: var(--btn-text);
   border: none;
   cursor: pointer;
-  transition: transform 0.18s cubic-bezier(0.2, 0.8, 0.2, 1), background 0.35s ease, color 0.35s ease;
-  will-change: transform;
+  transition: transform 0.2s var(--ease-spring);
   position: relative;
   z-index: 35;
-  transform: translateZ(0);
+  touch-action: manipulation;
 }
 
 .settings-btn:active {
-  transform: scale(0.9) rotate(30deg) translateZ(0);
+  transform: scale(0.85) rotate(30deg);
 }
 
+/* Кручение шестерёнки при открытии/закрытии панели настроек */
+.settings-btn svg {
+  transition: transform 0.5s var(--ease-spring);
+}
+
+.settings-btn.spun svg {
+  transform: rotate(180deg);
+}
+
+/* Settings panel */
 .settings-panel {
   position: absolute;
   top: calc(100% + 12px);
@@ -8832,28 +8985,28 @@ body.modal-open {
   max-height: 70vh;
   overflow-y: auto;
   overflow-x: hidden;
-  background: var(--card-bg);
+  background: var(--dropdown-bg);
   border: 1px solid var(--border-color);
   border-radius: 24px;
-  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.22);
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.25);
   padding: 14px;
   z-index: 34;
   opacity: 0;
   pointer-events: none;
-  transform: translateY(-12px) scale(0.92) translateZ(0);
-  transition: transform 0.24s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+  transform: translateY(-16px) scale(0.9);
+  transition: transform 0.4s var(--ease-spring), opacity 0.3s var(--ease-smooth);
   transform-origin: top right;
-  backdrop-filter: blur(20px);
-  -webkit-backdrop-filter: blur(20px);
   will-change: transform, opacity;
   overscroll-behavior: contain;
   -webkit-overflow-scrolling: touch;
+
+  contain: layout style;
 }
 
 .settings-panel.open {
   opacity: 1;
   pointer-events: auto;
-  transform: translateY(0) scale(1) translateZ(0);
+  transform: translateY(0) scale(1);
 }
 
 .settings-panel-title {
@@ -8864,6 +9017,7 @@ body.modal-open {
   display: flex;
   align-items: center;
   gap: 8px;
+
 }
 
 .settings-item {
@@ -8882,9 +9036,8 @@ body.modal-open {
   align-items: center;
   gap: 12px;
   margin-bottom: 4px;
-  transition: transform 0.16s cubic-bezier(0.2, 0.8, 0.2, 1), background 0.25s ease, border-color 0.25s ease;
-  will-change: transform;
-  transform: translateZ(0);
+  transition: transform 0.15s var(--ease-spring);
+  touch-action: manipulation;
 }
 
 .settings-item:last-child {
@@ -8892,7 +9045,7 @@ body.modal-open {
 }
 
 .settings-item:active {
-  transform: scale(0.96) translateZ(0);
+  transform: scale(0.95);
   background: var(--card-active);
 }
 
@@ -8906,7 +9059,6 @@ body.modal-open {
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
-  transition: background 0.35s ease, color 0.35s ease;
 }
 
 .settings-item-label {
@@ -8920,6 +9072,7 @@ body.modal-open {
   font-size: 11px;
   color: var(--subtext-color);
   margin-top: 2px;
+
 }
 
 .settings-divider {
@@ -8927,13 +9080,14 @@ body.modal-open {
   background: var(--border-color);
   margin: 8px 4px;
   border: none;
+
 }
 
 .settings-submenu {
   overflow: hidden;
   max-height: 0;
   opacity: 0;
-  transition: max-height 0.28s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+  transition: max-height 0.4s var(--ease-ultra), opacity 0.35s var(--ease-smooth);
   will-change: max-height, opacity;
 }
 
@@ -8948,26 +9102,26 @@ body.modal-open {
 
 .settings-panel .settings-item,
 .settings-panel .settings-submenu {
-  transform: translateX(12px) translateZ(0);
+  transform: translateX(16px);
   opacity: 0;
-  transition: transform 0.22s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.18s ease;
+  transition: transform 0.35s var(--ease-ultra), opacity 0.3s var(--ease-smooth);
 }
 
 .settings-panel.open .settings-item,
 .settings-panel.open .settings-submenu {
-  transform: translateX(0) translateZ(0);
+  transform: translateX(0);
   opacity: 1;
 }
 
-.settings-panel.open .settings-item:nth-child(1) { transition-delay: 0.02s; }
-.settings-panel.open .settings-item:nth-child(2) { transition-delay: 0.04s; }
-.settings-panel.open .settings-item:nth-child(3) { transition-delay: 0.06s; }
-.settings-panel.open .settings-item:nth-child(4) { transition-delay: 0.08s; }
-.settings-panel.open .settings-item:nth-child(5) { transition-delay: 0.10s; }
-.settings-panel.open .settings-item:nth-child(6) { transition-delay: 0.12s; }
-.settings-panel.open .settings-item:nth-child(7) { transition-delay: 0.14s; }
-.settings-panel.open .settings-item:nth-child(8) { transition-delay: 0.16s; }
-.settings-panel.open .settings-item:nth-child(9) { transition-delay: 0.18s; }
+.settings-panel.open .settings-item:nth-child(1) { transition-delay: 0.03s; }
+.settings-panel.open .settings-item:nth-child(2) { transition-delay: 0.06s; }
+.settings-panel.open .settings-item:nth-child(3) { transition-delay: 0.09s; }
+.settings-panel.open .settings-item:nth-child(4) { transition-delay: 0.12s; }
+.settings-panel.open .settings-item:nth-child(5) { transition-delay: 0.15s; }
+.settings-panel.open .settings-item:nth-child(6) { transition-delay: 0.18s; }
+.settings-panel.open .settings-item:nth-child(7) { transition-delay: 0.21s; }
+.settings-panel.open .settings-item:nth-child(8) { transition-delay: 0.24s; }
+.settings-panel.open .settings-item:nth-child(9) { transition-delay: 0.27s; }
 
 .settings-overlay {
   position: fixed;
@@ -8976,7 +9130,7 @@ body.modal-open {
   background: transparent;
   pointer-events: none;
   opacity: 0;
-  transition: opacity 0.2s ease;
+  transition: opacity 0.3s var(--ease-smooth);
 }
 
 .settings-overlay.active {
@@ -8984,6 +9138,7 @@ body.modal-open {
   opacity: 1;
 }
 
+/* Selection bar */
 #selectionBar {
   position: fixed;
   bottom: calc(20px + env(safe-area-inset-bottom));
@@ -8996,20 +9151,20 @@ body.modal-open {
   border: 1px solid var(--border-color);
   border-radius: 9999px;
   box-shadow: 0 14px 40px rgba(0, 0, 0, 0.22), 0 4px 12px rgba(0, 0, 0, 0.08);
-  backdrop-filter: blur(24px);
-  -webkit-backdrop-filter: blur(24px);
   opacity: 0;
   pointer-events: none;
-  transform: translateX(-50%) translateY(140%) scale(0.96) translateZ(0);
-  transition: transform 0.28s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.22s ease;
+  transform: translateX(-50%) translateY(150%) scale(0.94);
+  transition: transform 0.45s var(--ease-spring), opacity 0.35s var(--ease-smooth);
   will-change: transform, opacity;
   overscroll-behavior: contain;
+
+  contain: layout style;
 }
 
 #selectionBar.visible {
   opacity: 1;
   pointer-events: auto;
-  transform: translateX(-50%) translateY(0) scale(1) translateZ(0);
+  transform: translateX(-50%) translateY(0) scale(1);
 }
 
 #selectionBar .sel-inner {
@@ -9032,19 +9187,18 @@ body.modal-open {
   gap: 4px;
   white-space: nowrap;
   min-height: 36px;
-  transition: transform 0.16s cubic-bezier(0.2, 0.8, 0.2, 1);
+  transition: transform 0.2s var(--ease-spring);
   will-change: transform;
-  transform: translateZ(0);
 }
 
 #selectionBar .sel-count.pulse {
-  animation: countPulse 0.25s cubic-bezier(0.2, 0.8, 0.2, 1);
+  animation: countPulse 0.35s var(--ease-spring);
 }
 
 @keyframes countPulse {
-  0% { transform: scale(1) translateZ(0); }
-  50% { transform: scale(1.12) translateZ(0); }
-  100% { transform: scale(1) translateZ(0); }
+  0% { transform: scale(1); }
+  40% { transform: scale(1.18); }
+  100% { transform: scale(1); }
 }
 
 #selectionBar .sel-btn {
@@ -9060,14 +9214,13 @@ body.modal-open {
   justify-content: center;
   cursor: pointer;
   font-size: 15px;
-  transition: transform 0.12s cubic-bezier(0.2, 0.8, 0.2, 1), background 0.25s ease, border-color 0.25s ease;
-  will-change: transform;
+  transition: transform 0.15s var(--ease-spring);
   -webkit-tap-highlight-color: transparent;
-  transform: translateZ(0);
+  touch-action: manipulation;
 }
 
 #selectionBar .sel-btn:active {
-  transform: scale(0.88) translateZ(0);
+  transform: scale(0.85);
 }
 
 #selectionBar .sel-btn.danger {
@@ -9088,6 +9241,115 @@ body.modal-open {
 
 #selectionBar .sel-btn.hidden {
   display: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* ВОЛНА 22.35: баннер-рекомендация разработчика — личный приватный канал */
+.dev-rec-banner {
+  position: relative;
+  background: linear-gradient(135deg, rgba(59, 130, 246, 0.12), rgba(147, 51, 234, 0.12));
+  border: 1px solid var(--border-color);
+  border-radius: 20px;
+  padding: 14px 38px 14px 14px;
+  margin-bottom: 12px;
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  overflow: hidden;
+}
+
+.dev-rec-banner.hide {
+  display: none;
+}
+
+.dev-rec-icon {
+  width: 40px;
+  height: 40px;
+  border-radius: 13px;
+  background: var(--btn-bg);
+  color: var(--btn-text);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.dev-rec-text {
+  flex: 1;
+  min-width: 0;
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--text-color);
+  line-height: 1.55;
+}
+
+.dev-rec-text b {
+  display: block;
+  font-size: 13.5px;
+  font-weight: 900;
+  margin-bottom: 3px;
+}
+
+.dev-rec-text span {
+  color: var(--subtext-color);
+  font-weight: 600;
+}
+
+.dev-rec-actions {
+  margin-top: 10px;
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.dev-rec-btn {
+  padding: 8px 14px;
+  border-radius: 9999px;
+  background: var(--btn-bg);
+  color: var(--btn-text);
+  font-family: 'Nunito', sans-serif;
+  font-weight: 800;
+  font-size: 12.5px;
+  border: none;
+  cursor: pointer;
+  touch-action: manipulation;
+  transition: transform 0.15s var(--ease-spring);
+}
+
+.dev-rec-btn:active {
+  transform: scale(0.94);
+}
+
+.dev-rec-btn.ghost {
+  background: var(--card-bg);
+  color: var(--text-color);
+  border: 1px solid var(--border-color);
+}
+
+.dev-rec-close {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  border: none;
+  background: var(--card-bg);
+  color: var(--subtext-color);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  touch-action: manipulation;
 }
 </style>
 </head>
@@ -9141,6 +9403,11 @@ body.modal-open {
       <button class="sound-item-btn" onclick="downloadCurrentFile()">
         <span>Скачать файл</span>
         <i data-lucide="download" style="width:18px;height:18px"></i>
+      </button>
+
+      <button class="sound-item-btn" onclick="sendCurrentFileToChat()">
+        <span>Отправить в чат Telegram</span>
+        <i data-lucide="send" style="width:18px;height:18px"></i>
       </button>
 
       <button class="sound-item-btn" style="color:#ef4444" onclick="deleteCurrentFile()">
@@ -9452,7 +9719,6 @@ body.modal-open {
   </div>
 </div>
 
-
 <div class="main-wrapper">
 
   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
@@ -9623,15 +9889,37 @@ body.modal-open {
   </div>
 
   <div style="display:flex;gap:12px;margin-bottom:12px;">
-    <div style="flex:1;background:var(--stat-bg);border:1px solid var(--border-color);border-radius:18px;padding:12px 16px;backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);transition:background 0.35s ease,border-color 0.35s ease">
+    <div style="flex:1;background:var(--stat-bg);border:1px solid var(--border-color);border-radius:18px;padding:12px 16px">
       <p style="font-weight:700;font-size:12px;color:var(--text-color);text-transform:uppercase;letter-spacing:.04em;opacity:.6">Файлов</p>
       <p id="statFiles" style="font-weight:900;font-size:22px;margin-top:2px">0</p>
     </div>
 
-    <div style="flex:1;background:var(--stat-bg);border:1px solid var(--border-color);border-radius:18px;padding:12px 16px;backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);transition:background 0.35s ease,border-color 0.35s ease">
+    <div style="flex:1;background:var(--stat-bg);border:1px solid var(--border-color);border-radius:18px;padding:12px 16px">
       <p style="font-weight:700;font-size:12px;color:var(--text-color);text-transform:uppercase;letter-spacing:.04em;opacity:.6">Занято</p>
       <p id="statSize" style="font-weight:900;font-size:22px;margin-top:2px">0 Б</p>
     </div>
+  </div>
+
+  <div id="devRecBanner" class="dev-rec-banner hide">
+    <div class="dev-rec-icon">
+      <i data-lucide="shield-check" style="width:20px;height:20px"></i>
+    </div>
+
+    <div class="dev-rec-text">
+      <b>Совет разработчика</b>
+      <span>Создайте свой <b>частный канал</b> в Telegram и подключите его в боте
+      («Облако» → «Моё облако») — файлы будут храниться именно там, с максимальной
+      приватностью и безопасностью. DEVO+ — удобный коннектор к неограниченному
+      пространству хранения ваших файлов.</span>
+
+      <div class="dev-rec-actions">
+        <button class="dev-rec-btn" onclick="openStorageModal()">Подключить канал</button>
+      </div>
+    </div>
+
+    <button class="dev-rec-close" onclick="dismissDevRec(event)" title="Скрыть">
+      <i data-lucide="x" style="width:14px;height:14px"></i>
+    </button>
   </div>
 
   <div class="search-box" style="margin-bottom:12px">
@@ -9765,15 +10053,28 @@ body.modal-open {
   </div>
 </div>
 
-
-
 <script>
+/* Иконки lucide: склеиваем несколько вызовов в один кадр (rAF),
+   а после отрисовки снимаем data-lucide с готовых SVG —
+   следующий createIcons обрабатывает только НОВЫЕ иконки, а не весь документ */
+let _iconsQueued = false;
+
 function safeIcons() {
-  try {
-    if (window.lucide && typeof lucide.createIcons === 'function') {
-      lucide.createIcons();
-    }
-  } catch (e) {}
+  if (_iconsQueued) return;
+  _iconsQueued = true;
+
+  requestAnimationFrame(() => {
+    _iconsQueued = false;
+
+    try {
+      if (window.lucide && typeof lucide.createIcons === 'function') {
+        lucide.createIcons();
+        document.querySelectorAll('svg[data-lucide]').forEach((el) => {
+          el.removeAttribute('data-lucide');
+        });
+      }
+    } catch (e) {}
+  });
 }
 
 const tg = window.Telegram?.WebApp;
@@ -9786,6 +10087,28 @@ let currentTheme = localStorage.getItem('devo_theme') || 'system';
 let blobsEnabled = localStorage.getItem('devo_blobs_enabled') !== 'false';
 let blobIdleSpeed = localStorage.getItem('devo_blob_speed') || '5';
 
+/* Слабые устройства: тяжёлые эффекты выключаем по умолчанию,
+   чтобы не было лагов — пользователь может включить вручную */
+let LOW_END = false;
+
+try {
+  const nav = navigator;
+  const mem = +nav.deviceMemory || 0;
+  const cores = nav.hardwareConcurrency || 0;
+
+  LOW_END = (mem > 0 && mem <= 2) || (cores > 0 && cores <= 3);
+} catch (e) {}
+
+if (LOW_END) {
+  try { document.documentElement.classList.add('low-end'); } catch (e) {}
+}
+
+if (LOW_END && localStorage.getItem('devo_blobs_enabled') === null) {
+  blobsEnabled = false;
+
+  try { localStorage.setItem('devo_blobs_enabled', 'false'); } catch (e) {}
+}
+
 function toggleSettingsPanel(e) {
   if (e) e.stopPropagation();
 
@@ -9793,6 +10116,9 @@ function toggleSettingsPanel(e) {
   const overlay = document.getElementById('settingsOverlay');
 
   const willOpen = !panel.classList.contains('open');
+
+  const gear = document.getElementById('settingsToggleBtn');
+  if (gear) gear.classList.toggle('spun', willOpen);
 
   if (willOpen) {
     panel.classList.add('open');
@@ -9809,6 +10135,9 @@ function closeSettingsPanel() {
   panel.classList.remove('open');
   overlay.classList.remove('active');
 
+  const gear = document.getElementById('settingsToggleBtn');
+  if (gear) gear.classList.remove('spun');
+
   document.querySelectorAll('.settings-submenu.open').forEach((s) => {
     s.classList.remove('open');
   });
@@ -9816,7 +10145,7 @@ function closeSettingsPanel() {
 
 function closeSettingsAndDo(fn) {
   closeSettingsPanel();
-  setTimeout(fn, 180);
+  setTimeout(fn, 250);
 }
 
 function toggleSettingsSubmenu(id) {
@@ -9837,6 +10166,8 @@ function toggleSettingsSubmenu(id) {
   }
 }
 
+let themeBootApplied = false;
+
 function applyTheme(theme) {
   currentTheme = theme;
   localStorage.setItem('devo_theme', theme);
@@ -9849,41 +10180,60 @@ function applyTheme(theme) {
     isDark = theme === 'dark';
   }
 
-  document.documentElement.setAttribute(
-    'data-theme',
-    theme === 'custom' ? 'custom' : (isDark ? 'dark' : 'light')
-  );
-
-  const iconEl = document.getElementById('themeIcon');
-  if (iconEl) {
-    iconEl.setAttribute(
-      'data-lucide',
-      theme === 'custom' ? 'palette' : (isDark ? 'moon' : 'sun')
+  const domUpdate = () => {
+    document.documentElement.setAttribute(
+      'data-theme',
+      theme === 'custom' ? 'custom' : (isDark ? 'dark' : 'light')
     );
-    safeIcons();
-  }
 
-  const label = document.getElementById('themeCurrentLabel');
-  if (label) {
-    const names = {
-      light: 'Светлая',
-      dark: 'Тёмная',
-      system: 'Системная',
-      custom: 'Свой цвет'
-    };
-    label.textContent = names[theme] || 'Системная';
-  }
-
-  document.querySelectorAll('#themeSubmenu .sound-item-btn').forEach((btn) => {
-    if (btn.id.startsWith('theme-')) {
-      btn.classList.toggle('active-sound', btn.id === `theme-${theme}-btn`);
+    const iconEl = document.getElementById('themeIcon');
+    if (iconEl) {
+      iconEl.setAttribute(
+        'data-lucide',
+        theme === 'custom' ? 'palette' : (isDark ? 'moon' : 'sun')
+      );
+      safeIcons();
     }
-  });
 
-  const picker = document.getElementById('customThemePicker');
-  if (picker) picker.classList.toggle('active', theme === 'custom');
+    const label = document.getElementById('themeCurrentLabel');
+    if (label) {
+      const names = {
+        light: 'Светлая',
+        dark: 'Тёмная',
+        system: 'Системная',
+        custom: 'Свой цвет'
+      };
+      label.textContent = names[theme] || 'Системная';
+    }
 
-  if (theme === 'custom') updateCustomColors();
+    document.querySelectorAll('#themeSubmenu .sound-item-btn').forEach((btn) => {
+      if (btn.id.startsWith('theme-')) {
+        btn.classList.toggle('active-sound', btn.id === `theme-${theme}-btn`);
+      }
+    });
+
+    const picker = document.getElementById('customThemePicker');
+    if (picker) picker.classList.toggle('active', theme === 'custom');
+
+    if (theme === 'custom') updateCustomColors();
+  };
+
+  /* Первое применение при загрузке — мгновенно, без анимации */
+  if (!themeBootApplied) {
+    themeBootApplied = true;
+    domUpdate();
+    return;
+  }
+
+  /* Плавный кроссфейд View Transitions: смена на композиторе,
+     без пересчёта стилей каждый кадр. Fallback — мгновенно. */
+  const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  if (document.startViewTransition && !LOW_END && !reduced) {
+    document.startViewTransition(domUpdate);
+  } else {
+    domUpdate();
+  }
 }
 
 function updateCustomColors() {
@@ -9936,13 +10286,32 @@ function updateBlobsVisibility() {
   if (bgBlobs) bgBlobs.style.opacity = blobsEnabled ? '1' : '0';
   if (blobsIcon) blobsIcon.style.display = blobsEnabled ? 'inline-block' : 'none';
   if (blobsLabel) blobsLabel.textContent = blobsEnabled ? 'Включен' : 'Выключен';
+
+  /* rAF-цикл работает только когда блобы реально видны */
+  if (blobsEnabled) startBlobAnimation();
+  else stopBlobAnimation();
 }
 
-// Живой фон на requestAnimationFrame: кадры идут в такт экрану (60/90/120 Гц),
-// без setInterval и CSS-переходов — поэтому анимация плавная на ProMotion/ high refresh
 let blobRafId = null;
 let blobLastTs = 0;
 let blobTime = Math.random() * 500;
+
+let blobVW = 0;
+let blobVH = 0;
+
+/* LERP-сглаживание для плавности */
+let blobCurrentX = [0, 0];
+let blobCurrentY = [0, 0];
+let blobCurrentS = [1, 1];
+
+/* Последние записанные в DOM значения: на 90/120 Гц кадры идут каждые 8 мс,
+   поэтому стиль пишем только при видимом изменении — меньше инвалидаций стилей */
+const BLOB_LAST = [
+  { x: NaN, y: NaN, s: 0 },
+  { x: NaN, y: NaN, s: 0 }
+];
+
+const BLOB_ELS = [null, null];
 
 const BLOB_PHASES = [0, 1].map(() =>
   Array.from({ length: 7 }, () => Math.random() * Math.PI * 2)
@@ -9966,7 +10335,30 @@ function blobOffset(i, t) {
   return { x: x, y: y, s: s };
 }
 
+function lerp(a, b, t) {
+  return a + (b - a) * t;
+}
+
+function updateBlobViewport() {
+  blobVW = window.innerWidth * 0.22;
+  blobVH = window.innerHeight * 0.22;
+}
+
+function stopBlobAnimation() {
+  if (blobRafId) {
+    cancelAnimationFrame(blobRafId);
+    blobRafId = null;
+  }
+
+  blobLastTs = 0;
+}
+
 function blobLoop(ts) {
+  if (!blobsEnabled || document.hidden) {
+    blobRafId = null;
+    return;
+  }
+
   blobRafId = requestAnimationFrame(blobLoop);
 
   if (!blobLastTs) blobLastTs = ts;
@@ -9974,33 +10366,57 @@ function blobLoop(ts) {
   const dt = Math.min(0.06, (ts - blobLastTs) / 1000);
   blobLastTs = ts;
 
-  const b1 = document.getElementById('blob1');
-  const b2 = document.getElementById('blob2');
-
-  if (!blobsEnabled || document.hidden || !b1 || !b2) return;
-
   const speed = parseInt(blobIdleSpeed) || 5;
-  // Степенная кривая: на низких значениях — медленно и плавно, на максимуме — заметно быстрее (было 0.64, стало ~1.4)
   blobTime += dt * (0.04 + Math.pow(speed, 1.35) * 0.06);
 
-  const w = window.innerWidth * 0.22;
-  const h = window.innerHeight * 0.22;
+  /* LERP-коэффициент: чем меньше dt, тем плавнее */
+  const lerpFactor = Math.min(1, dt * 8);
 
-  [b1, b2].forEach((el, i) => {
+  for (let i = 0; i < 2; i++) {
+    if (!BLOB_ELS[i]) BLOB_ELS[i] = document.getElementById(i === 0 ? 'blob1' : 'blob2');
+
+    const el = BLOB_ELS[i];
+    if (!el) continue;
+
     const o = blobOffset(i, blobTime);
 
-    el.style.transform =
-      'translate(' + (o.x * w).toFixed(2) + 'px, ' + (o.y * h).toFixed(2) + 'px) ' +
-      'scale(' + o.s.toFixed(3) + ') translateZ(0)';
-  });
+    blobCurrentX[i] = lerp(blobCurrentX[i], o.x * blobVW, lerpFactor);
+    blobCurrentY[i] = lerp(blobCurrentY[i], o.y * blobVH, lerpFactor);
+    blobCurrentS[i] = lerp(blobCurrentS[i], o.s, lerpFactor);
+
+    const cx = blobCurrentX[i];
+    const cy = blobCurrentY[i];
+    const cs = blobCurrentS[i];
+    const last = BLOB_LAST[i];
+
+    if (
+      Math.abs(cx - last.x) > 0.05 ||
+      Math.abs(cy - last.y) > 0.05 ||
+      Math.abs(cs - last.s) > 0.0008
+    ) {
+      last.x = cx;
+      last.y = cy;
+      last.s = cs;
+
+      el.style.transform =
+        'translate3d(' + cx.toFixed(2) + 'px, ' + cy.toFixed(2) + 'px, 0) ' +
+        'scale(' + cs.toFixed(4) + ')';
+    }
+  }
 }
 
 function startBlobAnimation() {
-  if (blobRafId) cancelAnimationFrame(blobRafId);
+  stopBlobAnimation();
 
-  blobLastTs = 0;
+  if (!blobsEnabled || document.hidden) return;
+
+  updateBlobViewport();
   blobRafId = requestAnimationFrame(blobLoop);
 }
+
+window.addEventListener('resize', function () {
+  updateBlobViewport();
+}, { passive: true });
 
 function changeBlobSpeed(val) {
   blobIdleSpeed = val;
@@ -10010,17 +10426,7 @@ function changeBlobSpeed(val) {
   if (label) label.textContent = val + 'x';
 }
 
-let themeAnimTimer = null;
-
 function setTheme(theme) {
-  // Плавный переход цветов: включаем класс-аниматор, убираем через 600 мс
-  const root = document.documentElement;
-
-  root.classList.add('theme-anim');
-
-  if (themeAnimTimer) clearTimeout(themeAnimTimer);
-  themeAnimTimer = setTimeout(() => root.classList.remove('theme-anim'), 600);
-
   applyTheme(theme);
 }
 
@@ -10152,7 +10558,6 @@ const SOUND_PROFILES = [
 
 let selectedSoundId = parseInt(localStorage.getItem('devo_sound_id') || '1');
 
-// Звук №4 удалён — сбрасываем сохранённые старые id (4 «Sci-Fi Pulse», 5 бывший)
 if (!SOUND_PROFILES.some((s) => s.id === selectedSoundId)) {
   selectedSoundId = 1;
   localStorage.setItem('devo_sound_id', '1');
@@ -10280,15 +10685,13 @@ function showAuthCard(text) {
   const btn = document.getElementById('authOpenBtn');
   if (btn) btn.style.display = AUTH_BOT ? '' : 'none';
 
-  card.classList.add('open');
-  document.body.classList.add('modal-open');
+  openModalEl('authModal');
 }
 
 function closeAuthModal(e) {
   if (e) e.stopPropagation();
 
-  document.getElementById('authModal').classList.remove('open');
-  document.body.classList.remove('modal-open');
+  closeModalEl('authModal');
 }
 
 function openBotChat() {
@@ -10303,20 +10706,13 @@ function openBotChat() {
 }
 
 function openLoginModal() {
-  const m = document.getElementById('loginModal');
-  if (!m) return;
-
-  m.classList.add('open');
-  document.body.classList.add('modal-open');
+  openModalEl('loginModal');
 }
 
 function closeLoginModal(e) {
   if (e) e.stopPropagation();
 
-  const m = document.getElementById('loginModal');
-  if (m) m.classList.remove('open');
-
-  document.body.classList.remove('modal-open');
+  closeModalEl('loginModal');
 }
 
 async function webLogin() {
@@ -10629,7 +11025,12 @@ function maybeAutoResync() {
 }
 
 document.addEventListener('visibilitychange', function () {
-  if (!document.hidden) {
+  if (document.hidden) {
+    /* Полная остановка анимации в фоне — не тратим батарею и кадры */
+    stopBlobAnimation();
+  } else {
+    startBlobAnimation();
+
     clearTimeout(RESYNC_TIMER);
     RESYNC_TIMER = setTimeout(maybeAutoResync, 600);
   }
@@ -10661,7 +11062,6 @@ let nameMode = 'each';
 let clickTimer = null;
 let clickCount = 0;
 
-/* Эмодзи заменены на SVG-иконки Lucide: showToast превращает эмодзи в строке в <i data-lucide> */
 const TOAST_ICON_MAP = {
   '📦': 'package',
   '🗂': 'folder-open',
@@ -10707,10 +11107,12 @@ function showToast(text) {
 
   safeIcons();
 
-  setTimeout(() => t.remove(), 3500);
+  setTimeout(() => t.remove(), 4000);
 }
 
 function flashScreen() {
+  if (LOW_END) return;
+
   const flash = document.getElementById('themeFlash');
 
   flash.classList.remove('active');
@@ -10730,7 +11132,36 @@ function fmtSize(n) {
     i++;
   }
 
-  return n.toFixed(i === 0 ? 0 : 1) + ' ' + u[i];
+  return (i === 0 ? n : n.toFixed(1)) + ' ' + u[i];
+}
+
+/* Дата и ВРЕМЯ добавления файла: «25.09.2025 18:30».
+   Понимает ISO-строки, «YYYY-MM-DD HH:MM», unix-секунды/мс */
+function fmtDateTime(ts) {
+  const s = String(ts || '').trim();
+
+  if (!s) return '';
+
+  const iso = s.match(/^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2}))?/);
+
+  if (iso) {
+    return iso[4]
+      ? `${iso[3]}.${iso[2]}.${iso[1]} ${iso[4]}:${iso[5]}`
+      : `${iso[3]}.${iso[2]}.${iso[1]}`;
+  }
+
+  let d;
+
+  if (/^\d{10}$/.test(s)) d = new Date(+s * 1000);
+  else if (/^\d{13}$/.test(s)) d = new Date(+s);
+  else {
+    d = new Date(s);
+    if (isNaN(d)) return s.slice(0, 10);
+  }
+
+  const p = (x) => String(x).padStart(2, '0');
+
+  return `${p(d.getDate())}.${p(d.getMonth() + 1)}.${d.getFullYear()} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
 function iconFor(kind) {
@@ -10779,17 +11210,20 @@ function applyFilters() {
 }
 
 function renderAll() {
-  renderFiles(applyFilters());
-  renderStats();
+  /* Один проход фильтрации на рендер вместо двух */
+  const list = applyFilters();
+
+  renderFiles(list);
+  renderStats(list);
 }
 
-function renderStats() {
+function renderStats(list) {
   document.getElementById('statFiles').textContent = ALL_FILES.length;
   document.getElementById('statSize').textContent = fmtSize(
     ALL_FILES.reduce((s, f) => s + (+f.size || 0), 0)
   );
 
-  const shown = applyFilters().length;
+  const shown = (list || applyFilters()).length;
 
   document.getElementById('filesCount').textContent =
     shown === ALL_FILES.length
@@ -10817,7 +11251,7 @@ function renderFiles(files) {
       : `openEditModal('${f.id}')`;
 
     const checkHtml = selectMode ? `
-      <div onclick="toggleFileSelection(event,'${f.id}')" style="flex-shrink:0;width:24px;height:24px;border-radius:8px;display:flex;align-items:center;justify-content:center;border:2px solid ${sel ? 'var(--btn-text)' : 'var(--border-color)'};background:${sel ? 'var(--btn-text)' : 'transparent'};transition:all .12s">
+      <div onclick="toggleFileSelection(event,'${f.id}')" style="flex-shrink:0;width:24px;height:24px;border-radius:8px;display:flex;align-items:center;justify-content:center;border:2px solid ${sel ? 'var(--btn-text)' : 'var(--border-color)'};background:${sel ? 'var(--btn-text)' : 'transparent'};transition:transform .15s var(--ease-spring)">
         ${sel ? '<i data-lucide="check" style="width:14px;height:14px;stroke:var(--card-bg)"></i>' : ''}
       </div>
     ` : '';
@@ -10844,7 +11278,7 @@ function renderFiles(files) {
           </p>
 
           <p style="font-weight:600;font-size:12px;color:var(--subtext-color);margin-top:2px">
-            ${fmtSize(f.size)} · ${(f.ts || '').slice(0, 10)}
+            ${fmtSize(f.size)} · ${fmtDateTime(f.ts)}
           </p>
         </div>
 
@@ -10886,7 +11320,7 @@ modalCard.addEventListener('touchmove', (e) => {
   const deltaY = touchCurrentY - touchStartY;
 
   if (deltaY > 0) {
-    modalCard.style.transform = `translateY(${deltaY}px) translateZ(0)`;
+    modalCard.style.transform = `translateY(${deltaY}px)`;
   }
 }, { passive: true });
 
@@ -10897,12 +11331,12 @@ modalCard.addEventListener('touchend', () => {
 
   const deltaY = touchCurrentY - touchStartY;
 
-  modalCard.style.transition = 'transform 0.28s cubic-bezier(0.16, 1, 0.3, 1)';
+  modalCard.style.transition = 'transform 0.42s var(--ease-snap)';
 
   if (deltaY > 100) {
     closeEditModal();
   } else {
-    modalCard.style.transform = 'translateY(0) translateZ(0)';
+    modalCard.style.transform = 'translateY(0)';
   }
 
   touchStartY = 0;
@@ -10925,22 +11359,20 @@ function openEditModal(id) {
 
   modalCard.style.transform = '';
 
-  document.getElementById('editModal').classList.add('open');
-  document.body.classList.add('modal-open');
+  openModalEl('editModal');
 }
 
 function closeEditModal(e) {
   if (e) e.stopPropagation();
 
-  modalCard.style.transform = 'translateY(100%) translateZ(0)';
+  modalCard.style.transform = 'translateY(100%)';
 
-  document.getElementById('editModal').classList.remove('open');
-  document.body.classList.remove('modal-open');
+  closeModalEl('editModal');
 
   setTimeout(() => {
     activeEditingFileId = null;
     modalCard.style.transform = '';
-  }, 280);
+  }, 450);
 }
 
 async function saveFileName() {
@@ -10970,12 +11402,18 @@ async function saveFileName() {
 
 let VAULT_PW = '';
 let VAULT_SERVER_UNLOCKED = false;
-let PENDING_FILE_ACTION = null; // отложенное «посмотреть файл» после ввода пароля Сейфа
+let PENDING_FILE_ACTION = null;
 
 function vaultHeaders(extra) {
   const h = authHeaders(extra);
 
-  if (VAULT_PW) h['X-Vault-Password'] = VAULT_PW;
+  if (VAULT_PW) {
+    /* HTTP-заголовки принимают только Latin-1: пароль с кириллицей/эмодзи
+       кодируем (encodeURIComponent), сервер сам раскодирует обратно */
+    h['X-Vault-Password'] = /^[\x20-\x7E]*$/.test(VAULT_PW)
+      ? VAULT_PW
+      : encodeURIComponent(VAULT_PW);
+  }
 
   return h;
 }
@@ -10986,8 +11424,7 @@ function openSafeModal() {
 
   loadSafeStatus();
 
-  m.classList.add('open');
-  document.body.classList.add('modal-open');
+  openModalEl('safeModal');
 }
 
 function closeSafeModal(e) {
@@ -10995,10 +11432,7 @@ function closeSafeModal(e) {
 
   PENDING_FILE_ACTION = null;
 
-  const m = document.getElementById('safeModal');
-  if (m) m.classList.remove('open');
-
-  document.body.classList.remove('modal-open');
+  closeModalEl('safeModal');
 }
 
 async function loadSafeStatus() {
@@ -11049,7 +11483,7 @@ async function unlockSafe() {
     loadFiles(true);
 
     if (pending && pending.type === 'view') {
-      setTimeout(() => openFileViewer(pending.id), 300);
+      setTimeout(() => openFileViewer(pending.id), 350);
     }
   } catch (e) {
     showToast(cloudErrText(e));
@@ -11143,14 +11577,8 @@ async function fromSafeCurrentFile() {
   }
 }
 
-
-/* ===== Скачивание на телефоне =====
-   Обычная ссылка через tg.openLink не работает: внешний браузер теряет заголовки
-   авторизации и пароля Сейфа. Поэтому качаем файл сами (fetch с заголовками),
-   а на телефоне открываем системное меню «Поделиться» → «Сохранить в Файлы/Фото». */
-
 const IS_MOBILE = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent || '') || (navigator.maxTouchPoints || 0) > 1;
-const BIG_FILE_LIMIT = 1024 * 1024 * 1024; // файлы больше 1 ГБ не влезают в память телефона — открываем ссылку в браузере
+const BIG_FILE_LIMIT = 1024 * 1024 * 1024;
 
 function guessMime(name) {
   const n = String(name || '').toLowerCase();
@@ -11178,7 +11606,6 @@ function openExternalLink(abs) {
   else window.open(abs, '_blank', 'noopener');
 }
 
-// Качаем файл сами, с заголовками авторизации и паролем Сейфа
 async function fetchFileBlob(absUrl, name) {
   const r = await fetch(absUrl, { headers: vaultHeaders() });
 
@@ -11213,7 +11640,6 @@ async function fetchFileBlob(absUrl, name) {
   return new Blob(chunks, { type: type });
 }
 
-// Сохраняем на телефон: меню «Поделиться» → «Сохранить в Файлы / Сохранить фото», иначе прямое скачивание
 async function saveBlobToPhone(blob, name) {
   let file;
 
@@ -11228,7 +11654,7 @@ async function saveBlobToPhone(blob, name) {
       await navigator.share({ files: [file], title: name });
       return true;
     } catch (e) {
-      if (e && e.name === 'AbortError') return true; // пользователь закрыл меню — файл уже выбран им
+      if (e && e.name === 'AbortError') return true;
     }
   }
 
@@ -11305,9 +11731,39 @@ async function downloadCurrentFile() {
 
   if (!f) return;
 
-  if (f.vault && !VAULT_PW && !ensureSafeUnlocked()) return;
+  if (f.vault && !f.plain && !VAULT_PW && !ensureSafeUnlocked()) return;
 
   downloadFileById(f.id, f.name, f.size);
+}
+
+async function sendCurrentFileToChat() {
+  const f = ALL_FILES.find((x) => x.id === activeEditingFileId);
+
+  closeEditModal();
+
+  if (!f) return;
+
+  if (f.vault && !f.plain && !VAULT_PW && !ensureSafeUnlocked()) return;
+
+  showToast('📤 Отправляю в чат…');
+
+  try {
+    await apiJson('/api/files/' + encodeURIComponent(f.id) + '/to_chat', {
+      method: 'POST',
+      headers: vaultHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({})
+    });
+
+    showToast('📲 Файл в чате бота — откройте и сохраните в галерею');
+  } catch (e) {
+    if (e.code === 'safe_locked') {
+      VAULT_PW = '';
+      VAULT_SERVER_UNLOCKED = false;
+      openSafeModal();
+    }
+
+    showToast('Не удалось: ' + cloudErrText(e));
+  }
 }
 
 async function downloadSelected() {
@@ -11321,7 +11777,7 @@ async function downloadSelected() {
 
     if (!f) return;
 
-    if (f.vault && !VAULT_PW && !ensureSafeUnlocked()) return;
+    if (f.vault && !f.plain && !VAULT_PW && !ensureSafeUnlocked()) return;
 
     downloadFileById(f.id, f.name, f.size);
 
@@ -11362,7 +11818,10 @@ function viewCurrentFile() {
 
   if (!f) return;
 
-  const needPw = f.vault || STORAGE_ENCRYPTED === true;
+  /* Пароль нужен ТОЛЬКО для НАСТОЯЩИХ зашифрованных файлов Сейфа.
+     Файлы обычного облака и Сейф-файлы режима «без шифрования» (plain)
+     открываются свободно — что в боте, что здесь. */
+  const needPw = f.vault && !f.plain;
 
   closeEditModal();
 
@@ -11435,7 +11894,13 @@ function onSearch() {
 
   document.getElementById('clearSearch').style.display = SEARCH ? 'flex' : 'none';
 
-  renderAll();
+  /* Перерисовка не чаще одного раза на кадр — плавный ввод даже на 120 Гц */
+  if (onSearch._raf) return;
+
+  onSearch._raf = requestAnimationFrame(function () {
+    onSearch._raf = 0;
+    renderAll();
+  });
 }
 
 function clearSearch() {
@@ -11509,7 +11974,6 @@ document.addEventListener('pointerdown', (e) => {
 function handleDropZoneClick(e) {
   if (isUploading) return;
 
-  // Сначала окно загрузки (пароль/список файлов), выбор файлов — кнопкой «Добавить файл»
   openUploadModal();
 }
 
@@ -11630,7 +12094,7 @@ function closeAlbumModal(e) {
   if (e) e.stopPropagation();
 
   closeModalEl('albumModal');
-  openNameChoiceModal(); // «Отмена» — возвращаемся к выбору способа имён
+  openNameChoiceModal();
 }
 
 function confirmAlbumName() {
@@ -11712,7 +12176,7 @@ function nextNameStep() {
   nameEditIndex++;
 
   if (nameEditIndex < pendingFiles.length) {
-    setTimeout(showNameModal, 140);
+    setTimeout(showNameModal, 200);
   } else {
     applyCustomNames();
   }
@@ -11730,7 +12194,7 @@ function closeNameModal(e) {
   if (e) e.stopPropagation();
 
   closeModalEl('nameModal');
-  applyCustomNames(); // что успели ввести — применится, остальные с оригинальными именами
+  applyCustomNames();
 }
 
 function startActualUpload() {
@@ -11739,10 +12203,15 @@ function startActualUpload() {
   proceedUpload(pendingFiles);
 }
 
-let STORAGE_ENCRYPTED = null; // true — в боте включено шифрование, false — «без шифрования», null — неизвестно
+let STORAGE_ENCRYPTED = null;
 
 function passwordRequired() {
-  return STORAGE_ENCRYPTED === true || ALL_FILES.some((f) => f.vault);
+  /* ВОЛНА 22.35: пароль на ЗАГРУЗКУ нужен только когда сервер работает
+     в режиме шифрования (STORAGE_ENCRYPTED = true). Старые зашифрованные
+     файлы Сейфа на новые загрузки не влияют: в режиме «без шифрования»
+     новые файлы грузятся свободно, а старые открываются паролем при
+     просмотре/скачивании (нужен f.vault && !f.plain). */
+  return STORAGE_ENCRYPTED !== false;
 }
 
 async function detectStorageMode() {
@@ -11757,16 +12226,38 @@ async function detectStorageMode() {
 
       const d = await r.json();
 
-      if (typeof d.plain === 'boolean') { STORAGE_ENCRYPTED = !d.plain; return; }
-      if (typeof d.encrypted === 'boolean') { STORAGE_ENCRYPTED = d.encrypted; return; }
-      if (typeof d.encryption === 'boolean') { STORAGE_ENCRYPTED = d.encryption; return; }
+      if (typeof d.plain === 'boolean') { STORAGE_ENCRYPTED = !d.plain; }
+      if (typeof d.encrypted === 'boolean') { STORAGE_ENCRYPTED = d.encrypted; }
+      if (typeof d.encryption === 'boolean') { STORAGE_ENCRYPTED = d.encryption; }
+
+      /* ВОЛНА 22.35: баннер-рекомендация виден, пока канал не подключён */
+      if (typeof d.connected === 'boolean') updateDevRecBanner(d.connected);
+
+      if (STORAGE_ENCRYPTED !== null) return;
     } catch (e) {}
   }
 }
 
-/* ===== Модалка «Хранилище» ===== */
+/* ВОЛНА 22.35: баннер-рекомендация разработчика */
+function updateDevRecBanner(connected) {
+  const b = document.getElementById('devRecBanner');
+  if (!b) return;
 
-let STORAGE_PLAIN = null; // null — неизвестно, true — «без шифрования», false — шифрование включено
+  const dismissed = localStorage.getItem('devo_recbanner_hide') === '1';
+
+  b.classList.toggle('hide', dismissed || connected === true);
+}
+
+function dismissDevRec(e) {
+  if (e) e.stopPropagation();
+
+  localStorage.setItem('devo_recbanner_hide', '1');
+
+  const b = document.getElementById('devRecBanner');
+  if (b) b.classList.add('hide');
+}
+
+let STORAGE_PLAIN = null;
 
 async function loadStorageStatus() {
   const box = document.getElementById('storageStatus');
@@ -11796,6 +12287,9 @@ async function loadStorageStatus() {
       STORAGE_PLAIN = d.plain;
       STORAGE_ENCRYPTED = !d.plain;
     }
+
+    /* ВОЛНА 22.35: канал подключили/отключили — баннер скрываем/показываем */
+    updateDevRecBanner(connected);
 
     if (plainBtn && STORAGE_PLAIN !== null) {
       plainBtn.style.display = '';
@@ -11897,7 +12391,10 @@ function openModalEl(id) {
 
 function closeModalEl(id) {
   const m = document.getElementById(id);
-  if (m) m.classList.remove('open');
+
+  if (m) {
+    m.classList.remove('open');
+  }
 
   if (!document.querySelector('.modal-overlay.open')) {
     document.body.classList.remove('modal-open');
@@ -11987,7 +12484,7 @@ function confirmUploadFiles() {
   closeModalEl('uploadModal');
 
   if (pendingFiles.length > 1) {
-    openNameChoiceModal(); // много файлов — спросить: альбом / по одному / пропустить
+    openNameChoiceModal();
   } else {
     startActualUpload();
   }
@@ -12313,10 +12810,17 @@ async function uploadEngine(bar) {
   playSoundDirectly(selectedSoundId);
   flashScreen();
 
-  // ВОЛНА 22.34: честный фидбек — файл зашифрован (попал в Сейф) или «как есть»
   const anySafe = added.some((r) => r && r.vault);
 
-  showToast(anySafe ? '✅ Успешно! 🔒 Зашифровано и в Сейфе' : '✅ Загружено');
+  /* ВОЛНА 22.35: если публикаций в канал много, сервер ставит файл в очередь —
+     честно показываем позицию (файл уже сохранён и виден в списке). */
+  const maxQueuePos = added.reduce(
+    (m, r) => Math.max(m, +((r && r.queue_pos) || 0)), 0);
+
+  showToast(
+    (anySafe ? '✅ Успешно! 🔒 Зашифровано и в Сейфе' : '✅ Загружено') +
+    (maxQueuePos > 1 ? ' · ⏳ публикация в канале, перед вами: ' + (maxQueuePos - 1) : '')
+  );
 
   added.forEach((rec) => {
     ALL_FILES.unshift({
@@ -12333,7 +12837,7 @@ async function uploadEngine(bar) {
 
   setTimeout(() => {
     resetUploadUI(bar, checkmark, squareStop);
-  }, 1000);
+  }, 1200);
 }
 
 document.getElementById('fileInput').addEventListener('change', (e) => {
@@ -12371,6 +12875,18 @@ updateSoundLabel();
 setSort('date-desc');
 renderAll();
 detectStorageMode();
+updateDevRecBanner(false);
+
+/* Прогрев GPU-шейдеров размытия: компиляция первого backdrop-filter в движке
+   занимает десятки мс — из-за этого лагало первое открытие модалки.
+   Прогреваем незаметно: 2 кадра на пиксельном слое в углу экрана */
+setTimeout(() => {
+  const w = document.createElement('div');
+  w.style.cssText = 'position:fixed;right:0;bottom:0;width:2px;height:2px;pointer-events:none;opacity:0.01;backdrop-filter:blur(2px);-webkit-backdrop-filter:blur(2px);';
+  document.body.appendChild(w);
+
+  requestAnimationFrame(() => requestAnimationFrame(() => w.remove()));
+}, 150);
 
 if (!IS_TELEGRAM) {
   if (WEB_TOKEN) {
@@ -12381,14 +12897,16 @@ if (!IS_TELEGRAM) {
         } else {
           localStorage.removeItem('devo_web_token');
           WEB_TOKEN = '';
-          openLoginModal();
+          setTimeout(openLoginModal, 500);
         }
       })
       .catch(function () {
-        openLoginModal();
+        setTimeout(openLoginModal, 500);
       });
   } else {
-    openLoginModal();
+    /* Окно входа открываем чуть позже старта: прогрев размытия успевает
+       отработать, первый рендер и иконки — устаканиться, без рывка */
+    setTimeout(openLoginModal, 650);
   }
 } else {
   loadFiles().then(function (ok) {
@@ -12597,6 +13115,40 @@ def _miniapp_vault_pw_verify(user, password):
     return False
 
 
+def _vault_pw_candidates(pw):
+    """ВОЛНА 22.35: варианты пароля из HTTP-заголовка. Заголовки не принимают
+    кириллицу/эмодзи (Latin-1) — клиент шлёт encodeURIComponent(пароль).
+    Здесь пробуем и «как есть», и URL-декодированный вариант: обычные ASCII
+    пароли декодируются в себя, а кириллические — восстанавливаются."""
+    out = []
+    pw = str(pw or "")
+    if not pw:
+        return out
+    if pw not in out:
+        out.append(pw)
+    try:
+        from urllib.parse import unquote
+        dec = unquote(pw)
+        if dec and dec != pw and dec not in out:
+            out.append(dec)
+    except Exception:
+        pass
+    return out
+
+
+def _miniapp_vault_pw_pick(user, candidates):
+    """ВОЛНА 22.35: выбирает первый пароль-кандидат, который подходит по
+    верификаторам. None среди кандидатов не бывает (пустые отфильтрованы).
+    Если ни один не подтверждён — возвращаем последний (ошибку покажет verify)."""
+    cands = [c for c in (candidates or []) if c]
+    if not cands:
+        return None
+    for pw in cands:
+        if _miniapp_vault_pw_verify(user, pw) is True:
+            return pw
+    return cands[-1]
+
+
 async def _miniapp_serve_file(request, user, rec, where, pw_override=None):
     """ВОЛНА 22.30: отдаёт файл ПОТОКОМ (Cloud: Bot API ≤20 МБ / MTProto до
     2 ГБ; Сейф: расшифровка на лету — нужен пароль). Стриминг вместо «всё в
@@ -12608,7 +13160,10 @@ async def _miniapp_serve_file(request, user, rec, where, pw_override=None):
             cloud_like = rec
             name = str(cloud_like.get("name") or rec.get("label") or "file")
         else:
-            password = pw_override or _miniapp_vault_pw_for(request, user)
+            pw_raw = pw_override or _miniapp_vault_pw_for(request, user)
+            # ВОЛНА 22.35: не-Latin1 пароль из заголовка — резолвим кандидатов
+            password = _miniapp_vault_pw_pick(
+                user, _vault_pw_candidates(pw_raw)) if pw_raw else None
             if not password:
                 return _miniapp_err(
                     423, "safe_locked",
@@ -12847,7 +13402,10 @@ async def miniapp_files_link(request):
     # его (проверенный) в одноразовый токен, иначе ссылка не сможет расшифровать.
     pw_embed = None
     if where == "safe" and not rec.get("plain"):
-        pw_embed = _miniapp_vault_pw_for(request, user)
+        pw_raw = _miniapp_vault_pw_for(request, user)
+        # ВОЛНА 22.35: URL-кодированный кириллический пароль — резолвим
+        pw_embed = _miniapp_vault_pw_pick(user, _vault_pw_candidates(pw_raw)) \
+            if pw_raw else None
         if not pw_embed:
             return _miniapp_err(
                 423, "safe_locked",
@@ -12939,6 +13497,10 @@ async def miniapp_safe_unlock(request):
         return _miniapp_err(503, "no_crypto",
                             "На сервере нет библиотеки cryptography — шифрование "
                             "недоступно.")
+    # ВОЛНА 22.35: кириллический пароль приходит URL-кодированным —
+    # выбираем рабочий вариант по верификаторам, его же храним в сессии.
+    password = _miniapp_vault_pw_pick(user, _vault_pw_candidates(password)) \
+        or password
     ok = _miniapp_vault_pw_verify(user, password)
     if ok is False:
         return _miniapp_err(403, "wrong_password", "Пароль Сейфа не подходит.")
@@ -13303,6 +13865,135 @@ async def miniapp_files_from_safe(request):
     return web.json_response({"file": _miniapp_rec_out(new_rec), "ok": True})
 
 
+async def miniapp_files_to_chat(request):
+    """ВОЛНА 22.35: отправляет файл в ЛИЧНЫЙ чат пользователя с ботом —
+    «скачалось в ТГ и в галерею». Фото/видео остаются медиа (в галерею —
+    одним тапом), остальное — документом.
+    Облако и plain-Сейф: copy_message из канала (без перекачивания!), фолбэк —
+    отправка по file_id. Зашифрованный Сейф: DVF1 ≤20 МБ — расшифровка в
+    память и send_document; DVF2 ≤49 МБ — расшифровка в temp и отправка;
+    DVF2 >49 МБ — честный отказ (Bot API не умеет, качайте кнопкой «Скачать»)."""
+    user, uid, err = await _api_get_user_any(request)
+    if err is not None:
+        return err
+    rec, where = _miniapp_find_any(user, request.match_info["fid"])
+    if not rec:
+        return _miniapp_err(404, "not_found", "Файл не найден (возможно, уже удалён).")
+    app = _MINIAPP_PTB_APP
+    bot = getattr(app, "bot", None) if app is not None else None
+    if bot is None:
+        return _miniapp_err(503, "no_bot",
+                            "Бот ещё запускается — попробуйте через минуту.")
+    try:
+        chat_id = int(uid)
+    except (TypeError, ValueError):
+        return _miniapp_err(400, "bad_uid", "Не удалось определить ваш чат с ботом.")
+    name = str(rec.get("name") or rec.get("label") or "файл")
+    kind = str(rec.get("kind") or "document")
+
+    # --- путь 1: облако / plain-Сейф — копируем сообщение из канала ---
+    if where == "cloud" or rec.get("plain"):
+        channel_id = rec.get("channel_id") or get_storage_channel_id()
+        if channel_id and rec.get("msg_id"):
+            try:
+                await bot.copy_message(
+                    chat_id=chat_id,
+                    from_chat_id=int(channel_id),
+                    message_id=int(rec["msg_id"]),
+                )
+                return web.json_response({"ok": True, "how": "copy"})
+            except Exception as e:
+                logger.warning(f"miniapp to_chat: copy не сработал ({e}), пробую file_id")
+        file_id = rec.get("file_id")
+        if not file_id:
+            return _miniapp_err(404, "no_source",
+                                "Источник файла недоступен (нет канала/сообщения).")
+        try:
+            if kind == "photo":
+                await bot.send_photo(chat_id=chat_id, photo=file_id, caption=name[:100])
+            elif kind == "video":
+                await bot.send_video(chat_id=chat_id, video=file_id, caption=name[:100])
+            elif kind == "audio":
+                await bot.send_audio(chat_id=chat_id, audio=file_id, caption=name[:100])
+            else:
+                await bot.send_document(chat_id=chat_id, document=file_id,
+                                        caption=name[:100])
+            return web.json_response({"ok": True, "how": "file_id"})
+        except Exception as e:
+            msg = str(e)
+            if "bot was blocked" in msg or "chat not found" in msg.lower():
+                return _miniapp_err(400, "no_chat",
+                                    "Напишите боту любое сообщение в чат — и "
+                                    "попробуйте снова (так бот сможет отправить файл).")
+            return _miniapp_err(502, "send_failed",
+                                f"Не удалось отправить файл в чат ({e}).")
+
+    # --- путь 2: ЗАШИФРОВАННЫЙ Сейф — расшифровка и отправка ---
+    pw_raw = _miniapp_vault_pw_for(request, {})
+    password = _miniapp_vault_pw_pick(user, _vault_pw_candidates(pw_raw)) \
+        if pw_raw else None
+    if not password:
+        return _miniapp_err(
+            423, "safe_locked",
+            "Файл зашифрован Сейфом — сначала введите пароль Сейфа "
+            "(⚙️ → Сейф), затем отправляйте в чат.")
+    if _miniapp_vault_pw_verify(user, password) is False:
+        return _miniapp_err(403, "wrong_password", "Пароль Сейфа не подходит.")
+
+    try:
+        if not rec.get("dvf2"):
+            container = await _miniapp_fetch_container_bytes(user, rec)
+            meta, payload = await asyncio.to_thread(_vault_unpack, password, container)
+            name = str(meta.get("n") or name)
+            await bot.send_document(
+                chat_id=chat_id,
+                document=InputFile(payload, filename=name[:120] or "file.bin"),
+                caption=name[:100],
+            )
+            return web.json_response({"ok": True, "how": "dvf1"})
+        # DVF2: расшифровка во временный файл
+        size_orig = int(rec.get("size_orig") or 0)
+        if size_orig > STORAGE_MAX_FILE_BYTES:
+            return _miniapp_err(
+                400, "too_big_for_chat",
+                "Файл больше 49 МБ — Telegram не даёт ботам отправлять такие "
+                "документы. Скачайте его кнопкой «Скачать» (ссылка откроется "
+                "в браузере) — файл попадёт в загрузки и галерею.")
+        tmpdir = _miniapp_tmpdir()
+        tmp_plain = os.path.join(
+            tmpdir, f"chat_{rec.get('id', 'x')}_{os.getpid()}.bin")
+        try:
+            res = await _miniapp_stream_dvf2(
+                request, user, rec, password, to_file=tmp_plain)
+            # to_file=True возвращает (мета, размер) либо Response при ошибке
+            if isinstance(res, web.Response):
+                return res
+            meta, orig = res
+            name = str((meta or {}).get("n") or name)
+            with open(tmp_plain, "rb") as fh:
+                data = fh.read()
+            await bot.send_document(
+                chat_id=chat_id,
+                document=InputFile(data, filename=name[:120] or "file.bin"),
+                caption=name[:100],
+            )
+            return web.json_response({"ok": True, "how": "dvf2"})
+        finally:
+            try:
+                os.remove(tmp_plain)
+            except Exception:
+                pass
+    except Exception as e:
+        msg = str(e)
+        if "bot was blocked" in msg or "chat not found" in msg.lower():
+            return _miniapp_err(400, "no_chat",
+                                "Напишите боту любое сообщение в чат — и "
+                                "попробуйте снова.")
+        logger.error(f"miniapp to_chat (vault): {e}")
+        return _miniapp_err(502, "send_failed",
+                            f"Не удалось отправить файл в чат ({e}).")
+
+
 # --- ВОЛНА 22.32: ЗАГРУЗКИ МИНИ-АППА ШИФРУЮТСЯ КАК В ЧАТЕ ---
 # Раньше файл из веба уходил в канал КАК ЕСТЬ и попадал в cloud_files
 # («Файлы без шифра» в чате, волна 22.33), а файл из чата — ВСЕГДА в Сейф.
@@ -13458,7 +14149,10 @@ def _miniapp_vault_pw_from(request, body, upload_sess=None):
 def _miniapp_vault_pw_guard(user, password):
     """ВОЛНА 22.32: проверка пароля Сейфа перед шифрованием загрузки.
     None — пароль не задан (нужен 423); web.Response — ошибка (403/400/503);
-    True — пароль принят (или создаётся новый при первом файле)."""
+    True — пароль принят (или создаётся новый при первом файле).
+    ВОЛНА 22.35: НЕ-Latin1 пароли резолвятся ЗАРАНЕЕ через
+    _miniapp_vault_pw_pick(_vault_pw_candidates(raw)) — сюда приходит уже
+    выбранный рабочий пароль (одна строка)."""
     if not password:
         return None
     if not _vault_kdf_available():
@@ -13506,7 +14200,11 @@ async def miniapp_upload_init(request):
                   and _vault_channel_plain(user))
     vault_pw = None
     if not plain_mode:
-        vault_pw = _miniapp_vault_pw_from(request, body)
+        vault_pw_raw = _miniapp_vault_pw_from(request, body)
+        # ВОЛНА 22.35: не-Latin1 пароль из заголовка URL-кодирован клиентом —
+        # выбираем рабочий вариант (как есть / URL-декод) по верификаторам.
+        vault_pw = _miniapp_vault_pw_pick(user, _vault_pw_candidates(vault_pw_raw)) \
+            if vault_pw_raw else None
         guard = _miniapp_vault_pw_guard(user, vault_pw)
         if guard is None:
             return _miniapp_err(
@@ -13635,7 +14333,11 @@ async def miniapp_upload_complete(request):
         size = s["size"]
         # === ВОЛНА 22.32: ШИФРОВАННАЯ ЗАГРУЗКА (режим по умолчанию) ===
         if not s.get("plain"):
-            vault_pw = _miniapp_vault_pw_from(request, body, upload_sess=s)
+            vault_pw_raw = _miniapp_vault_pw_from(request, body, upload_sess=s)
+            # ВОЛНА 22.35: резолвим URL-кодированный не-Latin1 пароль из заголовка
+            vault_pw = _miniapp_vault_pw_pick(
+                user, _vault_pw_candidates(vault_pw_raw)) \
+                if vault_pw_raw else None
             guard = _miniapp_vault_pw_guard(user, vault_pw)
             if guard is None:
                 return _miniapp_err(
@@ -13713,7 +14415,13 @@ async def miniapp_upload_complete(request):
                             if isinstance(f, dict)]
         user.cloud_files.append(rec)
         save_user(user)
-        return web.json_response({"file": _miniapp_rec_out(rec)})
+        # ВОЛНА 22.35: позиция в очереди публикаций канала (1 = печатали сразу)
+        out = _miniapp_rec_out(rec)
+        try:
+            out["queue_pos"] = int(sent.get("queue_pos") or 1)
+        except Exception:
+            out["queue_pos"] = 1
+        return web.json_response({"file": out})
     finally:
         for p in (s["path"], mt_renamed):
             try:
@@ -14301,6 +15009,8 @@ def mount_miniapp_routes(app):
     app.router.add_post("/api/safe/lock", miniapp_safe_lock)
     app.router.add_post("/api/files/{fid}/to_safe", miniapp_files_to_safe)
     app.router.add_post("/api/files/{fid}/from_safe", miniapp_files_from_safe)
+    # ВОЛНА 22.35: «скачалось в ТГ и в галерею» — файл в личный чат пользователя
+    app.router.add_post("/api/files/{fid}/to_chat", miniapp_files_to_chat)
     app.router.add_post("/api/upload/init", miniapp_upload_init)
     app.router.add_post("/api/upload/chunk", miniapp_upload_chunk)
     app.router.add_post("/api/upload/complete", miniapp_upload_complete)
@@ -16902,18 +17612,25 @@ async def _mt_upload_container(client, path, size, caption, filename=None,
     for ch in targets:
         try:
             peer = await _mt_resolve_channel(client, ch)
-            sent = await _mt_run_with_flood(lambda: client.send_file(
-                peer, upload_path, force_document=True,
-                caption=(caption or "")[:1024] or None,
-                file_size=int(size or 0) or None,
-                progress_callback=progress_cb,
-            ))
+
+            async def _send_file(peer=peer, upload_path=upload_path):
+                return await _mt_run_with_flood(lambda: client.send_file(
+                    peer, upload_path, force_document=True,
+                    caption=(caption or "")[:1024] or None,
+                    file_size=int(size or 0) or None,
+                    progress_callback=progress_cb,
+                ))
+
+            # ВОЛНА 22.35: публикация через «шлагбаум» — очередь на канал,
+            # чтобы массовые загрузки из веба не упёрлись в лимиты Telegram.
+            sent, queue_pos = await _pub_send(ch, _send_file)
             doc = getattr(sent, "document", None)
             return {
                 "message_id": int(getattr(sent, "id", 0) or 0),
                 "file_id": None,
                 "size": int(getattr(doc, "size", 0) or size or 0),
                 "channel_id": ch,
+                "queue_pos": queue_pos,
             }
         except Exception as e:
             logger.error(f"mtproto: заливка контейнера в канал {ch} не удалась: {e}")
@@ -36789,21 +37506,59 @@ def _duty_is_day_on(class_obj, weekday):
     return int(weekday) in [int(d) for d in (getattr(class_obj, "duty_days", []) or [])]
 
 
+def _duty_custom_names(class_obj):
+    """ВОЛНА 22.35: список имён СВОЕГО графика (без ТГ-аккаунтов) или []."""
+    dc = getattr(class_obj, "duty_custom", None)
+    if not isinstance(dc, dict):
+        return []
+    names = [str(n).strip()[:60] for n in (dc.get("names") or []) if str(n).strip()]
+    return names
+
+
+def _duty_custom_plan_for(class_obj, occ):
+    """ВОЛНА 22.35: имена из плана своего графика на дату occ или None."""
+    dc = getattr(class_obj, "duty_custom", None)
+    if not isinstance(dc, dict):
+        return None
+    plan = dc.get("plan") if isinstance(dc.get("plan"), dict) else {}
+    names = plan.get(occ)
+    if isinstance(names, list) and names:
+        return [str(n).strip()[:60] for n in names if str(n).strip()]
+    return None
+
+
 def _duty_pick_today(class_obj, occ):
     """Выбирает дежурных на дату occ. Если на сегодня уже есть ручное
     назначение (duty_today) — используем его. Иначе берём голову очереди;
     если в очереди меньше нужного — перемешиваем ВСЁ заново (рандом под
     каждый день, как просил пользователь).
+    ВОЛНА 22.35: режим СВОЕГО графика — имена берутся из плана на дату
+    (duty_custom.plan), а если даты в плане нет — случайные имена из списка.
     Возвращает список uid (может быть пустым — дежурить некому)."""
     need = max(1, min(3, int(getattr(class_obj, "duty_count", 1) or 1)))
     today = getattr(class_obj, "duty_today", None)
     if isinstance(today, dict) and today.get("date") == occ:
+        names = today.get("names")
+        if isinstance(names, list) and names:
+            class_obj.duty_today = {"date": occ, "ids": [], "names": names}
+            return []
         ids = [str(i) for i in (today.get("ids") or [])]
         pool = set(_duty_pool(class_obj))
         ids = [i for i in ids if i in pool]
         if ids:
             class_obj.duty_today = {"date": occ, "ids": ids}
             return ids
+    # --- ВОЛНА 22.35: свой график (имена без аккаунтов) ---
+    if _duty_custom_names(class_obj):
+        plan_names = _duty_custom_plan_for(class_obj, occ)
+        if plan_names:
+            selected_names = plan_names[:3]
+        else:
+            pool_names = _duty_custom_names(class_obj)
+            random.shuffle(pool_names)
+            selected_names = pool_names[:need]
+        class_obj.duty_today = {"date": occ, "ids": [], "names": selected_names}
+        return []
     queue, _ch = _duty_clean_queue(class_obj)
     if len(queue) < need:
         pool = _duty_pool(class_obj)
@@ -36860,7 +37615,11 @@ def _duty_overview_text(class_obj, local_today, for_admin=False):
                  f"дежурных в день: <b>{getattr(class_obj, 'duty_count', 1)}</b>")
     lines.append("")
     today = getattr(class_obj, "duty_today", None)
-    if isinstance(today, dict) and today.get("date") == occ and today.get("ids"):
+    if isinstance(today, dict) and today.get("date") == occ and today.get("names"):
+        # ВОЛНА 22.35: свой график — сегодня дежурят ПО ИМЕНАМ из списка
+        names = ", ".join(str(n) for n in today["names"])
+        lines.append(f"📌 Сегодня ({occ}) дежурят: <b>{names}</b>")
+    elif isinstance(today, dict) and today.get("date") == occ and today.get("ids"):
         names = ", ".join(_duty_member_name(i) for i in today["ids"])
         lines.append(f"📌 Сегодня ({occ}) дежурят: <b>{names}</b>")
     elif _duty_is_day_on(class_obj, local_today.weekday()):
@@ -36868,6 +37627,30 @@ def _duty_overview_text(class_obj, local_today, for_admin=False):
     else:
         lines.append("📌 Сегодня не день дежурств.")
     lines.append("")
+    # ВОЛНА 22.35: свой график — план из заданных дат (ближайшие 14 дней)
+    dc = getattr(class_obj, "duty_custom", None)
+    if isinstance(dc, dict):
+        cnames = [str(n) for n in (dc.get("names") or []) if str(n).strip()]
+        cplan = dc.get("plan") if isinstance(dc.get("plan"), dict) else {}
+        if cnames:
+            lines.append(f"📥 <b>Свой график</b> — {len(cnames)} чел. "
+                         "(имена из списка, без привязки к аккаунтам)")
+            future = sorted(k for k in cplan.keys()
+                            if isinstance(k, str) and k >= occ)[:14]
+            if future:
+                lines.append("📅 <b>План по датам:</b>")
+                for k in future:
+                    try:
+                        d = datetime.strptime(k, "%Y-%m-%d").date()
+                        ds = f"{_DUTY_DAYS_RU_FULL[d.weekday()]} {d.strftime('%d.%m')}"
+                    except Exception:
+                        ds = k
+                    names = ", ".join(str(n) for n in (cplan[k] or [])[:3])
+                    lines.append(f"  • {ds} — {names}")
+            else:
+                lines.append("Даты не заданы — в дни дежурств бот выбирает "
+                             "случайные имена из списка.")
+            return "\n".join(lines)
     plan = _duty_upcoming_schedule(class_obj, local_today)
     if plan:
         lines.append("📅 <b>Дальше по очереди:</b>")
@@ -36887,7 +37670,26 @@ def _duty_overview_text(class_obj, local_today, for_admin=False):
 async def _duty_announce(bot, class_obj, selected, sick_note=None):
     """Утреннее объявление: дежурному — «вы сегодня дежурный» с кнопкой
     «🤒 Я заболел(а)», всем — «Сегодня дежурный: …» (у админов — кнопки
-    «заболел» на каждого дежурного). sick_note — если это замена болевшего."""
+    «заболел» на каждого дежурного). sick_note — если это замена болевшего.
+    ВОЛНА 22.35: если selected — СТРОКИ-имена (свой график), рассылаем
+    только текст «Сегодня дежурят: …» без личных сообщений и кнопок."""
+    if selected and all(isinstance(i, str) and not i.isdigit() for i in selected):
+        names = ", ".join(str(i) for i in selected) if selected else "—"
+        members = [str(m) for m in dict.fromkeys(
+            [str(m) for m in (class_obj.students or [])] +
+            [str(m) for m in (class_obj.admins or [])])]
+        blocked = set(str(b) for b in (class_obj.blocked_users or []))
+        members = [m for m in members if m not in blocked and get_user(m)]
+        for uid in members:
+            try:
+                await bot.send_message(
+                    chat_id=int(uid),
+                    text=("🕐 <b>Сегодня дежурят: " + names + "</b>\n"
+                          + (sick_note if sick_note else "")).rstrip(),
+                    parse_mode=ParseMode.HTML)
+            except Exception as e:
+                logger.error(f"duty announce(names): send failed {uid}: {e}")
+        return
     members = [str(m) for m in dict.fromkeys(
         [str(m) for m in (class_obj.students or [])] +
         [str(m) for m in (class_obj.admins or [])])]
@@ -37020,6 +37822,9 @@ def _duty_settings_kb(class_obj):
         [InlineKeyboardButton("📋 Очередь и участники", callback_data="duty_queue"),
          InlineKeyboardButton("🔀 Перемешать заново", callback_data="duty_shuffle")],
         [InlineKeyboardButton("⭐ Назначить дежурным сегодня", callback_data="duty_pick_today")],
+        # ВОЛНА 22.35: свой график — имена без ТГ-аккаунтов, ИИ составляет план
+        [InlineKeyboardButton("📥 Свой график (список/ИИ)",
+                              callback_data="duty_custom_menu")],
         [InlineKeyboardButton("⬅️ В админ-панель", callback_data="back_to_admin")],
     ]
     return InlineKeyboardMarkup(rows)
@@ -37214,6 +38019,468 @@ async def duty_time_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
         + _duty_settings_text(class_obj),
         parse_mode=ParseMode.HTML,
         reply_markup=_duty_settings_kb(class_obj))
+    return ADMIN_PANEL
+
+
+# --- ВОЛНА 22.35: СВОЙ ГРАФИК ДЕЖУРСТВ (имена без ТГ-аккаунтов) ---
+# Имена из загруженного списка НЕ совпадают с юзернеймами участников — и не
+# должны: бот просто присылает утром «Сегодня дежурят: Имя, Имя» (одного или
+# двух-трёх — как в «Сколько в день»). Два способа загрузки:
+#   1) 🤖 ИИ по списку: админ шлёт список имён (можно «как есть», с ника­неймами
+#      и пометками) — ИИ распознаёт имена и «сколько дней в неделю учитесь»,
+#      бот строит ротацию по учебным дням (📅 Дни дежурств) на 5 недель вперёд.
+#   2) 📅 Список с датами: админ шлёт «01.10 — Вася и Петя» — ИИ раскладывает
+#      по датам; если ИИ недоступен — надёжный локальный разбор.
+
+
+def _duty_custom_menu_text(class_obj):
+    dc = getattr(class_obj, "duty_custom", None)
+    names = _duty_custom_names(class_obj)
+    plan = dc.get("plan") if isinstance(dc, dict) and isinstance(dc.get("plan"), dict) else {}
+    lines = [
+        "📥 <b>Свой график дежурств</b>",
+        "",
+        "Загрузите СВОЙ список — имена могут не совпадать с аккаунтами "
+        "Telegram: бот просто будет присылать утром, <b>кто сегодня дежурит</b> "
+        "(один или два-три — как настроено в «👥 Сколько в день»).",
+        "",
+    ]
+    if names:
+        lines.append(f"✅ График активен: <b>{len(names)}</b> чел. · дат в плане: "
+                     f"<b>{len(plan)}</b>")
+        preview = ", ".join(names[:12])
+        if len(names) > 12:
+            preview += f" … и ещё {len(names) - 12}"
+        lines.append(f"Список: {preview}")
+    else:
+        lines.append("График пока не задан — работает обычная очередь из "
+                     "участников класса.")
+    lines += [
+        "",
+        "<b>Как загрузить:</b>",
+        "🤖 <b>ИИ по списку</b> — пришлите просто список имён, ИИ сам всё "
+        "составит. Укажите заодно, сколько ДНЕЙ В НЕДЕЛЮ вы учитесь — "
+        "например «учимся 5 дней в неделю»: бот настроит дни дежурств и "
+        "составит расписание «кто как».",
+        "📅 <b>Список с датами</b> — пришлите список, где у каждой строки "
+        "указаны числа дежурств: «01.10 — Вася и Петя», «02.10 — Вася».",
+    ]
+    return "\n".join(lines)
+
+
+def _duty_custom_menu_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🤖 ИИ по списку", callback_data="duty_custom_ai"),
+         InlineKeyboardButton("📅 Список с датами", callback_data="duty_custom_dates")],
+        [InlineKeyboardButton("🗑 Выключить свой график", callback_data="duty_custom_off")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="duty_admin")],
+    ])
+
+
+async def duty_custom_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Меню «📥 Свой график» (только админы)."""
+    query = update.callback_query
+    uid = str(query.from_user.id)
+    class_obj = _duty_ensure_admin_class(context, uid)
+    if not class_obj or not _duty_is_admin(uid, class_obj):
+        await query.answer("Только для админов класса.", show_alert=True)
+        return ADMIN_PANEL
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    _log_admin_action(uid, class_obj.class_code, "Дежурные: открыл «Свой график»")
+    try:
+        await query.edit_message_text(
+            _duty_custom_menu_text(class_obj), parse_mode=ParseMode.HTML,
+            reply_markup=_duty_custom_menu_kb())
+    except Exception:
+        pass
+    return ADMIN_PANEL
+
+
+async def duty_custom_ai_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Способ 1: ИИ составит график по списку имён."""
+    query = update.callback_query
+    uid = str(query.from_user.id)
+    class_obj = _duty_ensure_admin_class(context, uid)
+    if not class_obj or not _duty_is_admin(uid, class_obj):
+        await query.answer("Только для админов класса.", show_alert=True)
+        return ADMIN_PANEL
+    await query.answer()
+    await query.message.reply_text(
+        "🤖 Пришлите <b>список имён</b> — по одному в строке или через запятую. "
+        "Можно с пометками и никами, ИИ разберётся.\n\n"
+        "Укажите заодно, <b>сколько дней в неделю учитесь</b> — например: "
+        "«учимся 5 дней в неделю». Без указания бот возьмёт дни из "
+        "«📅 Дни дежурств».\n\n"
+        "ИИ сам составит расписание: по сколько человек в день (как в "
+        "«👥 Сколько в день») и в какие дни (учебные) — «кто как».\n\n"
+        "<i>Отмена — словом «отмена».</i>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_cancel_keyboard())
+    return DUTY_CUSTOM_AI
+
+
+async def duty_custom_dates_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Способ 2: список с датами дежурств (числами)."""
+    query = update.callback_query
+    uid = str(query.from_user.id)
+    class_obj = _duty_ensure_admin_class(context, uid)
+    if not class_obj or not _duty_is_admin(uid, class_obj):
+        await query.answer("Только для админов класса.", show_alert=True)
+        return ADMIN_PANEL
+    await query.answer()
+    await query.message.reply_text(
+        "📅 Пришлите <b>список с датами дежурств</b> — по строке на дату:\n\n"
+        "<code>01.10 — Вася и Петя\n02.10 — Вася\n05.10 — Петя, Аня</code>\n\n"
+        "Год можно не писать (подставится текущий/следующий). Можно наоборот: "
+        "<code>Вася: 3, 7 и 12 октября</code>.\n\n"
+        "ИИ разложит всё по датам. <i>Отмена — словом «отмена».</i>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_cancel_keyboard())
+    return DUTY_CUSTOM_DATES
+
+
+async def duty_custom_off_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выключить свой график — вернуть обычную очередь из участников."""
+    query = update.callback_query
+    uid = str(query.from_user.id)
+    class_obj = _duty_ensure_admin_class(context, uid)
+    if not class_obj or not _duty_is_admin(uid, class_obj):
+        await query.answer("Только для админов класса.", show_alert=True)
+        return ADMIN_PANEL
+    await query.answer()
+    class_obj.duty_custom = None
+    class_obj.duty_today = None
+    save_class(class_obj)
+    _log_admin_action(uid, class_obj.class_code, "Дежурные: свой график ВЫКЛЮЧЕН")
+    try:
+        await query.edit_message_text(
+            "🗑 Свой график выключен — снова работает обычная очередь "
+            "из участников класса.\n\n" + _duty_settings_text(class_obj),
+            parse_mode=ParseMode.HTML,
+            reply_markup=_duty_settings_kb(class_obj))
+    except Exception:
+        pass
+    return ADMIN_PANEL
+
+
+async def _duty_ai_json(system_prompt, user_text, max_tokens=2000):
+    """ВОЛНА 22.35: вопрос ИИ (Groq) → словарь JSON. None — ИИ недоступен
+    или ответил не JSON (тогда вызывающий использует локальный разбор)."""
+    try:
+        chat_completion = await asyncio.wait_for(
+            groq_client.chat.completions.create(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_text},
+                ],
+                model=GROQ_MODEL,
+                temperature=0.1,
+                max_tokens=max_tokens,
+            ),
+            timeout=60,
+        )
+        raw = chat_completion.choices[0].message.content or ""
+        m = re.search(r"\{.*\}", raw, re.S)
+        if not m:
+            return None
+        return json.loads(m.group(0))
+    except Exception as e:
+        logger.warning(f"duty AI: {e}")
+        return None
+
+
+_DUTY_STOP_WORDS = {
+    "учимся", "учеба", "учёба", "дней", "день", "неделю", "недели", "в", "по",
+    "список", "дежурств", "дежурные", "дежурный", "класс", "и", "с", "на",
+}
+
+
+def _duty_fallback_names(raw):
+    """Локальный разбор списка имён (если ИИ недоступен): строки/запятые/
+    точки с запятой, срезаем буллеты и нумерацию, отбрасываем служебные слова."""
+    names = []
+    for chunk in re.split(r"[\n;]|,\s", raw or ""):
+        t = re.sub(r"^[\s\-–—*•·\d.)\]]+", "", chunk.strip())
+        t = t.strip(" .,-–—")
+        if not t or len(t) > 60:
+            continue
+        low = t.lower().strip(" .")
+        if low in _DUTY_STOP_WORDS:
+            continue
+        m_days = re.search(r"(\d)\s*(?:дн|рабоч)", low)
+        if m_days and len(t.split()) <= 6:
+            continue  # строка про учебные дни, не имя
+        names.append(t[:60])
+    out = []
+    for n in names:
+        if n.lower() not in [x.lower() for x in out]:
+            out.append(n)
+    return out[:200]
+
+
+def _duty_fallback_dates(raw, today):
+    """Локальный разбор «дата — имена» (если ИИ недоступен).
+    Понимает «01.10 — Вася, Петя», «01.10.2027: Вася», «Вася — 3, 7 октября»."""
+    plan = {}
+    months = {m.lower(): i for i, m in enumerate(
+        ["января", "февраля", "марта", "апреля", "мая", "июня", "июля",
+         "августа", "сентября", "октября", "ноября", "декабря"], start=1)}
+    for line in (raw or "").splitlines():
+        line = line.strip(" -–—*•·")
+        if not line:
+            continue
+        names = []
+        occ = None
+        # форма «Вася: 3, 7 и 12 октября» / «Вася — 5, 7 октября»
+        # (имя в начале строки, после двоеточия или тире — числа)
+        m_named = re.match(
+            r"^([^:\d]{2,60}?)[:\-–—]\s*(.+)$", line)
+        if m_named and re.search(r"\d", m_named.group(2)):
+            who = m_named.group(1).strip(" ,-–—")
+            rest = m_named.group(2)
+            month_num = None
+            for nm, num in months.items():
+                if nm in rest.lower():
+                    month_num = num
+                    break
+            day_nums = [int(d) for d in re.findall(r"\b(\d{1,2})\b", rest)
+                        if 1 <= int(d) <= 31]
+            if who and day_nums:
+                year = today.year
+                if month_num and (month_num < today.month
+                                  or (month_num == today.month
+                                      and max(day_nums) < today.day)):
+                    year += 1
+                for dn in day_nums[:31]:
+                    mm = month_num or today.month
+                    try:
+                        occ = date(year, mm, dn).strftime("%Y-%m-%d")
+                    except ValueError:
+                        continue
+                    plan.setdefault(occ, [])
+                    for w in [who]:
+                        if w not in plan[occ]:
+                            plan[occ].append(w)
+            continue
+        # форма «дата — имена»
+        m_date = re.search(
+            r"(\d{1,2})\s*[.\/\-]\s*(\d{1,2})(?:\s*[.\/\-]\s*(\d{2,4}))?", line)
+        if m_date:
+            dd, mm = int(m_date.group(1)), int(m_date.group(2))
+            yy = m_date.group(3)
+            if 1 <= dd <= 31 and 1 <= mm <= 12:
+                year = today.year
+                if yy:
+                    yy = int(yy)
+                    if yy < 100:
+                        yy += 2000
+                    year = yy
+                elif (mm < today.month or (mm == today.month and dd < today.day)):
+                    year += 1
+                try:
+                    occ = date(year, mm, dd).strftime("%Y-%m-%d")
+                except ValueError:
+                    occ = None
+            tail = line[m_date.end():]
+            tail = re.sub(r"^[\s\-–—:]+", "", tail)
+            names = [n.strip(" .") for n in re.split(r",|;|\bи\b|\+", tail)
+                     if n.strip(" .")]
+            if occ and names:
+                plan.setdefault(occ, [])
+                for n in names[:3]:
+                    if n and n not in plan[occ]:
+                        plan[occ].append(n[:60])
+    return plan
+
+
+def _duty_build_rotation(names, duty_days, duty_count, today, days_ahead=35):
+    """Ротация имён по учебным дням на days_ahead дней вперёд: «кто как» —
+    по duty_count человек в день, без повторов пока все не подежурят."""
+    days = sorted({int(d) for d in (duty_days or [])})
+    if not names or not days:
+        return {}
+    need = max(1, min(3, int(duty_count or 1)))
+    pool = list(names)
+    random.shuffle(pool)
+    plan = {}
+    d = today
+    i = 0
+    while len(plan) < 1 or d <= today + timedelta(days=days_ahead):
+        if d > today + timedelta(days=days_ahead):
+            break
+        if d.weekday() in days and d > today:
+            chunk = [pool[(i + j) % len(pool)] for j in range(need)]
+            plan[d.strftime("%Y-%m-%d")] = chunk
+            i += need
+            if i >= len(pool):
+                i = 0
+                random.shuffle(pool)
+        d += timedelta(days=1)
+    return plan
+
+
+async def duty_custom_ai_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.35: список имён от админа → ИИ распознаёт имена и учебные
+    дни → бот строит ротацию на 5 недель и включает свой график."""
+    user = get_user(str(update.effective_user.id))
+    raw = (update.message.text or "").strip()
+    if raw.lower() in ("отмена", "cancel"):
+        await update.message.reply_text("Загрузка графика отменена.")
+        return await global_cancel_handler(update, context)
+    uid = str(update.effective_user.id)
+    class_obj = _duty_ensure_admin_class(context, uid)
+    if not class_obj or not user or not _duty_is_admin(uid, class_obj):
+        await update.message.reply_text("Только для админов класса.")
+        return MAIN_MENU
+    days_hint = None
+    m_days = re.search(r"(\d{1,2})\s*(?:рабоч\w*|учебн\w*)?\s*дн\w*", raw.lower())
+    if "недел" in raw.lower() and m_days and 1 <= int(m_days.group(1)) <= 7:
+        days_hint = int(m_days.group(1))
+    ai = await _duty_ai_json(
+        "Ты — помощник классного бота. Пользователь присылает список дежурных "
+        "(имена/ники, с пометками) и, возможно, фразу про учебные дни. "
+        'Верни СТРОГО JSON без пояснений: {"names": ["Имя", ...], '
+        '"days_per_week": 5 или null}. В names — ТОЛЬКО чистые имена людей '
+        "(до 60 символов, без нумерации и пометок, максимум 200). "
+        "days_per_week — сколько ДНЕЙ В НЕДЕЛЮ учатся, если пользователь "
+        "указал, иначе null.",
+        raw)
+    names = []
+    if isinstance(ai, dict):
+        cand = ai.get("names")
+        if isinstance(cand, list):
+            names = [str(n).strip()[:60] for n in cand
+                     if str(n).strip() and len(str(n).strip()) <= 60][:200]
+    if not names:
+        names = _duty_fallback_names(raw)
+    if not names:
+        await update.message.reply_text(
+            "Не нашёл ни одного имени в сообщении. Пришлите список ещё раз — "
+            "по одному имени в строке или через запятую.",
+            reply_markup=get_cancel_keyboard())
+        return DUTY_CUSTOM_AI
+    days_per_week = None
+    if isinstance(ai, dict):
+        dpw = ai.get("days_per_week")
+        try:
+            if dpw is not None and 1 <= int(dpw) <= 7:
+                days_per_week = int(dpw)
+        except (TypeError, ValueError):
+            days_per_week = None
+    if days_per_week is None:
+        days_per_week = days_hint
+    days_note = ""
+    if days_per_week is not None and days_per_week != len(class_obj.duty_days):
+        class_obj.duty_days = list(range(days_per_week))
+        days_note = (f"\n📅 Учебные дни обновлены: <b>{days_per_week} дн./нед.</b> "
+                     f"({' '.join(_DUTY_DAYS_RU[d] for d in class_obj.duty_days)}).")
+    tz = _duty_tz(class_obj)
+    today = (_now_utc() + timedelta(hours=tz)).date()
+    plan = _duty_build_rotation(names, class_obj.duty_days,
+                                class_obj.duty_count, today)
+    class_obj.duty_custom = {"names": names, "plan": plan}
+    class_obj.duty_today = None
+    save_class(class_obj)
+    _log_admin_action(uid, class_obj.class_code,
+                      f"Дежурные: свой график (ИИ), {len(names)} имён, "
+                      f"{len(plan)} дат")
+    preview_lines = [f"✅ <b>Свой график составлен</b> — {len(names)} чел."
+                     + days_note, ""]
+    upcoming = sorted(plan.keys())[:10]
+    if upcoming:
+        preview_lines.append("📅 <b>Кто когда дежурит (первые дни):</b>")
+        for k in upcoming:
+            try:
+                d = datetime.strptime(k, "%Y-%m-%d").date()
+                ds = f"{_DUTY_DAYS_RU_FULL[d.weekday()]} {d.strftime('%d.%m')}"
+            except Exception:
+                ds = k
+            preview_lines.append(f"  • {ds} — {', '.join(plan[k])}")
+    preview_lines += [
+        "",
+        "Утром в назначенное время бот пришлёт классу: «Сегодня дежурят: …» "
+        "— просто имена, без привязки к аккаунтам.",
+    ]
+    await update.message.reply_text(
+        "\n".join(preview_lines), parse_mode=ParseMode.HTML,
+        reply_markup=_duty_custom_menu_kb())
+    return ADMIN_PANEL
+
+
+async def duty_custom_dates_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.35: список «дата — имена» → ИИ раскладывает по датам
+    (фолбэк — локальный разбор). Даты без года: этот год или следующий."""
+    user = get_user(str(update.effective_user.id))
+    raw = (update.message.text or "").strip()
+    if raw.lower() in ("отмена", "cancel"):
+        await update.message.reply_text("Загрузка графика отменена.")
+        return await global_cancel_handler(update, context)
+    uid = str(update.effective_user.id)
+    class_obj = _duty_ensure_admin_class(context, uid)
+    if not class_obj or not user or not _duty_is_admin(uid, class_obj):
+        await update.message.reply_text("Только для админов класса.")
+        return MAIN_MENU
+    tz = _duty_tz(class_obj)
+    today = (_now_utc() + timedelta(hours=tz)).date()
+    ai = await _duty_ai_json(
+        "Ты — помощник классного бота. Пользователь присылает список "
+        "дежурств с датами на русском («01.10 — Вася и Петя», «Вася: 3, 7 "
+        "октября»). Сегодня " + today.strftime("%Y-%m-%d") + ". "
+        'Верни СТРОГО JSON без пояснений: {"plan": {"YYYY-MM-DD": '
+        '["Имя", ...], ...}}. Даты без года считай в текущем году; если '
+        "дата уже прошла в текущем году — следующий год. В один день — "
+        "максимум 3 имени. Включай ТОЛЬКО даты, которые удалось понять.",
+        raw)
+    plan = {}
+    if isinstance(ai, dict) and isinstance(ai.get("plan"), dict):
+        for k, v in ai["plan"].items():
+            if (isinstance(k, str) and re.match(r"^\d{4}-\d{2}-\d{2}$", k)
+                    and isinstance(v, list) and v):
+                names = [str(n).strip()[:60] for n in v
+                         if str(n).strip()][:3]
+                if names:
+                    plan[k] = names
+    if not plan:
+        plan = _duty_fallback_dates(raw, today)
+    if not plan:
+        await update.message.reply_text(
+            "Не нашёл ни одной даты. Пример: <code>01.10 — Вася и Петя</code>. "
+            "Пришлите список ещё раз.", parse_mode=ParseMode.HTML,
+            reply_markup=get_cancel_keyboard())
+        return DUTY_CUSTOM_DATES
+    names = []
+    for k in sorted(plan.keys()):
+        for n in plan[k]:
+            if n.lower() not in [x.lower() for x in names]:
+                names.append(n)
+    class_obj.duty_custom = {"names": names, "plan": plan}
+    class_obj.duty_today = None
+    save_class(class_obj)
+    _log_admin_action(uid, class_obj.class_code,
+                      f"Дежурные: свой график по датам, {len(plan)} дат")
+    preview_lines = [f"✅ <b>График по датам сохранён</b> — дат: {len(plan)}, "
+                     f"человек: {len(names)}.", ""]
+    upcoming = sorted(k for k in plan.keys() if k >= today.strftime("%Y-%m-%d"))[:10]
+    if upcoming:
+        preview_lines.append("📅 <b>Ближайшие дежурства:</b>")
+        for k in upcoming:
+            try:
+                d = datetime.strptime(k, "%Y-%m-%d").date()
+                ds = f"{_DUTY_DAYS_RU_FULL[d.weekday()]} {d.strftime('%d.%m')}"
+            except Exception:
+                ds = k
+            preview_lines.append(f"  • {ds} — {', '.join(plan[k])}")
+    preview_lines += [
+        "",
+        "В дни из списка бот утром пришлёт: «Сегодня дежурят: …». Если для "
+        "какого-то учебного дня даты нет — выберется случайное имя из списка.",
+    ]
+    await update.message.reply_text(
+        "\n".join(preview_lines), parse_mode=ParseMode.HTML,
+        reply_markup=_duty_custom_menu_kb())
     return ADMIN_PANEL
 
 
@@ -38638,6 +39905,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await duty_pick_today_cb(update, context)
     elif data.startswith("duty_today_"):
         return await duty_assign_today_cb(update, context)
+    # ВОЛНА 22.35: свой график дежурств (имена без ТГ-аккаунтов)
+    elif data == "duty_custom_menu":
+        return await duty_custom_menu_cb(update, context)
+    elif data == "duty_custom_ai":
+        return await duty_custom_ai_cb(update, context)
+    elif data == "duty_custom_dates":
+        return await duty_custom_dates_cb(update, context)
+    elif data == "duty_custom_off":
+        return await duty_custom_off_cb(update, context)
     elif data == "edit_schedule":
         return await edit_schedule_start(update, context)
     elif data == "edit_teachers":
@@ -45117,6 +46393,15 @@ def main():
             # ВОЛНА 22.30: дежурные — админ вписывает время утреннего объявления.
             DUTY_WAIT_TIME: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, duty_time_save),
+                CallbackQueryHandler(handle_callback),
+            ],
+            # ВОЛНА 22.35: свой график — ИИ по списку имён / список с датами.
+            DUTY_CUSTOM_AI: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, duty_custom_ai_save),
+                CallbackQueryHandler(handle_callback),
+            ],
+            DUTY_CUSTOM_DATES: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, duty_custom_dates_save),
                 CallbackQueryHandler(handle_callback),
             ],
             # ВОЛНА 22.27: правка напоминаний из «📋 Мои напоминания».
