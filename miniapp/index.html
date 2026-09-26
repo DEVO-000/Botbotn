@@ -5,6 +5,10 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
 <title>DEVO+ Облако</title>
 
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="dns-prefetch" href="https://unpkg.com">
+
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <script>
 (function () {
@@ -103,64 +107,89 @@
 <script src="https://unpkg.com/lucide@latest"></script>
 
 <style>
+/* ============================================================
+   МАКСИМАЛЬНАЯ ПЛАВНОСТЬ
+   ============================================================ */
+
+/* Плавная смена темы через View Transitions (см. applyTheme в JS):
+   старый кадр снимается в текстуру и растворяется в новый — смена цветов
+   идёт на композиторе, БЕЗ пересчёта стилей страницы каждый кадр.
+   Анимация CSS-переменных через @property пересчитывала ВСЮ страницу
+   каждый кадр и лагала на телефонах — заменено. */
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation-duration: 0.3s;
+  animation-timing-function: cubic-bezier(0.25, 1, 0.5, 1);
+}
+
 :root {
   --bg-color: #f8f9fa;
   --bg-gradient: none;
   --text-color: #0d0d0d;
-  --card-bg: rgba(255, 255, 255, 0.8);
-  --card-active: rgba(240, 242, 245, 0.9);
-  --stat-bg: rgba(255, 255, 255, 0.8);
+  --card-bg: #ffffff;
+  --card-active: #f0f2f5;
+  --stat-bg: #ffffff;
   --btn-bg: #000000;
   --btn-text: #ffffff;
-  --border-color: rgba(226, 232, 240, 0.85);
+  --border-color: #e2e8f0;
   --subtext-color: #64748b;
-  --drop-bg: rgba(241, 245, 249, 0.7);
-  --drop-active: rgba(226, 232, 240, 0.85);
+  --drop-bg: #f1f5f9;
+  --drop-active: #e2e8f0;
   --dropdown-bg: #ffffff;
   --loader-bg: #cbd5e1;
   --loader-bar: #000000;
   --blob-1: #60a5fa;
   --blob-2: #c084fc;
+  --overlay-bg: rgba(255, 255, 255, 0.42);
+
+  --ease-ultra: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-smooth: cubic-bezier(0.25, 1, 0.5, 1);
+  --ease-snap: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-in-out: cubic-bezier(0.4, 0, 0.2, 1);
+  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
 }
 
 [data-theme="dark"] {
   --bg-color: #121212;
   --bg-gradient: none;
   --text-color: #ffffff;
-  --card-bg: rgba(30, 30, 32, 0.8);
-  --card-active: rgba(42, 42, 45, 0.9);
-  --stat-bg: rgba(24, 24, 26, 0.8);
+  --card-bg: #1e1e20;
+  --card-active: #2a2a2d;
+  --stat-bg: #18181a;
   --btn-bg: #ffffff;
   --btn-text: #000000;
-  --border-color: rgba(46, 46, 50, 0.85);
+  --border-color: #2e2e32;
   --subtext-color: #aaaaaa;
-  --drop-bg: rgba(34, 34, 37, 0.7);
-  --drop-active: rgba(44, 44, 48, 0.85);
+  --drop-bg: #222225;
+  --drop-active: #2c2c30;
   --dropdown-bg: #1e1e20;
   --loader-bg: #444448;
   --loader-bar: #ffffff;
   --blob-1: #3b82f6;
   --blob-2: #9333ea;
+  --overlay-bg: rgba(10, 12, 18, 0.55);
 }
 
 [data-theme="custom"] {
   --bg-color: var(--custom-bg1, #4f46e5);
   --bg-gradient: linear-gradient(var(--custom-angle, 135deg), var(--custom-bg1, #4f46e5), var(--custom-bg2, #9333ea));
   --text-color: #ffffff;
-  --card-bg: rgba(255, 255, 255, 0.18);
-  --card-active: rgba(255, 255, 255, 0.28);
-  --stat-bg: rgba(255, 255, 255, 0.15);
+  --card-bg: rgba(0, 0, 0, 0.55);
+  --card-active: rgba(0, 0, 0, 0.65);
+  --stat-bg: rgba(0, 0, 0, 0.55);
   --btn-bg: var(--custom-btn-bg, #ffffff);
   --btn-text: var(--custom-btn-text, #000000);
   --border-color: rgba(255, 255, 255, 0.3);
-  --subtext-color: rgba(255, 255, 255, 0.8);
-  --drop-bg: rgba(255, 255, 255, 0.12);
-  --drop-active: rgba(255, 255, 255, 0.22);
-  --dropdown-bg: #1e1e20;
-  --loader-bg: rgba(255, 255, 255, 0.3);
+  --subtext-color: rgba(255, 255, 255, 0.85);
+  --drop-bg: rgba(0, 0, 0, 0.5);
+  --drop-active: rgba(0, 0, 0, 0.6);
+  --dropdown-bg: rgba(30, 30, 32, 0.98);
+  --loader-bg: rgba(255, 255, 255, 0.5);
   --loader-bar: var(--custom-btn-bg, #ffffff);
   --blob-1: var(--custom-bg1, #4f46e5);
   --blob-2: var(--custom-bg2, #9333ea);
+  --overlay-bg: rgba(0, 0, 0, 0.45);
+  --overlay-bg: color-mix(in srgb, var(--bg-color) 45%, transparent);
 }
 
 * {
@@ -193,26 +222,16 @@ body {
   background: var(--bg-gradient, var(--bg-color));
   background-color: var(--bg-color);
   color: var(--text-color);
-  transition: background-color 0.35s cubic-bezier(0.25, 1, 0.5, 1), color 0.35s cubic-bezier(0.25, 1, 0.5, 1);
   position: relative;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-}
-
-/* Плавное переключение темы: класс на 600 мс включает переход цветов у всех элементов */
-html.theme-anim body,
-html.theme-anim body * {
-  transition:
-    background-color 0.45s cubic-bezier(0.4, 0, 0.2, 1),
-    background 0.45s cubic-bezier(0.4, 0, 0.2, 1),
-    color 0.45s cubic-bezier(0.4, 0, 0.2, 1),
-    border-color 0.45s cubic-bezier(0.4, 0, 0.2, 1),
-    fill 0.45s cubic-bezier(0.4, 0, 0.2, 1),
-    stroke 0.45s cubic-bezier(0.4, 0, 0.2, 1) !important;
+  overscroll-behavior-y: contain;
 }
 
 button {
   touch-action: manipulation;
+  -webkit-user-select: none;
+  user-select: none;
 }
 
 body.modal-open {
@@ -220,8 +239,6 @@ body.modal-open {
   touch-action: none;
 }
 
-/* Вспышка при успешной загрузке: только opacity на статичных радиальных градиентах —
-   без mix-blend-mode, blur и transform-анимаций, чтобы не грузить GPU на телефонах */
 .theme-flash {
   position: fixed;
   inset: 0;
@@ -229,17 +246,18 @@ body.modal-open {
   pointer-events: none;
   opacity: 0;
   will-change: opacity;
+  
 }
 
 .theme-flash.active {
-  animation: themeFlash 0.9s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  animation: themeFlash 1.2s var(--ease-ultra) forwards;
 }
 
 @keyframes themeFlash {
   0% { opacity: 0; }
-  18% { opacity: 0.5; }
-  45% { opacity: 0.3; }
-  70% { opacity: 0.4; }
+  15% { opacity: 0.4; }
+  40% { opacity: 0.25; }
+  65% { opacity: 0.35; }
   100% { opacity: 0; }
 }
 
@@ -248,7 +266,8 @@ body.modal-open {
   content: '';
   position: absolute;
   border-radius: 50%;
-  will-change: opacity;
+  will-change: opacity, transform;
+  
 }
 
 .theme-flash::before {
@@ -276,48 +295,46 @@ body.modal-open {
   z-index: 0;
   pointer-events: none;
   overflow: hidden;
-  transition: opacity 0.5s ease;
+  transition: opacity 0.8s var(--ease-smooth);
   will-change: opacity;
+  contain: layout style paint;
 }
 
-/* Блоб-обёртка двигается через transform (дёшево для GPU),
-   а blur висит на статичном внутреннем слое — текстура размытия не пересчитывается каждый кадр */
 .blob {
   position: absolute;
   border-radius: 50%;
-  opacity: 0.65;
+  opacity: 0.75;
   will-change: transform;
-  transform: translateZ(0);
 }
 
+/* Мягкий радиальный градиент вместо filter: blur(90px) —
+   выглядит так же, но в разы дешевле для GPU */
 .blob-core {
   position: absolute;
   inset: 0;
   border-radius: 50%;
-  filter: blur(90px);
-  will-change: filter;
 }
 
 .blob-1 {
-  width: 320px;
-  height: 320px;
+  width: 360px;
+  height: 360px;
   top: 20%;
   left: 10%;
 }
 
 .blob-1 .blob-core {
-  background: var(--blob-1);
+  background: radial-gradient(closest-side, var(--blob-1), transparent 72%);
 }
 
 .blob-2 {
-  width: 360px;
-  height: 360px;
+  width: 400px;
+  height: 400px;
   bottom: 20%;
   right: 10%;
 }
 
 .blob-2 .blob-core {
-  background: var(--blob-2);
+  background: radial-gradient(closest-side, var(--blob-2), transparent 72%);
 }
 
 .main-wrapper {
@@ -338,36 +355,40 @@ body.modal-open {
   color: var(--text-color);
   font-size: 32px;
   line-height: 1;
-  transition: color 0.35s ease;
 }
 
 .toast-msg {
-  animation: fadeInOut 3.5s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  animation: fadeInOut 4s var(--ease-ultra) forwards;
   will-change: transform, opacity;
+  
+
 }
 
 @keyframes fadeInOut {
-  0% { opacity: 0; transform: translateY(15px); }
-  15% { opacity: 1; transform: translateY(0); }
-  85% { opacity: 1; transform: translateY(0); }
-  100% { opacity: 0; transform: translateY(10px); }
+  0% { opacity: 0; transform: translateY(20px) scale(0.95); }
+  12% { opacity: 1; transform: translateY(0) scale(1); }
+  88% { opacity: 1; transform: translateY(0) scale(1); }
+  100% { opacity: 0; transform: translateY(8px) scale(0.98); }
 }
 
+/* Виртуализация на уровне КАРТОЧКИ, а не всего списка:
+   offscreen-карточки не рендерятся, оценка высоты одной карточки точна —
+   скроллбар не прыгает (контейнерная оценка 500px давала скачки при прокрутке) */
 .file-card {
   background: var(--card-bg);
   border: 1px solid var(--border-color);
   border-radius: 20px;
   cursor: pointer;
-  backdrop-filter: blur(14px);
-  -webkit-backdrop-filter: blur(14px);
   padding: 12px 14px;
-  transition: transform 0.18s cubic-bezier(0.2, 0.8, 0.2, 1), background 0.35s ease, border-color 0.35s ease;
-  will-change: transform;
-  transform: translateZ(0);
+  transition: transform 0.18s var(--ease-spring);
+  contain: layout style;
+  content-visibility: auto;
+  contain-intrinsic-size: auto 72px;
+  touch-action: manipulation;
 }
 
 .file-card:active {
-  transform: scale(0.98) translateZ(0);
+  transform: scale(0.97);
   background: var(--card-active);
 }
 
@@ -380,8 +401,6 @@ body.modal-open {
   display: flex;
   align-items: center;
   justify-content: center;
-  transition: background 0.35s ease, color 0.35s ease;
-  will-change: background-color, color;
 }
 
 .action-btn {
@@ -395,14 +414,13 @@ body.modal-open {
   color: var(--btn-text);
   border: none;
   cursor: pointer;
-  transition: transform 0.16s cubic-bezier(0.2, 0.8, 0.2, 1), background 0.35s ease, color 0.35s ease;
-  will-change: transform;
-  transform: translateZ(0);
+  transition: transform 0.15s var(--ease-spring);
+  touch-action: manipulation;
 }
 
 .action-btn:active {
-  transform: scale(0.92) translateZ(0);
-  opacity: 0.8;
+  transform: scale(0.88);
+  opacity: 0.85;
 }
 
 .chip {
@@ -414,21 +432,18 @@ body.modal-open {
   font-size: 14px;
   border: 1px solid var(--border-color);
   cursor: pointer;
-  backdrop-filter: blur(10px);
-  -webkit-backdrop-filter: blur(10px);
-  transition: transform 0.16s cubic-bezier(0.2, 0.8, 0.2, 1), background 0.35s ease, color 0.35s ease, border-color 0.35s ease;
+  transition: transform 0.15s var(--ease-spring);
   white-space: nowrap;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   gap: 6px;
   flex-shrink: 0;
-  will-change: transform;
-  transform: translateZ(0);
+  touch-action: manipulation;
 }
 
 .chip:active {
-  transform: scale(0.95) translateZ(0);
+  transform: scale(0.93);
 }
 
 .chip.active {
@@ -456,11 +471,8 @@ body.modal-open {
   position: relative;
   border: 1.5px solid var(--border-color);
   background: var(--card-bg);
-  backdrop-filter: blur(10px);
-  -webkit-backdrop-filter: blur(10px);
   border-radius: 9999px;
   padding: 8px 16px 8px 40px;
-  transition: border-color 0.35s ease, background 0.35s ease;
 }
 
 .search-box input {
@@ -492,16 +504,13 @@ body.modal-open {
   justify-content: center;
   min-height: 110px;
   position: relative;
-  backdrop-filter: blur(10px);
-  -webkit-backdrop-filter: blur(10px);
-  transition: transform 0.18s cubic-bezier(0.2, 0.8, 0.2, 1), background 0.35s ease;
+  transition: transform 0.2s var(--ease-spring);
   margin-bottom: 12px;
-  will-change: transform;
-  transform: translateZ(0);
+  touch-action: manipulation;
 }
 
 .drop-zone:active {
-  transform: scale(0.99) translateZ(0);
+  transform: scale(0.98);
   background: var(--drop-active);
 }
 
@@ -521,6 +530,7 @@ body.modal-open {
   text-align: center;
   display: none;
   word-break: break-word;
+
 }
 
 .download-progress-wrap {
@@ -530,7 +540,7 @@ body.modal-open {
   justify-content: center;
   gap: 8px;
   opacity: 0;
-  transition: opacity 0.35s ease;
+  transition: opacity 0.5s var(--ease-smooth);
 }
 
 .download-progress-wrap.active {
@@ -546,6 +556,7 @@ body.modal-open {
   align-items: center;
   justify-content: center;
   cursor: pointer;
+  
 }
 
 .drop-loader svg {
@@ -570,7 +581,7 @@ body.modal-open {
   stroke-dasharray: 157;
   stroke-dashoffset: 157;
   stroke-linecap: round;
-  transition: stroke-dashoffset 0.2s linear, stroke 0.35s ease;
+  transition: stroke-dashoffset 0.15s linear;
 }
 
 .drop-loader circle.bar.success {
@@ -585,13 +596,14 @@ body.modal-open {
   left: 0;
   pointer-events: none;
   opacity: 0;
-  transition: opacity 0.25s ease;
+  transition: opacity 0.4s var(--ease-smooth);
+  
 }
 
 .checkmark-svg path {
   stroke-dasharray: 60;
   stroke-dashoffset: 60;
-  transition: stroke-dashoffset 0.5s cubic-bezier(0.65, 0, 0.35, 1);
+  transition: stroke-dashoffset 0.7s var(--ease-ultra);
 }
 
 .checkmark-svg.show {
@@ -608,13 +620,14 @@ body.modal-open {
   background: var(--btn-bg);
   border-radius: 4px;
   position: absolute;
-  transition: transform 0.3s ease, opacity 0.3s ease;
+  transition: transform 0.3s var(--ease-smooth), opacity 0.3s var(--ease-smooth);
 }
 
 .download-text {
   font-weight: 800;
   font-size: 13px;
   color: var(--subtext-color);
+
 }
 
 .files-container {
@@ -628,31 +641,32 @@ body.modal-open {
   display: none;
 }
 
+/* Dropdown */
 .dropdown-menu {
   position: absolute;
   top: calc(100% + 10px);
   right: 0;
-  background: var(--card-bg);
+  background: var(--dropdown-bg);
   border: 1px solid var(--border-color);
   border-radius: 20px;
-  box-shadow: 0 15px 35px rgba(0, 0, 0, 0.18);
+  box-shadow: 0 15px 35px rgba(0, 0, 0, 0.25);
   padding: 10px;
   min-width: 260px;
   z-index: 30;
   opacity: 0;
   pointer-events: none;
-  transform: translateY(-8px) scale(0.96) translateZ(0);
-  transition: transform 0.22s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.18s ease, background 0.35s ease;
+  transform: translateY(-12px) scale(0.94);
+  transition: transform 0.35s var(--ease-spring), opacity 0.3s var(--ease-smooth);
   transform-origin: top right;
-  backdrop-filter: blur(14px);
-  -webkit-backdrop-filter: blur(14px);
   will-change: transform, opacity;
+
+  contain: layout style;
 }
 
 .dropdown-menu.open {
   opacity: 1;
   pointer-events: auto;
-  transform: translateY(0) scale(1) translateZ(0);
+  transform: translateY(0) scale(1);
 }
 
 .sound-item-btn {
@@ -672,9 +686,8 @@ body.modal-open {
   justify-content: space-between;
   gap: 10px;
   margin-bottom: 6px;
-  transition: transform 0.16s ease, background-color 0.35s ease, color 0.35s ease, border-color 0.35s ease;
-  will-change: transform;
-  transform: translateZ(0);
+  transition: transform 0.15s var(--ease-spring);
+  touch-action: manipulation;
 }
 
 .sound-item-btn:last-child {
@@ -682,7 +695,7 @@ body.modal-open {
 }
 
 .sound-item-btn:active {
-  transform: scale(0.98) translateZ(0);
+  transform: scale(0.97);
 }
 
 .sound-item-btn.active-sound {
@@ -700,6 +713,7 @@ body.modal-open {
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
+  
 }
 
 .check-circle-icon svg {
@@ -739,6 +753,8 @@ body.modal-open {
   border: 2px solid var(--border-color);
   overflow: hidden;
   cursor: pointer;
+  
+  transition: border-color 0.4s var(--ease-ultra);
 }
 
 .color-picker-wrap input[type="color"] {
@@ -752,32 +768,56 @@ body.modal-open {
   background: none;
 }
 
+/* Modal overlay.
+   Никакой анимации opacity: пока прозрачность оверлея < 1, движок считает его
+   backdrop-root'ом и blur «не видит» страницу — размытие включалось рывком
+   в самом конце fade-in. Вместо этого с первого кадра плавно разгоняется сам
+   радиус blur (0 -> 14px), а подложка проявляется через background-color. */
 .modal-overlay {
   position: fixed;
   top: 0;
   left: 0;
   right: 0;
   bottom: 0;
-  background: rgba(0, 0, 0, 0.5);
-  backdrop-filter: blur(8px);
-  -webkit-backdrop-filter: blur(8px);
+  background: transparent;
   z-index: 100;
   display: flex;
   align-items: flex-end;
   justify-content: center;
-  opacity: 0;
   pointer-events: none;
-  transition: opacity 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+  visibility: hidden;
+  overflow: hidden;
   overscroll-behavior: contain;
   touch-action: none;
-  will-change: opacity;
+  backdrop-filter: blur(0px) saturate(100%);
+  -webkit-backdrop-filter: blur(0px) saturate(100%);
+  transition:
+    backdrop-filter 0.4s var(--ease-smooth),
+    -webkit-backdrop-filter 0.4s var(--ease-smooth),
+    background-color 0.35s var(--ease-smooth),
+    visibility 0s linear 0.45s;
 }
 
 .modal-overlay.open {
-  opacity: 1;
   pointer-events: auto;
+  visibility: visible;
+  background: var(--overlay-bg, rgba(0, 0, 0, 0.5));
+  backdrop-filter: blur(14px) saturate(160%);
+  -webkit-backdrop-filter: blur(14px) saturate(160%);
+  transition:
+    backdrop-filter 0.4s var(--ease-smooth),
+    -webkit-backdrop-filter 0.4s var(--ease-smooth),
+    background-color 0.35s var(--ease-smooth),
+    visibility 0s;
 }
 
+/* Слабые устройства: меньший радиус — анимация blur заметно дешевле */
+.low-end .modal-overlay.open {
+  backdrop-filter: blur(9px) saturate(150%);
+  -webkit-backdrop-filter: blur(9px) saturate(150%);
+}
+
+/* Modal card */
 .modal-card {
   background: var(--card-bg);
   border: 1px solid var(--border-color);
@@ -788,17 +828,18 @@ body.modal-open {
   width: 100%;
   max-width: 560px;
   box-shadow: 0 -10px 40px rgba(0, 0, 0, 0.25);
-  transform: translateY(100%) translateZ(0);
-  transition: transform 0.28s cubic-bezier(0.16, 1, 0.3, 1);
+  transform: translateY(100%);
+  /* ease-snap вместо ease-spring: у пружины перелёт > 100% — карточку
+     подбрасывало выше финальной позиции и было видно её нижний край */
+  transition: transform 0.42s var(--ease-snap);
   will-change: transform;
-  backdrop-filter: blur(20px);
-  -webkit-backdrop-filter: blur(20px);
   overscroll-behavior: contain;
   touch-action: pan-y;
+  contain: layout style;
 }
 
 .modal-overlay.open .modal-card {
-  transform: translateY(0) translateZ(0);
+  transform: translateY(0);
 }
 
 .sheet-handle-area {
@@ -807,6 +848,7 @@ body.modal-open {
   cursor: grab;
   display: flex;
   justify-content: center;
+  touch-action: pan-y;
 }
 
 .sheet-handle {
@@ -828,17 +870,26 @@ body.modal-open {
   color: var(--btn-text);
   border: none;
   cursor: pointer;
-  transition: transform 0.18s cubic-bezier(0.2, 0.8, 0.2, 1), background 0.35s ease, color 0.35s ease;
-  will-change: transform;
+  transition: transform 0.2s var(--ease-spring);
   position: relative;
   z-index: 35;
-  transform: translateZ(0);
+  touch-action: manipulation;
 }
 
 .settings-btn:active {
-  transform: scale(0.9) rotate(30deg) translateZ(0);
+  transform: scale(0.85) rotate(30deg);
 }
 
+/* Кручение шестерёнки при открытии/закрытии панели настроек */
+.settings-btn svg {
+  transition: transform 0.5s var(--ease-spring);
+}
+
+.settings-btn.spun svg {
+  transform: rotate(180deg);
+}
+
+/* Settings panel */
 .settings-panel {
   position: absolute;
   top: calc(100% + 12px);
@@ -847,28 +898,28 @@ body.modal-open {
   max-height: 70vh;
   overflow-y: auto;
   overflow-x: hidden;
-  background: var(--card-bg);
+  background: var(--dropdown-bg);
   border: 1px solid var(--border-color);
   border-radius: 24px;
-  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.22);
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.25);
   padding: 14px;
   z-index: 34;
   opacity: 0;
   pointer-events: none;
-  transform: translateY(-12px) scale(0.92) translateZ(0);
-  transition: transform 0.24s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+  transform: translateY(-16px) scale(0.9);
+  transition: transform 0.4s var(--ease-spring), opacity 0.3s var(--ease-smooth);
   transform-origin: top right;
-  backdrop-filter: blur(20px);
-  -webkit-backdrop-filter: blur(20px);
   will-change: transform, opacity;
   overscroll-behavior: contain;
   -webkit-overflow-scrolling: touch;
+
+  contain: layout style;
 }
 
 .settings-panel.open {
   opacity: 1;
   pointer-events: auto;
-  transform: translateY(0) scale(1) translateZ(0);
+  transform: translateY(0) scale(1);
 }
 
 .settings-panel-title {
@@ -879,6 +930,7 @@ body.modal-open {
   display: flex;
   align-items: center;
   gap: 8px;
+
 }
 
 .settings-item {
@@ -897,9 +949,8 @@ body.modal-open {
   align-items: center;
   gap: 12px;
   margin-bottom: 4px;
-  transition: transform 0.16s cubic-bezier(0.2, 0.8, 0.2, 1), background 0.25s ease, border-color 0.25s ease;
-  will-change: transform;
-  transform: translateZ(0);
+  transition: transform 0.15s var(--ease-spring);
+  touch-action: manipulation;
 }
 
 .settings-item:last-child {
@@ -907,7 +958,7 @@ body.modal-open {
 }
 
 .settings-item:active {
-  transform: scale(0.96) translateZ(0);
+  transform: scale(0.95);
   background: var(--card-active);
 }
 
@@ -921,7 +972,6 @@ body.modal-open {
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
-  transition: background 0.35s ease, color 0.35s ease;
 }
 
 .settings-item-label {
@@ -935,6 +985,7 @@ body.modal-open {
   font-size: 11px;
   color: var(--subtext-color);
   margin-top: 2px;
+
 }
 
 .settings-divider {
@@ -942,13 +993,14 @@ body.modal-open {
   background: var(--border-color);
   margin: 8px 4px;
   border: none;
+
 }
 
 .settings-submenu {
   overflow: hidden;
   max-height: 0;
   opacity: 0;
-  transition: max-height 0.28s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+  transition: max-height 0.4s var(--ease-ultra), opacity 0.35s var(--ease-smooth);
   will-change: max-height, opacity;
 }
 
@@ -963,26 +1015,26 @@ body.modal-open {
 
 .settings-panel .settings-item,
 .settings-panel .settings-submenu {
-  transform: translateX(12px) translateZ(0);
+  transform: translateX(16px);
   opacity: 0;
-  transition: transform 0.22s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.18s ease;
+  transition: transform 0.35s var(--ease-ultra), opacity 0.3s var(--ease-smooth);
 }
 
 .settings-panel.open .settings-item,
 .settings-panel.open .settings-submenu {
-  transform: translateX(0) translateZ(0);
+  transform: translateX(0);
   opacity: 1;
 }
 
-.settings-panel.open .settings-item:nth-child(1) { transition-delay: 0.02s; }
-.settings-panel.open .settings-item:nth-child(2) { transition-delay: 0.04s; }
-.settings-panel.open .settings-item:nth-child(3) { transition-delay: 0.06s; }
-.settings-panel.open .settings-item:nth-child(4) { transition-delay: 0.08s; }
-.settings-panel.open .settings-item:nth-child(5) { transition-delay: 0.10s; }
-.settings-panel.open .settings-item:nth-child(6) { transition-delay: 0.12s; }
-.settings-panel.open .settings-item:nth-child(7) { transition-delay: 0.14s; }
-.settings-panel.open .settings-item:nth-child(8) { transition-delay: 0.16s; }
-.settings-panel.open .settings-item:nth-child(9) { transition-delay: 0.18s; }
+.settings-panel.open .settings-item:nth-child(1) { transition-delay: 0.03s; }
+.settings-panel.open .settings-item:nth-child(2) { transition-delay: 0.06s; }
+.settings-panel.open .settings-item:nth-child(3) { transition-delay: 0.09s; }
+.settings-panel.open .settings-item:nth-child(4) { transition-delay: 0.12s; }
+.settings-panel.open .settings-item:nth-child(5) { transition-delay: 0.15s; }
+.settings-panel.open .settings-item:nth-child(6) { transition-delay: 0.18s; }
+.settings-panel.open .settings-item:nth-child(7) { transition-delay: 0.21s; }
+.settings-panel.open .settings-item:nth-child(8) { transition-delay: 0.24s; }
+.settings-panel.open .settings-item:nth-child(9) { transition-delay: 0.27s; }
 
 .settings-overlay {
   position: fixed;
@@ -991,7 +1043,7 @@ body.modal-open {
   background: transparent;
   pointer-events: none;
   opacity: 0;
-  transition: opacity 0.2s ease;
+  transition: opacity 0.3s var(--ease-smooth);
 }
 
 .settings-overlay.active {
@@ -999,6 +1051,7 @@ body.modal-open {
   opacity: 1;
 }
 
+/* Selection bar */
 #selectionBar {
   position: fixed;
   bottom: calc(20px + env(safe-area-inset-bottom));
@@ -1011,20 +1064,20 @@ body.modal-open {
   border: 1px solid var(--border-color);
   border-radius: 9999px;
   box-shadow: 0 14px 40px rgba(0, 0, 0, 0.22), 0 4px 12px rgba(0, 0, 0, 0.08);
-  backdrop-filter: blur(24px);
-  -webkit-backdrop-filter: blur(24px);
   opacity: 0;
   pointer-events: none;
-  transform: translateX(-50%) translateY(140%) scale(0.96) translateZ(0);
-  transition: transform 0.28s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.22s ease;
+  transform: translateX(-50%) translateY(150%) scale(0.94);
+  transition: transform 0.45s var(--ease-spring), opacity 0.35s var(--ease-smooth);
   will-change: transform, opacity;
   overscroll-behavior: contain;
+
+  contain: layout style;
 }
 
 #selectionBar.visible {
   opacity: 1;
   pointer-events: auto;
-  transform: translateX(-50%) translateY(0) scale(1) translateZ(0);
+  transform: translateX(-50%) translateY(0) scale(1);
 }
 
 #selectionBar .sel-inner {
@@ -1047,19 +1100,18 @@ body.modal-open {
   gap: 4px;
   white-space: nowrap;
   min-height: 36px;
-  transition: transform 0.16s cubic-bezier(0.2, 0.8, 0.2, 1);
+  transition: transform 0.2s var(--ease-spring);
   will-change: transform;
-  transform: translateZ(0);
 }
 
 #selectionBar .sel-count.pulse {
-  animation: countPulse 0.25s cubic-bezier(0.2, 0.8, 0.2, 1);
+  animation: countPulse 0.35s var(--ease-spring);
 }
 
 @keyframes countPulse {
-  0% { transform: scale(1) translateZ(0); }
-  50% { transform: scale(1.12) translateZ(0); }
-  100% { transform: scale(1) translateZ(0); }
+  0% { transform: scale(1); }
+  40% { transform: scale(1.18); }
+  100% { transform: scale(1); }
 }
 
 #selectionBar .sel-btn {
@@ -1075,14 +1127,13 @@ body.modal-open {
   justify-content: center;
   cursor: pointer;
   font-size: 15px;
-  transition: transform 0.12s cubic-bezier(0.2, 0.8, 0.2, 1), background 0.25s ease, border-color 0.25s ease;
-  will-change: transform;
+  transition: transform 0.15s var(--ease-spring);
   -webkit-tap-highlight-color: transparent;
-  transform: translateZ(0);
+  touch-action: manipulation;
 }
 
 #selectionBar .sel-btn:active {
-  transform: scale(0.88) translateZ(0);
+  transform: scale(0.85);
 }
 
 #selectionBar .sel-btn.danger {
@@ -1103,6 +1154,115 @@ body.modal-open {
 
 #selectionBar .sel-btn.hidden {
   display: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* ВОЛНА 22.35: баннер-рекомендация разработчика — личный приватный канал */
+.dev-rec-banner {
+  position: relative;
+  background: linear-gradient(135deg, rgba(59, 130, 246, 0.12), rgba(147, 51, 234, 0.12));
+  border: 1px solid var(--border-color);
+  border-radius: 20px;
+  padding: 14px 38px 14px 14px;
+  margin-bottom: 12px;
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  overflow: hidden;
+}
+
+.dev-rec-banner.hide {
+  display: none;
+}
+
+.dev-rec-icon {
+  width: 40px;
+  height: 40px;
+  border-radius: 13px;
+  background: var(--btn-bg);
+  color: var(--btn-text);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.dev-rec-text {
+  flex: 1;
+  min-width: 0;
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--text-color);
+  line-height: 1.55;
+}
+
+.dev-rec-text b {
+  display: block;
+  font-size: 13.5px;
+  font-weight: 900;
+  margin-bottom: 3px;
+}
+
+.dev-rec-text span {
+  color: var(--subtext-color);
+  font-weight: 600;
+}
+
+.dev-rec-actions {
+  margin-top: 10px;
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.dev-rec-btn {
+  padding: 8px 14px;
+  border-radius: 9999px;
+  background: var(--btn-bg);
+  color: var(--btn-text);
+  font-family: 'Nunito', sans-serif;
+  font-weight: 800;
+  font-size: 12.5px;
+  border: none;
+  cursor: pointer;
+  touch-action: manipulation;
+  transition: transform 0.15s var(--ease-spring);
+}
+
+.dev-rec-btn:active {
+  transform: scale(0.94);
+}
+
+.dev-rec-btn.ghost {
+  background: var(--card-bg);
+  color: var(--text-color);
+  border: 1px solid var(--border-color);
+}
+
+.dev-rec-close {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  border: none;
+  background: var(--card-bg);
+  color: var(--subtext-color);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  touch-action: manipulation;
 }
 </style>
 </head>
@@ -1156,6 +1316,11 @@ body.modal-open {
       <button class="sound-item-btn" onclick="downloadCurrentFile()">
         <span>Скачать файл</span>
         <i data-lucide="download" style="width:18px;height:18px"></i>
+      </button>
+
+      <button class="sound-item-btn" onclick="sendCurrentFileToChat()">
+        <span>Отправить в чат Telegram</span>
+        <i data-lucide="send" style="width:18px;height:18px"></i>
       </button>
 
       <button class="sound-item-btn" style="color:#ef4444" onclick="deleteCurrentFile()">
@@ -1467,7 +1632,6 @@ body.modal-open {
   </div>
 </div>
 
-
 <div class="main-wrapper">
 
   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
@@ -1638,15 +1802,37 @@ body.modal-open {
   </div>
 
   <div style="display:flex;gap:12px;margin-bottom:12px;">
-    <div style="flex:1;background:var(--stat-bg);border:1px solid var(--border-color);border-radius:18px;padding:12px 16px;backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);transition:background 0.35s ease,border-color 0.35s ease">
+    <div style="flex:1;background:var(--stat-bg);border:1px solid var(--border-color);border-radius:18px;padding:12px 16px">
       <p style="font-weight:700;font-size:12px;color:var(--text-color);text-transform:uppercase;letter-spacing:.04em;opacity:.6">Файлов</p>
       <p id="statFiles" style="font-weight:900;font-size:22px;margin-top:2px">0</p>
     </div>
 
-    <div style="flex:1;background:var(--stat-bg);border:1px solid var(--border-color);border-radius:18px;padding:12px 16px;backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);transition:background 0.35s ease,border-color 0.35s ease">
+    <div style="flex:1;background:var(--stat-bg);border:1px solid var(--border-color);border-radius:18px;padding:12px 16px">
       <p style="font-weight:700;font-size:12px;color:var(--text-color);text-transform:uppercase;letter-spacing:.04em;opacity:.6">Занято</p>
       <p id="statSize" style="font-weight:900;font-size:22px;margin-top:2px">0 Б</p>
     </div>
+  </div>
+
+  <div id="devRecBanner" class="dev-rec-banner hide">
+    <div class="dev-rec-icon">
+      <i data-lucide="shield-check" style="width:20px;height:20px"></i>
+    </div>
+
+    <div class="dev-rec-text">
+      <b>Совет разработчика</b>
+      <span>Создайте свой <b>частный канал</b> в Telegram и подключите его в боте
+      («Облако» → «Моё облако») — файлы будут храниться именно там, с максимальной
+      приватностью и безопасностью. DEVO+ — удобный коннектор к неограниченному
+      пространству хранения ваших файлов.</span>
+
+      <div class="dev-rec-actions">
+        <button class="dev-rec-btn" onclick="openStorageModal()">Подключить канал</button>
+      </div>
+    </div>
+
+    <button class="dev-rec-close" onclick="dismissDevRec(event)" title="Скрыть">
+      <i data-lucide="x" style="width:14px;height:14px"></i>
+    </button>
   </div>
 
   <div class="search-box" style="margin-bottom:12px">
@@ -1780,15 +1966,28 @@ body.modal-open {
   </div>
 </div>
 
-
-
 <script>
+/* Иконки lucide: склеиваем несколько вызовов в один кадр (rAF),
+   а после отрисовки снимаем data-lucide с готовых SVG —
+   следующий createIcons обрабатывает только НОВЫЕ иконки, а не весь документ */
+let _iconsQueued = false;
+
 function safeIcons() {
-  try {
-    if (window.lucide && typeof lucide.createIcons === 'function') {
-      lucide.createIcons();
-    }
-  } catch (e) {}
+  if (_iconsQueued) return;
+  _iconsQueued = true;
+
+  requestAnimationFrame(() => {
+    _iconsQueued = false;
+
+    try {
+      if (window.lucide && typeof lucide.createIcons === 'function') {
+        lucide.createIcons();
+        document.querySelectorAll('svg[data-lucide]').forEach((el) => {
+          el.removeAttribute('data-lucide');
+        });
+      }
+    } catch (e) {}
+  });
 }
 
 const tg = window.Telegram?.WebApp;
@@ -1801,6 +2000,28 @@ let currentTheme = localStorage.getItem('devo_theme') || 'system';
 let blobsEnabled = localStorage.getItem('devo_blobs_enabled') !== 'false';
 let blobIdleSpeed = localStorage.getItem('devo_blob_speed') || '5';
 
+/* Слабые устройства: тяжёлые эффекты выключаем по умолчанию,
+   чтобы не было лагов — пользователь может включить вручную */
+let LOW_END = false;
+
+try {
+  const nav = navigator;
+  const mem = +nav.deviceMemory || 0;
+  const cores = nav.hardwareConcurrency || 0;
+
+  LOW_END = (mem > 0 && mem <= 2) || (cores > 0 && cores <= 3);
+} catch (e) {}
+
+if (LOW_END) {
+  try { document.documentElement.classList.add('low-end'); } catch (e) {}
+}
+
+if (LOW_END && localStorage.getItem('devo_blobs_enabled') === null) {
+  blobsEnabled = false;
+
+  try { localStorage.setItem('devo_blobs_enabled', 'false'); } catch (e) {}
+}
+
 function toggleSettingsPanel(e) {
   if (e) e.stopPropagation();
 
@@ -1808,6 +2029,9 @@ function toggleSettingsPanel(e) {
   const overlay = document.getElementById('settingsOverlay');
 
   const willOpen = !panel.classList.contains('open');
+
+  const gear = document.getElementById('settingsToggleBtn');
+  if (gear) gear.classList.toggle('spun', willOpen);
 
   if (willOpen) {
     panel.classList.add('open');
@@ -1824,6 +2048,9 @@ function closeSettingsPanel() {
   panel.classList.remove('open');
   overlay.classList.remove('active');
 
+  const gear = document.getElementById('settingsToggleBtn');
+  if (gear) gear.classList.remove('spun');
+
   document.querySelectorAll('.settings-submenu.open').forEach((s) => {
     s.classList.remove('open');
   });
@@ -1831,7 +2058,7 @@ function closeSettingsPanel() {
 
 function closeSettingsAndDo(fn) {
   closeSettingsPanel();
-  setTimeout(fn, 180);
+  setTimeout(fn, 250);
 }
 
 function toggleSettingsSubmenu(id) {
@@ -1852,6 +2079,8 @@ function toggleSettingsSubmenu(id) {
   }
 }
 
+let themeBootApplied = false;
+
 function applyTheme(theme) {
   currentTheme = theme;
   localStorage.setItem('devo_theme', theme);
@@ -1864,41 +2093,60 @@ function applyTheme(theme) {
     isDark = theme === 'dark';
   }
 
-  document.documentElement.setAttribute(
-    'data-theme',
-    theme === 'custom' ? 'custom' : (isDark ? 'dark' : 'light')
-  );
-
-  const iconEl = document.getElementById('themeIcon');
-  if (iconEl) {
-    iconEl.setAttribute(
-      'data-lucide',
-      theme === 'custom' ? 'palette' : (isDark ? 'moon' : 'sun')
+  const domUpdate = () => {
+    document.documentElement.setAttribute(
+      'data-theme',
+      theme === 'custom' ? 'custom' : (isDark ? 'dark' : 'light')
     );
-    safeIcons();
-  }
 
-  const label = document.getElementById('themeCurrentLabel');
-  if (label) {
-    const names = {
-      light: 'Светлая',
-      dark: 'Тёмная',
-      system: 'Системная',
-      custom: 'Свой цвет'
-    };
-    label.textContent = names[theme] || 'Системная';
-  }
-
-  document.querySelectorAll('#themeSubmenu .sound-item-btn').forEach((btn) => {
-    if (btn.id.startsWith('theme-')) {
-      btn.classList.toggle('active-sound', btn.id === `theme-${theme}-btn`);
+    const iconEl = document.getElementById('themeIcon');
+    if (iconEl) {
+      iconEl.setAttribute(
+        'data-lucide',
+        theme === 'custom' ? 'palette' : (isDark ? 'moon' : 'sun')
+      );
+      safeIcons();
     }
-  });
 
-  const picker = document.getElementById('customThemePicker');
-  if (picker) picker.classList.toggle('active', theme === 'custom');
+    const label = document.getElementById('themeCurrentLabel');
+    if (label) {
+      const names = {
+        light: 'Светлая',
+        dark: 'Тёмная',
+        system: 'Системная',
+        custom: 'Свой цвет'
+      };
+      label.textContent = names[theme] || 'Системная';
+    }
 
-  if (theme === 'custom') updateCustomColors();
+    document.querySelectorAll('#themeSubmenu .sound-item-btn').forEach((btn) => {
+      if (btn.id.startsWith('theme-')) {
+        btn.classList.toggle('active-sound', btn.id === `theme-${theme}-btn`);
+      }
+    });
+
+    const picker = document.getElementById('customThemePicker');
+    if (picker) picker.classList.toggle('active', theme === 'custom');
+
+    if (theme === 'custom') updateCustomColors();
+  };
+
+  /* Первое применение при загрузке — мгновенно, без анимации */
+  if (!themeBootApplied) {
+    themeBootApplied = true;
+    domUpdate();
+    return;
+  }
+
+  /* Плавный кроссфейд View Transitions: смена на композиторе,
+     без пересчёта стилей каждый кадр. Fallback — мгновенно. */
+  const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  if (document.startViewTransition && !LOW_END && !reduced) {
+    document.startViewTransition(domUpdate);
+  } else {
+    domUpdate();
+  }
 }
 
 function updateCustomColors() {
@@ -1951,13 +2199,32 @@ function updateBlobsVisibility() {
   if (bgBlobs) bgBlobs.style.opacity = blobsEnabled ? '1' : '0';
   if (blobsIcon) blobsIcon.style.display = blobsEnabled ? 'inline-block' : 'none';
   if (blobsLabel) blobsLabel.textContent = blobsEnabled ? 'Включен' : 'Выключен';
+
+  /* rAF-цикл работает только когда блобы реально видны */
+  if (blobsEnabled) startBlobAnimation();
+  else stopBlobAnimation();
 }
 
-// Живой фон на requestAnimationFrame: кадры идут в такт экрану (60/90/120 Гц),
-// без setInterval и CSS-переходов — поэтому анимация плавная на ProMotion/ high refresh
 let blobRafId = null;
 let blobLastTs = 0;
 let blobTime = Math.random() * 500;
+
+let blobVW = 0;
+let blobVH = 0;
+
+/* LERP-сглаживание для плавности */
+let blobCurrentX = [0, 0];
+let blobCurrentY = [0, 0];
+let blobCurrentS = [1, 1];
+
+/* Последние записанные в DOM значения: на 90/120 Гц кадры идут каждые 8 мс,
+   поэтому стиль пишем только при видимом изменении — меньше инвалидаций стилей */
+const BLOB_LAST = [
+  { x: NaN, y: NaN, s: 0 },
+  { x: NaN, y: NaN, s: 0 }
+];
+
+const BLOB_ELS = [null, null];
 
 const BLOB_PHASES = [0, 1].map(() =>
   Array.from({ length: 7 }, () => Math.random() * Math.PI * 2)
@@ -1981,7 +2248,30 @@ function blobOffset(i, t) {
   return { x: x, y: y, s: s };
 }
 
+function lerp(a, b, t) {
+  return a + (b - a) * t;
+}
+
+function updateBlobViewport() {
+  blobVW = window.innerWidth * 0.22;
+  blobVH = window.innerHeight * 0.22;
+}
+
+function stopBlobAnimation() {
+  if (blobRafId) {
+    cancelAnimationFrame(blobRafId);
+    blobRafId = null;
+  }
+
+  blobLastTs = 0;
+}
+
 function blobLoop(ts) {
+  if (!blobsEnabled || document.hidden) {
+    blobRafId = null;
+    return;
+  }
+
   blobRafId = requestAnimationFrame(blobLoop);
 
   if (!blobLastTs) blobLastTs = ts;
@@ -1989,33 +2279,57 @@ function blobLoop(ts) {
   const dt = Math.min(0.06, (ts - blobLastTs) / 1000);
   blobLastTs = ts;
 
-  const b1 = document.getElementById('blob1');
-  const b2 = document.getElementById('blob2');
-
-  if (!blobsEnabled || document.hidden || !b1 || !b2) return;
-
   const speed = parseInt(blobIdleSpeed) || 5;
-  // Степенная кривая: на низких значениях — медленно и плавно, на максимуме — заметно быстрее (было 0.64, стало ~1.4)
   blobTime += dt * (0.04 + Math.pow(speed, 1.35) * 0.06);
 
-  const w = window.innerWidth * 0.22;
-  const h = window.innerHeight * 0.22;
+  /* LERP-коэффициент: чем меньше dt, тем плавнее */
+  const lerpFactor = Math.min(1, dt * 8);
 
-  [b1, b2].forEach((el, i) => {
+  for (let i = 0; i < 2; i++) {
+    if (!BLOB_ELS[i]) BLOB_ELS[i] = document.getElementById(i === 0 ? 'blob1' : 'blob2');
+
+    const el = BLOB_ELS[i];
+    if (!el) continue;
+
     const o = blobOffset(i, blobTime);
 
-    el.style.transform =
-      'translate(' + (o.x * w).toFixed(2) + 'px, ' + (o.y * h).toFixed(2) + 'px) ' +
-      'scale(' + o.s.toFixed(3) + ') translateZ(0)';
-  });
+    blobCurrentX[i] = lerp(blobCurrentX[i], o.x * blobVW, lerpFactor);
+    blobCurrentY[i] = lerp(blobCurrentY[i], o.y * blobVH, lerpFactor);
+    blobCurrentS[i] = lerp(blobCurrentS[i], o.s, lerpFactor);
+
+    const cx = blobCurrentX[i];
+    const cy = blobCurrentY[i];
+    const cs = blobCurrentS[i];
+    const last = BLOB_LAST[i];
+
+    if (
+      Math.abs(cx - last.x) > 0.05 ||
+      Math.abs(cy - last.y) > 0.05 ||
+      Math.abs(cs - last.s) > 0.0008
+    ) {
+      last.x = cx;
+      last.y = cy;
+      last.s = cs;
+
+      el.style.transform =
+        'translate3d(' + cx.toFixed(2) + 'px, ' + cy.toFixed(2) + 'px, 0) ' +
+        'scale(' + cs.toFixed(4) + ')';
+    }
+  }
 }
 
 function startBlobAnimation() {
-  if (blobRafId) cancelAnimationFrame(blobRafId);
+  stopBlobAnimation();
 
-  blobLastTs = 0;
+  if (!blobsEnabled || document.hidden) return;
+
+  updateBlobViewport();
   blobRafId = requestAnimationFrame(blobLoop);
 }
+
+window.addEventListener('resize', function () {
+  updateBlobViewport();
+}, { passive: true });
 
 function changeBlobSpeed(val) {
   blobIdleSpeed = val;
@@ -2025,17 +2339,7 @@ function changeBlobSpeed(val) {
   if (label) label.textContent = val + 'x';
 }
 
-let themeAnimTimer = null;
-
 function setTheme(theme) {
-  // Плавный переход цветов: включаем класс-аниматор, убираем через 600 мс
-  const root = document.documentElement;
-
-  root.classList.add('theme-anim');
-
-  if (themeAnimTimer) clearTimeout(themeAnimTimer);
-  themeAnimTimer = setTimeout(() => root.classList.remove('theme-anim'), 600);
-
   applyTheme(theme);
 }
 
@@ -2167,7 +2471,6 @@ const SOUND_PROFILES = [
 
 let selectedSoundId = parseInt(localStorage.getItem('devo_sound_id') || '1');
 
-// Звук №4 удалён — сбрасываем сохранённые старые id (4 «Sci-Fi Pulse», 5 бывший)
 if (!SOUND_PROFILES.some((s) => s.id === selectedSoundId)) {
   selectedSoundId = 1;
   localStorage.setItem('devo_sound_id', '1');
@@ -2295,15 +2598,13 @@ function showAuthCard(text) {
   const btn = document.getElementById('authOpenBtn');
   if (btn) btn.style.display = AUTH_BOT ? '' : 'none';
 
-  card.classList.add('open');
-  document.body.classList.add('modal-open');
+  openModalEl('authModal');
 }
 
 function closeAuthModal(e) {
   if (e) e.stopPropagation();
 
-  document.getElementById('authModal').classList.remove('open');
-  document.body.classList.remove('modal-open');
+  closeModalEl('authModal');
 }
 
 function openBotChat() {
@@ -2318,20 +2619,13 @@ function openBotChat() {
 }
 
 function openLoginModal() {
-  const m = document.getElementById('loginModal');
-  if (!m) return;
-
-  m.classList.add('open');
-  document.body.classList.add('modal-open');
+  openModalEl('loginModal');
 }
 
 function closeLoginModal(e) {
   if (e) e.stopPropagation();
 
-  const m = document.getElementById('loginModal');
-  if (m) m.classList.remove('open');
-
-  document.body.classList.remove('modal-open');
+  closeModalEl('loginModal');
 }
 
 async function webLogin() {
@@ -2644,7 +2938,12 @@ function maybeAutoResync() {
 }
 
 document.addEventListener('visibilitychange', function () {
-  if (!document.hidden) {
+  if (document.hidden) {
+    /* Полная остановка анимации в фоне — не тратим батарею и кадры */
+    stopBlobAnimation();
+  } else {
+    startBlobAnimation();
+
     clearTimeout(RESYNC_TIMER);
     RESYNC_TIMER = setTimeout(maybeAutoResync, 600);
   }
@@ -2676,7 +2975,6 @@ let nameMode = 'each';
 let clickTimer = null;
 let clickCount = 0;
 
-/* Эмодзи заменены на SVG-иконки Lucide: showToast превращает эмодзи в строке в <i data-lucide> */
 const TOAST_ICON_MAP = {
   '📦': 'package',
   '🗂': 'folder-open',
@@ -2722,10 +3020,12 @@ function showToast(text) {
 
   safeIcons();
 
-  setTimeout(() => t.remove(), 3500);
+  setTimeout(() => t.remove(), 4000);
 }
 
 function flashScreen() {
+  if (LOW_END) return;
+
   const flash = document.getElementById('themeFlash');
 
   flash.classList.remove('active');
@@ -2745,7 +3045,36 @@ function fmtSize(n) {
     i++;
   }
 
-  return n.toFixed(i === 0 ? 0 : 1) + ' ' + u[i];
+  return (i === 0 ? n : n.toFixed(1)) + ' ' + u[i];
+}
+
+/* Дата и ВРЕМЯ добавления файла: «25.09.2025 18:30».
+   Понимает ISO-строки, «YYYY-MM-DD HH:MM», unix-секунды/мс */
+function fmtDateTime(ts) {
+  const s = String(ts || '').trim();
+
+  if (!s) return '';
+
+  const iso = s.match(/^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2}))?/);
+
+  if (iso) {
+    return iso[4]
+      ? `${iso[3]}.${iso[2]}.${iso[1]} ${iso[4]}:${iso[5]}`
+      : `${iso[3]}.${iso[2]}.${iso[1]}`;
+  }
+
+  let d;
+
+  if (/^\d{10}$/.test(s)) d = new Date(+s * 1000);
+  else if (/^\d{13}$/.test(s)) d = new Date(+s);
+  else {
+    d = new Date(s);
+    if (isNaN(d)) return s.slice(0, 10);
+  }
+
+  const p = (x) => String(x).padStart(2, '0');
+
+  return `${p(d.getDate())}.${p(d.getMonth() + 1)}.${d.getFullYear()} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
 function iconFor(kind) {
@@ -2794,17 +3123,20 @@ function applyFilters() {
 }
 
 function renderAll() {
-  renderFiles(applyFilters());
-  renderStats();
+  /* Один проход фильтрации на рендер вместо двух */
+  const list = applyFilters();
+
+  renderFiles(list);
+  renderStats(list);
 }
 
-function renderStats() {
+function renderStats(list) {
   document.getElementById('statFiles').textContent = ALL_FILES.length;
   document.getElementById('statSize').textContent = fmtSize(
     ALL_FILES.reduce((s, f) => s + (+f.size || 0), 0)
   );
 
-  const shown = applyFilters().length;
+  const shown = (list || applyFilters()).length;
 
   document.getElementById('filesCount').textContent =
     shown === ALL_FILES.length
@@ -2832,7 +3164,7 @@ function renderFiles(files) {
       : `openEditModal('${f.id}')`;
 
     const checkHtml = selectMode ? `
-      <div onclick="toggleFileSelection(event,'${f.id}')" style="flex-shrink:0;width:24px;height:24px;border-radius:8px;display:flex;align-items:center;justify-content:center;border:2px solid ${sel ? 'var(--btn-text)' : 'var(--border-color)'};background:${sel ? 'var(--btn-text)' : 'transparent'};transition:all .12s">
+      <div onclick="toggleFileSelection(event,'${f.id}')" style="flex-shrink:0;width:24px;height:24px;border-radius:8px;display:flex;align-items:center;justify-content:center;border:2px solid ${sel ? 'var(--btn-text)' : 'var(--border-color)'};background:${sel ? 'var(--btn-text)' : 'transparent'};transition:transform .15s var(--ease-spring)">
         ${sel ? '<i data-lucide="check" style="width:14px;height:14px;stroke:var(--card-bg)"></i>' : ''}
       </div>
     ` : '';
@@ -2859,7 +3191,7 @@ function renderFiles(files) {
           </p>
 
           <p style="font-weight:600;font-size:12px;color:var(--subtext-color);margin-top:2px">
-            ${fmtSize(f.size)} · ${(f.ts || '').slice(0, 10)}
+            ${fmtSize(f.size)} · ${fmtDateTime(f.ts)}
           </p>
         </div>
 
@@ -2901,7 +3233,7 @@ modalCard.addEventListener('touchmove', (e) => {
   const deltaY = touchCurrentY - touchStartY;
 
   if (deltaY > 0) {
-    modalCard.style.transform = `translateY(${deltaY}px) translateZ(0)`;
+    modalCard.style.transform = `translateY(${deltaY}px)`;
   }
 }, { passive: true });
 
@@ -2912,12 +3244,12 @@ modalCard.addEventListener('touchend', () => {
 
   const deltaY = touchCurrentY - touchStartY;
 
-  modalCard.style.transition = 'transform 0.28s cubic-bezier(0.16, 1, 0.3, 1)';
+  modalCard.style.transition = 'transform 0.42s var(--ease-snap)';
 
   if (deltaY > 100) {
     closeEditModal();
   } else {
-    modalCard.style.transform = 'translateY(0) translateZ(0)';
+    modalCard.style.transform = 'translateY(0)';
   }
 
   touchStartY = 0;
@@ -2940,22 +3272,20 @@ function openEditModal(id) {
 
   modalCard.style.transform = '';
 
-  document.getElementById('editModal').classList.add('open');
-  document.body.classList.add('modal-open');
+  openModalEl('editModal');
 }
 
 function closeEditModal(e) {
   if (e) e.stopPropagation();
 
-  modalCard.style.transform = 'translateY(100%) translateZ(0)';
+  modalCard.style.transform = 'translateY(100%)';
 
-  document.getElementById('editModal').classList.remove('open');
-  document.body.classList.remove('modal-open');
+  closeModalEl('editModal');
 
   setTimeout(() => {
     activeEditingFileId = null;
     modalCard.style.transform = '';
-  }, 280);
+  }, 450);
 }
 
 async function saveFileName() {
@@ -2985,12 +3315,18 @@ async function saveFileName() {
 
 let VAULT_PW = '';
 let VAULT_SERVER_UNLOCKED = false;
-let PENDING_FILE_ACTION = null; // отложенное «посмотреть файл» после ввода пароля Сейфа
+let PENDING_FILE_ACTION = null;
 
 function vaultHeaders(extra) {
   const h = authHeaders(extra);
 
-  if (VAULT_PW) h['X-Vault-Password'] = VAULT_PW;
+  if (VAULT_PW) {
+    /* HTTP-заголовки принимают только Latin-1: пароль с кириллицей/эмодзи
+       кодируем (encodeURIComponent), сервер сам раскодирует обратно */
+    h['X-Vault-Password'] = /^[\x20-\x7E]*$/.test(VAULT_PW)
+      ? VAULT_PW
+      : encodeURIComponent(VAULT_PW);
+  }
 
   return h;
 }
@@ -3001,8 +3337,7 @@ function openSafeModal() {
 
   loadSafeStatus();
 
-  m.classList.add('open');
-  document.body.classList.add('modal-open');
+  openModalEl('safeModal');
 }
 
 function closeSafeModal(e) {
@@ -3010,10 +3345,7 @@ function closeSafeModal(e) {
 
   PENDING_FILE_ACTION = null;
 
-  const m = document.getElementById('safeModal');
-  if (m) m.classList.remove('open');
-
-  document.body.classList.remove('modal-open');
+  closeModalEl('safeModal');
 }
 
 async function loadSafeStatus() {
@@ -3064,7 +3396,7 @@ async function unlockSafe() {
     loadFiles(true);
 
     if (pending && pending.type === 'view') {
-      setTimeout(() => openFileViewer(pending.id), 300);
+      setTimeout(() => openFileViewer(pending.id), 350);
     }
   } catch (e) {
     showToast(cloudErrText(e));
@@ -3158,14 +3490,8 @@ async function fromSafeCurrentFile() {
   }
 }
 
-
-/* ===== Скачивание на телефоне =====
-   Обычная ссылка через tg.openLink не работает: внешний браузер теряет заголовки
-   авторизации и пароля Сейфа. Поэтому качаем файл сами (fetch с заголовками),
-   а на телефоне открываем системное меню «Поделиться» → «Сохранить в Файлы/Фото». */
-
 const IS_MOBILE = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent || '') || (navigator.maxTouchPoints || 0) > 1;
-const BIG_FILE_LIMIT = 1024 * 1024 * 1024; // файлы больше 1 ГБ не влезают в память телефона — открываем ссылку в браузере
+const BIG_FILE_LIMIT = 1024 * 1024 * 1024;
 
 function guessMime(name) {
   const n = String(name || '').toLowerCase();
@@ -3193,7 +3519,6 @@ function openExternalLink(abs) {
   else window.open(abs, '_blank', 'noopener');
 }
 
-// Качаем файл сами, с заголовками авторизации и паролем Сейфа
 async function fetchFileBlob(absUrl, name) {
   const r = await fetch(absUrl, { headers: vaultHeaders() });
 
@@ -3228,7 +3553,6 @@ async function fetchFileBlob(absUrl, name) {
   return new Blob(chunks, { type: type });
 }
 
-// Сохраняем на телефон: меню «Поделиться» → «Сохранить в Файлы / Сохранить фото», иначе прямое скачивание
 async function saveBlobToPhone(blob, name) {
   let file;
 
@@ -3243,7 +3567,7 @@ async function saveBlobToPhone(blob, name) {
       await navigator.share({ files: [file], title: name });
       return true;
     } catch (e) {
-      if (e && e.name === 'AbortError') return true; // пользователь закрыл меню — файл уже выбран им
+      if (e && e.name === 'AbortError') return true;
     }
   }
 
@@ -3320,9 +3644,39 @@ async function downloadCurrentFile() {
 
   if (!f) return;
 
-  if (f.vault && !VAULT_PW && !ensureSafeUnlocked()) return;
+  if (f.vault && !f.plain && !VAULT_PW && !ensureSafeUnlocked()) return;
 
   downloadFileById(f.id, f.name, f.size);
+}
+
+async function sendCurrentFileToChat() {
+  const f = ALL_FILES.find((x) => x.id === activeEditingFileId);
+
+  closeEditModal();
+
+  if (!f) return;
+
+  if (f.vault && !f.plain && !VAULT_PW && !ensureSafeUnlocked()) return;
+
+  showToast('📤 Отправляю в чат…');
+
+  try {
+    await apiJson('/api/files/' + encodeURIComponent(f.id) + '/to_chat', {
+      method: 'POST',
+      headers: vaultHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({})
+    });
+
+    showToast('📲 Файл в чате бота — откройте и сохраните в галерею');
+  } catch (e) {
+    if (e.code === 'safe_locked') {
+      VAULT_PW = '';
+      VAULT_SERVER_UNLOCKED = false;
+      openSafeModal();
+    }
+
+    showToast('Не удалось: ' + cloudErrText(e));
+  }
 }
 
 async function downloadSelected() {
@@ -3336,7 +3690,7 @@ async function downloadSelected() {
 
     if (!f) return;
 
-    if (f.vault && !VAULT_PW && !ensureSafeUnlocked()) return;
+    if (f.vault && !f.plain && !VAULT_PW && !ensureSafeUnlocked()) return;
 
     downloadFileById(f.id, f.name, f.size);
 
@@ -3377,7 +3731,10 @@ function viewCurrentFile() {
 
   if (!f) return;
 
-  const needPw = f.vault || STORAGE_ENCRYPTED === true;
+  /* Пароль нужен ТОЛЬКО для НАСТОЯЩИХ зашифрованных файлов Сейфа.
+     Файлы обычного облака и Сейф-файлы режима «без шифрования» (plain)
+     открываются свободно — что в боте, что здесь. */
+  const needPw = f.vault && !f.plain;
 
   closeEditModal();
 
@@ -3450,7 +3807,13 @@ function onSearch() {
 
   document.getElementById('clearSearch').style.display = SEARCH ? 'flex' : 'none';
 
-  renderAll();
+  /* Перерисовка не чаще одного раза на кадр — плавный ввод даже на 120 Гц */
+  if (onSearch._raf) return;
+
+  onSearch._raf = requestAnimationFrame(function () {
+    onSearch._raf = 0;
+    renderAll();
+  });
 }
 
 function clearSearch() {
@@ -3524,7 +3887,6 @@ document.addEventListener('pointerdown', (e) => {
 function handleDropZoneClick(e) {
   if (isUploading) return;
 
-  // Сначала окно загрузки (пароль/список файлов), выбор файлов — кнопкой «Добавить файл»
   openUploadModal();
 }
 
@@ -3645,7 +4007,7 @@ function closeAlbumModal(e) {
   if (e) e.stopPropagation();
 
   closeModalEl('albumModal');
-  openNameChoiceModal(); // «Отмена» — возвращаемся к выбору способа имён
+  openNameChoiceModal();
 }
 
 function confirmAlbumName() {
@@ -3727,7 +4089,7 @@ function nextNameStep() {
   nameEditIndex++;
 
   if (nameEditIndex < pendingFiles.length) {
-    setTimeout(showNameModal, 140);
+    setTimeout(showNameModal, 200);
   } else {
     applyCustomNames();
   }
@@ -3745,7 +4107,7 @@ function closeNameModal(e) {
   if (e) e.stopPropagation();
 
   closeModalEl('nameModal');
-  applyCustomNames(); // что успели ввести — применится, остальные с оригинальными именами
+  applyCustomNames();
 }
 
 function startActualUpload() {
@@ -3754,10 +4116,15 @@ function startActualUpload() {
   proceedUpload(pendingFiles);
 }
 
-let STORAGE_ENCRYPTED = null; // true — в боте включено шифрование, false — «без шифрования», null — неизвестно
+let STORAGE_ENCRYPTED = null;
 
 function passwordRequired() {
-  return STORAGE_ENCRYPTED === true || ALL_FILES.some((f) => f.vault);
+  /* ВОЛНА 22.35: пароль на ЗАГРУЗКУ нужен только когда сервер работает
+     в режиме шифрования (STORAGE_ENCRYPTED = true). Старые зашифрованные
+     файлы Сейфа на новые загрузки не влияют: в режиме «без шифрования»
+     новые файлы грузятся свободно, а старые открываются паролем при
+     просмотре/скачивании (нужен f.vault && !f.plain). */
+  return STORAGE_ENCRYPTED !== false;
 }
 
 async function detectStorageMode() {
@@ -3772,16 +4139,38 @@ async function detectStorageMode() {
 
       const d = await r.json();
 
-      if (typeof d.plain === 'boolean') { STORAGE_ENCRYPTED = !d.plain; return; }
-      if (typeof d.encrypted === 'boolean') { STORAGE_ENCRYPTED = d.encrypted; return; }
-      if (typeof d.encryption === 'boolean') { STORAGE_ENCRYPTED = d.encryption; return; }
+      if (typeof d.plain === 'boolean') { STORAGE_ENCRYPTED = !d.plain; }
+      if (typeof d.encrypted === 'boolean') { STORAGE_ENCRYPTED = d.encrypted; }
+      if (typeof d.encryption === 'boolean') { STORAGE_ENCRYPTED = d.encryption; }
+
+      /* ВОЛНА 22.35: баннер-рекомендация виден, пока канал не подключён */
+      if (typeof d.connected === 'boolean') updateDevRecBanner(d.connected);
+
+      if (STORAGE_ENCRYPTED !== null) return;
     } catch (e) {}
   }
 }
 
-/* ===== Модалка «Хранилище» ===== */
+/* ВОЛНА 22.35: баннер-рекомендация разработчика */
+function updateDevRecBanner(connected) {
+  const b = document.getElementById('devRecBanner');
+  if (!b) return;
 
-let STORAGE_PLAIN = null; // null — неизвестно, true — «без шифрования», false — шифрование включено
+  const dismissed = localStorage.getItem('devo_recbanner_hide') === '1';
+
+  b.classList.toggle('hide', dismissed || connected === true);
+}
+
+function dismissDevRec(e) {
+  if (e) e.stopPropagation();
+
+  localStorage.setItem('devo_recbanner_hide', '1');
+
+  const b = document.getElementById('devRecBanner');
+  if (b) b.classList.add('hide');
+}
+
+let STORAGE_PLAIN = null;
 
 async function loadStorageStatus() {
   const box = document.getElementById('storageStatus');
@@ -3811,6 +4200,9 @@ async function loadStorageStatus() {
       STORAGE_PLAIN = d.plain;
       STORAGE_ENCRYPTED = !d.plain;
     }
+
+    /* ВОЛНА 22.35: канал подключили/отключили — баннер скрываем/показываем */
+    updateDevRecBanner(connected);
 
     if (plainBtn && STORAGE_PLAIN !== null) {
       plainBtn.style.display = '';
@@ -3912,7 +4304,10 @@ function openModalEl(id) {
 
 function closeModalEl(id) {
   const m = document.getElementById(id);
-  if (m) m.classList.remove('open');
+
+  if (m) {
+    m.classList.remove('open');
+  }
 
   if (!document.querySelector('.modal-overlay.open')) {
     document.body.classList.remove('modal-open');
@@ -4002,7 +4397,7 @@ function confirmUploadFiles() {
   closeModalEl('uploadModal');
 
   if (pendingFiles.length > 1) {
-    openNameChoiceModal(); // много файлов — спросить: альбом / по одному / пропустить
+    openNameChoiceModal();
   } else {
     startActualUpload();
   }
@@ -4328,10 +4723,17 @@ async function uploadEngine(bar) {
   playSoundDirectly(selectedSoundId);
   flashScreen();
 
-  // ВОЛНА 22.34: честный фидбек — файл зашифрован (попал в Сейф) или «как есть»
   const anySafe = added.some((r) => r && r.vault);
 
-  showToast(anySafe ? '✅ Успешно! 🔒 Зашифровано и в Сейфе' : '✅ Загружено');
+  /* ВОЛНА 22.35: если публикаций в канал много, сервер ставит файл в очередь —
+     честно показываем позицию (файл уже сохранён и виден в списке). */
+  const maxQueuePos = added.reduce(
+    (m, r) => Math.max(m, +((r && r.queue_pos) || 0)), 0);
+
+  showToast(
+    (anySafe ? '✅ Успешно! 🔒 Зашифровано и в Сейфе' : '✅ Загружено') +
+    (maxQueuePos > 1 ? ' · ⏳ публикация в канале, перед вами: ' + (maxQueuePos - 1) : '')
+  );
 
   added.forEach((rec) => {
     ALL_FILES.unshift({
@@ -4348,7 +4750,7 @@ async function uploadEngine(bar) {
 
   setTimeout(() => {
     resetUploadUI(bar, checkmark, squareStop);
-  }, 1000);
+  }, 1200);
 }
 
 document.getElementById('fileInput').addEventListener('change', (e) => {
@@ -4386,6 +4788,18 @@ updateSoundLabel();
 setSort('date-desc');
 renderAll();
 detectStorageMode();
+updateDevRecBanner(false);
+
+/* Прогрев GPU-шейдеров размытия: компиляция первого backdrop-filter в движке
+   занимает десятки мс — из-за этого лагало первое открытие модалки.
+   Прогреваем незаметно: 2 кадра на пиксельном слое в углу экрана */
+setTimeout(() => {
+  const w = document.createElement('div');
+  w.style.cssText = 'position:fixed;right:0;bottom:0;width:2px;height:2px;pointer-events:none;opacity:0.01;backdrop-filter:blur(2px);-webkit-backdrop-filter:blur(2px);';
+  document.body.appendChild(w);
+
+  requestAnimationFrame(() => requestAnimationFrame(() => w.remove()));
+}, 150);
 
 if (!IS_TELEGRAM) {
   if (WEB_TOKEN) {
@@ -4396,14 +4810,16 @@ if (!IS_TELEGRAM) {
         } else {
           localStorage.removeItem('devo_web_token');
           WEB_TOKEN = '';
-          openLoginModal();
+          setTimeout(openLoginModal, 500);
         }
       })
       .catch(function () {
-        openLoginModal();
+        setTimeout(openLoginModal, 500);
       });
   } else {
-    openLoginModal();
+    /* Окно входа открываем чуть позже старта: прогрев размытия успевает
+       отработать, первый рендер и иконки — устаканиться, без рывка */
+    setTimeout(openLoginModal, 650);
   }
 } else {
   loadFiles().then(function (ok) {
