@@ -3568,7 +3568,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.37"
+BOT_BUILD = "22.38"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -9287,10 +9287,10 @@ body.modal-open {
   opacity: 1;
 }
 
-/* === ВОЛНА 22.37: ПИЛЮЛЯ-ПРОГРЕСС СНИЗУ ЭКРАНА (стадион) ===
-   Небольшая «таблетка» в правом нижнем углу: во время загрузки/скачивания
-   показывает общий процент. Нажатие раскрывает список активных передач.
-   Центральный круговой прогресс в зоне загрузки удалён (просил пользователь). */
+/* === ВОЛНА 22.37/22.38: ПИЛЮЛЯ-ПРОГРЕСС СНИЗУ ЭКРАНА (стадион) ===
+   22.38: пилюля показывает ТОЛЬКО скачивания/синхронизации; ЗАГРУЗКИ
+   файлов вернулись В ЦЕНТР экрана (индикатор #uploadCenter). Тап по пилюле
+   раскрывает список передач с плавной анимацией, размытым фоном и SVG-иконками. */
 #transferPill {
   position: fixed;
   right: 14px;
@@ -9339,25 +9339,169 @@ body.modal-open {
   text-overflow: ellipsis;
 }
 
+/* ВОЛНА 22.38: размытый фон под раскрытой панелью передач */
+#transferScrim {
+  position: fixed;
+  inset: 0;
+  z-index: 91;
+  background: rgba(0, 0, 0, 0.28);
+  -webkit-backdrop-filter: blur(12px);
+  backdrop-filter: blur(12px);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.3s var(--ease-smooth);
+}
+
+#transferScrim.open {
+  opacity: 1;
+  pointer-events: auto;
+}
+
 #transferPanel {
   position: fixed;
   right: 14px;
   left: 14px;
   bottom: calc(16px + env(safe-area-inset-bottom, 0px));
-  z-index: 91;
+  z-index: 92;
   background: var(--card-bg);
+  background: color-mix(in srgb, var(--card-bg) 84%, transparent);
+  -webkit-backdrop-filter: blur(20px);
+  backdrop-filter: blur(20px);
   border: 1px solid var(--border-color);
   border-radius: 24px;
   box-shadow: 0 16px 44px rgba(0, 0, 0, 0.3);
   padding: 14px;
-  display: none;
+  display: block;
   max-height: 46vh;
   overflow-y: auto;
   -webkit-overflow-scrolling: touch;
   overscroll-behavior: contain;
+  opacity: 0;
+  transform: translateY(32px) scale(0.96);
+  pointer-events: none;
+  transition: opacity 0.28s var(--ease-smooth),
+              transform 0.45s var(--ease-spring);
 }
 
-#transferPanel.open { display: block; }
+#transferPanel.open {
+  opacity: 1;
+  transform: translateY(0) scale(1);
+  pointer-events: auto;
+}
+
+/* ВОЛНА 22.38: ЦЕНТРАЛЬНЫЙ индикатор ЗАГРУЗКИ файлов — вернули посередине
+   экрана (круговой кольцо как в оригинальном дизайне), пока пилюля осталась
+   для скачиваний */
+#uploadCenter {
+  position: fixed;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%) scale(0.9);
+  z-index: 95;
+  display: none;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 22px 28px;
+  border-radius: 26px;
+  background: var(--card-bg);
+  background: color-mix(in srgb, var(--card-bg) 92%, transparent);
+  -webkit-backdrop-filter: blur(16px);
+  backdrop-filter: blur(16px);
+  border: 1px solid var(--border-color);
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.35);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.3s var(--ease-smooth),
+              transform 0.45s var(--ease-spring);
+  max-width: 80vw;
+}
+
+#uploadCenter.visible {
+  display: flex;
+  opacity: 1;
+  transform: translate(-50%, -50%) scale(1);
+}
+
+#uploadCenter .uc-ring {
+  width: 58px;
+  height: 58px;
+  position: relative;
+}
+
+#uploadCenter .uc-ring > svg:first-child {
+  width: 58px;
+  height: 58px;
+  transform: rotate(-90deg);
+}
+
+#uploadCenter circle.uc-bg {
+  stroke: var(--loader-bg);
+  stroke-width: 6;
+  fill: none;
+}
+
+#uploadCenter circle.uc-bar {
+  stroke: var(--loader-bar);
+  stroke-width: 6;
+  fill: none;
+  stroke-dasharray: 157;
+  stroke-dashoffset: 157;
+  stroke-linecap: round;
+  transition: stroke-dashoffset 0.15s linear;
+}
+
+#uploadCenter .uc-pct {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 900;
+  color: var(--text-color);
+  font-variant-numeric: tabular-nums;
+}
+
+#uploadCenter .uc-name {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--subtext-color);
+  max-width: 210px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: center;
+}
+
+#uploadCenter .uc-cancel {
+  border: none;
+  background: var(--btn-bg);
+  color: var(--btn-text);
+  font-family: 'Nunito', sans-serif;
+  font-size: 11px;
+  font-weight: 900;
+  padding: 8px 18px;
+  border-radius: 9999px;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+#uploadCenter .uc-cancel:active { transform: scale(0.94); }
+
+/* SVG-иконки строк панели передач (22.38: вместо эмодзи) */
+.tp-ico {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  display: block;
+}
+
+.tp-ico svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
 
 .tp-row { margin-bottom: 12px; }
 .tp-row:last-child { margin-bottom: 2px; }
@@ -9713,8 +9857,8 @@ body.modal-open {
 
 #musicArt {
   width: 100%;
-  max-width: 300px;
-  max-height: 300px;
+  max-width: 320px;
+  max-height: 320px;
   aspect-ratio: 1 / 1;
   border-radius: 36px;
   overflow: hidden;
@@ -9735,6 +9879,20 @@ body.modal-open {
   width: 100%;
   height: 100%;
   object-fit: cover;
+}
+
+/* ВОЛНА 22.38: фолбэк-обложка — SVG пользователя (нота на тёмном фоне)
+   когда во встроенных метаданных аудио нет картинки */
+#musicArt .mm-fb {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+}
+
+#musicArt .mm-fb svg {
+  width: 100%;
+  height: 100%;
+  display: block;
 }
 
 #musicArtIcon { font-size: 84px; z-index: 1; }
@@ -9815,7 +9973,7 @@ body.modal-open {
 #musicModal .mm-btn:active { transform: scale(0.92); }
 
 #musicPlayBtn {
-  width: 68px; height: 68px;
+  width: 72px; height: 72px;
   border-radius: 9999px;
   background: #fff;
   color: #000;
@@ -10733,8 +10891,12 @@ body.modal-open {
 
 </div>
 
-<!-- ВОЛНА 22.37: пилюля-прогресс снизу (стадион): загрузки и скачивания.
-     Тап по пилюле раскрывает список активных передач -->
+<!-- ВОЛНА 22.37/22.38: пилюля-прогресс снизу (стадион) — СКАЧИВАНИЯ.
+     Загрузки файлов показываются ЦЕНТРАЛЬНЫМ индикатором (#uploadCenter).
+     Тап по пилюле раскрывает список передач (плавная анимация, размытый фон,
+     SVG-иконки) -->
+<div id="transferScrim" onclick="toggleTransferPanel(event)"></div>
+
 <div id="transferPill" onclick="toggleTransferPanel(event)">
   <span class="tp-spin"></span>
   <span id="tpLabel">Загрузка…</span>
@@ -10743,9 +10905,25 @@ body.modal-open {
 <div id="transferPanel" onclick="event.stopPropagation()">
   <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
     <div style="font-weight:900;font-size:14px;color:var(--text-color)">Передачи</div>
-    <button class="tp-cancel" onclick="toggleTransferPanel(event)" style="width:26px;height:26px">✕</button>
+    <button class="tp-cancel" onclick="toggleTransferPanel(event)" style="width:26px;height:26px" aria-label="Закрыть">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" style="width:12px;height:12px;display:block;margin:0 auto"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+    </button>
   </div>
   <div id="tpRows"></div>
+</div>
+
+<!-- ВОЛНА 22.38: ЦЕНТРАЛЬНЫЙ индикатор ЗАГРУЗКИ файлов (вернули посередине
+     экрана по просьбе пользователя); для скачиваний — пилюля снизу -->
+<div id="uploadCenter">
+  <div class="uc-ring">
+    <svg viewBox="0 0 60 60">
+      <circle class="uc-bg" cx="30" cy="30" r="25"></circle>
+      <circle class="uc-bar" id="ucBar" cx="30" cy="30" r="25"></circle>
+    </svg>
+    <div class="uc-pct" id="ucPct">0%</div>
+  </div>
+  <div class="uc-name" id="ucName">Загрузка…</div>
+  <button class="uc-cancel" onclick="ucCancel(event)">Отмена</button>
 </div>
 
 <div id="selectionBar">
@@ -13503,9 +13681,22 @@ function addMoreUploadFiles() {
 }
 
 function uploadFiles(fileList) {
-  const files = Array.from(fileList);
+  let files = Array.from(fileList);
 
   if (!files.length || isUploading) return;
+
+  /* ВОЛНА 22.38: пустые файлы (0 Б) не грузим вообще — «такого не должно
+     быть» (раньше они доходили до сервера и портами 0-байтовые записи) */
+  const empty = files.filter((f) => !+f.size);
+
+  if (empty.length) {
+    showToast('⚠️ Пустых файлов (0 Б): ' + empty.length +
+      ' — пропущены. Перекачайте их заново.');
+  }
+
+  files = files.filter((f) => +f.size);
+
+  if (!files.length) return;
 
   const modalOpen = !!(document.getElementById('uploadModal') || {}).classList &&
     document.getElementById('uploadModal').classList.contains('open');
@@ -13521,10 +13712,11 @@ function uploadFiles(fileList) {
   pickerAppend = false;
 }
 
-/* === ВОЛНА 22.37: РЕЕСТР ПЕРЕДАЧ (пилюля снизу справа) ===
-   Все загрузки и скачивания показываются одной маленькой пилюлей-«стадионом»
-   внизу экрана; тап раскрывает список активных передач. Центральный
-   круговой прогресс больше не используется (просил пользователь). */
+/* === ВОЛНА 22.37/22.38: РЕЕСТР ПЕРЕДАЧ ===
+   22.38: ЗАГРУЗКИ файлов показываются ЦЕНТРАЛЬНЫМ индикатором #uploadCenter
+   (вернули посередине экрана), СКАЧИВАНИЯ и синхронизации — маленькой пилюлей
+   снизу справа; тап раскрывает список передач (плавная анимация, размытый
+   фон, SVG-иконки). */
 const TRANSFERS = new Map();
 let _tpSeq = 0;
 let _tpRenderRaf = 0;
@@ -13586,6 +13778,11 @@ function tpPct(t) {
   return Math.min(99, Math.floor((t.got / t.size) * 100));
 }
 
+/* SVG-иконки строк панели (22.38: вместо эмодзи — просил пользователь) */
+const TP_ICO_UP = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5"/><path d="m5 12 7-7 7 7"/></svg>';
+const TP_ICO_DOWN = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14"/><path d="m19 12-7 7-7-7"/></svg>';
+const TP_ICO_OK = '<svg viewBox="0 0 24 24" fill="none" stroke="#22c55e" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>';
+
 function tpRender() {
   if (_tpRenderRaf) return;
   _tpRenderRaf = requestAnimationFrame(() => {
@@ -13595,47 +13792,91 @@ function tpRender() {
     const label = document.getElementById('tpLabel');
     const panel = document.getElementById('transferPanel');
     const rows = document.getElementById('tpRows');
+    const scrim = document.getElementById('transferScrim');
+    const uc = document.getElementById('uploadCenter');
 
     if (!pill || !label || !panel || !rows) return;
 
     if (!TRANSFERS.size) {
       pill.classList.remove('visible');
       panel.classList.remove('open');
+      if (scrim) scrim.classList.remove('open');
+      if (uc) uc.classList.remove('visible');
       return;
     }
 
-    let sumGot = 0;
-    let sumSize = 0;
+    let upGot = 0, upSize = 0, downGot = 0, downSize = 0;
+    let upsActive = 0, downsActive = 0, upCur = null;
 
     TRANSFERS.forEach((t) => {
-      sumGot += t.done ? (t.size || t.got) : t.got;
-      sumSize += t.size || 0;
+      const got = t.done ? (t.size || t.got) : t.got;
+
+      if (t.kind === 'up') {
+        upGot += got;
+        upSize += t.size || 0;
+
+        if (!t.done) {
+          upsActive++;
+
+          if (!upCur) upCur = t;
+        }
+      } else {
+        downGot += got;
+        downSize += t.size || 0;
+
+        if (!t.done) downsActive++;
+      }
     });
 
-    const overall = sumSize ? Math.min(100, Math.round((sumGot / sumSize) * 100)) : 0;
-    const ups = [...TRANSFERS.values()].filter((t) => t.kind === 'up' && !t.done).length;
-    const downs = [...TRANSFERS.values()].filter((t) => t.kind === 'down' && !t.done).length;
+    /* --- ЦЕНТРАЛЬНЫЙ индикатор ЗАГРУЗКИ (22.38: вернули посередине) --- */
+    if (uc) {
+      if (upsActive) {
+        const pct = upSize ? Math.min(99, Math.floor((upGot / upSize) * 100)) : 0;
+        const bar = document.getElementById('ucBar');
+        const pctEl = document.getElementById('ucPct');
+        const nameEl = document.getElementById('ucName');
 
-    label.textContent = (ups && downs) ? `↕ ${overall}%`
-      : ups ? `Загрузка ${overall}%`
-      : downs ? `Скачивание ${overall}%`
-      : `Готово ${overall}%`;
+        if (bar) bar.style.strokeDashoffset = String(157 - 157 * pct / 100);
+        if (pctEl) pctEl.textContent = pct + '%';
+        if (nameEl && upCur) nameEl.textContent = upCur.name || 'Загрузка…';
 
-    pill.classList.add('visible');
+        uc.classList.add('visible');
+      } else {
+        uc.classList.remove('visible');
+      }
+    }
+
+    /* --- ПИЛЮЛЯ СНИЗУ — только СКАЧИВАНИЯ/синхронизации (22.38) --- */
+    if (!downSize && !downsActive) {
+      pill.classList.remove('visible');
+      if (!panel.classList.contains('open') && scrim) {
+        scrim.classList.remove('open');
+      }
+    } else {
+      const overall = downSize ? Math.min(100, Math.round((downGot / downSize) * 100)) : 0;
+
+      label.textContent = downsActive ? `Скачивание ${overall}%` : `Готово ${overall}%`;
+
+      pill.classList.add('visible');
+    }
 
     let html = '';
 
     TRANSFERS.forEach((t, id) => {
       const pct = tpPct(t);
-      const icon = t.kind === 'down' ? '⬇️' : '⬆️';
+      const ico = t.kind === 'down' ? TP_ICO_DOWN : TP_ICO_UP;
+      const icoHtml = t.done ? TP_ICO_OK
+        : `<span class="tp-ico" style="color:var(--subtext-color)">${ico}</span>`;
 
       html += '<div class="tp-row' + (t.done ? ' tp-done' : '') + '">' +
         '<div class="tp-row-top">' +
-        '<span>' + icon + '</span>' +
+        icoHtml +
         '<span class="tp-name">' + escapeHtml(t.name) + '</span>' +
         '<span>' + (t.done ? '✓' : pct + '%') + '</span>' +
         (t.done || t.kind !== 'up' ? '' :
-          '<button class="tp-cancel" onclick="tpCancelTransfer(\'' + id + '\')">✕</button>') +
+          '<button class="tp-cancel" onclick="tpCancelTransfer(\'' + id + '\')">' +
+          '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.2" stroke-linecap="round" style="width:10px;height:10px;display:block;margin:0 auto"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>' +
+          '</button>') +
         '</div>' +
         '<div class="tp-track"><div class="tp-fill" style="width:' + pct + '%"></div></div>' +
         '</div>';
@@ -13656,10 +13897,36 @@ function toggleTransferPanel(e) {
   if (e) e.stopPropagation();
 
   const panel = document.getElementById('transferPanel');
+  const scrim = document.getElementById('transferScrim');
 
   if (panel) {
     panel.classList.toggle('open');
+
+    if (scrim) scrim.classList.toggle('open', panel.classList.contains('open'));
+
     tpRender();
+  }
+}
+
+/* ВОЛНА 22.38: отмена текущей загрузки из центрального индикатора */
+function ucCancel(e) {
+  if (e) e.stopPropagation();
+
+  let cancelled = false;
+
+  TRANSFERS.forEach((t, id) => {
+    if (cancelled || t.done || t.kind !== 'up') return;
+
+    if (typeof t.cancel === 'function') t.cancel();
+    else tpDrop(id);
+
+    cancelled = true;
+  });
+
+  if (!cancelled) {
+    const uc = document.getElementById('uploadCenter');
+
+    if (uc) uc.classList.remove('visible');
   }
 }
 
@@ -14857,6 +15124,17 @@ let mPlaying = false;
 let mInterval = null;
 let mMeta = null;   /* {title, artist, coverUrl} */
 
+/* ВОЛНА 22.38: обложка-фолбэк — SVG пользователя (нота на тёмном фоне),
+   если во встроенных метаданных аудио (ID3 APIC) нет картинки */
+const M_FALLBACK_COVER_SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 500 500" width="100%" height="100%">' +
+  '<rect width="500" height="500" rx="32" fill="#121318" />' +
+  '<g fill="none" stroke="#5c6079" stroke-width="12" stroke-linecap="round" stroke-linejoin="round">' +
+  '<path d="M 270 160 V 290" />' +
+  '<path d="M 270 160 C 310 160, 330 180, 330 200" />' +
+  '<circle cx="230" cy="300" r="40" fill="#5c6079" />' +
+  '</g>' +
+  '</svg>';
+
 const M_PALETTES = [
   { grad: 'linear-gradient(135deg, #4285f4, #9b72f2)', bg: '#0b1120', glow: '#4285f4' },
   { grad: 'linear-gradient(135deg, #f4a142, #f442a1)', bg: '#200e13', glow: '#f4a142' },
@@ -15005,8 +15283,9 @@ function mApplyMeta() {
   document.getElementById('musicArtist').textContent =
     (mMeta && mMeta.artist) || 'DEVO+ Облако';
 
-  /* обложка: из аудио пользователя, иначе — градиент по имени файла */
-  art.querySelectorAll('img').forEach((i) => i.remove());
+  /* обложка: из аудио пользователя (ID3 APIC); если её нет — SVG-иконка
+     ноты на тёмном фоне (прислана пользователем, ВОЛНА 22.38) */
+  art.querySelectorAll('img, .mm-fb').forEach((i) => i.remove());
 
   if (mMeta && mMeta.coverUrl) {
     const img = document.createElement('img');
@@ -15014,14 +15293,19 @@ function mApplyMeta() {
     img.src = mMeta.coverUrl;
     art.appendChild(img);
     icon.style.display = 'none';
+    art.style.background = '#121318';
   } else {
-    icon.style.display = 'block';
-    icon.textContent = '🎵';
+    icon.style.display = 'none';
+
+    const fb = document.createElement('div');
+
+    fb.className = 'mm-fb';
+    fb.innerHTML = M_FALLBACK_COVER_SVG;
+    art.appendChild(fb);
+    art.style.background = '#121318';
   }
 
   const pal = (mMeta && mMeta.palette) || M_PALETTES[0];
-
-  if (!mMeta || !mMeta.coverUrl) art.style.background = pal.grad;
 
   document.getElementById('musicModal').style.background = pal.bg;
   document.getElementById('musicGlow').style.background = pal.glow;
@@ -16361,6 +16645,9 @@ async def miniapp_files_to_chat(request):
         return _miniapp_err(400, "bad_uid", "Не удалось определить ваш чат с ботом.")
     name = str(rec.get("name") or rec.get("label") or "файл")
     kind = str(rec.get("kind") or "document")
+    # ВОЛНА 22.38: под файлом в личном чате — кнопка «🙈 Скрыть» (удаляет
+    # ЭТО сообщение из чата; сам файл остаётся в облаке/Сейфе).
+    hide_kb = _miniapp_hide_kb(str(rec.get("id") or ""))
 
     # --- путь 1: облако / plain-Сейф — копируем сообщение из канала ---
     if where == "cloud" or rec.get("plain"):
@@ -16371,6 +16658,7 @@ async def miniapp_files_to_chat(request):
                     chat_id=chat_id,
                     from_chat_id=int(channel_id),
                     message_id=int(rec["msg_id"]),
+                    reply_markup=hide_kb,
                 )
                 return web.json_response({"ok": True, "how": "copy"})
             except Exception as e:
@@ -16381,14 +16669,17 @@ async def miniapp_files_to_chat(request):
                                 "Источник файла недоступен (нет канала/сообщения).")
         try:
             if kind == "photo":
-                await bot.send_photo(chat_id=chat_id, photo=file_id, caption=name[:100])
+                await bot.send_photo(chat_id=chat_id, photo=file_id, caption=name[:100],
+                                     reply_markup=hide_kb)
             elif kind == "video":
-                await bot.send_video(chat_id=chat_id, video=file_id, caption=name[:100])
+                await bot.send_video(chat_id=chat_id, video=file_id, caption=name[:100],
+                                     reply_markup=hide_kb)
             elif kind == "audio":
-                await bot.send_audio(chat_id=chat_id, audio=file_id, caption=name[:100])
+                await bot.send_audio(chat_id=chat_id, audio=file_id, caption=name[:100],
+                                     reply_markup=hide_kb)
             else:
                 await bot.send_document(chat_id=chat_id, document=file_id,
-                                        caption=name[:100])
+                                        caption=name[:100], reply_markup=hide_kb)
             return web.json_response({"ok": True, "how": "file_id"})
         except Exception as e:
             msg = str(e)
@@ -16420,6 +16711,7 @@ async def miniapp_files_to_chat(request):
                 chat_id=chat_id,
                 document=InputFile(payload, filename=name[:120] or "file.bin"),
                 caption=name[:100],
+                reply_markup=hide_kb,
             )
             return web.json_response({"ok": True, "how": "dvf1"})
         # DVF2: расшифровка во временный файл
@@ -16447,6 +16739,7 @@ async def miniapp_files_to_chat(request):
                 chat_id=chat_id,
                 document=InputFile(data, filename=name[:120] or "file.bin"),
                 caption=name[:100],
+                reply_markup=hide_kb,
             )
             return web.json_response({"ok": True, "how": "dvf2"})
         finally:
@@ -16600,46 +16893,60 @@ async def _miniapp_encrypt_local_to_safe(user, src_path, size, name, kind,
         _shutil.rmtree(job, ignore_errors=True)
 
 
-# --- ВОЛНА 22.36: КНОПКА «Скрыть» ПОД ФАЙЛАМИ ИЗ МИНИ-АППА ---
-# Пользователь: «под файлом, который отправил мини-апп, должно быть сообщение
-# «скрыть»; при нажатии файл скрывается из чата». После загрузки бот отправляет
-# в канал следом небольшое сообщение с кнопкой «🙈 Скрыть»: нажатие удаляет
-# ИЗ КАНАЛА сообщение с файлом и само сообщение-подсказку (в облаке файл
-# остаётся — скачивание работает по file_id, а для MTProto хранится mt_doc).
-async def _miniapp_send_hide_button(app, channel_id, rec, name):
-    """Следом за файлом шлёт в канал кнопку «Скрыть». Возвращает message_id
-    сообщения-подсказки (или 0 — отправить не удалось)."""
+# --- ВОЛНА 22.36/22.38: КНОПКА «Скрыть» ПОД ФАЙЛОМ В ЧАТЕ С БОТОМ ---
+# ВОЛНА 22.36: кнопка вешалась на сообщение в КАНАЛЕ. Пользователь уточнил
+# (22.38): «я имел ввиду скрыть когда отправляется В БОТА, а не в канал» —
+# теперь кнопка «🙈 Скрыть» приходит под файлом, который бот ОТПРАВИЛ
+# ПОЛЬЗОВАТЕЛЮ в личный чат (кнопка «Отправить в чат Telegram» в мини-аппе).
+# Нажатие удаляет ЭТО сообщение из чата с ботом; в облаке/Сейфе файл остаётся
+# и качается дальше (по file_id/mt_doc). Канал больше не трогаем.
+def _miniapp_hide_kb(fid):
+    """Клавиатура «🙈 Скрыть» для сообщения с файлом в личном чате."""
     try:
-        if app is None or not channel_id or not isinstance(rec, dict):
-            return 0
-        fid = str(rec.get("id") or "")
-        if not fid:
-            return 0
-        kb = InlineKeyboardMarkup([[
+        return InlineKeyboardMarkup([[
             InlineKeyboardButton("🙈 Скрыть", callback_data=f"fhide_{fid}")
         ]])
-        sent, _qp = await _pub_send(
-            int(channel_id),
-            lambda: app.bot.send_message(
-                chat_id=int(channel_id),
-                text=("🙈 «%s» — скрыть файл из канала?\nФайл ОСТАНЕТСЯ в вашем "
-                      "облаке — скроется только из чата." % str(name or "файл")[:60]),
-                reply_markup=kb),
-        )
-        return int(getattr(sent, "message_id", 0) or 0)
-    except Exception as e:
-        logger.warning(f"miniapp hide-button: не отправилось ({e})")
-        return 0
+    except Exception:
+        return None
 
 
 async def miniapp_hide_file_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Кнопка «🙈 Скрыть» под файлом из мини-аппа: удаляет сообщение файла и
-    сообщение-подсказку из канала. Владелец файла — тот, кто грузил; нажать
-    может любой админ канала, но удаляем только если файл наш."""
+    """Кнопка «🙈 Скрыть» под файлом, отправленным В ЛИЧНЫЙ ЧАТ С БОТОМ
+    (ВОЛНА 22.38: «скрыть — когда отправляется в бота, а не в канал»).
+    Нажатие удаляет сообщение с файлом из чата пользователя; файл остаётся
+    в облаке/Сейфе и качается дальше. Старые кнопки из волны 22.36 (в канале)
+    тоже работают — если чат НЕ личный, удаляем сообщение из канала, как раньше."""
     query = update.callback_query
     uid = str(query.from_user.id)
     fid = str(query.data or "").replace("fhide_", "", 1)
     user = get_user(uid)
+    msg = getattr(query, "message", None)
+    chat = getattr(msg, "chat", None)
+    chat_type = str(getattr(chat, "type", "") or "")
+    chat_id = int(getattr(chat, "id", 0) or 0)
+    # --- НОВОЕ (22.38): кнопка в личном чате пользователя с ботом ---
+    if chat is not None and ("private" in chat_type.lower()
+                             or (chat_id and chat_id == int(uid or 0))):
+        deleted = False
+        try:
+            await msg.delete()
+            deleted = True
+        except Exception:
+            try:
+                await context.bot.delete_message(
+                    chat_id=chat_id, message_id=int(msg.message_id))
+                deleted = True
+            except Exception:
+                pass
+        try:
+            if deleted:
+                await query.answer("🙈 Скрыто из чата — в облаке файл остался.")
+            else:
+                await query.answer("Не удалось удалить сообщение.", show_alert=True)
+        except Exception:
+            pass
+        return MAIN_MENU
+    # --- СТАРОЕ поведение (кнопки в канале из волны 22.36) ---
     rec, where = _miniapp_find_any(user, fid) if user else (None, None)
     if not rec:
         try:
@@ -16671,10 +16978,7 @@ async def miniapp_hide_file_cb(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception:
         pass
     if deleted and user is not None:
-        if where == "safe":
-            rec["hide_msg"] = 0
-        else:
-            rec["hide_msg"] = 0
+        rec["hide_msg"] = 0
         save_user(user)
     return MAIN_MENU
 
@@ -16737,8 +17041,13 @@ async def miniapp_upload_init(request):
         size = int(body.get("size") or 0)
     except (TypeError, ValueError):
         size = 0
-    if size < 0:
-        return _miniapp_err(400, "bad_size", "Некорректный размер файла.")
+    # ВОЛНА 22.38: файлы 0 Б запрещены — «получается 0б такого не должно
+    # быть вообще». Пустой файл — ошибка ДО создания сессии.
+    if size <= 0:
+        return _miniapp_err(
+            400, "empty_file",
+            "Файл пустой (0 Б) — загрузка отменена. Перекачайте файл заново "
+            "или выберите другой.")
     if size > VAULT_MTPROTO_MAX_BYTES:
         return _miniapp_err(
             413, "too_big",
@@ -16892,7 +17201,26 @@ async def miniapp_upload_complete(request):
     # ВАЖНО: _mt_upload_container может ПЕРЕИМЕНОВАТЬ временный файл — чистим оба пути.
     mt_renamed = os.path.join(os.path.dirname(s["path"]), s["name"] or "file.bin")
     try:
-        if s["size"] and s["received"] != s["size"]:
+        if s["size"] <= 0:
+            # ВОЛНА 22.38: 0-байтовые файлы невозможны (init их отвергает;
+            # здесь страховка от повреждённой сессии).
+            return _miniapp_err(
+                400, "empty_file",
+                "Файл пустой (0 Б) — запись не создана. Попробуйте загрузить "
+                "файл заново.")
+        _disk_size = 0
+        try:
+            _disk_size = os.path.getsize(s["path"])
+        except OSError:
+            _disk_size = 0
+        if _disk_size != s["size"]:
+            # ВОЛНА 22.38: не создаём запись, если на диске не все байты —
+            # иначе получаются «файлы 0б / повреждённые».
+            return _miniapp_err(
+                400, "incomplete_disk",
+                f"Файл получен не полностью (на диске {_disk_size} из "
+                f"{s['size']} байт) — начните загрузку заново.")
+        if s["received"] != s["size"]:
             return _miniapp_err(
                 400, "incomplete",
                 f"Получено {s['received']} из {s['size']} байт — загрузка не завершена.")
@@ -16932,13 +17260,8 @@ async def miniapp_upload_complete(request):
                 sess = _miniapp_session_of(request)
                 if sess is not None:
                     sess["vault_pw"] = vault_pw
-            # ВОЛНА 22.36: кнопка «Скрыть» и для зашифрованных загрузок
-            try:
-                new_rec["hide_msg"] = await _miniapp_send_hide_button(
-                    _MINIAPP_PTB_APP, int(new_rec.get("channel_id") or 0),
-                    new_rec, name)
-            except Exception:
-                pass
+            # ВОЛНА 22.38: «Скрыть» больше НЕ отправляется в канал — кнопка
+            # живёт только под файлами в личном чате с ботом (to_chat).
             save_user(user)
             logger.info(f"miniapp upload: файл пользователя {uid} "
                         "зашифрован и сохранён в Сейф")
@@ -16994,11 +17317,7 @@ async def miniapp_upload_complete(request):
                             if isinstance(f, dict)]
         user.cloud_files.append(rec)
         save_user(user)
-        # ВОЛНА 22.36: под файлом в канале — кнопка «Скрыть» (уборка чата;
-        # файл остаётся в облаке и качается по file_id/mt_doc).
-        rec["hide_msg"] = await _miniapp_send_hide_button(
-            app, int(sent.get("channel_id") or 0), rec, name)
-        save_user(user)
+        # ВОЛНА 22.38: «Скрыть» в канале больше не отправляем (см. выше).
         # ВОЛНА 22.35: позиция в очереди публикаций канала (1 = печатали сразу)
         out = _miniapp_rec_out(rec)
         try:
@@ -40277,14 +40596,31 @@ async def _duty_announce(bot, class_obj, selected, sick_note=None):
     текст «Сегодня дежурят: …» без личных сообщений.
     ВОЛНА 22.36: в режиме имён админы получают копию с кнопками
     «🤒 заболел(а)» / «🚫 не будет» на каждого дежурного — нажатие передаёт
-    дежурство следующему по списку, а заболевший уходит в конец списка."""
+    дежурство следующему по списку, а заболевший уходит в конец списка.
+    ВОЛНА 22.38: 1) если selected ПУСТОЙ — восстанавливаем сегодняшний
+    состав из duty_today (имена или uid) — раньше пустой список давал
+    объявление «Сегодня дежурный(е): —» (режим имён через тикер);
+    2) рассылка ВСЕМ участникам класса, даже если get_user их не вернул
+    (раньше такие молча выкидывались — «уведомления не приходят»);
+    3) возвращает число УСПЕШНО доставленных сообщений — тикер по нему
+    понимает, надо ли повторить попытку."""
+    if not selected:
+        today = getattr(class_obj, "duty_today", None)
+        if isinstance(today, dict):
+            nm = today.get("names")
+            if isinstance(nm, list) and nm:
+                selected = [str(n) for n in nm]
+            else:
+                ids = [str(i) for i in (today.get("ids") or [])]
+                if ids:
+                    selected = ids
     if selected and all(isinstance(i, str) and not i.isdigit() for i in selected):
         names = ", ".join(str(i) for i in selected) if selected else "—"
         members = [str(m) for m in dict.fromkeys(
             [str(m) for m in (class_obj.students or [])] +
             [str(m) for m in (class_obj.admins or [])])]
         blocked = set(str(b) for b in (class_obj.blocked_users or []))
-        members = [m for m in members if m not in blocked and get_user(m)]
+        members = [m for m in members if m not in blocked]
         # ВОЛНА 22.36: админам — кнопки замены по индексу в списке дежурных
         admin_rows = []
         for i, nm in enumerate(selected):
@@ -40294,6 +40630,7 @@ async def _duty_announce(bot, class_obj, selected, sick_note=None):
                 InlineKeyboardButton(f"🚫 не будет", callback_data=f"duty_cnn_{i}"),
             ])
         admin_kb = InlineKeyboardMarkup(admin_rows) if admin_rows else None
+        sent_ok = 0
         for uid in members:
             is_admin = str(uid) in [str(a) for a in (class_obj.admins or [])]
             try:
@@ -40303,17 +40640,19 @@ async def _duty_announce(bot, class_obj, selected, sick_note=None):
                           + (sick_note if sick_note else "")).rstrip(),
                     parse_mode=ParseMode.HTML,
                     reply_markup=admin_kb if is_admin else None)
+                sent_ok += 1
             except Exception as e:
                 logger.error(f"duty announce(names): send failed {uid}: {e}")
-        return
+        return sent_ok
     members = [str(m) for m in dict.fromkeys(
         [str(m) for m in (class_obj.students or [])] +
         [str(m) for m in (class_obj.admins or [])])]
     blocked = set(str(b) for b in (class_obj.blocked_users or []))
-    members = [m for m in members if m not in blocked and get_user(m)]
+    members = [m for m in members if m not in blocked]
     names = ", ".join(_duty_member_name(i) for i in selected) if selected else "—"
     officer_kb = InlineKeyboardMarkup([[
         InlineKeyboardButton("🤒 Я заболел(а)", callback_data="duty_sick")]])
+    sent_ok = 0
     for uid in members:
         try:
             if uid in selected:
@@ -40326,6 +40665,7 @@ async def _duty_announce(bot, class_obj, selected, sick_note=None):
                           + (f"\n\n{sick_note}" if sick_note else ""),
                     parse_mode=ParseMode.HTML,
                     reply_markup=officer_kb)
+                sent_ok += 1
                 continue
             is_admin = str(uid) in [str(a) for a in (class_obj.admins or [])]
             kb = None
@@ -40350,8 +40690,51 @@ async def _duty_announce(bot, class_obj, selected, sick_note=None):
                       + (sick_note if sick_note else "")).rstrip(),
                 parse_mode=ParseMode.HTML,
                 reply_markup=kb)
+            sent_ok += 1
         except Exception as e:
             logger.error(f"duty announce: send failed {uid}: {e}")
+    return sent_ok
+
+
+async def _duty_announce_today_if_due(bot, class_obj):
+    """ВОЛНА 22.38: мгновенное объявление ПОСЛЕ сохранения графика — если
+    сегодняшний слот уже наступил (в пределах окна догоняния) и объявление
+    ещё не уходило. Раньше график, сохранённый ДНЁМ, молча ждал завтрашнего
+    утра — «не приходят уведомления о дежурстве». Возвращает True, если
+    объявление ушло."""
+    try:
+        if not getattr(class_obj, "duty_enabled", False):
+            return False
+        tz = _duty_tz(class_obj)
+        local_now = _now_utc() + timedelta(hours=tz)
+        occ = local_now.strftime("%Y-%m-%d")
+        if getattr(class_obj, "duty_last_date", None) == occ:
+            return False  # сегодня уже объявляли
+        if not _duty_is_day_on(class_obj, local_now.weekday()) \
+                and not _duty_custom_plan_for(class_obj, occ):
+            return False  # сегодня не день дежурств
+        due, too_late, slot_occ = _is_daily_time_due(
+            local_now, getattr(class_obj, "duty_time", "07:30"),
+            max_late_minutes=_DUTY_MAX_LATE_MIN)
+        if not due or too_late or slot_occ != occ:
+            return False
+        class_obj.duty_last_date = occ
+        save_class(class_obj)
+        selected = _duty_pick_today(class_obj, occ)
+        if not selected:
+            t = getattr(class_obj, "duty_today", None)
+            if isinstance(t, dict) and t.get("date") == occ:
+                nm = t.get("names")
+                if isinstance(nm, list) and nm:
+                    selected = [str(n) for n in nm]
+        save_class(class_obj)
+        sent = await _duty_announce(bot, class_obj, selected)
+        logger.info(f"duty: мгновенное объявление после сохранения графика "
+                    f"({class_obj.class_code}) -> {selected}, доставлено {sent}")
+        return sent > 0
+    except Exception as e:
+        logger.error(f"duty announce_today_if_due: {e}")
+        return False
 
 
 async def _tick_send_duty(bot):
@@ -40388,9 +40771,37 @@ async def _tick_send_duty(bot):
             class_obj.duty_last_date = occ
             save_class(class_obj)
             selected = _duty_pick_today(class_obj, occ)
+            # ВОЛНА 22.38: режим СВОЕГО графика — _duty_pick_today возвращает
+            # [] (имена лежат в duty_today.names). Раньше announce получал
+            # пустой список и слал «Сегодня дежурный(е): —».
+            if not selected:
+                t = getattr(class_obj, "duty_today", None)
+                if isinstance(t, dict) and t.get("date") == occ:
+                    nm = t.get("names")
+                    if isinstance(nm, list) and nm:
+                        selected = [str(n) for n in nm]
             save_class(class_obj)
-            await _duty_announce(bot, class_obj, selected)
-            logger.info(f"tick/duty: {class_code} -> {selected} ({occ})")
+            sent = await _duty_announce(bot, class_obj, selected)
+            # ВОЛНА 22.38: НИ ОДНО сообщение не доставлено (сбой Telegram,
+            # флуд-лимит) — снимаем пометку, следующий тик повторит попытку
+            # (в пределах окна догоняния). Дубли не страшны: duty_today уже
+            # зафиксирован за этой датой.
+            if not sent:
+                pool_members = [str(m) for m in dict.fromkeys(
+                    [str(m) for m in (class_obj.students or [])] +
+                    [str(m) for m in (class_obj.admins or [])])]
+                _blocked = set(str(b) for b in (class_obj.blocked_users or []))
+                pool_members = [m for m in pool_members if m not in _blocked]
+                if pool_members:
+                    class_obj.duty_last_date = None
+                    save_class(class_obj)
+                    logger.warning(f"tick/duty: {class_code} — 0 доставлено, "
+                                   "повторю на следующем тике")
+                else:
+                    logger.warning(f"tick/duty: {class_code} — в классе нет "
+                                   "участников, уведомлять некому")
+            logger.info(f"tick/duty: {class_code} -> {selected} ({occ}), "
+                        f"доставлено {sent}")
         except Exception as e:
             logger.error(f"tick/duty: error on {class_code}: {e}")
 
@@ -41057,6 +41468,12 @@ async def duty_custom_ai_save(update: Update, context: ContextTypes.DEFAULT_TYPE
     _log_admin_action(uid, class_obj.class_code,
                       f"Дежурные: свой график (ИИ), {len(names)} имён, "
                       f"{len(plan)} дат")
+    # ВОЛНА 22.38: график сохранили ДНЁМ — если сегодняшний слот уже был,
+    # объявляем СРАЗУ (раньше класс молча ждал завтрашнего утра).
+    try:
+        await _duty_announce_today_if_due(context.bot, class_obj)
+    except Exception:
+        pass
     preview_lines = [f"✅ <b>Свой график составлен</b> — {len(names)} чел."
                      + days_note, ""]
     upcoming = sorted(plan.keys())[:10]
@@ -41134,6 +41551,12 @@ async def duty_custom_dates_save(update: Update, context: ContextTypes.DEFAULT_T
     save_class(class_obj)
     _log_admin_action(uid, class_obj.class_code,
                       f"Дежурные: свой график по датам, {len(plan)} дат")
+    # ВОЛНА 22.38: мгновенное объявление, если сегодняшний слот уже был
+    # (см. duty_custom_ai_save).
+    try:
+        await _duty_announce_today_if_due(context.bot, class_obj)
+    except Exception:
+        pass
     preview_lines = [f"✅ <b>График по датам сохранён</b> — дат: {len(plan)}, "
                      f"человек: {len(names)}.", ""]
     upcoming = sorted(k for k in plan.keys() if k >= today.strftime("%Y-%m-%d"))[:10]
