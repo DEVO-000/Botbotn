@@ -215,6 +215,8 @@ body {
   min-height: 100%;
   overflow-x: hidden;
   overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  height: auto;
 }
 
 body {
@@ -234,9 +236,12 @@ button {
   user-select: none;
 }
 
+/* ВОЛНА 22.37: touch-action:none на body УБРАН — в WebView Telegram после
+   закрытия модалки жест прокрутки мог остаться «отравленным» и главный
+   экран переставал листаться. Блокировку скролла делает JS (position:fixed
+   + сохранённая позиция) — надёжно на iOS/Android и без побочек. */
 body.modal-open {
   overflow: hidden;
-  touch-action: none;
 }
 
 .theme-flash {
@@ -1060,6 +1065,568 @@ body.modal-open {
   opacity: 1;
 }
 
+/* === ВОЛНА 22.37: ПИЛЮЛЯ-ПРОГРЕСС СНИЗУ ЭКРАНА (стадион) ===
+   Небольшая «таблетка» в правом нижнем углу: во время загрузки/скачивания
+   показывает общий процент. Нажатие раскрывает список активных передач.
+   Центральный круговой прогресс в зоне загрузки удалён (просил пользователь). */
+#transferPill {
+  position: fixed;
+  right: 14px;
+  bottom: calc(16px + env(safe-area-inset-bottom, 0px));
+  z-index: 90;
+  display: none;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 16px;
+  border-radius: 9999px;
+  background: var(--card-bg);
+  border: 1px solid var(--border-color);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25);
+  font-weight: 800;
+  font-size: 13px;
+  color: var(--text-color);
+  cursor: pointer;
+  opacity: 0;
+  transform: translateY(20px) scale(0.9);
+  transition: opacity 0.35s var(--ease-smooth), transform 0.45s var(--ease-spring);
+  max-width: 62vw;
+  touch-action: manipulation;
+}
+
+#transferPill.visible {
+  display: flex;
+  opacity: 1;
+  transform: translateY(0) scale(1);
+}
+
+#transferPill .tp-spin {
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  border: 2.5px solid var(--border-color);
+  border-top-color: var(--btn-bg);
+  animation: tpSpin 0.9s linear infinite;
+  flex-shrink: 0;
+}
+
+@keyframes tpSpin { to { transform: rotate(360deg); } }
+
+#tpLabel {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#transferPanel {
+  position: fixed;
+  right: 14px;
+  left: 14px;
+  bottom: calc(16px + env(safe-area-inset-bottom, 0px));
+  z-index: 91;
+  background: var(--card-bg);
+  border: 1px solid var(--border-color);
+  border-radius: 24px;
+  box-shadow: 0 16px 44px rgba(0, 0, 0, 0.3);
+  padding: 14px;
+  display: none;
+  max-height: 46vh;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+}
+
+#transferPanel.open { display: block; }
+
+.tp-row { margin-bottom: 12px; }
+.tp-row:last-child { margin-bottom: 2px; }
+
+.tp-row-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text-color);
+  margin-bottom: 6px;
+}
+
+.tp-row-top .tp-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tp-row-top .tp-cancel {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  border: none;
+  background: var(--btn-bg);
+  color: var(--btn-text);
+  font-size: 12px;
+  font-weight: 900;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  flex-shrink: 0;
+  padding: 0;
+}
+
+.tp-track {
+  height: 7px;
+  border-radius: 9999px;
+  background: var(--btn-bg);
+  opacity: 0.14;
+  overflow: hidden;
+  position: relative;
+}
+
+.tp-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 0%;
+  border-radius: 9999px;
+  background: var(--btn-bg);
+  opacity: 1;
+  transition: width 0.3s var(--ease-smooth);
+}
+
+.tp-done .tp-fill { background: #22c55e; }
+
+/* === ВОЛНА 22.37: ВИДЕОПЛЕЕР (полный экран) === */
+#videoModal {
+  position: fixed;
+  inset: 0;
+  background: #000;
+  z-index: 120;
+  display: none;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+}
+
+#videoModal.open { display: flex; }
+
+#videoModal .vm-header {
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  padding: calc(env(safe-area-inset-top, 0px) + 14px) 16px 14px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  z-index: 30;
+  background: linear-gradient(to bottom, rgba(0,0,0,0.8), transparent);
+  transition: opacity 0.3s;
+}
+
+#videoModal .vm-title {
+  color: #fff;
+  font-weight: 700;
+  font-size: 14px;
+  max-width: 60%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.vm-btn {
+  color: #fff;
+  background: rgba(255,255,255,0.2);
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+  padding: 8px;
+  border-radius: 9999px;
+  border: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+#videoStage {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #000;
+  overflow: hidden;
+  touch-action: none;
+}
+
+#videoPlayer {
+  width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  background: #000;
+  will-change: transform;
+}
+
+#videoModal .vm-controls {
+  position: absolute;
+  bottom: 0; left: 0; right: 0;
+  padding: 20px 18px calc(env(safe-area-inset-bottom, 0px) + 20px);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  z-index: 30;
+  background: linear-gradient(to top, rgba(0,0,0,0.9), rgba(0,0,0,0.4), transparent);
+  transition: opacity 0.3s;
+}
+
+#videoModal .vm-seekrow { display: flex; align-items: center; gap: 10px; }
+
+#videoModal .vm-time {
+  color: rgba(255,255,255,0.85);
+  font-weight: 600;
+  font-size: 12px;
+  min-width: 38px;
+  font-variant-numeric: tabular-nums;
+}
+
+#videoModal input[type=range] {
+  -webkit-appearance: none;
+  appearance: none;
+  flex: 1;
+  background: transparent;
+}
+
+#videoModal input[type=range]::-webkit-slider-runnable-track {
+  height: 4px;
+  background: rgba(255,255,255,0.3);
+  border-radius: 2px;
+}
+
+#videoModal input[type=range]::-webkit-slider-thumb {
+  height: 14px; width: 14px;
+  border-radius: 50%;
+  background: #fff;
+  -webkit-appearance: none;
+  margin-top: -5px;
+}
+
+#videoModal .vm-btnrow {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 30px;
+}
+
+#speedIndicator {
+  position: absolute;
+  top: calc(env(safe-area-inset-top, 0px) + 60px);
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 40;
+  background: rgba(0,0,0,0.75);
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+  color: #fff;
+  padding: 6px 16px;
+  border-radius: 9999px;
+  font-weight: 900;
+  font-size: 12px;
+  letter-spacing: 1px;
+  border: 1px solid rgba(255,255,255,0.2);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.2s;
+}
+
+#rewindIndicator {
+  position: absolute;
+  z-index: 20;
+  background: rgba(0,0,0,0.6);
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+  color: #fff;
+  padding: 8px 16px;
+  border-radius: 9999px;
+  font-weight: 700;
+  font-size: 12px;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.2s;
+}
+
+/* === ВОЛНА 22.37: ФОТОПРОСМОТРЩИК (полный экран) === */
+#photoModal {
+  position: fixed;
+  inset: 0;
+  background: #000;
+  z-index: 120;
+  display: none;
+  flex-direction: column;
+}
+
+#photoModal.open { display: flex; }
+
+#photoModal .pm-header {
+  padding: calc(env(safe-area-inset-top, 0px) + 14px) 16px 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  z-index: 5;
+  background: linear-gradient(to bottom, rgba(0,0,0,0.75), transparent);
+}
+
+#photoModal .pm-title {
+  color: #fff;
+  font-weight: 700;
+  font-size: 14px;
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#photoStage {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  position: relative;
+  touch-action: none;
+}
+
+#photoImg {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  will-change: transform;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+#photoModal .pm-footer {
+  padding: 12px 16px calc(env(safe-area-inset-bottom, 0px) + 14px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  z-index: 5;
+  background: linear-gradient(to top, rgba(0,0,0,0.75), transparent);
+}
+
+#photoModal .pm-count {
+  color: rgba(255,255,255,0.85);
+  font-weight: 800;
+  font-size: 12px;
+  min-width: 64px;
+  text-align: center;
+}
+
+/* === ВОЛНА 22.37: МУЗЫКАЛЬНЫЙ ПЛЕЕР (дизайн пользователя) === */
+#musicModal {
+  position: fixed;
+  inset: 0;
+  background: #08080c;
+  color: #fff;
+  z-index: 120;
+  display: none;
+  flex-direction: column;
+  justify-content: space-between;
+  padding: calc(env(safe-area-inset-top, 0px) + 20px) 24px
+           calc(env(safe-area-inset-bottom, 0px) + 20px);
+  overflow: hidden;
+  transition: background 0.8s ease;
+}
+
+#musicModal.open { display: flex; }
+
+#musicGlow {
+  position: absolute;
+  top: 50%; left: 50%;
+  width: 100vw; height: 100vh;
+  margin-top: -50vh; margin-left: -50vw;
+  border-radius: 50%;
+  filter: blur(100px);
+  background: #4285f4;
+  opacity: 0.55;
+  animation: float 8s ease-in-out infinite alternate;
+  pointer-events: none;
+  z-index: 0;
+}
+
+@keyframes float {
+  0% { transform: translate(-10%, -10%) scale(1); }
+  50% { transform: translate(10%, 15%) scale(1.2); }
+  100% { transform: translate(-5%, 10%) scale(0.9); }
+}
+
+#musicModal .mm-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  z-index: 1;
+}
+
+#musicModal .mm-label {
+  font-size: 12px;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  color: rgba(255,255,255,0.6);
+  font-weight: 600;
+}
+
+#musicModal .mm-art-wrap {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 0;
+  padding: 16px 0;
+  z-index: 1;
+}
+
+#musicArt {
+  width: 100%;
+  max-width: 300px;
+  max-height: 300px;
+  aspect-ratio: 1 / 1;
+  border-radius: 36px;
+  overflow: hidden;
+  position: relative;
+  box-shadow: 0 20px 40px rgba(0,0,0,0.5);
+  background: linear-gradient(135deg, #4285f4, #9b72f2);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: transform 0.5s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+}
+
+#musicArt.playing { transform: scale(1.03); }
+
+#musicArt img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+#musicArtIcon { font-size: 84px; z-index: 1; }
+
+#musicModal .mm-bottom {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  z-index: 1;
+}
+
+#musicTitle {
+  font-size: 22px;
+  font-weight: 700;
+  letter-spacing: -0.3px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-align: center;
+}
+
+#musicArtist {
+  font-size: 14px;
+  color: rgba(255,255,255,0.6);
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#musicProgressBg {
+  height: 6px;
+  background: rgba(255,255,255,0.15);
+  border-radius: 9999px;
+  position: relative;
+  cursor: pointer;
+}
+
+#musicProgressFill {
+  height: 100%;
+  background: #fff;
+  border-radius: 9999px;
+  width: 0%;
+  position: relative;
+  transition: width 0.15s linear;
+}
+
+#musicModal .mm-times {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+  color: rgba(255,255,255,0.5);
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+
+#musicModal .mm-controls {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 28px;
+}
+
+#musicModal .mm-btn {
+  width: 54px; height: 54px;
+  border-radius: 9999px;
+  background: rgba(255,255,255,0.08);
+  border: 1px solid rgba(255,255,255,0.12);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: rgba(255,255,255,0.85);
+  cursor: pointer;
+  flex-shrink: 0;
+  touch-action: manipulation;
+}
+
+#musicModal .mm-btn:active { transform: scale(0.92); }
+
+#musicPlayBtn {
+  width: 68px; height: 68px;
+  border-radius: 9999px;
+  background: #fff;
+  color: #000;
+  border: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  flex-shrink: 0;
+  box-shadow: 0 10px 25px rgba(255,255,255,0.25);
+}
+
+#musicPlayBtn:active { transform: scale(0.94); }
+
+#musicModal .mm-dots {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+#musicModal .mm-dot {
+  width: 8px; height: 8px;
+  border-radius: 9999px;
+  background: rgba(255,255,255,0.25);
+  transition: all 0.3s;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+#musicModal .mm-dot.active { background: #fff; width: 24px; }
+
 /* Selection bar */
 #selectionBar {
   position: fixed;
@@ -1362,10 +1929,8 @@ body.modal-open {
         <i data-lucide="unlock" style="width:18px;height:18px"></i>
       </button>
 
-      <button class="sound-item-btn" onclick="lockSafe()">
-        <span>Заблокировать снова</span>
-        <i data-lucide="lock" style="width:18px;height:18px"></i>
-      </button>
+      <!-- ВОЛНА 22.37: кнопка «Заблокировать снова» удалена (просил пользователь):
+           в окне — только пароль, «Разблокировать» и «Закрыть» -->
 
       <button class="sound-item-btn" onclick="closeSafeModal()">
         <span>Закрыть</span>
@@ -1925,22 +2490,8 @@ body.modal-open {
 
     <div class="upload-filename" id="uploadFilename"></div>
 
-    <div class="download-progress-wrap" id="progressWrap">
-      <div class="drop-loader" id="dropLoader" onclick="handleLoaderClick(event)" title="1 клик - пауза/старт, 2 клика - отмена">
-        <svg viewBox="0 0 60 60">
-          <circle class="bg" cx="30" cy="30" r="25"></circle>
-          <circle class="bar" id="progressBar" cx="30" cy="30" r="25"></circle>
-        </svg>
-
-        <svg class="checkmark-svg" id="checkmark" viewBox="0 0 60 60">
-          <path d="M17 31 L26 40 L43 21" fill="none" stroke="#22c55e" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
-        </svg>
-
-        <div class="square-stop" id="squareStop"></div>
-      </div>
-
-      <p class="download-text" id="downloadText">Загрузка...</p>
-    </div>
+    <!-- ВОЛНА 22.37: центральный круговой прогресс удалён — прогресс теперь
+         показывает маленькая пилюля снизу экрана (справа), раскрывается по тапу -->
 
     <input type="file" id="fileInput" multiple style="display:none">
   </div>
@@ -1960,6 +2511,21 @@ body.modal-open {
 
 </div>
 
+<!-- ВОЛНА 22.37: пилюля-прогресс снизу (стадион): загрузки и скачивания.
+     Тап по пилюле раскрывает список активных передач -->
+<div id="transferPill" onclick="toggleTransferPanel(event)">
+  <span class="tp-spin"></span>
+  <span id="tpLabel">Загрузка…</span>
+</div>
+
+<div id="transferPanel" onclick="event.stopPropagation()">
+  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
+    <div style="font-weight:900;font-size:14px;color:var(--text-color)">Передачи</div>
+    <button class="tp-cancel" onclick="toggleTransferPanel(event)" style="width:26px;height:26px">✕</button>
+  </div>
+  <div id="tpRows"></div>
+</div>
+
 <div id="selectionBar">
   <div class="sel-inner">
     <div class="sel-count" id="selCount">
@@ -1972,6 +2538,128 @@ body.modal-open {
     <button class="sel-btn hidden" id="unzipBtn" onclick="unzipSelected()" title="Распаковать"><i data-lucide="folder-open" style="width:17px;height:17px"></i></button>
     <button class="sel-btn danger" onclick="deleteSelected()" title="Удалить"><i data-lucide="trash-2" style="width:17px;height:17px"></i></button>
     <button class="sel-btn done" onclick="toggleSelectMode()">Готово</button>
+  </div>
+</div>
+
+<!-- ВОЛНА 22.37: ВИДЕОПЛЕЕР — по HTML пользователя: тап-зоны ±10с,
+     зажатие 2x, пинч-зум, поворот/фуллскрин, PiP, автоскрытие кнопок -->
+<div id="videoModal">
+  <div id="speedIndicator">2X УСКОРЕНИЕ</div>
+
+  <div class="vm-header" id="vmHeader">
+    <span class="vm-title" id="vmTitle"></span>
+    <div style="display:flex;align-items:center;gap:8px">
+      <button class="vm-btn" onclick="vmToggleRotate(event)" title="Повернуть экран">
+        <i data-lucide="rotate-cw" style="width:20px;height:20px"></i>
+      </button>
+      <button class="vm-btn" onclick="vmClose(event)" title="Закрыть">
+        <i data-lucide="x" style="width:20px;height:20px"></i>
+      </button>
+    </div>
+  </div>
+
+  <div id="videoStage">
+    <video id="videoPlayer" playsinline preload="metadata"></video>
+
+    <div style="position:absolute;top:80px;bottom:110px;left:0;width:33.33%;z-index:10" onclick="vmTapZone(event,-10)"></div>
+    <div style="position:absolute;top:80px;bottom:110px;left:33.33%;width:33.34%;z-index:10" onclick="vmCenterTap(event)"></div>
+    <div style="position:absolute;top:80px;bottom:110px;left:66.67%;width:33.33%;z-index:10" onclick="vmTapZone(event,10)"></div>
+
+    <div id="rewindIndicator"></div>
+
+    <div class="vm-controls" id="vmControls" onclick="event.stopPropagation()">
+      <div class="vm-seekrow">
+        <span class="vm-time" id="vmCur">00:00</span>
+        <input id="vmSeek" type="range" min="0" max="100" value="0" oninput="vmSeeking=true;vmShowControls()" onchange="vmSeekTo(this.value)">
+        <span class="vm-time" id="vmDur">00:00</span>
+      </div>
+      <div class="vm-btnrow">
+        <button class="vm-btn" style="background:none" onclick="vmRewind(-10,event)">
+          <i data-lucide="rotate-ccw" style="width:24px;height:24px"></i>
+        </button>
+        <button class="vm-btn" id="vmPlayBtn" style="background:#fff;color:#000;padding:15px" onclick="vmTogglePlay(event)">
+          <span id="vmPlayIcon"><i data-lucide="play" style="width:24px;height:24px;fill:#000;margin-left:2px"></i></span>
+        </button>
+        <button class="vm-btn" style="background:none" onclick="vmRewind(10,event)">
+          <i data-lucide="rotate-cw" style="width:24px;height:24px"></i>
+        </button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ВОЛНА 22.37: ФОТОПРОСМОТРЩИК — свайп между фото, зум, скачивание -->
+<div id="photoModal">
+  <div class="pm-header">
+    <span class="pm-title" id="pmTitle"></span>
+    <button class="vm-btn" onclick="pmDownload(event)" title="Скачать">
+      <i data-lucide="download" style="width:20px;height:20px"></i>
+    </button>
+    <button class="vm-btn" onclick="pmClose(event)" title="Закрыть">
+      <i data-lucide="x" style="width:20px;height:20px"></i>
+    </button>
+  </div>
+  <div id="photoStage">
+    <img id="photoImg" alt="">
+  </div>
+  <div class="pm-footer">
+    <button class="vm-btn" onclick="pmNav(-1,event)" title="Предыдущее">
+      <i data-lucide="chevron-left" style="width:22px;height:22px"></i>
+    </button>
+    <span class="pm-count" id="pmCount"></span>
+    <button class="vm-btn" onclick="pmNav(1,event)" title="Следующее">
+      <i data-lucide="chevron-right" style="width:22px;height:22px"></i>
+    </button>
+  </div>
+</div>
+
+<!-- ВОЛНА 22.37: МУЗЫКАЛЬНЫЙ ПЛЕЕР — дизайн пользователя, обложка из
+     метаданных аудио (ID3), плейлист = все аудиофайлы облака -->
+<div id="musicModal">
+  <div id="musicGlow"></div>
+
+  <div class="mm-top">
+    <span class="mm-label">Сейчас играет</span>
+    <button class="vm-btn" onclick="musicClose(event)" title="Закрыть">
+      <i data-lucide="x" style="width:20px;height:20px"></i>
+    </button>
+  </div>
+
+  <div class="mm-art-wrap">
+    <div id="musicArt">
+      <span id="musicArtIcon">🎵</span>
+    </div>
+  </div>
+
+  <div class="mm-bottom">
+    <div>
+      <div id="musicTitle">—</div>
+      <div id="musicArtist">DEVO+ Облако</div>
+    </div>
+
+    <div>
+      <div id="musicProgressBg" onclick="musicSeekClick(event)">
+        <div id="musicProgressFill"></div>
+      </div>
+      <div class="mm-times" style="margin-top:8px">
+        <span id="musicCur">0:00</span>
+        <span id="musicDur">0:00</span>
+      </div>
+    </div>
+
+    <div class="mm-controls">
+      <button class="mm-btn" onclick="musicPrev(event)" title="Назад">
+        <svg viewBox="0 0 24 24" width="24" height="24" fill="currentColor" stroke="currentColor" stroke-width="1.5"><path d="M19 20L9 12l10-8z"/><line x1="6" y1="5" x2="6" y2="19" fill="none" stroke-linecap="round"/></svg>
+      </button>
+      <button id="musicPlayBtn" onclick="musicTogglePlay(event)">
+        <svg id="musicPlayIcon" viewBox="0 0 24 24" width="28" height="28" fill="currentColor"><path d="M8 5.14v13.72a1 1 0 0 0 1.5.86l10.5-6.86a1 1 0 0 0 0-1.72L9.5 4.28A1 1 0 0 0 8 5.14z"/></svg>
+      </button>
+      <button class="mm-btn" onclick="musicNext(event)" title="Вперёд">
+        <svg viewBox="0 0 24 24" width="24" height="24" fill="currentColor" stroke="currentColor" stroke-width="1.5"><path d="M5 4l10 8-10 8z"/><line x1="18" y1="5" x2="18" y2="19" fill="none" stroke-linecap="round"/></svg>
+      </button>
+    </div>
+
+    <div class="mm-dots" id="musicDots"></div>
   </div>
 </div>
 
@@ -2093,6 +2781,7 @@ let themeBootApplied = false;
 function applyTheme(theme) {
   currentTheme = theme;
   localStorage.setItem('devo_theme', theme);
+  settingsChanged(); /* ВОЛНА 22.37: настройки живут в базе */
 
   let isDark = false;
 
@@ -2176,6 +2865,7 @@ function updateCustomColors() {
   localStorage.setItem('devo_custom_angle', angle);
   localStorage.setItem('devo_custom_btn_bg', btnBg);
   localStorage.setItem('devo_custom_btn_text', btnText);
+  settingsChanged(); /* ВОЛНА 22.37: настройки живут в базе */
 }
 
 function initCustomColors() {
@@ -2197,6 +2887,7 @@ function initCustomColors() {
 function toggleBlobs() {
   blobsEnabled = !blobsEnabled;
   localStorage.setItem('devo_blobs_enabled', blobsEnabled);
+  settingsChanged(); /* ВОЛНА 22.37: настройки живут в базе */
   updateBlobsVisibility();
 }
 
@@ -2343,6 +3034,7 @@ window.addEventListener('resize', function () {
 function changeBlobSpeed(val) {
   blobIdleSpeed = val;
   localStorage.setItem('devo_blob_speed', val);
+  settingsChanged(); /* ВОЛНА 22.37: настройки живут в базе */
 
   const label = document.getElementById('speedValueLabel');
   if (label) label.textContent = val + 'x';
@@ -2546,6 +3238,7 @@ function handleSoundSelect(e, id) {
 
   selectedSoundId = Number(id);
   localStorage.setItem('devo_sound_id', selectedSoundId);
+  settingsChanged(); /* ВОЛНА 22.37: настройки живут в базе */
 
   renderSoundMenu();
   playSoundDirectly(selectedSoundId);
@@ -2974,11 +3667,14 @@ let isUploading = false;
 let isPaused = false;
 let activeEditingFileId = null;
 
-const CHUNK_SIZE = 4 * 1024 * 1024;
+const CHUNK_SIZE = 6 * 1024 * 1024;
+/* ВОЛНА 22.37: 3 параллельных куска × 6 МиБ — загрузка быстрее в ~3 раза
+   на мобильных сетях (раньше кусок ждал ответа сервера перед следующим). */
+const UPLOAD_PARALLEL = 3;
 
 let uploadQueue = [];
 let uploadAbortFlag = false;
-let uploadXhr = null;
+const uploadXhrs = new Set();
 
 let pendingFiles = [];
 let pendingNames = {};
@@ -3457,6 +4153,10 @@ async function unlockSafe() {
     showToast('🔒 Сейф разблокирован');
 
     closeSafeModal();
+
+    /* ВОЛНА 22.37: верный пароль → окно закрылось → справа снизу пошла
+       пилюля «Обновляю файлы…» (как просил пользователь) */
+    tpRefreshPulse();
     loadFiles(true);
 
     if (pending && pending.type === 'view') {
@@ -3579,7 +4279,7 @@ function openExternalLink(abs) {
   else window.open(abs, '_blank', 'noopener');
 }
 
-async function fetchFileBlob(absUrl, name) {
+async function fetchFileBlob(absUrl, name, tId) {
   const r = await fetch(absUrl, { headers: vaultHeaders() });
 
   if (!r.ok) throw new Error('HTTP ' + r.status);
@@ -3592,7 +4292,7 @@ async function fetchFileBlob(absUrl, name) {
   const reader = r.body.getReader();
   const chunks = [];
   let got = 0;
-  let lastPct = -1;
+  let lastUi = 0;
 
   for (;;) {
     const part = await reader.read();
@@ -3602,13 +4302,16 @@ async function fetchFileBlob(absUrl, name) {
     chunks.push(part.value);
     got += part.value.length;
 
-    const pct = Math.floor((got / total) * 100);
+    /* ВОЛНА 22.37: прогресс — в пилюлю снизу (не чаще раза в 150 мс) */
+    const now = Date.now();
 
-    if (pct >= lastPct + 20 && pct < 100) {
-      lastPct = pct;
-      showToast('📥 Скачиваю… ' + pct + '%');
+    if (tId && now - lastUi > 150) {
+      lastUi = now;
+      tpProgress(tId, got, total);
     }
   }
+
+  if (tId) tpProgress(tId, got, total);
 
   return new Blob(chunks, { type: type });
 }
@@ -3672,7 +4375,7 @@ function handleSafeAuthError(e, pendingType, pendingId) {
 }
 
 async function downloadFileById(id, name, size) {
-  showToast('📥 Готовлю скачивание…');
+  const tId = tpAdd(name || 'файл', 'down', +size || 0);
 
   try {
     const data = await apiJson('/api/files/' + encodeURIComponent(id) + '/link', {
@@ -3683,6 +4386,7 @@ async function downloadFileById(id, name, size) {
 
     if ((+size || 0) > BIG_FILE_LIMIT) {
       openExternalLink(abs);
+      tpDrop(tId);
       showToast('Файл больше 1 ГБ — открыл ссылку в браузере');
       return;
     }
@@ -3691,8 +4395,7 @@ async function downloadFileById(id, name, size) {
        Telegram на телефоне:
        1) системное меню «Поделиться» с файлом — оттуда файл сохраняется
           в галерею/файлы одним касанием;
-       2) если шаринг недоступен — открываем одноразовую ссылку в браузере:
-          там файл скачивается сам (attachment) в «Загрузки»/галерею.
+       2) если шаринг недоступен — открываем одноразовую ссылку в браузере.
        Blob-режим оставлен для обычного браузера (вне Telegram). */
     let blob = null;
 
@@ -3700,24 +4403,26 @@ async function downloadFileById(id, name, size) {
       let shared = false;
 
       try {
-        blob = await fetchFileBlob(abs, name);
+        blob = await fetchFileBlob(abs, name, tId);
         shared = await saveBlobToPhone(blob, name || 'file');
       } catch (err) {
         shared = false;
       }
 
       if (shared) {
+        tpFinish(tId);
         showToast('✅ Готово — файл в галерее/загрузках');
         return;
       }
 
       openExternalLink(abs);
+      tpDrop(tId);
       showToast('📥 Открыл ссылку — файл скачается в браузере (в галерею)');
       return;
     }
 
     try {
-      blob = await fetchFileBlob(abs, name);
+      blob = await fetchFileBlob(abs, name, tId);
     } catch (err) {
       blob = null;
     }
@@ -3726,14 +4431,18 @@ async function downloadFileById(id, name, size) {
       const ok = await saveBlobToPhone(blob, name || 'file');
 
       if (ok) {
+        tpFinish(tId);
         showToast('✅ Готово');
         return;
       }
     }
 
     openExternalLink(abs);
+    tpDrop(tId);
     showToast('Открыл ссылку в браузере — если файл не скачался, нажмите на неё там');
   } catch (e) {
+    tpDrop(tId);
+
     if (!handleSafeAuthError(e)) {
       showToast('Ошибка скачивания: ' + cloudErrText(e));
     }
@@ -4000,50 +4709,14 @@ function handleDropZoneClick(e) {
   openUploadModal();
 }
 
-function handleLoaderClick(e) {
-  if (e) e.stopPropagation();
-
-  if (!isUploading) return;
-
-  clickCount++;
-
-  if (clickCount === 1) {
-    clickTimer = setTimeout(() => {
-      togglePauseUpload();
-      clickCount = 0;
-    }, 260);
-  } else if (clickCount === 2) {
-    clearTimeout(clickTimer);
-    clickCount = 0;
-    cancelUpload();
-  }
-}
-
-function togglePauseUpload() {
-  isPaused = !isPaused;
-
-  const downloadText = document.getElementById('downloadText');
-  const squareStop = document.getElementById('squareStop');
-
-  if (isPaused) {
-    downloadText.textContent = 'Пауза (нажмите для продолжения)';
-    if (squareStop) squareStop.style.opacity = '0.4';
-  } else {
-    downloadText.textContent = 'Загрузка... (1 клик - пауза, 2 - отмена)';
-    if (squareStop) squareStop.style.opacity = '1';
-  }
-}
-
 function cancelUpload() {
   if (!isUploading) return;
 
   uploadAbortFlag = true;
 
-  if (uploadXhr) {
-    try {
-      uploadXhr.abort();
-    } catch (e) {}
-  }
+  uploadXhrs.forEach((xhr) => {
+    try { xhr.abort(); } catch (e) {}
+  });
 
   showToast('⏹ Загрузка отменена');
 }
@@ -4275,6 +4948,7 @@ function dismissDevRec(e) {
   if (e) e.stopPropagation();
 
   localStorage.setItem('devo_recbanner_hide', '1');
+  settingsChanged(); /* ВОЛНА 22.37: настройки живут в базе */
 
   const b = document.getElementById('devRecBanner');
   if (b) b.classList.add('hide');
@@ -4404,12 +5078,45 @@ async function disconnectStorage() {
   }
 }
 
+/* ВОЛНА 22.37: блокировка скролла страницы на время модалок БЕЗ
+   overflow:hidden в сочетании с touch-action:none — в WebView Telegram
+   после закрытия модалки страница могла навсегда перестать листаться.
+   Техника position:fixed + сохранённая позиция работает на iOS/Android
+   одинаково и никогда не «залипает» (снимается в unlockPageScroll). */
+let _scrollLockY = 0;
+
+function lockPageScroll() {
+  if (_scrollLockY || document.body.style.position === 'fixed') return;
+  _scrollLockY = window.scrollY || window.pageYOffset || 0;
+  document.body.style.position = 'fixed';
+  document.body.style.top = (-_scrollLockY) + 'px';
+  document.body.style.left = '0';
+  document.body.style.right = '0';
+  document.body.style.width = '100%';
+}
+
+function unlockPageScroll() {
+  if (document.body.style.position !== 'fixed') {
+    _scrollLockY = 0;
+    return;
+  }
+  const y = _scrollLockY || 0;
+  document.body.style.position = '';
+  document.body.style.top = '';
+  document.body.style.left = '';
+  document.body.style.right = '';
+  document.body.style.width = '';
+  _scrollLockY = 0;
+  window.scrollTo(0, y);
+}
+
 function openModalEl(id) {
   const m = document.getElementById(id);
   if (!m) return;
 
   m.classList.add('open');
   document.body.classList.add('modal-open');
+  lockPageScroll();
 
   /* ВОЛНА 22.36: на время модалки останавливаем анимацию блобов — RAF-цикл
      под backdrop-filter сильно ест GPU и «лагает» при нажатии на файл */
@@ -4425,20 +5132,25 @@ function closeModalEl(id) {
 
   if (!document.querySelector('.modal-overlay.open')) {
     document.body.classList.remove('modal-open');
+    unlockPageScroll();
 
     try { startBlobAnimation(); } catch (e) {}
   }
 }
 
-/* ВОЛНА 22.36: страховка «залипшего» modal-open. Если после сбоя в анимации/
-   JS ни одна модалка не открыта, а блокировка скролла на body осталась —
-   страница навсегда перестаёт пролистываться (ни вверх, ни вниз). Раз в
-   секунду снимаем блокировку, если она не нужна. */
+/* ВОЛНА 22.36/22.37: страховка «залипшей» блокировки скролла. Если ни одна
+   модалка не открыта, а блокировка осталась (класс или position:fixed) —
+   снимаем. Раз в секунду. Главный экран больше никогда не «перестанет
+   пролистываться ни вверх, ни вниз». */
 setInterval(function () {
-  if (document.body.classList.contains('modal-open') &&
-      !document.querySelector('.modal-overlay.open')) {
-    document.body.classList.remove('modal-open');
-    try { startBlobAnimation(); } catch (e) {}
+  if (!document.querySelector('.modal-overlay.open')) {
+    if (document.body.classList.contains('modal-open')) {
+      document.body.classList.remove('modal-open');
+      try { startBlobAnimation(); } catch (e) {}
+    }
+    if (document.body.style.position === 'fixed') {
+      unlockPageScroll();
+    }
   }
 }, 1000);
 
@@ -4587,8 +5299,181 @@ function uploadFiles(fileList) {
   pickerAppend = false;
 }
 
+/* === ВОЛНА 22.37: РЕЕСТР ПЕРЕДАЧ (пилюля снизу справа) ===
+   Все загрузки и скачивания показываются одной маленькой пилюлей-«стадионом»
+   внизу экрана; тап раскрывает список активных передач. Центральный
+   круговой прогресс больше не используется (просил пользователь). */
+const TRANSFERS = new Map();
+let _tpSeq = 0;
+let _tpRenderRaf = 0;
+
+function tpAdd(name, kind, size) {
+  const id = 't' + (++_tpSeq);
+
+  TRANSFERS.set(id, {
+    name: String(name || 'файл'),
+    kind: kind || 'up',
+    size: +size || 0,
+    got: 0,
+    done: false,
+    cancel: null
+  });
+
+  tpRender();
+
+  return id;
+}
+
+function tpProgress(id, got, size) {
+  const t = TRANSFERS.get(id);
+
+  if (!t) return;
+
+  if (size) t.size = +size || t.size;
+  t.got = Math.max(0, +got || 0);
+
+  tpRender();
+}
+
+function tpFinish(id) {
+  const t = TRANSFERS.get(id);
+
+  if (!t) return;
+
+  t.done = true;
+  t.got = t.size || t.got;
+
+  tpRender();
+
+  setTimeout(() => {
+    if (TRANSFERS.get(id) && TRANSFERS.get(id).done) {
+      TRANSFERS.delete(id);
+      tpRender();
+    }
+  }, 4000);
+}
+
+function tpDrop(id) {
+  TRANSFERS.delete(id);
+  tpRender();
+}
+
+function tpPct(t) {
+  if (t.done) return 100;
+  if (!t.size) return 0;
+  return Math.min(99, Math.floor((t.got / t.size) * 100));
+}
+
+function tpRender() {
+  if (_tpRenderRaf) return;
+  _tpRenderRaf = requestAnimationFrame(() => {
+    _tpRenderRaf = 0;
+
+    const pill = document.getElementById('transferPill');
+    const label = document.getElementById('tpLabel');
+    const panel = document.getElementById('transferPanel');
+    const rows = document.getElementById('tpRows');
+
+    if (!pill || !label || !panel || !rows) return;
+
+    if (!TRANSFERS.size) {
+      pill.classList.remove('visible');
+      panel.classList.remove('open');
+      return;
+    }
+
+    let sumGot = 0;
+    let sumSize = 0;
+
+    TRANSFERS.forEach((t) => {
+      sumGot += t.done ? (t.size || t.got) : t.got;
+      sumSize += t.size || 0;
+    });
+
+    const overall = sumSize ? Math.min(100, Math.round((sumGot / sumSize) * 100)) : 0;
+    const ups = [...TRANSFERS.values()].filter((t) => t.kind === 'up' && !t.done).length;
+    const downs = [...TRANSFERS.values()].filter((t) => t.kind === 'down' && !t.done).length;
+
+    label.textContent = (ups && downs) ? `↕ ${overall}%`
+      : ups ? `Загрузка ${overall}%`
+      : downs ? `Скачивание ${overall}%`
+      : `Готово ${overall}%`;
+
+    pill.classList.add('visible');
+
+    let html = '';
+
+    TRANSFERS.forEach((t, id) => {
+      const pct = tpPct(t);
+      const icon = t.kind === 'down' ? '⬇️' : '⬆️';
+
+      html += '<div class="tp-row' + (t.done ? ' tp-done' : '') + '">' +
+        '<div class="tp-row-top">' +
+        '<span>' + icon + '</span>' +
+        '<span class="tp-name">' + escapeHtml(t.name) + '</span>' +
+        '<span>' + (t.done ? '✓' : pct + '%') + '</span>' +
+        (t.done || t.kind !== 'up' ? '' :
+          '<button class="tp-cancel" onclick="tpCancelTransfer(\'' + id + '\')">✕</button>') +
+        '</div>' +
+        '<div class="tp-track"><div class="tp-fill" style="width:' + pct + '%"></div></div>' +
+        '</div>';
+    });
+
+    rows.innerHTML = html;
+  });
+}
+
+function tpCancelTransfer(id) {
+  const t = TRANSFERS.get(id);
+
+  if (t && typeof t.cancel === 'function') t.cancel();
+  else tpDrop(id);
+}
+
+function toggleTransferPanel(e) {
+  if (e) e.stopPropagation();
+
+  const panel = document.getElementById('transferPanel');
+
+  if (panel) {
+    panel.classList.toggle('open');
+    tpRender();
+  }
+}
+
+/* Пилюля «Обновляю файлы…» — появляется при разблокировке Сейфа и других
+   синхронизациях (просил пользователь: верный пароль → окно закрылось →
+   справа снизу пошла загрузка) */
+function tpRefreshPulse() {
+  const id = tpAdd('Обновляю файлы…', 'down', 0);
+
+  let n = 0;
+
+  const iv = setInterval(() => {
+    n += 20;
+
+    const t = TRANSFERS.get(id);
+
+    if (!t) {
+      clearInterval(iv);
+      return;
+    }
+
+    t.got = n;
+
+    if (n >= 100) {
+      clearInterval(iv);
+      tpFinish(id);
+    } else {
+      tpRender();
+    }
+  }, 160);
+
+  return id;
+}
+
 function proceedUpload(files, opts) {
-  if (!files.length) return;
+  if (!files.length || isUploading) return;
 
   const isResume = !!(opts && opts.resume);
 
@@ -4620,80 +5505,14 @@ function proceedUpload(files, opts) {
     }
   }
 
-  const initial = document.getElementById('initialState');
-  const filenameEl = document.getElementById('uploadFilename');
-  const wrap = document.getElementById('progressWrap');
-  const bar = document.getElementById('progressBar');
-  const checkmark = document.getElementById('checkmark');
-  const squareStop = document.getElementById('squareStop');
-
-  if (files.length === 1) {
-    filenameEl.innerHTML = `Загружается:<br><b>${escapeHtml(files[0].uploadName || files[0].name)}</b>`;
-  } else {
-    const namesPreview = files.slice(0, 2).map((f) => escapeHtml(f.uploadName || f.name)).join(', ');
-    const moreText = files.length > 2 ? ` и ещё ${files.length - 2}` : '';
-
-    filenameEl.innerHTML =
-      `Загружается файлов: <b>${files.length}</b><br>` +
-      `<span style="font-size:11px;opacity:0.8">${namesPreview}${moreText}</span>`;
-  }
-
-  filenameEl.style.display = 'block';
-
-  initial.style.display = 'none';
-  wrap.classList.add('active');
-
-  const circumference = 157;
-
-  bar.classList.remove('success');
-  bar.style.strokeDasharray = `${circumference}`;
-  bar.style.strokeDashoffset = `${circumference}`;
-
-  if (checkmark) checkmark.classList.remove('show');
-
-  if (squareStop) {
-    squareStop.style.display = 'block';
-    squareStop.style.opacity = '1';
-  }
-
-  document.getElementById('downloadText').textContent = 'Загрузка... (1 клик - пауза, 2 - отмена)';
-
-  uploadEngine(bar);
-}
-
-function setUploadPct(pct, bar) {
-  const circumference = 157;
-
-  if (pct >= 100) pct = 100;
-
-  bar.style.strokeDashoffset = String(circumference - (pct / 100) * circumference);
+  uploadEngine();
 }
 
 function sleepMs(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-function resetUploadUI(bar, checkmark, squareStop) {
-  const initial = document.getElementById('initialState');
-  const filenameEl = document.getElementById('uploadFilename');
-  const wrap = document.getElementById('progressWrap');
-
-  const circumference = 157;
-
-  wrap.classList.remove('active');
-  filenameEl.style.display = 'none';
-  initial.style.display = 'flex';
-
-  bar.classList.remove('success');
-  bar.style.strokeDashoffset = `${circumference}`;
-
-  if (checkmark) checkmark.classList.remove('show');
-
-  if (squareStop) {
-    squareStop.style.display = 'block';
-    squareStop.style.opacity = '1';
-  }
-
+function resetUploadUI() {
   isUploading = false;
   isPaused = false;
 
@@ -4702,18 +5521,21 @@ function resetUploadUI(bar, checkmark, squareStop) {
 
   pendingFiles = [];
   pendingNames = {};
+
+  tpRender();
 }
 
-function sendChunk(uploadId, index, blobPart, onLoaded) {
+function sendChunk(uploadId, index, blobPart, offset, onLoaded) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
 
-    uploadXhr = xhr;
+    uploadXhrs.add(xhr);
 
-    xhr.open(
-      'POST',
-      '/api/upload/chunk?uploadId=' + encodeURIComponent(uploadId) + '&index=' + index
-    );
+    const q = '/api/upload/chunk?uploadId=' + encodeURIComponent(uploadId) +
+      '&index=' + index +
+      (offset != null ? '&offset=' + offset : '');
+
+    xhr.open('POST', q);
 
     const headers = vaultHeaders();
 
@@ -4732,7 +5554,7 @@ function sendChunk(uploadId, index, blobPart, onLoaded) {
     };
 
     xhr.onload = () => {
-      uploadXhr = null;
+      uploadXhrs.delete(xhr);
 
       if (xhr.status >= 200 && xhr.status < 300) {
         let resp = {};
@@ -4759,12 +5581,12 @@ function sendChunk(uploadId, index, blobPart, onLoaded) {
     };
 
     xhr.onerror = () => {
-      uploadXhr = null;
+      uploadXhrs.delete(xhr);
       reject(new Error('нет связи с ботом'));
     };
 
     xhr.onabort = () => {
-      uploadXhr = null;
+      uploadXhrs.delete(xhr);
       reject(new Error('aborted'));
     };
 
@@ -4885,12 +5707,17 @@ async function resumePendingUploads() {
   RESUMING = false;
 }
 
-async function uploadOneFile(file, reportBytes) {
+/* === ВОЛНА 22.37: ПАРАЛЛЕЛЬНАЯ ЗАГРУЗКА ===
+   Файл режется на куски по 6 МиБ, куски летят на сервер тремя параллельными
+   потоками (сервер 22.37 пишет их по offset — порядок прилёта не важен).
+   Докачка после закрытия мини-аппа работает как раньше (IndexedDB + идемпо-
+   тентные куски: повтор куска сервер отвечает «duplicate»). */
+async function _uploadOneSession(file, reportBytes, tId) {
   const upName = String(file.uploadName || file.name || 'file.bin').slice(0, 120);
   const key = file._entryKey || null;
 
   let uploadId = file._resumeId || '';
-  let index = file._resumeIndex || 0;
+  let startIndex = file._resumeIndex || 0;
 
   if (uploadId) {
     /* ВОЛНА 22.36: продолжаем ПОСЛЕ закрытия мини-аппа */
@@ -4909,95 +5736,110 @@ async function uploadOneFile(file, reportBytes) {
     uploadId = initData.uploadId;
   }
 
+  file._lastUploadId = uploadId;
+
   if (key) {
     upqPut({
       k: key, blob: file, name: file.name, uploadName: upName,
       size: +file.size || 0, mime: file.type || '',
-      uploadId: uploadId, index: index, added: Date.now()
+      uploadId: uploadId, index: startIndex, added: Date.now()
     });
   }
 
-  let offset = index * CHUNK_SIZE;
+  const totalChunks = Math.ceil((+file.size || 0) / CHUNK_SIZE);
 
-  while (offset < file.size) {
-    while (isPaused && !uploadAbortFlag) await sleepMs(150);
+  let nextIndex = startIndex;         /* следующий кусок для отправки */
+  const chunkGot = new Map();         /* idx -> принятых байт куска (для прогресса) */
 
-    if (uploadAbortFlag) {
-      apiJson('/api/upload/abort', {
-        method: 'POST',
-        headers: authHeaders({ 'Content-Type': 'application/json' }),
-        body: JSON.stringify({ uploadId })
-      }).catch(() => {});
+  const reportChunk = (idx, n) => {
+    chunkGot.set(idx, n);
 
-      if (key) upqDel(key);
+    let s = 0;
 
-      throw new Error('aborted');
-    }
+    for (const v of chunkGot.values()) s += v;
 
-    const end = Math.min(offset + CHUNK_SIZE, file.size);
+    reportBytes(s);
+    tpProgress(tId, s, +file.size || 0);
+  };
 
-    let lastErr = null;
-    let resp = null;
+  async function worker() {
+    for (;;) {
+      while (isPaused && !uploadAbortFlag && !file._cancelFlag) await sleepMs(150);
 
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try {
-        resp = await sendChunk(uploadId, index, file.slice(offset, end),
-          (n) => reportBytes(offset + n));
+      if (uploadAbortFlag || file._cancelFlag) return 'abort';
 
-        lastErr = null;
+      const idx = nextIndex;
 
-        break;
-      } catch (err) {
-        if (err && err.message === 'aborted') throw err;
+      if (idx >= totalChunks) return null;
 
-        /* при докачке сервер мог забыть сессию (6 ч TTL) — начинаем файл
-           заново: исходник сохранён в IndexedDB */
-        if (err && err.code === 'session_not_found' && key) {
-          try {
-            const initData = await apiJson('/api/upload/init', {
-              method: 'POST',
-              headers: vaultHeaders({ 'Content-Type': 'application/json' }),
-              body: JSON.stringify({
-                name: upName,
-                size: +file.size || 0,
-                mime: file.type || ''
-              })
-            });
+      nextIndex++;
 
-            uploadId = initData.uploadId;
-            index = 0;
-            offset = 0;
-            lastErr = null;
+      const off = idx * CHUNK_SIZE;
+      const end = Math.min(off + CHUNK_SIZE, file.size);
 
-            break;
-          } catch (e2) {
-            lastErr = e2;
-            break;
-          }
+      let lastErr = null;
+      let resp = null;
+
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          resp = await sendChunk(uploadId, idx, file.slice(off, end), off,
+            (n) => reportChunk(idx, n));
+
+          lastErr = null;
+
+          break;
+        } catch (err) {
+          if (err && err.message === 'aborted') return 'abort';
+
+          /* при докачке сервер мог забыть сессию (6 ч TTL) — перезапуск
+             файла целиком с новой сессией (исходник сохранён в IDB) */
+          if (err && err.code === 'session_not_found') return 'restart';
+
+          lastErr = err;
+
+          if (attempt < 2) await sleepMs(1200 * (attempt + 1));
         }
+      }
 
-        lastErr = err;
+      if (lastErr) throw lastErr;
 
-        if (attempt < 2) await sleepMs(1200 * (attempt + 1));
+      /* синхронизация с сервером: received — сколько байт он реально имеет
+         (при параллельной загрузке идём по точке впереди самого медленного) */
+      const srv = Math.min(+((resp && resp.received) || end), +file.size || end);
+
+      if (srv < end) {
+        const nextByServer = Math.ceil(srv / CHUNK_SIZE);
+
+        if (nextByServer > idx + 1) nextIndex = Math.max(nextIndex, nextByServer);
+      }
+
+      if (key) {
+        upqPut({
+          k: key, blob: file, name: file.name, uploadName: upName,
+          size: +file.size || 0, mime: file.type || '',
+          uploadId: uploadId,
+          index: Math.min(nextIndex, totalChunks), added: Date.now()
+        });
       }
     }
-
-    if (lastErr) throw lastErr;
-
-    /* синхронизация с сервером: received — сколько байт он реально имеет */
-    const srv = Math.min(+((resp && resp.received) || end), +file.size || end);
-
-    index = Math.ceil(srv / CHUNK_SIZE);
-    offset = index * CHUNK_SIZE;
-
-    if (key) {
-      upqPut({
-        k: key, blob: file, name: file.name, uploadName: upName,
-        size: +file.size || 0, mime: file.type || '',
-        uploadId: uploadId, index: index, added: Date.now()
-      });
-    }
   }
+
+  const results = await Promise.all(
+    Array.from({ length: Math.max(1, Math.min(UPLOAD_PARALLEL, 6)) }, worker));
+
+  if (results.includes('abort')) {
+    apiJson('/api/upload/abort', {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ uploadId })
+    }).catch(() => {});
+
+    if (key) upqDel(key);
+
+    throw new Error('aborted');
+  }
+
+  if (results.includes('restart')) return 'restart';
 
   /* complete — одна повторная попытка (сеть/503) */
   let done = null;
@@ -5030,37 +5872,56 @@ async function uploadOneFile(file, reportBytes) {
   return done.file;
 }
 
-async function uploadEngine(bar) {
-  const checkmark = document.getElementById('checkmark');
-  const squareStop = document.getElementById('squareStop');
+async function uploadOneFile(file, reportBytes, tId) {
+  for (let session = 0; session < 3; session++) {
+    const r = await _uploadOneSession(file, reportBytes, tId);
+
+    if (r !== 'restart') return r;
+
+    showToast('🔄 Сессия загрузки устарела — продолжаю с начала файла');
+  }
+
+  throw new Error('Загрузка не удалась — попробуйте ещё раз');
+}
+
+async function uploadEngine() {
+  const added = [];
+  const failedFiles = [];
 
   const totalBytes = uploadQueue.reduce((s, f) => s + (+f.size || 0), 0) || 1;
 
   let doneBytes = 0;
-  const added = [];
-  const failedFiles = [];
 
   /* ВОЛНА 22.36: ошибка ОДНОГО файла больше не роняет всю пачку — грузим
-     дальше, итог честно показываем в конце (раньше пачка обрывалась с
-     пугающей «бот не админ канала», хотя по одному всё грузилось). */
+     дальше, итог честно показываем в конце. */
   for (const file of uploadQueue.slice()) {
     if (uploadAbortFlag) break;
 
+    const tId = tpAdd(file.uploadName || file.name, 'up', +file.size || 0);
+
+    file._cancelFlag = false;
+
+    tId && (TRANSFERS.get(tId).cancel = () => { file._cancelFlag = true; });
+
     try {
       const rec = await uploadOneFile(file, (cur) => {
-        setUploadPct(((doneBytes + cur) / totalBytes) * 100, bar);
-      });
+        tpProgress(tId, cur, +file.size || 0);
+      }, tId);
 
       if (rec) added.push(rec);
+
+      tpFinish(tId);
     } catch (e) {
-      if (e.message === 'aborted' || uploadAbortFlag) break;
+      if (e.message === 'aborted' || uploadAbortFlag) {
+        tpDrop(tId);
+        break;
+      }
 
       failedFiles.push({ file: file, e: e });
+      tpDrop(tId);
     }
 
     doneBytes += (+file.size || 0);
-
-    setUploadPct((doneBytes / totalBytes) * 100, bar);
   }
 
   if (uploadAbortFlag) {
@@ -5069,7 +5930,7 @@ async function uploadEngine(bar) {
       if (f._entryKey) upqDel(f._entryKey);
     }
 
-    resetUploadUI(bar, checkmark, squareStop);
+    resetUploadUI();
     return;
   }
 
@@ -5081,7 +5942,7 @@ async function uploadEngine(bar) {
 
     const retryFiles = needPass ? failedFiles.map((x) => x.file) : [];
 
-    resetUploadUI(bar, checkmark, squareStop);
+    resetUploadUI();
 
     if (needPass) {
       STORAGE_ENCRYPTED = true;
@@ -5094,22 +5955,11 @@ async function uploadEngine(bar) {
       showToast(
         '⚠️ Не удалось: ' + failedFiles.length + ' из ' +
         (added.length + failedFiles.length) + ' — ' + msg.slice(0, 90) +
-        (added.length ? ' (остальное сохранено)' : '')
-      );
+        (added.length ? ' (остальное сохранено)' : ''));
     }
 
     return;
   }
-
-  setUploadPct(100, bar);
-  bar.style.strokeDashoffset = '0';
-
-  bar.classList.add('success');
-
-  if (squareStop) squareStop.style.display = 'none';
-  if (checkmark) checkmark.classList.add('show');
-
-  document.getElementById('downloadText').textContent = 'Успешно загружено!';
 
   playSoundDirectly(selectedSoundId);
   flashScreen();
@@ -5123,8 +5973,7 @@ async function uploadEngine(bar) {
 
   showToast(
     (anySafe ? '✅ Успешно! 🔒 Зашифровано и в Сейфе' : '✅ Загружено') +
-    (maxQueuePos > 1 ? ' · ⏳ публикация в канале, перед вами: ' + (maxQueuePos - 1) : '')
-  );
+    (maxQueuePos > 1 ? ' · ⏳ публикация в канале, перед вами: ' + (maxQueuePos - 1) : ''));
 
   added.forEach((rec) => {
     ALL_FILES.unshift({
@@ -5140,7 +5989,7 @@ async function uploadEngine(bar) {
   renderAll();
 
   setTimeout(() => {
-    resetUploadUI(bar, checkmark, squareStop);
+    resetUploadUI();
   }, 1200);
 }
 
@@ -5180,6 +6029,7 @@ setSort('date-desc');
 renderAll();
 detectStorageMode();
 updateDevRecBanner(false);
+pullSettingsApply(); /* ВОЛНА 22.37: подтянуть настройки из базы */
 
 /* Прогрев GPU-шейдеров размытия: компиляция первого backdrop-filter в движке
    занимает десятки мс — из-за этого лагало первое открытие модалки.
@@ -5191,6 +6041,995 @@ setTimeout(() => {
 
   requestAnimationFrame(() => requestAnimationFrame(() => w.remove()));
 }, 150);
+
+
+/* ================================================================
+   ВОЛНА 22.37: ПЛЕЕРЫ (видео / фото / музыка) + НАСТРОЙКИ В БАЗЕ
+   ================================================================ */
+
+let _viewerUrl = null;
+
+function _viewerRevoke() {
+  if (_viewerUrl) {
+    try { URL.revokeObjectURL(_viewerUrl); } catch (e) {}
+    _viewerUrl = null;
+  }
+}
+
+/* Скачивает файл в память с пилюлей прогресса; > 1 ГБ — null (внешняя ссылка) */
+async function _viewerFetch(f) {
+  const data = await apiJson('/api/files/' + encodeURIComponent(f.id) + '/link?disp=inline', {
+    headers: vaultHeaders()
+  });
+
+  const abs = new URL(data.url, location.origin).href;
+
+  if ((+f.size || 0) > BIG_FILE_LIMIT) {
+    openExternalLink(abs);
+    showToast('Файл больше 1 ГБ — открыл ссылку в браузере');
+    return null;
+  }
+
+  const tId = tpAdd(f.name || 'файл', 'down', +f.size || 0);
+
+  try {
+    const blob = await fetchFileBlob(abs, f.name, tId);
+    tpFinish(tId);
+    return blob;
+  } catch (e) {
+    tpDrop(tId);
+    throw e;
+  }
+}
+
+async function openFileViewer(id) {
+  const f = ALL_FILES.find((x) => x.id === id);
+
+  if (!f) return;
+
+  try {
+    /* ВОЛНА 22.37: фото/видео/аудио открываются ВНУТРИ мини-аппа в новых
+       плеерах; остальные файлы — как раньше, по одноразовой ссылке (disp=inline
+       открывает PDF/текст в браузере, а не скачивает молча). */
+    if (f.kind === 'image') return await pmOpen(f);
+    if (f.kind === 'video') return await vmOpen(f);
+    if (f.kind === 'audio') return await musicOpenFor(f);
+
+    const data = await apiJson('/api/files/' + encodeURIComponent(id) + '/link?disp=inline', {
+      headers: vaultHeaders()
+    });
+
+    const abs = new URL(data.url, location.origin).href;
+
+    if (IS_TELEGRAM && tg && tg.openLink) {
+      tg.openLink(abs);
+    } else {
+      window.open(abs, '_blank', 'noopener');
+    }
+  } catch (e) {
+    if (!handleSafeAuthError(e, 'view', id)) {
+      showToast('Не удалось открыть: ' + cloudErrText(e));
+    }
+  }
+}
+
+/* ---------- ВИДЕОПЛЕЕР (по HTML пользователя) ---------- */
+
+const vPlayer = document.getElementById('videoPlayer');
+const vStage = document.getElementById('videoStage');
+const vSeek = document.getElementById('vmSeek');
+
+let vmSeeking = false;
+let vmControlsTimeout = null;
+let vmPressTimer = null;
+let vmLongPressing = false;
+let vmSavedRate = 1.0;
+let vmZoom = 1.0;
+let vmPinch = null;
+let vmWasPinch = false;
+let vmFullscreen = false;
+let vmLastTap = 0;
+let vmLastSide = null;
+let vmLastCenter = 0;
+let vmLastManualExit = 0;
+let vmCurFile = null;
+
+function vmFmt(sec) {
+  if (isNaN(sec)) return '00:00';
+  const m = Math.floor(sec / 60);
+  const s = Math.floor(sec % 60);
+  return (m < 10 ? '0' : '') + m + ':' + (s < 10 ? '0' : '') + s;
+}
+
+function vmShowFeedback(text) {
+  const ind = document.getElementById('rewindIndicator');
+
+  ind.textContent = text;
+  ind.style.opacity = '1';
+  setTimeout(() => { ind.style.opacity = '0'; }, 600);
+}
+
+function vmShowControls() {
+  const controls = document.getElementById('vmControls');
+  const header = document.getElementById('vmHeader');
+
+  controls.style.opacity = '1';
+  header.style.opacity = '1';
+
+  if (vmControlsTimeout) clearTimeout(vmControlsTimeout);
+
+  vmControlsTimeout = setTimeout(() => {
+    if (!vPlayer.paused && !vmSeeking && !vmLongPressing) {
+      controls.style.opacity = '0';
+      header.style.opacity = '0';
+    }
+  }, 3000);
+}
+
+function vmUpdateIcon() {
+  document.getElementById('vmPlayIcon').innerHTML = vPlayer.paused
+    ? '<i data-lucide="play" style="width:24px;height:24px;fill:#000;margin-left:2px"></i>'
+    : '<i data-lucide="pause" style="width:24px;height:24px;fill:#000"></i>';
+
+  safeIcons();
+}
+
+function vmApplyZoom(scale, animate) {
+  vmZoom = Math.min(3.0, Math.max(1.0, scale));
+
+  vPlayer.style.transition = animate ? 'transform 0.3s cubic-bezier(0.16,1,0.3,1)' : 'none';
+  vPlayer.style.transform = 'scale(' + vmZoom.toFixed(2) + ')';
+}
+
+async function vmOpen(f) {
+  vmCurFile = f;
+
+  document.getElementById('vmTitle').textContent = f.name || 'Видео';
+
+  const blob = await _viewerFetch(f);
+
+  if (!blob) return;
+
+  _viewerRevoke();
+  _viewerUrl = URL.createObjectURL(blob);
+
+  vPlayer.src = _viewerUrl;
+  vmZoom = 1.0;
+  vmApplyZoom(1.0, false);
+  vPlayer.playbackRate = 1.0;
+  vmSavedRate = 1.0;
+
+  document.getElementById('videoModal').classList.add('open');
+  lockPageScroll();
+
+  if ('mediaSession' in navigator) {
+    try {
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title: (f.name || 'Видео').replace(/\.[^/.]+$/, ''),
+        artist: 'DEVO+ Облако'
+      });
+      navigator.mediaSession.setActionHandler('play', () => vPlayer.play());
+      navigator.mediaSession.setActionHandler('pause', () => vPlayer.pause());
+      navigator.mediaSession.setActionHandler('seekbackward', () => vmRewind(-10));
+      navigator.mediaSession.setActionHandler('seekforward', () => vmRewind(10));
+    } catch (e) {}
+  }
+
+  vPlayer.play().catch(() => {});
+  vmShowControls();
+}
+
+function vmClose(e) {
+  if (e) e.stopPropagation();
+
+  vPlayer.pause();
+  vPlayer.removeAttribute('src');
+  try { vPlayer.load(); } catch (e2) {}
+
+  vmZoom = 1.0;
+  document.getElementById('videoModal').classList.remove('open');
+  unlockPageScroll();
+
+  vmFullscreen = false;
+  vmLastManualExit = Date.now();
+
+  if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+  vmForceLandscape(false);
+
+  _viewerRevoke();
+}
+
+function vmTogglePlay(e) {
+  if (e) e.stopPropagation();
+
+  if (vPlayer.paused) vPlayer.play();
+  else vPlayer.pause();
+
+  vmShowControls();
+}
+
+function vmRewind(seconds, e) {
+  if (e) {
+    e.stopPropagation();
+    if (e.cancelable) e.preventDefault();
+  }
+
+  vPlayer.currentTime += seconds;
+  vmShowFeedback(seconds > 0 ? '+10 сек' : '-10 сек');
+  vmShowControls();
+}
+
+function vmTapZone(e, seconds) {
+  if (vmLongPressing || vmWasPinch) return;
+
+  if (e) e.stopPropagation();
+
+  const now = Date.now();
+
+  if (now - vmLastTap < 300 && vmLastSide === seconds) {
+    vmRewind(seconds, e);
+  } else {
+    /* одиночный тап — показать/скрыть кнопки */
+    const controls = document.getElementById('vmControls');
+
+    if (controls.style.opacity === '0') vmShowControls();
+    else {
+      controls.style.opacity = '0';
+      document.getElementById('vmHeader').style.opacity = '0';
+    }
+  }
+
+  vmLastTap = now;
+  vmLastSide = seconds;
+}
+
+function vmCenterTap(e) {
+  if (vmLongPressing || vmWasPinch) return;
+
+  if (e) e.stopPropagation();
+
+  const now = Date.now();
+
+  if (now - vmLastCenter < 280) {
+    const target = vmZoom > 1.01 ? 1.0 : 2.0;
+
+    vmApplyZoom(target, true);
+    vmShowFeedback(Math.round(target * 100) + '%');
+    vmShowControls();
+  } else {
+    vmTapZone(e, 0);
+  }
+
+  vmLastCenter = now;
+}
+
+function vmSeekTo(v) {
+  if (vPlayer.duration) vPlayer.currentTime = (v / 100) * vPlayer.duration;
+
+  vmSeeking = false;
+}
+
+async function vmToggleRotate(e) {
+  if (e) e.stopPropagation();
+
+  const modal = document.getElementById('videoModal');
+
+  if (!vmFullscreen) {
+    vmFullscreen = true;
+
+    try {
+      if (modal.requestFullscreen) await modal.requestFullscreen();
+    } catch (err) {}
+
+    if (screen.orientation && screen.orientation.lock) {
+      try { await screen.orientation.lock('landscape'); } catch (err) {
+        vmForceLandscape(true);
+      }
+    } else {
+      vmForceLandscape(true);
+    }
+
+    vPlayer.style.objectFit = 'cover';
+  } else {
+    vmLastManualExit = Date.now();
+    vmFullscreen = false;
+
+    try {
+      if (document.exitFullscreen) await document.exitFullscreen();
+    } catch (err) {}
+
+    if (screen.orientation && screen.orientation.unlock) screen.orientation.unlock();
+
+    vmForceLandscape(false);
+    vPlayer.style.objectFit = 'contain';
+  }
+
+  vmShowControls();
+}
+
+function vmForceLandscape(on) {
+  if (on) {
+    const w = window.innerWidth, h = window.innerHeight;
+
+    vStage.style.position = 'absolute';
+    vStage.style.width = h + 'px';
+    vStage.style.height = w + 'px';
+    vStage.style.top = '50%';
+    vStage.style.left = '50%';
+    vStage.style.transform = 'translate(-50%, -50%) rotate(90deg)';
+  } else {
+    vStage.style.position = '';
+    vStage.style.width = '';
+    vStage.style.height = '';
+    vStage.style.top = '';
+    vStage.style.left = '';
+    vStage.style.transform = '';
+  }
+}
+
+/* зажатие = 2x скорость; пинч = зум (как в присланном плеере) */
+vStage.addEventListener('touchstart', (e) => {
+  if (e.touches.length > 1) return;
+
+  const t = e.touches[0];
+
+  vmPressTimer = setTimeout(() => {
+    vmLongPressing = true;
+    vmSavedRate = vPlayer.playbackRate;
+    vPlayer.playbackRate = 2.0;
+    document.getElementById('speedIndicator').style.opacity = '1';
+  }, 300);
+}, { passive: true });
+
+vStage.addEventListener('touchend', () => {
+  clearTimeout(vmPressTimer);
+
+  if (vmLongPressing) {
+    vmLongPressing = false;
+    vPlayer.playbackRate = vmSavedRate;
+    document.getElementById('speedIndicator').style.opacity = '0';
+  }
+});
+
+vStage.addEventListener('touchstart', (e) => {
+  if (e.touches.length === 2) {
+    e.preventDefault();
+    clearTimeout(vmPressTimer);
+
+    if (vmLongPressing) {
+      vmLongPressing = false;
+      vPlayer.playbackRate = vmSavedRate;
+      document.getElementById('speedIndicator').style.opacity = '0';
+    }
+
+    vmWasPinch = true;
+    vmPinch = {
+      dist: Math.hypot(e.touches[0].clientX - e.touches[1].clientX,
+                       e.touches[0].clientY - e.touches[1].clientY),
+      scale: vmZoom
+    };
+  }
+}, { passive: false });
+
+vStage.addEventListener('touchmove', (e) => {
+  if (vmPinch && e.touches.length === 2) {
+    e.preventDefault();
+
+    const d = Math.hypot(e.touches[0].clientX - e.touches[1].clientX,
+                         e.touches[0].clientY - e.touches[1].clientY);
+
+    if (vmPinch.dist > 0) vmApplyZoom(vmPinch.scale * (d / vmPinch.dist), false);
+  }
+}, { passive: false });
+
+vStage.addEventListener('touchend', () => {
+  if (vmPinch) {
+    vmPinch = null;
+    vmApplyZoom(vmZoom, true);
+    vmShowControls();
+    setTimeout(() => { vmWasPinch = false; }, 150);
+  }
+});
+
+window.addEventListener('orientationchange', () => {
+  setTimeout(() => {
+    const modal = document.getElementById('videoModal');
+
+    if (!modal.classList.contains('open')) return;
+    if (Date.now() - vmLastManualExit < 2000) return;
+
+    const isLandscape = !!(screen.orientation && screen.orientation.type &&
+      screen.orientation.type.indexOf('landscape') === 0);
+
+    if (isLandscape && !vmFullscreen) {
+      vmFullscreen = true;
+      try { modal.requestFullscreen().catch(() => {}); } catch (e) {}
+      vPlayer.style.objectFit = 'cover';
+    } else if (!isLandscape && vmFullscreen) {
+      vmFullscreen = false;
+      try { document.exitFullscreen().catch(() => {}); } catch (e) {}
+      vPlayer.style.objectFit = 'contain';
+    }
+  }, 300);
+});
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden && !vPlayer.paused && vPlayer.src &&
+      document.getElementById('videoModal').classList.contains('open')) {
+    if (document.pictureInPictureEnabled && !document.pictureInPictureElement) {
+      vPlayer.requestPictureInPicture().catch(() => {});
+    }
+  }
+});
+
+vPlayer.ontimeupdate = () => {
+  if (!vmSeeking && vPlayer.duration) {
+    vSeek.value = (vPlayer.currentTime / vPlayer.duration) * 100;
+    document.getElementById('vmCur').textContent = vmFmt(vPlayer.currentTime);
+    document.getElementById('vmDur').textContent = vmFmt(vPlayer.duration);
+  }
+};
+
+vPlayer.onloadedmetadata = () => {
+  document.getElementById('vmDur').textContent = vmFmt(vPlayer.duration);
+};
+
+vPlayer.onplay = vmUpdateIcon;
+vPlayer.onpause = vmUpdateIcon;
+
+/* ---------- ФОТОПРОСМОТРЩИК ---------- */
+
+let pmList = [];
+let pmIndex = 0;
+let pmCache = new Map();
+let pmZoom = 1.0;
+let pmPinch = null;
+let pmTouchStart = null;
+
+function pmPhotos() {
+  return ALL_FILES.filter((f) => f.kind === 'image');
+}
+
+async function pmShow(idx) {
+  pmIndex = (idx + pmList.length) % pmList.length;
+
+  const f = pmList[pmIndex];
+
+  if (!f) return;
+
+  document.getElementById('pmTitle').textContent = f.name || 'Фото';
+  document.getElementById('pmCount').textContent =
+    (pmIndex + 1) + ' / ' + pmList.length;
+
+  pmZoom = 1.0;
+  pmApplyZoom(false);
+
+  let url = pmCache.get(f.id);
+
+  if (!url) {
+    try {
+      const blob = await _viewerFetch(f);
+
+      if (!blob) return;
+
+      url = URL.createObjectURL(blob);
+      pmCache.set(f.id, url);
+    } catch (e) {
+      showToast('Не удалось открыть: ' + cloudErrText(e));
+      return;
+    }
+  }
+
+  document.getElementById('photoImg').src = url;
+}
+
+function pmApplyZoom(animate) {
+  const img = document.getElementById('photoImg');
+
+  img.style.transition = animate === false ? 'none' : 'transform 0.25s cubic-bezier(0.16,1,0.3,1)';
+  img.style.transform = 'scale(' + pmZoom.toFixed(2) + ')';
+}
+
+async function pmOpen(f) {
+  pmList = pmPhotos();
+  pmIndex = Math.max(0, pmList.findIndex((x) => x.id === f.id));
+
+  document.getElementById('photoModal').classList.add('open');
+  lockPageScroll();
+
+  await pmShow(pmIndex);
+}
+
+function pmClose(e) {
+  if (e) e.stopPropagation();
+
+  document.getElementById('photoModal').classList.remove('open');
+  document.getElementById('photoImg').src = '';
+  unlockPageScroll();
+}
+
+async function pmNav(dir, e) {
+  if (e) e.stopPropagation();
+  await pmShow(pmIndex + dir);
+}
+
+function pmDownload(e) {
+  if (e) e.stopPropagation();
+
+  const f = pmList[pmIndex];
+
+  if (f) downloadFileById(f.id, f.name, f.size);
+}
+
+const pmStage = document.getElementById('photoStage');
+
+pmStage.addEventListener('touchstart', (e) => {
+  if (e.touches.length === 2) {
+    e.preventDefault();
+
+    pmPinch = {
+      dist: Math.hypot(e.touches[0].clientX - e.touches[1].clientX,
+                       e.touches[0].clientY - e.touches[1].clientY),
+      scale: pmZoom
+    };
+
+    return;
+  }
+
+  pmTouchStart = {
+    x: e.touches[0].clientX,
+    y: e.touches[0].clientY,
+    t: Date.now()
+  };
+}, { passive: false });
+
+pmStage.addEventListener('touchmove', (e) => {
+  if (pmPinch && e.touches.length === 2) {
+    e.preventDefault();
+
+    const d = Math.hypot(e.touches[0].clientX - e.touches[1].clientX,
+                         e.touches[0].clientY - e.touches[1].clientY);
+
+    if (pmPinch.dist > 0) pmZoom = Math.min(4, Math.max(1, pmPinch.scale * (d / pmPinch.dist)));
+
+    pmApplyZoom(false);
+  }
+}, { passive: false });
+
+pmStage.addEventListener('touchend', (e) => {
+  if (pmPinch) {
+    pmPinch = null;
+    pmApplyZoom();
+    return;
+  }
+
+  if (!pmTouchStart) return;
+
+  const dx = e.changedTouches[0].clientX - pmTouchStart.x;
+  const dy = e.changedTouches[0].clientY - pmTouchStart.y;
+  const dt = Date.now() - pmTouchStart.t;
+
+  pmTouchStart = null;
+
+  /* свайп в сторону — листать фото; тап — зум 2x/1x */
+  if (Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy) && dt < 600) {
+    pmShow(pmIndex + (dx < 0 ? 1 : -1));
+  } else if (Math.abs(dx) < 12 && Math.abs(dy) < 12 && dt < 400) {
+    pmZoom = pmZoom > 1.01 ? 1.0 : 2.0;
+    pmApplyZoom();
+  }
+});
+
+pmStage.addEventListener('dblclick', () => {
+  pmZoom = pmZoom > 1.01 ? 1.0 : 2.0;
+  pmApplyZoom();
+});
+
+/* ---------- МУЗЫКАЛЬНЫЙ ПЛЕЕР (дизайн пользователя) ---------- */
+
+const mAudio = new Audio();
+let mPlaylist = [];
+let mIndex = 0;
+let mCache = new Map();
+let mPlaying = false;
+let mInterval = null;
+let mMeta = null;   /* {title, artist, coverUrl} */
+
+const M_PALETTES = [
+  { grad: 'linear-gradient(135deg, #4285f4, #9b72f2)', bg: '#0b1120', glow: '#4285f4' },
+  { grad: 'linear-gradient(135deg, #f4a142, #f442a1)', bg: '#200e13', glow: '#f4a142' },
+  { grad: 'linear-gradient(135deg, #f442a1, #9b72f2)', bg: '#1c0a1f', glow: '#f442a1' },
+  { grad: 'linear-gradient(135deg, #42f4c8, #4285f4)', bg: '#0a1d20', glow: '#42f4c8' },
+  { grad: 'linear-gradient(135deg, #9b72f2, #42f4c8)', bg: '#140c24', glow: '#9b72f2' }
+];
+
+function mFmt(sec) {
+  if (isNaN(sec)) return '0:00';
+  const m = Math.floor(sec / 60);
+  const s = Math.floor(sec % 60);
+  return m + ':' + (s < 10 ? '0' : '') + s;
+}
+
+/* --- ID3: обложка + название + исполнитель из метаданных аудио --- */
+function parseId3(buf) {
+  const out = { title: null, artist: null, picture: null };
+  const u8 = new Uint8Array(buf);
+
+  try {
+    if (u8.length < 20 || u8[0] !== 0x49 || u8[1] !== 0x44 || u8[2] !== 0x33) return out;
+
+    const ver = u8[3];
+    const flags = u8[5];
+    const size = ((u8[6] & 0x7f) << 21) | ((u8[7] & 0x7f) << 14) |
+                 ((u8[8] & 0x7f) << 7) | (u8[9] & 0x7f);
+    const end = Math.min(10 + size, u8.length);
+
+    let pos = 10;
+
+    if (flags & 0x40) {
+      /* extended header: пропускаем */
+      const es = ver >= 4
+        ? ((u8[pos] & 0x7f) << 21) | ((u8[pos + 1] & 0x7f) << 14) |
+          ((u8[pos + 2] & 0x7f) << 7) | (u8[pos + 3] & 0x7f)
+        : ((u8[pos] << 24) | (u8[pos + 1] << 16) | (u8[pos + 2] << 8) | u8[pos + 3]) + 4;
+      pos += Math.max(0, es);
+    }
+
+    const td = (bytes) => {
+      if (!bytes || !bytes.length) return '';
+
+      let enc = bytes[0];
+      let body = bytes.slice(1);
+
+      try {
+        if (enc === 0) return new TextDecoder('windows-1251').decode(body).replace(/\0+$/, '');
+        if (enc === 1) return new TextDecoder('utf-16').decode(body).replace(/\0+$/, '');
+        return new TextDecoder('utf-8').decode(body).replace(/\0+$/, '');
+      } catch (e) {
+        return '';
+      }
+    };
+
+    while (pos + 10 <= end) {
+      const id = String.fromCharCode(u8[pos], u8[pos + 1], u8[pos + 2], u8[pos + 3]);
+
+      if (!/^[A-Z0-9]{4}$/.test(id)) break;
+
+      let fsize = ver >= 4
+        ? ((u8[pos + 4] & 0x7f) << 21) | ((u8[pos + 5] & 0x7f) << 14) |
+          ((u8[pos + 6] & 0x7f) << 7) | (u8[pos + 7] & 0x7f)
+        : (u8[pos + 4] << 24) | (u8[pos + 5] << 16) | (u8[pos + 6] << 8) | u8[pos + 7];
+
+      pos += 10;
+
+      if (fsize <= 0 || pos + fsize > end) break;
+
+      const data = u8.subarray(pos, pos + fsize);
+
+      if (id === 'TIT2' && !out.title) out.title = td(data) || null;
+      else if (id === 'TPE1' && !out.artist) out.artist = td(data) || null;
+      else if (id === 'APIC' && !out.picture) {
+        let p = 1;
+
+        while (p < data.length && data[p] !== 0) p++;
+
+        const mime = new TextDecoder('ascii').decode(data.subarray(1, p)) || 'image/jpeg';
+
+        p++;          /* null mime */
+        p++;          /* picture type */
+
+        while (p < data.length && data[p] !== 0) p++;
+
+        p++;          /* null description */
+
+        out.picture = new Blob([data.subarray(p)], { type: mime.indexOf('/') > 0 ? mime : 'image/' + mime });
+      }
+
+      pos += fsize;
+    }
+  } catch (e) {}
+
+  return out;
+}
+
+async function mLoadMeta(f, blob) {
+  const meta = { title: null, artist: null, coverUrl: null, palette: null };
+
+  try {
+    const head = blob.size > 3 * 1024 * 1024 ? blob.slice(0, 3 * 1024 * 1024) : blob;
+    const buf = await head.arrayBuffer();
+    const id3 = parseId3(buf);
+
+    meta.title = id3.title;
+    meta.artist = id3.artist;
+
+    if (id3.picture) meta.coverUrl = URL.createObjectURL(id3.picture);
+  } catch (e) {}
+
+  const h = [...String(f.name || '')].reduce((a, c) => (a * 31 + c.charCodeAt(0)) | 0, 7);
+
+  meta.palette = M_PALETTES[Math.abs(h) % M_PALETTES.length];
+
+  return meta;
+}
+
+function mRenderDots() {
+  const dots = document.getElementById('musicDots');
+
+  dots.innerHTML = '';
+
+  if (mPlaylist.length > 12) {
+    dots.innerHTML = '<span style="font-size:11px;font-weight:700;color:rgba(255,255,255,0.6)">' +
+      'Трек ' + (mIndex + 1) + ' из ' + mPlaylist.length + '</span>';
+    return;
+  }
+
+  mPlaylist.forEach((_, i) => {
+    const d = document.createElement('div');
+
+    d.className = 'mm-dot' + (i === mIndex ? ' active' : '');
+    d.onclick = (e) => { e.stopPropagation(); mLoad(i, mPlaying); };
+    dots.appendChild(d);
+  });
+}
+
+function mApplyMeta() {
+  const art = document.getElementById('musicArt');
+  const icon = document.getElementById('musicArtIcon');
+  const f = mPlaylist[mIndex];
+
+  document.getElementById('musicTitle').textContent =
+    (mMeta && mMeta.title) || (f ? f.name.replace(/\.[^/.]+$/, '') : '—');
+  document.getElementById('musicArtist').textContent =
+    (mMeta && mMeta.artist) || 'DEVO+ Облако';
+
+  /* обложка: из аудио пользователя, иначе — градиент по имени файла */
+  art.querySelectorAll('img').forEach((i) => i.remove());
+
+  if (mMeta && mMeta.coverUrl) {
+    const img = document.createElement('img');
+
+    img.src = mMeta.coverUrl;
+    art.appendChild(img);
+    icon.style.display = 'none';
+  } else {
+    icon.style.display = 'block';
+    icon.textContent = '🎵';
+  }
+
+  const pal = (mMeta && mMeta.palette) || M_PALETTES[0];
+
+  if (!mMeta || !mMeta.coverUrl) art.style.background = pal.grad;
+
+  document.getElementById('musicModal').style.background = pal.bg;
+  document.getElementById('musicGlow').style.background = pal.glow;
+}
+
+async function mLoad(i, autoplay) {
+  mIndex = (i + mPlaylist.length) % mPlaylist.length;
+
+  const f = mPlaylist[mIndex];
+
+  if (!f) return;
+
+  mRenderDots();
+
+  document.getElementById('musicTitle').textContent = f.name.replace(/\.[^/.]+$/, '');
+  document.getElementById('musicArtist').textContent = 'Загружаю…';
+
+  let blob = mCache.get(f.id);
+
+  if (!blob) {
+    try {
+      blob = await _viewerFetch(f);
+      if (!blob) return;
+      mCache.set(f.id, blob);
+    } catch (e) {
+      showToast('Не удалось открыть: ' + cloudErrText(e));
+      return;
+    }
+  }
+
+  mMeta = await mLoadMeta(f, blob);
+  mApplyMeta();
+  mRenderDots();
+
+  if (mAudio.src) URL.revokeObjectURL(mAudio.src);
+
+  mAudio.src = URL.createObjectURL(blob);
+
+  if (autoplay) mAudio.play().catch(() => {});
+  else mUpdatePlayIcon();
+}
+
+function mUpdatePlayIcon() {
+  mPlaying = !mAudio.paused;
+
+  document.getElementById('musicPlayIcon').innerHTML = mPlaying
+    ? '<rect x="6" y="4" width="4" height="16" rx="2"/><rect x="14" y="4" width="4" height="16" rx="2"/>'
+    : '<path d="M8 5.14v13.72a1 1 0 0 0 1.5.86l10.5-6.86a1 1 0 0 0 0-1.72L9.5 4.28A1 1 0 0 0 8 5.14z"/>';
+
+  document.getElementById('musicArt').classList.toggle('playing', mPlaying);
+}
+
+function mStartInterval() {
+  if (mInterval) clearInterval(mInterval);
+
+  mInterval = setInterval(() => {
+    if (!mAudio.duration) return;
+
+    document.getElementById('musicProgressFill').style.width =
+      ((mAudio.currentTime / mAudio.duration) * 100) + '%';
+    document.getElementById('musicCur').textContent = mFmt(mAudio.currentTime);
+    document.getElementById('musicDur').textContent = mFmt(mAudio.duration);
+  }, 500);
+}
+
+async function musicOpenFor(f) {
+  mPlaylist = ALL_FILES.filter((x) => x.kind === 'audio');
+
+  if (!mPlaylist.length) mPlaylist = [f];
+
+  const idx = mPlaylist.findIndex((x) => x.id === f.id);
+
+  document.getElementById('musicModal').classList.add('open');
+  lockPageScroll();
+
+  await mLoad(idx < 0 ? 0 : idx, true);
+  mStartInterval();
+}
+
+function musicClose(e) {
+  if (e) e.stopPropagation();
+
+  mAudio.pause();
+
+  if (mAudio.src) URL.revokeObjectURL(mAudio.src);
+  mAudio.removeAttribute('src');
+
+  if (mInterval) clearInterval(mInterval);
+  mInterval = null;
+
+  document.getElementById('musicModal').classList.remove('open');
+  unlockPageScroll();
+}
+
+function musicTogglePlay(e) {
+  if (e) e.stopPropagation();
+
+  if (!mAudio.src) {
+    mLoad(mIndex, true);
+    return;
+  }
+
+  if (mAudio.paused) mAudio.play().catch(() => {});
+  else mAudio.pause();
+
+  mUpdatePlayIcon();
+}
+
+function musicNext(e) {
+  if (e) e.stopPropagation();
+  mLoad(mIndex + 1, mPlaying);
+}
+
+function musicPrev(e) {
+  if (e) e.stopPropagation();
+  mLoad(mIndex - 1, mPlaying);
+}
+
+function musicSeekClick(e) {
+  if (!mAudio.duration) return;
+
+  const rect = e.currentTarget.getBoundingClientRect();
+  const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+
+  mAudio.currentTime = pct * mAudio.duration;
+}
+
+mAudio.onended = () => mLoad(mIndex + 1, true);
+mAudio.onplay = mUpdatePlayIcon;
+mAudio.onpause = mUpdatePlayIcon;
+
+/* ---------- НАСТРОЙКИ В БАЗЕ (переживают очистку кэша/смену телефона) ---------- */
+
+var _settingsSaveT = null; /* var: вызывается из applyTheme при старте (TDZ let недопустим) */
+
+function settingsChanged() {
+  clearTimeout(_settingsSaveT);
+  _settingsSaveT = setTimeout(pushSettingsToServer, 1200);
+}
+
+async function pushSettingsToServer() {
+  try {
+    const s = {
+      theme: localStorage.getItem('devo_theme') || 'system',
+      blobs: localStorage.getItem('devo_blobs_enabled') !== 'false',
+      blob_speed: localStorage.getItem('devo_blob_speed') || '5',
+      sound: localStorage.getItem('devo_sound_id') || '1',
+      custom_c1: localStorage.getItem('devo_custom_c1') || '',
+      custom_c2: localStorage.getItem('devo_custom_c2') || '',
+      custom_angle: localStorage.getItem('devo_custom_angle') || '',
+      custom_btn_bg: localStorage.getItem('devo_custom_btn_bg') || '',
+      custom_btn_text: localStorage.getItem('devo_custom_btn_text') || '',
+      recbanner_hide: localStorage.getItem('devo_recbanner_hide') === '1'
+    };
+
+    await apiJson('/api/settings', {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ settings: s })
+    });
+  } catch (e) {}
+}
+
+async function pullSettingsApply() {
+  try {
+    const d = await apiJson('/api/settings', { headers: authHeaders() });
+    const s = d && d.settings;
+
+    /* первый запуск на этом аккаунте — сохраняем локальные в базу */
+    if (!s || !Object.keys(s).length) {
+      settingsChanged();
+      return;
+    }
+
+    let dirty = false;
+    const map = {
+      theme: 'devo_theme',
+      blob_speed: 'devo_blob_speed',
+      sound: 'devo_sound_id',
+      custom_c1: 'devo_custom_c1',
+      custom_c2: 'devo_custom_c2',
+      custom_angle: 'devo_custom_angle',
+      custom_btn_bg: 'devo_custom_btn_bg',
+      custom_btn_text: 'devo_custom_btn_text'
+    };
+
+    for (const k in map) {
+      if (s[k] != null && String(s[k]) !== '' &&
+          localStorage.getItem(map[k]) !== String(s[k])) {
+        localStorage.setItem(map[k], String(s[k]));
+        dirty = true;
+      }
+    }
+
+    if (typeof s.blobs === 'boolean') {
+      const want = s.blobs ? 'true' : 'false';
+
+      if (localStorage.getItem('devo_blobs_enabled') !== want) {
+        localStorage.setItem('devo_blobs_enabled', want);
+        dirty = true;
+      }
+    }
+
+    if (s.recbanner_hide === true) localStorage.setItem('devo_recbanner_hide', '1');
+
+    if (dirty) {
+      currentTheme = localStorage.getItem('devo_theme') || 'system';
+      blobsEnabled = localStorage.getItem('devo_blobs_enabled') !== 'false';
+      blobIdleSpeed = localStorage.getItem('devo_blob_speed') || '5';
+      selectedSoundId = parseInt(localStorage.getItem('devo_sound_id') || '1');
+
+      applyTheme(currentTheme);
+      updateBlobsVisibility();
+
+      const bs = document.getElementById('blobSpeedInput');
+
+      if (bs) bs.value = blobIdleSpeed;
+
+      const sl = document.getElementById('speedValueLabel');
+
+      if (sl) sl.textContent = blobIdleSpeed + 'x';
+
+      renderSoundMenu();
+      updateSoundLabel();
+      initCustomColors();
+    }
+
+    updateDevRecBanner(false);
+  } catch (e) {}
+}
 
 if (!IS_TELEGRAM) {
   if (WEB_TOKEN) {
