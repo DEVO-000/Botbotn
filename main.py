@@ -1701,7 +1701,10 @@ def load_prices():
     return prices
 
 def save_prices(prices):
-    return save_data(PRICES_FILE, prices)
+    """ВОЛНА 22.40: возвращает РЕЗУЛЬТАТ записи (True/False) — раньше молча
+    падали записи в Supabase/Mongo, а обработчики писали «✅ Цена изменена»,
+    и после рестарта цена откатывалась («не сохраняются цены разработчика»)."""
+    return bool(save_data(PRICES_FILE, prices))
 
 def reload_prices():
     """Синхронизация цен: перечитывает prices.json из БД в глобальный PRICES.
@@ -2212,6 +2215,12 @@ class User:
         # скорость анимации, звук, свой цвет) — переживают очистку кэша и
         # смену устройства; localStorage остаётся мгновенным кэшем.
         self.miniapp_settings = {}
+        # ВОЛНА 22.40: бот ждёт от админа список дежурных («свой график»).
+        # {"mode": "ai"|"dates", "ts": epoch} или None. ПЕРСИСТЕНТЕН: после
+        # рестарта сервера FSM-состояние терялось, и присланный список имён
+        # молча пропадал («в боте не приходят свои списки дежурных и списки
+        # ии»). Теперь глобальный обработчик доводит список до ИИ/парсера.
+        self.duty_pending = None
         self.birthday = None
         # ВОЛНА 22.28: пропустить ввод ДР больше нельзя — дата обязательна.
         # Флаг остался только для совместимости старых JSON-записей; при
@@ -2437,6 +2446,8 @@ class User:
             'miniapp_settings': (getattr(self, 'miniapp_settings', None)
                                  if isinstance(getattr(self, 'miniapp_settings', None), dict)
                                  else {}),
+            # ВОЛНА 22.40: ожидаемый список дежурных (переживает рестарт)
+            'duty_pending': getattr(self, 'duty_pending', None),
             'birthday': self.birthday,
             'birthday_skipped': getattr(self, 'birthday_skipped', False),
             'show_birthday_countdown': self.show_birthday_countdown,
@@ -2553,6 +2564,16 @@ class User:
         # ВОЛНА 22.37: настройки мини-аппа в базе (старые записи без поля).
         if not hasattr(user, 'miniapp_settings') or not isinstance(user.miniapp_settings, dict):
             user.miniapp_settings = {}
+        # ВОЛНА 22.40: флаг «ждём список дежурных» (старые записи без поля).
+        if not hasattr(user, 'duty_pending') or not isinstance(user.duty_pending, dict):
+            user.duty_pending = None
+        else:
+            try:
+                if str(user.duty_pending.get('mode') or '') not in ('ai', 'dates') \
+                        or (time.time() - float(user.duty_pending.get('ts') or 0)) > 3 * 3600:
+                    user.duty_pending = None
+            except Exception:
+                user.duty_pending = None
         if not hasattr(user, 'birthday_eve_notify') or user.birthday_eve_notify is None:
             user.birthday_eve_notify = True
         if not hasattr(user, 'dnd_enabled') or user.dnd_enabled is None:
@@ -3568,7 +3589,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.39"
+BOT_BUILD = "22.40"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -5318,6 +5339,8 @@ def get_developer_keyboard():
         # и применяются при каждой покупке через load_prices(), поэтому менять
         # текст инструкции после смены цены не нужно — бот сам покажет новые цифры.
         [InlineKeyboardButton("💰 Изменить цены функций", callback_data="dev_quick_prices")],
+        # ВОЛНА 22.40: самопроверка базы — «всё ли сохраняется в базу данных».
+        [InlineKeyboardButton("🗄 Проверка БД", callback_data="dev_db_check")],
         # НОВОЕ: сброс статистики Stars (история переводов больше не ведётся).
         [InlineKeyboardButton("🧹 Сбросить статистику Stars", callback_data="dev_reset_stars")],
         [InlineKeyboardButton("🌍 Создать глобальную кнопку", callback_data="dev_global_button")],
@@ -10751,25 +10774,17 @@ body.vp-lock {
       <div class="sheet-handle"></div>
     </div>
 
-    <h3 style="font-weight:900;font-size:20px;margin-bottom:4px;display:flex;align-items:center;gap:8px">
-      <i data-lucide="lock" style="width:20px;height:20px"></i>Сейф
-    </h3>
-    <p id="safeStatusLine" style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:14px;line-height:1.5">Загружаю…</p>
-
+    <!-- ВОЛНА 22.40: в окне Сейфа ТОЛЬКО строка пароля, кнопка действия
+         («Переместить в сейф» / «Разблокировать») и «Закрыть» — больше ничего -->
     <div style="margin-bottom:14px">
       <label style="font-size:11px;font-weight:800;color:var(--subtext-color);text-transform:uppercase;letter-spacing:0.04em">Пароль Сейфа</label>
       <input type="password" id="safePassword" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;margin-top:4px;outline:none;font-size:15px" placeholder="Пароль">
     </div>
 
     <div style="display:flex;flex-direction:column;gap:8px">
-      <button class="sound-item-btn" onclick="unlockSafe()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
-        <span>Разблокировать</span>
+      <button class="sound-item-btn" id="safeActionBtn" onclick="onSafeAction()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
+        <span id="safeActionLabel">Разблокировать</span>
         <i data-lucide="unlock" style="width:18px;height:18px"></i>
-      </button>
-
-      <button class="sound-item-btn" onclick="lockSafe()">
-        <span>Заблокировать снова</span>
-        <i data-lucide="lock" style="width:18px;height:18px"></i>
       </button>
 
       <button class="sound-item-btn" onclick="closeSafeModal()">
@@ -10777,11 +10792,6 @@ body.vp-lock {
         <i data-lucide="x" style="width:18px;height:18px"></i>
       </button>
     </div>
-
-    <p style="font-size:11px;font-weight:600;color:var(--subtext-color);margin-top:12px;line-height:1.5">
-      Пароль Сейфа нужен, чтобы скачать зашифрованный файл или переместить файл в Сейф из веб-облака.
-      Пароль держится только в памяти страницы и никогда не сохраняется.
-    </p>
   </div>
 </div>
 
@@ -12792,6 +12802,11 @@ async function saveFileName() {
 let VAULT_PW = '';
 let VAULT_SERVER_UNLOCKED = false;
 let PENDING_FILE_ACTION = null;
+/* ВОЛНА 22.40: окно Сейфа контекстное — 'unlock' (просто разблокировать),
+   'to_safe' (кнопка «Переместить в сейф»), 'from_safe' (кнопка «Разблокировать»
+   и достать файл). В окне только пароль, кнопка действия и «Закрыть». */
+let SAFE_MODAL_MODE = 'unlock';
+let SAFE_MODAL_FILE_ID = null;
 
 function vaultHeaders(extra) {
   const h = authHeaders(extra);
@@ -12807,11 +12822,29 @@ function vaultHeaders(extra) {
   return h;
 }
 
-function openSafeModal() {
+function openSafeModal(mode, fileId) {
   const m = document.getElementById('safeModal');
   if (!m) return;
 
-  loadSafeStatus();
+  /* ВОЛНА 22.40: контекстное окно Сейфа — подпись кнопки зависит от действия */
+  SAFE_MODAL_MODE = (mode === 'to_safe' || mode === 'from_safe') ? mode : 'unlock';
+  SAFE_MODAL_FILE_ID = fileId || null;
+
+  const lbl = document.getElementById('safeActionLabel');
+
+  if (lbl) {
+    lbl.textContent = SAFE_MODAL_MODE === 'to_safe'
+      ? 'Переместить в сейф'
+      : 'Разблокировать';
+  }
+
+  const input = document.getElementById('safePassword');
+
+  if (input) {
+    input.value = '';
+    /* автофокус — сразу видно, что нужно ввести пароль */
+    setTimeout(() => { try { input.focus(); } catch (e) {} }, 320);
+  }
 
   openModalEl('safeModal');
 }
@@ -12820,26 +12853,92 @@ function closeSafeModal(e) {
   if (e) e.stopPropagation();
 
   PENDING_FILE_ACTION = null;
+  SAFE_MODAL_FILE_ID = null;
+  SAFE_MODAL_MODE = 'unlock';
 
   closeModalEl('safeModal');
 }
 
-async function loadSafeStatus() {
-  const line = document.getElementById('safeStatusLine');
+/* Кнопка действия в окне Сейфа: разблокировать / переместить в сейф */
+function onSafeAction() {
+  if (SAFE_MODAL_MODE === 'to_safe') {
+    safeDoTransfer('to_safe');
+  } else if (SAFE_MODAL_MODE === 'from_safe') {
+    safeDoTransfer('from_safe');
+  } else {
+    unlockSafe();
+  }
+}
+
+/* ВОЛНА 22.40: перемещение в Сейф и обратно ЧЕРЕЗ окно с паролем.
+   Верный пароль → окно закрывается → справа снизу идёт загрузка
+   (та же пилюля, что у скачивания), чтобы было видно, сколько ждать. */
+async function safeDoTransfer(kind) {
+  const input = document.getElementById('safePassword');
+  const pw = (input && input.value) || '';
+
+  const f = ALL_FILES.find((x) => x.id === SAFE_MODAL_FILE_ID);
+
+  if (!f) {
+    closeSafeModal();
+    return;
+  }
+
+  if (!pw) {
+    showToast('Введите пароль Сейфа');
+    return;
+  }
+
+  /* пароль проверяем сразу: неверный — окно остаётся открытым */
+  try {
+    await apiJson('/api/safe/unlock', {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ password: pw })
+    });
+  } catch (e) {
+    showToast(cloudErrText(e));
+    return;
+  }
+
+  VAULT_PW = pw;
+  VAULT_SERVER_UNLOCKED = true;
+
+  if (input) input.value = '';
+
+  closeSafeModal();
+
+  const tid = 'safe-' + Date.now().toString(36) + '-' +
+    Math.floor(Math.random() * 1e6).toString(36);
+
+  transferStart({
+    id: tid,
+    type: kind === 'to_safe' ? 'safe' : 'safe_out',
+    name: f.name || 'Файл',
+    total: 0
+  });
 
   try {
-    const s = await apiJson('/api/safe/status', { headers: vaultHeaders() });
+    await apiJson('/api/files/' + encodeURIComponent(f.id) + '/' + kind, {
+      method: 'POST',
+      headers: vaultHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({})
+    });
 
-    if (s.unlocked) {
-      VAULT_SERVER_UNLOCKED = true;
-      line.textContent = 'Сейф разблокирован. Файлов в Сейфе: ' + (s.count || 0) + '.';
-    } else {
-      line.textContent =
-        'Сейф заблокирован. Введите пароль Сейфа, чтобы скачивать зашифрованные файлы и переносить файлы в Сейф. Файлов: ' +
-        (s.count || 0) + '.';
-    }
+    transferFinish(tid, true);
+
+    showToast(kind === 'to_safe' ? '🔐 Файл в Сейфе' : '🔓 Файл достан из Сейфа');
+
+    loadFiles(true);
   } catch (e) {
-    line.textContent = cloudErrText(e);
+    transferFinish(tid, false, 'Ошибка');
+
+    if (e.code === 'safe_locked' || e.code === 'wrong_password') {
+      VAULT_PW = '';
+      VAULT_SERVER_UNLOCKED = false;
+    }
+
+    showToast(cloudErrText(e));
   }
 }
 
@@ -12884,22 +12983,6 @@ async function unlockSafe() {
   }
 }
 
-async function lockSafe() {
-  try {
-    await apiJson('/api/safe/lock', {
-      method: 'POST',
-      headers: authHeaders()
-    });
-  } catch (e) {}
-
-  VAULT_PW = '';
-  VAULT_SERVER_UNLOCKED = false;
-
-  showToast('Сейф заблокирован');
-
-  closeSafeModal();
-}
-
 function ensureSafeUnlocked() {
   if (VAULT_PW || VAULT_SERVER_UNLOCKED) return true;
 
@@ -12909,68 +12992,28 @@ function ensureSafeUnlocked() {
   return false;
 }
 
-async function toSafeCurrentFile() {
+/* ВОЛНА 22.40: «Переместить в сейф» — сначала окно с паролем
+   (только пароль + кнопка «Переместить в сейф» + закрыть). */
+function toSafeCurrentFile() {
   const f = ALL_FILES.find((x) => x.id === activeEditingFileId);
 
   closeEditModal();
 
   if (!f) return;
 
-  if (!ensureSafeUnlocked()) return;
-
-  showToast('🔐 Шифрую и переношу в Сейф…');
-
-  try {
-    await apiJson('/api/files/' + encodeURIComponent(f.id) + '/to_safe', {
-      method: 'POST',
-      headers: vaultHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify({})
-    });
-
-    showToast('Файл в Сейфе — теперь он и в чате, и здесь');
-
-    loadFiles(true);
-  } catch (e) {
-    if (e.code === 'safe_locked') {
-      VAULT_PW = '';
-      VAULT_SERVER_UNLOCKED = false;
-      openSafeModal();
-    }
-
-    showToast(cloudErrText(e));
-  }
+  openSafeModal('to_safe', f.id);
 }
 
-async function fromSafeCurrentFile() {
+/* ВОЛНА 22.40: «Достать из сейфа» — окно только с паролем и кнопкой
+   «Разблокировать»; верный пароль закрывает окно и запускает загрузку. */
+function fromSafeCurrentFile() {
   const f = ALL_FILES.find((x) => x.id === activeEditingFileId);
 
   closeEditModal();
 
   if (!f) return;
 
-  if (!ensureSafeUnlocked()) return;
-
-  showToast('🔓 Расшифровываю и возвращаю в облако…');
-
-  try {
-    await apiJson('/api/files/' + encodeURIComponent(f.id) + '/from_safe', {
-      method: 'POST',
-      headers: vaultHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify({})
-    });
-
-    showToast('Файл достан из Сейфа в обычное облако');
-
-    loadFiles(true);
-  } catch (e) {
-    if (e.code === 'safe_locked') {
-      VAULT_PW = '';
-      VAULT_SERVER_UNLOCKED = false;
-      openSafeModal();
-    }
-
-    showToast(cloudErrText(e));
-  }
+  openSafeModal('from_safe', f.id);
 }
 
 const IS_MOBILE = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent || '') || (navigator.maxTouchPoints || 0) > 1;
@@ -13304,7 +13347,8 @@ async function openFileViewer(id) {
   showToast('📂 Открываю файл…');
 
   try {
-    const data = await apiJson('/api/files/' + encodeURIComponent(id) + '/link', {
+    /* ВОЛНА 22.40: disp=inline для просмотра (аудио/видео плееры, PDF) */
+    const data = await apiJson('/api/files/' + encodeURIComponent(id) + '/link?disp=inline', {
       headers: vaultHeaders()
     });
 
@@ -13937,7 +13981,6 @@ function refreshUploadModal() {
   const passInput = document.getElementById('uploadPassword');
 
   const has = pendingFiles.length > 0;
-  const needPw = passwordRequired();
 
   if (info) {
     info.textContent = !has
@@ -13971,9 +14014,31 @@ function refreshUploadModal() {
   if (sendBtn) sendBtn.classList.toggle('hidden', !has);
   if (moreBtn) moreBtn.classList.toggle('hidden', !has);
 
-  if (passRow) passRow.style.display = needPw ? 'block' : 'none';
-  if (plainHint) plainHint.style.display = (!needPw && STORAGE_ENCRYPTED === false) ? 'block' : 'none';
-  if (passInput && !passInput.value) passInput.value = (needPw && VAULT_PW) ? VAULT_PW : '';
+  /* ВОЛНА 22.40: пароль ОБЯЗАТЕЛЕН только когда хранилище шифруется
+     (STORAGE_ENCRYPTED === true). Раньше поле становилось обязательным,
+     если в облаке ЕСТЬ ХОТЬ ОДИН старый vault-файл — «просит пароль хотя
+     шифрование отключено». В режиме «без шифрования» поле видно, но
+     НЕобязательно: ввёл пароль → файл зашифруется и попадёт в Сейф
+     (и в боте, и здесь); оставил пустым → обычная загрузка без пароля. */
+  const pwRequired = STORAGE_ENCRYPTED === true;
+
+  if (passRow) passRow.style.display = 'block';
+  if (plainHint) {
+    plainHint.style.display = pwRequired ? 'none' : 'block';
+    plainHint.textContent = pwRequired
+      ? ''
+      : 'Шифрование отключено — пароль не нужен. Но можете ввести пароль Сейфа: тогда файл зашифруется и появится в Сейфе (в боте и здесь).';
+  }
+
+  if (passInput) {
+    passInput.placeholder = pwRequired
+      ? 'Пароль из бота'
+      : 'Необязательно — для загрузки в Сейф';
+
+    if (!passInput.value) {
+      passInput.value = (pwRequired && VAULT_PW) ? VAULT_PW : '';
+    }
+  }
 }
 
 function openUploadModal() {
@@ -13996,7 +14061,11 @@ function closeUploadModal(e) {
 function confirmUploadFiles() {
   const passInput = document.getElementById('uploadPassword');
 
-  if (passwordRequired()) {
+  /* ВОЛНА 22.40: пароль обязателен ТОЛЬКО при включённом шифровании.
+     В режиме «без шифрования» пустой пароль = обычная загрузка,
+     введённый пароль = зашифровать файл и положить в Сейф
+     (пароль уйдёт в теле upload/init именно этой загрузки). */
+  if (STORAGE_ENCRYPTED === true) {
     const pw = (passInput && passInput.value) || '';
 
     if (!pw) {
@@ -14005,6 +14074,16 @@ function confirmUploadFiles() {
     }
 
     VAULT_PW = pw;
+    UPLOAD_PLAIN_PW = '';
+  } else {
+    const pw = (passInput && passInput.value) || '';
+
+    /* пустое поле НЕ затирает ранее введённый пароль Сейфа —
+       иначе старые зашифрованные файлы перестанут открываться */
+    if (pw) VAULT_PW = pw;
+
+    /* но в Сейф файл попадает только если пароль введён ИМЕННО здесь */
+    UPLOAD_PLAIN_PW = pw;
   }
 
   if (passInput) passInput.value = '';
@@ -14019,6 +14098,10 @@ function confirmUploadFiles() {
 }
 
 let pickerAppend = false;
+/* ВОЛНА 22.40: пароль, введённый В ЭТОМ окне загрузки (для режима
+   «без шифрования»: ввёл — файл шифруется в Сейф; пусто — обычная загрузка).
+   Передаётся В ТЕЛЕ init-запроса — не наследуется от прежних разблокировок. */
+let UPLOAD_PLAIN_PW = '';
 
 function pickUploadFiles() {
   pickerAppend = false;
@@ -14398,7 +14481,9 @@ async function _uploadOneSession(file, reportBytes) {
       body: JSON.stringify({
         name: upName,
         size: +file.size || 0,
-        mime: file.type || ''
+        mime: file.type || '',
+        /* 22.40: пароль именно этой загрузки (для «без шифрования» → Сейф) */
+        password: UPLOAD_PLAIN_PW || ''
       })
     });
 
@@ -14921,10 +15006,21 @@ function ctAggregate() {
 
 function ctSubText(t) {
   if (t.done) {
-    return t.ok
-      ? 'Завершено · ' + fmtSize(t.total || t.loaded || 0)
-      : (t.note || 'Отменено');
+    if (t.ok) {
+      /* для Сейфа байты не считаются — честное «Готово» */
+      if (t.type === 'safe' || t.type === 'safe_out') return 'Готово';
+
+      return 'Завершено · ' + fmtSize(t.total || t.loaded || 0);
+    }
+
+    return (t.note || 'Отменено');
   }
+
+  /* ВОЛНА 22.40: перемещения в Сейф/из Сейфа — без байт, статус текстом,
+     чтобы пользователь видел, что процесс идёт и сколько примерно ждать */
+  if (t.type === 'safe') return 'Шифрую и переношу в Сейф…';
+
+  if (t.type === 'safe_out') return 'Расшифровываю и возвращаю…';
 
   const sec = (Date.now() - t.t0) / 1000;
   const speed = (sec > 0.8 && t.loaded) ? fmtSize(t.loaded / sec) + '/с · ' : '';
@@ -14947,7 +15043,11 @@ function ctRow(t) {
   icon.innerHTML = '<svg viewBox="0 0 24 24">'
     + (t.type === 'upload'
       ? '<path d="M12 19V5"/><path d="m5 12 7-7 7 7"/>'
-      : '<path d="M12 5v14"/><path d="m19 12-7 7-7-7"/>')
+      : t.type === 'safe'
+        ? '<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/>'
+        : t.type === 'safe_out'
+          ? '<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 7.5-2"/><path d="m3 3 18 18"/>'
+          : '<path d="M12 5v14"/><path d="m19 12-7 7-7-7"/>')
     + '</svg>';
 
   const main = document.createElement('div');
@@ -15220,7 +15320,9 @@ async function mpResolveUrl(t) {
   }
 
   try {
-    const data = await apiJson('/api/files/' + encodeURIComponent(t.id) + '/link', {
+    /* ВОЛНА 22.40: disp=inline — честный Content-Type без attachment,
+       чтобы <audio> играл сразу (а не предлагал «скачать») */
+    const data = await apiJson('/api/files/' + encodeURIComponent(t.id) + '/link?disp=inline', {
       headers: vaultHeaders()
     });
 
@@ -17065,10 +17167,16 @@ async def miniapp_files_link(request):
 
 async def miniapp_dl_token(request):
     """Скачивание по одноразовому токену (без заголовков — токен и есть ключ).
-    Токен сгорает при первом обращении: украденная ссылка бесполезна."""
+    ВОЛНА 22.40: токен больше НЕ сгорает при первом обращении — живёт до
+    истечения TTL (15 мин). Причина: <audio>/<video> делают НЕСКОЛЬКО запросов
+    к одной ссылке (preload=metadata + Range-докачка при play/seek), и
+    «одноразовость» роняла ВТОРОЙ запрос → музыка/видео не воспроизводились
+    ВООБЩЕ («не одну музыку не послушать»). Токен по-прежнему секретный
+    (24 байта entropy) и протухает по времени."""
     token = request.match_info["token"]
-    t = _MINIAPP_DL_TOKENS.pop(token, None)
+    t = _MINIAPP_DL_TOKENS.get(token)
     if not t or t.get("exp", 0) < time.time():
+        _MINIAPP_DL_TOKENS.pop(token, None)
         return _miniapp_err(404, "link_expired",
                             "Ссылка устарела — обновите страницу и попробуйте снова.")
     user = get_user(str(t.get("uid") or ""))
@@ -18005,6 +18113,24 @@ async def miniapp_upload_init(request):
                 "Сейфа — и загрузка продолжится уже зашифрованной.")
         if guard is not True:
             return guard
+    else:
+        # ВОЛНА 22.40: «загружаю в мини-апп и шифрую» — ДОЛЖНО попадать в Сейф
+        # бота. В режиме «без шифрования» пароль теперь ОПЦИОНАЛЕН: ввёл пароль
+        # Сейфа → файл шифруется и кладётся в user.vault_files (виден в Сейфе
+        # в чате); оставил поле пустым → обычная незашифрованная загрузка.
+        # ВАЖНО: пароль берём ТОЛЬКО из тела ЭТОГО запроса (поле ввода в окне
+        # загрузки) — унаследованный от прежней разблокировки веб-сессии
+        # пароль НЕ переключает режим (иначе «обычная загрузка» внезапно
+        # шифровалась без ведома пользователя).
+        pw_raw = str((body or {}).get("password") or "")
+        cand = _miniapp_vault_pw_pick(user, _vault_pw_candidates(pw_raw)) \
+            if pw_raw else None
+        if cand:
+            if _miniapp_vault_pw_verify(user, cand) is False:
+                return _miniapp_err(403, "wrong_password",
+                                    "Пароль Сейфа не подходит.")
+            plain_mode = False
+            vault_pw = cand
     files = [f for f in (getattr(user, "cloud_files", []) or []) if isinstance(f, dict)]
     limit = get_price('cloud_max_files', 50)
     if not plain_mode:
@@ -37842,15 +37968,22 @@ async def dev_set_prices_handler(update: Update, context: ContextTypes.DEFAULT_T
 
         if key in PRICES:
             PRICES[key] = value
-            save_prices(PRICES)
-            # Синхронизация цен: перечитываем из БД, чтобы in-memory состояние
-            # гарантированно совпало с сохранённым, и мгновенно применяем
-            # новую цену во ВСЕХ модулях (они читают PRICES на каждом вызове).
-            reload_prices()
-            await update.message.reply_text(
-                f"✅ Цена '{key}' изменена на {value} ⭐\n"
-                f"🔄 Обновление мгновенно применено во всех модулях бота."
-            )
+            # ВОЛНА 22.40: честное сохранение — если запись в базу не прошла,
+            # разработчику сообщают об ошибке, а не об успехе.
+            if save_prices(PRICES):
+                # Синхронизация цен: перечитываем из БД, чтобы in-memory состояние
+                # гарантированно совпало с сохранённым, и мгновенно применяем
+                # новую цену во ВСЕХ модулях (они читают PRICES на каждом вызове).
+                reload_prices()
+                await update.message.reply_text(
+                    f"✅ Цена '{key}' изменена на {value} ⭐\n"
+                    f"🔄 Обновление мгновенно применено во всех модулях бота."
+                )
+            else:
+                await update.message.reply_text(
+                    f"❌ НЕ удалось сохранить цену '{key}' в базу данных — "
+                    "проверьте Supabase/Mongo. Цена действует только до рестарта."
+                )
         else:
             await update.message.reply_text(f"Неизвестный ключ '{key}'. Доступные: {', '.join(PRICES.keys())}")
 
@@ -37951,11 +38084,19 @@ async def dev_quick_price_delta_handler(update: Update, context: ContextTypes.DE
 
     new_value = max(0, PRICES[key] + delta)
     PRICES[key] = new_value
-    save_prices(PRICES)
-    # Синхронизация цен: перечитываем и мгновенно применяем во всех модулях.
-    reload_prices()
+    # ВОЛНА 22.40: честное сохранение (см. dev_set_prices_handler).
+    _price_ok = save_prices(PRICES)
+    if _price_ok:
+        # Синхронизация цен: перечитываем и мгновенно применяем во всех модулях.
+        reload_prices()
 
     label = PRICE_LABELS.get(key, key)
+    if not _price_ok:
+        await query.edit_message_text(
+            f"❌ НЕ удалось сохранить цену «{label}» в базу данных — "
+            "проверьте Supabase/Mongo. Цена действует только до рестарта.",
+            reply_markup=get_quick_price_value_keyboard(key))
+        return DEV_QUICK_PRICE_SELECT
     text = (
         f"⚡ **{label}**\n\n"
         f"Текущая цена: {PRICES[key]} ⭐\n\n"
@@ -38001,17 +38142,113 @@ async def dev_quick_price_value_handler(update: Update, context: ContextTypes.DE
         return DEV_QUICK_PRICE_VALUE
 
     PRICES[key] = value
-    save_prices(PRICES)
+    # ВОЛНА 22.40: честное сохранение (см. dev_set_prices_handler).
+    label = PRICE_LABELS.get(key, key)
+    if not save_prices(PRICES):
+        await update.message.reply_text(
+            f"❌ НЕ удалось сохранить «{label}» в базу данных — "
+            "проверьте Supabase/Mongo. Цена действует только до рестарта.")
+        return DEV_QUICK_PRICE_VALUE
     # Синхронизация цен: перечитываем и мгновенно применяем во всех модулях.
     reload_prices()
 
-    label = PRICE_LABELS.get(key, key)
     await update.message.reply_text(f"✅ «{label}» = {value} ⭐\n🔄 Обновление применено во всех модулях бота.")
 
     context.user_data.pop('quick_price_key', None)
     text = "⚡ **Быстрое изменение цен**\n\nВыберите цену для изменения:"
     await update.message.reply_text(text, reply_markup=get_quick_prices_keyboard(), parse_mode="Markdown")
     return DEV_QUICK_PRICE_SELECT
+
+
+# ==================================
+# === ВОЛНА 22.40: ПРОВЕРКА БАЗЫ ДАННЫХ ===
+# ==================================
+
+_DB_CHECK_FILES = ("prices.json", "classes.json", "users.json",
+                   "dev_settings.json")
+
+
+async def dev_db_check_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопка «🗄 Проверка БД»: честный отчёт «всё ли сохраняется в базу».
+
+    1) Тестовая запись «записал → прочитал» через ТЕКУЩИЙ активный бэкенд
+       (Supabase → Mongo → локальный файл) с замером результата.
+    2) Присутствие основных файлов базы в ОБЛАЧНОМ хранилище (read-only,
+       без миграций) и на диске — исчезающие цены/классы/настройки сразу
+       видны разработчику."""
+    query = update.callback_query
+    await query.answer()
+    if str(query.from_user.id) != DEVELOPER_ID:
+        await query.edit_message_text("Доступ запрещён.")
+        return DEV_PANEL
+
+    import os as _os
+    lines = ["🗄 <b>Проверка базы данных</b>", ""]
+
+    # --- 1. Тестовая запись через активный бэкенд ---
+    test_key = "_db_check_2240.json"
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ok = save_data(test_key, {"ts": stamp, "check": True})
+    back = ""
+    if ok:
+        got = load_data(test_key, None)
+        ok = isinstance(got, dict) and got.get("check") is True \
+            and str(got.get("ts") or "") == stamp
+        if _supabase_ready or (SUPABASE_URL and SUPABASE_KEY
+                               and _supabase_try_late_init()):
+            back = "Supabase"
+        elif _mongo_kv is not None:
+            back = "MongoDB"
+        else:
+            back = "локальный файл"
+    if ok:
+        lines.append(f"✅ Тестовая запись: записана и прочитана ({back}).")
+    else:
+        lines.append("❌ Тестовая запись: ЗАПИСЬ НЕ РАБОТАЕТ — цены, классы и "
+                     "настройки будут теряться при рестарте! Проверьте "
+                     "SUPABASE_URL/SUPABASE_KEY (или MONGO_URI) в Variables.")
+    lines.append("")
+
+    # --- 2. Основные файлы в облачном хранилище (read-only) ---
+    cloud = None
+    if _supabase_ready or (SUPABASE_URL and SUPABASE_KEY
+                           and _supabase_try_late_init()):
+        cloud = "supabase"
+    elif _mongo_kv is not None:
+        cloud = "mongo"
+    if cloud:
+        lines.append(f"☁️ Облачная база: <b>{'Supabase' if cloud == 'supabase' else 'MongoDB'}</b>")
+        paths = {os.path.basename(str(p)): p for p in STORAGE_BACKUP_FILES}
+        for fn in _DB_CHECK_FILES:
+            p = paths.get(fn, fn)
+            try:
+                if cloud == "supabase":
+                    _d, found = _supabase_load(p, None)
+                else:
+                    _d, found = _mongo_load(p, None)
+                lines.append(f"• {fn}: {'✅ есть' if found else '❌ НЕТ — ещё не сохранялся'}")
+            except Exception as e:
+                lines.append(f"• {fn}: ⚠️ ошибка чтения ({e})")
+    else:
+        lines.append("⚠️ Облачная база НЕ подключена (ни Supabase, ни Mongo) — "
+                     "данные живут только в локальном файле и пропадают при "
+                     "каждом деплое на Render!")
+    lines.append("")
+    # --- 3. Локальные файлы на диске ---
+    disk_rows = []
+    paths = {os.path.basename(str(p)): p for p in STORAGE_BACKUP_FILES}
+    for fn in _DB_CHECK_FILES:
+        p = paths.get(fn, fn)
+        disk_rows.append(f"• {fn}: {'✅' if _os.path.exists(p) else '—'}")
+    lines.append("💾 Локальные файлы (кэш/фолбэк):")
+    lines.extend(disk_rows)
+
+    try:
+        await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.HTML,
+                                      reply_markup=get_developer_keyboard())
+    except Exception:
+        await query.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    return DEV_PANEL
 
 # ==================================
 # === РЕДАКТИРОВАНИЕ ИНСТРУКЦИИ (НОВОЕ) ===
@@ -41547,7 +41784,16 @@ async def _duty_announce(bot, class_obj, selected, sick_note=None):
                 ids = [str(i) for i in (today.get("ids") or [])]
                 if ids:
                     selected = ids
-    if selected and all(isinstance(i, str) and not i.isdigit() for i in selected):
+    # ВОЛНА 22.40: режим имён распознаём устойчиво — раньше список имён,
+    # состоящий из «числоподобных» строк (например «07», «13»), проваливался
+    # в uid-ветку, слал личные сообщения по int(имени) и падал: 0 доставлено,
+    # объявление повторялось и снова падало.
+    _t_names = [str(n) for n in (getattr(class_obj, "duty_today", {}) or {}).get("names") or []] \
+        if isinstance(getattr(class_obj, "duty_today", None), dict) else []
+    _is_names_mode = bool(selected) and all(isinstance(i, str) for i in selected) and (
+        all(not str(i).isdigit() for i in selected)
+        or [str(i) for i in selected] == _t_names)
+    if _is_names_mode:
         names = ", ".join(str(i) for i in selected) if selected else "—"
         members = [str(m) for m in dict.fromkeys(
             [str(m) for m in (class_obj.students or [])] +
@@ -42081,6 +42327,12 @@ async def duty_custom_ai_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("Только для админов класса.", show_alert=True)
         return ADMIN_PANEL
     await query.answer()
+    _puser = get_user(uid)
+    if _puser is not None:
+        # ВОЛНА 22.40: флаг «ждём список» ПЕРСИСТЕНТЕН — после рестарта сервера
+        # FSM-состояние теряется, но присланный список всё равно обработается.
+        _puser.duty_pending = {"mode": "ai", "ts": time.time()}
+        save_user(_puser)
     await query.message.reply_text(
         "🤖 Пришлите <b>список имён</b> — по одному в строке или через запятую. "
         "Можно с пометками и никами, ИИ разберётся.\n\n"
@@ -42104,6 +42356,10 @@ async def duty_custom_dates_cb(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.answer("Только для админов класса.", show_alert=True)
         return ADMIN_PANEL
     await query.answer()
+    _puser = get_user(uid)
+    if _puser is not None:
+        _puser.duty_pending = {"mode": "dates", "ts": time.time()}
+        save_user(_puser)
     await query.message.reply_text(
         "📅 Пришлите <b>список с датами дежурств</b> — по строке на дату:\n\n"
         "<code>01.10 — Вася и Петя\n02.10 — Вася\n05.10 — Петя, Аня</code>\n\n"
@@ -42345,6 +42601,7 @@ async def duty_custom_ai_save(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not class_obj or not user or not _duty_is_admin(uid, class_obj):
         await update.message.reply_text("Только для админов класса.")
         return MAIN_MENU
+    _pending_clear(user)  # ВОЛНА 22.40: список получен — флаг больше не нужен
     days_hint = None
     m_days = re.search(r"(\d{1,2})\s*(?:рабоч\w*|учебн\w*)?\s*дн\w*", raw.lower())
     if "недел" in raw.lower() and m_days and 1 <= int(m_days.group(1)) <= 7:
@@ -42443,6 +42700,7 @@ async def duty_custom_dates_save(update: Update, context: ContextTypes.DEFAULT_T
     if not class_obj or not user or not _duty_is_admin(uid, class_obj):
         await update.message.reply_text("Только для админов класса.")
         return MAIN_MENU
+    _pending_clear(user)  # ВОЛНА 22.40: список получен — флаг больше не нужен
     tz = _duty_tz(class_obj)
     today = (_now_utc() + timedelta(hours=tz)).date()
     ai = await _duty_ai_json(
@@ -43061,6 +43319,88 @@ async def duty_custom_mark_cb(update: Update, context: ContextTypes.DEFAULT_TYPE
     if today_names:
         await _duty_announce(context.bot, class_obj, today_names, sick_note=note)
     return MAIN_MENU
+
+
+# === ВОЛНА 22.40: ДЕЖУРСТВА РАБОТАЮТ ДАЖЕ ПОСЛЕ ПОТЕРИ FSM-СОСТОЯНИЯ ===
+# После рестарта/деплоя (Render Free) in-memory состояния ConversationHandler
+# пусты: 1) кнопки «🤒 заболел(а)»/«🚫 не будет» под УТРЕННИМ сообщением
+# молча не реагировали (обработчики жили только внутри FSM), 2) присланные
+# списки дежурных (свой список / список для ИИ) пропадали без ответа.
+# Теперь: флаг ожидания списка лежит В БАЗЕ (user.duty_pending), а кнопки
+# дежурств ловит глобальный обработчик ВНЕ FSM.
+
+def _pending_clear(user):
+    """Сбросить флаг «ждём список дежурных» (если был)."""
+    try:
+        if user is not None and getattr(user, "duty_pending", None):
+            user.duty_pending = None
+            save_user(user)
+    except Exception:
+        pass
+
+
+async def _duty_pending_text_handler(update: Update,
+                                     context: ContextTypes.DEFAULT_TYPE):
+    """Глобальный приёмник списков дежурных вне ConversationHandler.
+
+    Срабатывает, только если админ ранее нажал «🤖 ИИ по списку» или
+    «📅 Список с датами» (флаг в user.duty_pending), а FSM-состояние было
+    потеряно (рестарт сервера). Текст списка передаётся тем же обработчикам,
+    что и в нормальном потоке — ответ и расписание придут как обычно."""
+    if not update.message or not update.effective_user:
+        return
+    uid = str(update.effective_user.id)
+    user = get_user(uid)
+    if user is None:
+        return
+    pend = getattr(user, "duty_pending", None)
+    if not isinstance(pend, dict):
+        return
+    try:
+        if str(pend.get("mode") or "") not in ("ai", "dates") \
+                or (time.time() - float(pend.get("ts") or 0)) > 3 * 3600:
+            user.duty_pending = None
+            save_user(user)
+            return
+    except Exception:
+        user.duty_pending = None
+        save_user(user)
+        return
+    raw = (update.message.text or "").strip()
+    if raw.lower() in ("отмена", "cancel"):
+        _pending_clear(user)
+        await update.message.reply_text("Загрузка графика отменена.")
+        return
+    # Передаём ТЕМ ЖЕ обработчикам, что и внутри FSM (они сами сбросят флаг).
+    if pend.get("mode") == "ai":
+        await duty_custom_ai_save(update, context)
+    else:
+        await duty_custom_dates_save(update, context)
+
+
+async def _duty_buttons_global(update: Update,
+                               context: ContextTypes.DEFAULT_TYPE):
+    """Глобальный роутер кнопок дежурств ВНЕ FSM: замена заболевшего,
+    «не будет», тест-уведомление и прочие duty_* работают даже когда
+    разговор потерян (после рестарта). Когда FSM активен, апдейт первым
+    забирает ConversationHandler — двойной обработки нет."""
+    return await handle_callback(update, context)
+
+
+class _DutyPendingFilter(filters.MessageFilter):
+    """ВОЛНА 22.40: текст можно трактовать как «список дежурных» только если
+    админ ранее нажал «ИИ по списку»/«Список с датами» и флаг ещё жив."""
+    def filter(self, message):
+        try:
+            if not message.from_user:
+                return False
+            u = get_user(str(message.from_user.id))
+            return bool(u and isinstance(getattr(u, "duty_pending", None), dict))
+        except Exception:
+            return False
+
+
+_DUTY_PENDING_FILTER = _DutyPendingFilter()
 
 
 # === ВОЛНА 22.27/22.28: возрастной гейт 13+ ===
@@ -43730,6 +44070,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "dev_user_management":
         return await dev_user_management_start(update, context)
     # ПУНКТ (цены): возвращены callback'и для быстрого изменения цен функций.
+    elif data == "dev_db_check":
+        # ВОЛНА 22.40: самопроверка базы данных («всё ли сохраняется в базу»).
+        return await dev_db_check_cb(update, context)
     elif data == "dev_quick_prices":
         return await dev_quick_prices_start(update, context)
     elif data.startswith("qprice_pick_"):
@@ -50901,6 +51244,19 @@ def main():
         _cdb_private_doc_handler))
 
     application.add_handler(conv_handler)
+
+    # ВОЛНА 22.40: дежурства вне FSM (после conv_handler, до global cancel —
+    # в той же группе 0 первым срабатывает тот, кто зарегистрирован раньше):
+    # 1) ЛЮБЫЕ duty_* кнопки работают даже когда разговор потерян после
+    #    рестарта («заболел/не будет» под утренним сообщением молчали);
+    # 2) присланный список дежурных (свой/для ИИ) доходит до обработчиков,
+    #    даже если FSM-состояние сброшено (флаг ждём-список — в базе).
+    application.add_handler(CallbackQueryHandler(
+        _duty_buttons_global, pattern=r"^duty_"))
+    application.add_handler(MessageHandler(
+        filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND
+        & _DUTY_PENDING_FILTER,
+        _duty_pending_text_handler))
 
     # ВОЛНА 12: standalone-перехватчик отмены ПОСЛЕ ConversationHandler —
     # срабатывает, когда FSM-состояние ПОТЕРЯНО (state=None после
