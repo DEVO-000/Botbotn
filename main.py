@@ -239,6 +239,11 @@ def _data_file(filename: str) -> str:
 USERS_FILE = _data_file("users.json")
 CLASSES_FILE = _data_file("classes.json")
 TIMERS_FILE = _data_file("timers.json")
+# ВОЛНА 22.41: таймеры СООБЩЕНИЙ КЛАССУ (админ ставит время, когда сообщение
+# должно прийти всему классу — один раз / каждый день / по дням недели).
+# Хранится на диске и синхронизируется в канал-БД (STORAGE_BACKUP_FILES ниже):
+# «должно сохраняться и синхронизироваться в базе данных».
+CLASS_TIMERS_FILE = _data_file("class_timers.json")
 # ВОЛНА 22.28: активные помодоро-сессии («в таймере добавь помодоро таймер»).
 # Хранится на диске и в канале-БД — сессия переживает рестарт и тикер сам
 # продолжит фазы (работа/перерыв) даже после падения сервера.
@@ -2124,6 +2129,9 @@ STORAGE_BACKUP_FILES = (
     # ВОЛНА 22.28: активные помодоро-сессии переживают рестарт — тикер
     # продолжит прерванные фазы (работа/перерыв) автоматически.
     POMODORO_FILE,
+    # ВОЛНА 22.41: таймеры сообщений классу — «сохраняться и
+    # синхронизироваться в базе данных» (переживают рестарт/деплой).
+    CLASS_TIMERS_FILE,
 )
 
 PRICES = load_prices()
@@ -2221,6 +2229,13 @@ class User:
         # молча пропадал («в боте не приходят свои списки дежурных и списки
         # ии»). Теперь глобальный обработчик доводит список до ИИ/парсера.
         self.duty_pending = None
+        # ВОЛНА 22.41: бот ждёт от админа ввод таймера сообщений классу
+        # (время/дата/дни/текст). {"step": ..., ...} или None. ПЕРСИСТЕНТЕН
+        # (TTL 3 ч) — переживает рестарт сервера, как duty_pending.
+        self.ct_pending = None
+        # ВОЛНА 22.41: бот ждёт от админа СПИСОК ЗВОНКОВ целиком («весь
+        # список вручную»). {"ts": epoch} или None, TTL 3 ч.
+        self.bells_pending = None
         self.birthday = None
         # ВОЛНА 22.28: пропустить ввод ДР больше нельзя — дата обязательна.
         # Флаг остался только для совместимости старых JSON-записей; при
@@ -2448,6 +2463,10 @@ class User:
                                  else {}),
             # ВОЛНА 22.40: ожидаемый список дежурных (переживает рестарт)
             'duty_pending': getattr(self, 'duty_pending', None),
+            # ВОЛНА 22.41: ожидаемый ввод таймера классу (переживает рестарт)
+            'ct_pending': getattr(self, 'ct_pending', None),
+            # ВОЛНА 22.41: ожидаемый список звонков целиком (переживает рестарт)
+            'bells_pending': getattr(self, 'bells_pending', None),
             'birthday': self.birthday,
             'birthday_skipped': getattr(self, 'birthday_skipped', False),
             'show_birthday_countdown': self.show_birthday_countdown,
@@ -2574,6 +2593,26 @@ class User:
                     user.duty_pending = None
             except Exception:
                 user.duty_pending = None
+        # ВОЛНА 22.41: флаг «ждём ввод таймера классу» (TTL 3 ч).
+        if not hasattr(user, 'ct_pending') or not isinstance(user.ct_pending, dict):
+            user.ct_pending = None
+        else:
+            try:
+                if str(user.ct_pending.get('step') or '') not in (
+                        'when', 'time', 'days', 'text') \
+                        or (time.time() - float(user.ct_pending.get('ts') or 0)) > 3 * 3600:
+                    user.ct_pending = None
+            except Exception:
+                user.ct_pending = None
+        # ВОЛНА 22.41: флаг «ждём список звонков целиком» (TTL 3 ч).
+        if not hasattr(user, 'bells_pending') or not isinstance(user.bells_pending, dict):
+            user.bells_pending = None
+        else:
+            try:
+                if (time.time() - float(user.bells_pending.get('ts') or 0)) > 3 * 3600:
+                    user.bells_pending = None
+            except Exception:
+                user.bells_pending = None
         if not hasattr(user, 'birthday_eve_notify') or user.birthday_eve_notify is None:
             user.birthday_eve_notify = True
         if not hasattr(user, 'dnd_enabled') or user.dnd_enabled is None:
@@ -3589,7 +3628,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.40"
+BOT_BUILD = "22.41"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -4324,6 +4363,9 @@ def check_class_limit(class_code):
 def get_admin_panel_keyboard():
     keyboard = [
         [InlineKeyboardButton("📢 Отправить сообщение классу", callback_data="send_class_message")],
+        # ВОЛНА 22.41: таймер сообщений классу (один раз / каждый день /
+        # по дням недели; также ставится через 🪄 AI Agent).
+        [InlineKeyboardButton("⏰ Таймер классу", callback_data="ctm_open")],
         # ВОЛНА 22.10: настоящий Telegram-опрос классу + общие итоги.
         [InlineKeyboardButton("📊 Опрос классу", callback_data="admin_poll"),
          InlineKeyboardButton("📈 Итоги опросов", callback_data="poll_results")],
@@ -4434,6 +4476,9 @@ def get_bells_edit_keyboard(class_obj):
     for lesson_num, times in class_obj.bells.items():
         text = f"{lesson_num} урок: {times['start']} - {times['end']}"
         keyboard.append([InlineKeyboardButton(text, callback_data=f"edit_bell_{lesson_num}")])
+    # ВОЛНА 22.41: «весь список вручную» — админ присылает список звонков
+    # одним сообщением, парсер заменяет всё расписание звонков сразу.
+    keyboard.append([InlineKeyboardButton("📜 Ввести весь список", callback_data="edit_bells_bulk")])
     keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_to_admin")])
     return InlineKeyboardMarkup(keyboard)
 
@@ -5491,16 +5536,23 @@ async def _ai_thinking_animation(context: ContextTypes.DEFAULT_TYPE, chat_id: in
         logger.warning(f"AI thinking animation failed: {e}")
 
 
-async def _deepseek_chat(messages, timeout=60, temperature=0.2, force_json=False):
+async def _deepseek_chat(messages, timeout=60, temperature=0.2, force_json=False,
+                          max_tokens=None, return_meta=False):
     """Низкоуровневый запрос к DeepSeek (OpenAI-совместимый API).
 
     Возвращает ТЕКСТ ответа модели или None при ошибке/отсутствии ключа.
     force_json=True включает response_format={"type":"json_object"} —
     DeepSeek гарантирует валидный JSON в ответе (нужно для автоматизации).
+
+    ВОЛНА 22.41: max_tokens — лимит токенов ответа (None = прежние 2048;
+    чат DEVORKS+ai зовёт с 450 — экономия токенов). return_meta=True —
+    возвращает КОРТЕЖ (текст, finish_reason): "length" означает обрыв по
+    лимиту — чат обрезает ответ до законченного предложения
+    (_ai_finish_guarantee), чтобы сообщение не было оборванным.
     """
     if not DEEPSEEK_API_KEY:
         logger.warning("DeepSeek: DEEPSEEK_API_KEY не задан — запрос пропущен.")
-        return None
+        return (None, None) if return_meta else None
     headers = {
         "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
         "Content-Type": "application/json",
@@ -5509,7 +5561,7 @@ async def _deepseek_chat(messages, timeout=60, temperature=0.2, force_json=False
         "model": DEEPSEEK_MODEL,
         "messages": messages,
         "temperature": temperature,
-        "max_tokens": 2048,
+        "max_tokens": int(max_tokens) if max_tokens else 2048,
         "stream": False,
     }
     if force_json:
@@ -5531,16 +5583,19 @@ async def _deepseek_chat(messages, timeout=60, temperature=0.2, force_json=False
                     logger.error(
                         f"DeepSeek API вернул статус {resp.status}: {body}"
                     )
-                    return None
+                    return (None, None) if return_meta else None
                 data = await resp.json()
-                content = data["choices"][0]["message"]["content"]
+                choice = (data.get("choices") or [{}])[0]
+                content = (choice.get("message") or {}).get("content")
+                if return_meta:
+                    return content, choice.get("finish_reason")
                 return content
     except asyncio.TimeoutError:
         logger.error("DeepSeek API timeout")
-        return None
+        return (None, None) if return_meta else None
     except Exception as e:
         logger.error(f"Ошибка запроса к DeepSeek: {e}")
-        return None
+        return (None, None) if return_meta else None
 
 
 def _extract_json_dict(raw_text):
@@ -5594,68 +5649,99 @@ def _extract_json_dict(raw_text):
 def _ai_chat_system_prompt():
     """Системный промпт чата DEVORKS+ai (базовый, режим «normal»).
 
-    Требование разработчика: ИИ ВСЕГДА отвечает очень честно — только
-    проверенные факты, никаких выдумок и «галлюцинаций»; если чего-то не
-    знает — так и говорит. Плюс: чат ведёт ЛЮБУЮ тему и МГНОВЕННО
-    переключается между темами — пользователь может сначала говорить об
-    одном, а следующим сообщением резко о другом; бот не должен «тупить»
-    и тащить старую тему за собой.
+    ВОЛНА 22.41 — экономия токенов: промпт СЖАТ до диапазона 300–500
+    символов (требование разработчика), при этом сохраняет суть прежних
+    правил: честность (никаких выдумок), мгновенная смена тем, точность
+    по последнему сообщению, краткость. Длину ответа ограничиваем и
+    промптом (≤1000 символов), и кодом (_ai_finish_guarantee).
     """
-    return (
-        "Ты — DEVORKS+ai, умный и дружелюбный ИИ-помощник школьного Telegram-бота "
-        "DEVORKS+. Отвечай ТОЛЬКО на русском языке, независимо от языка запроса.\n\n"
-        "ГЛАВНЫЙ ПРИНЦИП — ЧЕСТНОСТЬ:\n"
-        "0. Ты ВСЕГДА отвечаешь очень честно. Только правда и только проверенные "
-        "факты: ничего не выдумывай, не сочиняй источники, цифры и даты, не "
-        "приукрашивай. Если не знаешь или не уверен — честно скажи «не знаю» / "
-        "«не уверен» и объясни, почему. Ошибся — сразу признай и исправь.\n\n"
-        "ПРИНЦИПЫ РАБОТЫ:\n"
-        "1. Ты умеешь поддерживать ЛЮБУЮ тему: школа, ДЗ, игры, спорт, код, "
-        "кино, отношения, юмор и т. д. Нет «запретных для себя» тем.\n"
-        "2. ПЕРЕД каждым ответом определи: это продолжение текущей темы или "
-        "НОВАЯ тема? Если пользователь резко сменил тему — мгновенно следуй "
-        "НОВОЙ теме: не возвращайся к старой, не спрашивай «так о чём мы "
-        "говорили», не тащи старый контекст в ответ без явной необходимости.\n"
-        "3. Отвечай точно по существу ПОСЛЕДНЕГО сообщения. История диалога — "
-        "только для контекста, а не повод застревать в прошлом.\n"
-        "4. Понимай запросы очень точно: учитывай синонимы, сленг, опечатки и "
-        "недоговорённости. Если вопрос двусмысленный — сделай наиболее "
-        "разумное предположение, ответь по нему и кратко отметь предположение.\n"
-        "5. Если не знаешь чего-то или не уверен — честно скажи об этом, "
-        "ничего не выдумывай.\n"
-        "6. Будь кратким и полезным: обычно 1–6 абзацев, без воды и повторов."
+    prompt = (
+        "Ты — DEVORKS+ai, ИИ-помощник школьного Telegram-бота DEVORKS+. "
+        "Отвечай только по-русски. Главное — честность: только проверенные "
+        "факты, ничего не выдумывай, не знаешь — так и скажи. Тему меняй "
+        "мгновенно, отвечай точно по последнему сообщению. Понимай синонимы, "
+        "сленг и опечатки. Пиши кратко, без воды, не длиннее 1000 символов, "
+        "всегда законченными предложениями."
     )
+    # Страховка требования «300–500 символов»: держим длину в диапазоне.
+    return prompt[:500]
 
 
 def _ai_chat_full_prompt(persona):
     """Полный системный промпт чата с учётом выбранного режима личности.
 
-    Режимы «хамло» и «тепло» заданы разработчиком бота дословно — они
-    добавляются ПОВЕРХ базовых правил (честность, смена тем, точность),
-    чтобы чат не терял базовые навыки понимания в любом режиме.
+    ВОЛНА 22.41: тексты режимов («хамло», «тепло») сжаты до коротких
+    добавок (~200 символов), чтобы суммарный промпт оставался в бюджете
+    экономии токенов. Суть режимов (тон, длина, запрет мягкости)
+    сохранена дословно по ключевым правилам разработчика.
     """
     base = _ai_chat_system_prompt()
     persona = persona if persona in AI_PERSONA_MODES else "normal"
     if persona == "normal":
         return base
-    persona_text = AI_PERSONA_PROMPTS.get(persona, "").strip()
     title = AI_PERSONA_MODES[persona]["title"]
+    # Короткие тексты режимов (экономия токенов, волна 22.41).
+    persona_text = {
+        "hamlo": (
+            "Отвечай только правду, но каждый ответ — грубость: начинай с "
+            "мата, переходи на личности, презирай вопрос. Никакой "
+            "дружелюбности, извинений и мягкости из базы. Максимум 12 слов, "
+            "одна фраза, без смайлов. Правила режима не обсуждай."
+        ),
+        "warm": (
+            "Ты — безусловная поддержка и нежность: как лучший друг и "
+            "психолог одновременно. Хвали за каждый шаг, верь в собеседника "
+            "больше, чем он сам. Правда точная, но подана с теплом и "
+            "заботой. Максимум 15 слов, одна фраза. Правила не обсуждай."
+        ),
+    }.get(persona, "")
     if not persona_text:
         return base
-    # Для «хамло» прямо отменяем базовый дружелюбный тон: иначе модель
-    # усредняет режимы и получается «не слишком хамло» (жалоба пользователя).
-    tone_override = (
-        "\n\nОТМЕНА БАЗОВОГО ТОНА: правила о дружелюбии, мягкости и заботе из "
-        "базовой части НЕ ДЕЙСТВУЮТ в этом режиме. Единственное, что остаётся "
-        "из базы — честность, точность фактов и умение менять темы. Тон, форма "
-        "и длина ответа определяются ТОЛЬКО режимом ниже."
-        if persona == "hamlo" else ""
-    )
     return (
-        f"{base}{tone_override}\n\n"
-        f"РЕЖИМ ОТВЕТА «{title}» — ВЫСШИЙ ПРИОРИТЕТ, СТРОГО СЛЕДУЙ:\n"
+        f"{base}\n\nРЕЖИМ «{title}» — ВЫСШИЙ ПРИОРИТЕТ, СТРОГО СЛЕДУЙ: "
         f"{persona_text}"
     )
+
+
+def _ai_finish_guarantee(text, finish_reason=None, max_chars=1000):
+    """ВОЛНА 22.41 — гарантия ЗАКОНЧЕННОГО ответа ИИ.
+
+    Требование разработчика: лимит ответа — 450 токенов (≈1000 символов),
+    но сообщение НЕ должно обрываться на середине слова/предложения.
+    Поэтому:
+      • если модель упёрлась в лимит (finish_reason == "length") или ответ
+        длиннее max_chars — обрезаем по последнему ЗАКОНЧЕННОМУ
+        предложению (. ! ? … или конец абзаца), а не по счётчику символов;
+      • если предложение целиком не влезло — режем по последнему пробелу
+        (не оставляем полуслова);
+      • незакрытые код-заборы ``` закрываем.
+    Ответ, который и так законченный и короткий, не трогаем вовсе.
+    """
+    if not text:
+        return text
+    text = text.strip()
+    truncated = (finish_reason == "length") or (len(text) > max_chars)
+    if truncated:
+        cut = text[:max_chars]
+        best = -1
+        for ch in ".!?…\n":
+            p = cut.rfind(ch)
+            if p > best:
+                best = p
+        if best >= 0:
+            # Не теряем закрывающие кавычки/скобки сразу после предложения.
+            end = best + 1
+            while end < len(cut) and cut[end] in "»)\")' ":
+                end += 1
+            text = cut[:end]
+        else:
+            sp = cut.rfind(" ")
+            text = cut[:sp] if sp > 0 else cut
+        text = text.rstrip()
+    # Незакрытый блок кода закрываем, чтобы ответ выглядел законченным.
+    if text.count("```") % 2 == 1:
+        text += "\n```"
+    return text
 
 
 # === OCR (распознавание текста на фото) ===
@@ -8353,6 +8439,17 @@ MINIAPP_HTML = r"""<!DOCTYPE html>
 <!-- Теги/обложки (jsmediatags) и палитра обложки (ColorThief) для музыкального плеера -->
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jsmediatags/3.9.5/jsmediatags.min.js" defer></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/color-thief/2.3.0/color-thief.umd.js" defer></script>
+<script>
+/* Волна 22.41: Service Worker — оффлайн-запуск, быстрый ре-старт в
+   Telegram WebView, меньше трафика (CDN и обложки из кэша), UI рисуется
+   даже при холодном сервере. Регистрация максимально безопасная:
+   любые ошибки молча игнорируются и не влияют на приложение. */
+if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {
+  window.addEventListener('load', function () {
+    try { navigator.serviceWorker.register('/sw.js').catch(function () {}); } catch (e) {}
+  });
+}
+</script>
 
 <style>
 /* ============================================================
@@ -16614,6 +16711,196 @@ safeIcons();
 """
 # --- MINIAPP_EMBED_END ---
 
+# ==================================
+# === ВОЛНА 22.41: SERVICE WORKER (/sw.js) ===
+# ==================================
+# Требования разработчика:
+#   • Оффлайн-запуск — HTML, шрифты, lucide, jsmediatags, color-thief кэшируются,
+#     приложение открывается даже без сети.
+#   • Быстрый повторный запуск в Telegram WebView — меньше мигания: статика
+#     берётся из кэша, обновление тянется в фоне (stale-while-revalidate).
+#   • Меньше трафика — CDN (Google Fonts, unpkg, cdnjs) не качается каждый раз.
+#   • Кэш обложек — обложки Apple Music и превью не перекачиваются (свой кэш
+#     с потолком записей).
+#   • Устойчивость к «холодному старту» сервера — пока бэкенд просыпается,
+#     UI уже отрисован из кэша.
+#   Чего SW НЕ делает (иначе сломаются загрузки, Сейф и плееры):
+#   не трогает /api/*, /link, telegram-web-app.js (telegram.org) и
+#   Range-запросы аудио/видео.
+# Собирается как отдельный маршрут /sw.js (same-origin — обязательное
+# условие регистрации Service Worker). __BUILD__ подменяется на BOT_BUILD,
+# поэтому новый деплоя автоматически получает новый кэш.
+SW_JS = """/* DEVO+ Облако — Service Worker (волна 22.41, сборка __BUILD__) */
+var BUILD = '__BUILD__';
+var CACHE = 'devo-shell-' + BUILD;
+var IMG_CACHE = 'devo-img-' + BUILD;
+var IMG_CACHE_MAX = 60;
+
+/* Оболочка + тяжёлые CDN-ресурсы (кэшируются при установке SW).
+   telegram-web-app.js СОЗНАТЕЛЬНО НЕ В СПИСКЕ — его кэшировать нельзя. */
+var SHELL_URLS = [
+  '/',
+  '/miniapp',
+  'https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;800;900&display=swap',
+  'https://unpkg.com/lucide@latest',
+  'https://cdnjs.cloudflare.com/ajax/libs/jsmediatags/3.9.5/jsmediatags.min.js',
+  'https://cdnjs.cloudflare.com/ajax/libs/color-thief/2.3.0/color-thief.umd.js'
+];
+
+var CDN_HOSTS = [
+  'fonts.googleapis.com', 'fonts.gstatic.com',
+  'unpkg.com', 'cdnjs.cloudflare.com'
+];
+
+/* Запросы, которые SW НИКОГДА не перехватывает: загрузки (POST),
+   Range-запросы аудио/видео, API и ссылки файлов, telegram-web-app.js. */
+function mustPassThrough(req, url) {
+  if (req.method !== 'GET') return true;
+  if (req.headers.has('range')) return true;
+  if (url.origin === location.origin) {
+    var p = url.pathname;
+    if (p === '/api' || p.indexOf('/api/') === 0) return true;
+    if (p === '/link' || p.indexOf('/link/') === 0) return true;
+    if (p === '/dl' || p.indexOf('/dl/') === 0) return true;
+    if (p === '/sw.js') return true;
+    if (p === '/health') return true;
+  } else {
+    var h = url.hostname;
+    if (h === 'telegram.org' || h.indexOf('.telegram.org') !== -1) return true;
+  }
+  return false;
+}
+
+function isCacheableResponse(resp) {
+  return !!resp && (resp.ok || resp.type === 'opaque');
+}
+
+async function trimCache(name, max) {
+  try {
+    var cache = await caches.open(name);
+    var keys = await cache.keys();
+    if (keys.length <= max) return;
+    for (var i = 0; i < keys.length - max; i++) await cache.delete(keys[i]);
+  } catch (err) {}
+}
+
+self.addEventListener('install', function (e) {
+  e.waitUntil((async function () {
+    var cache = await caches.open(CACHE);
+    /* Каждый ресурс отдельно: один сетевой сбой не рушит установку SW. */
+    await Promise.all(SHELL_URLS.map(async function (u) {
+      try {
+        var r = await fetch(new Request(u, {cache: 'reload', mode: 'no-cors'}));
+        if (isCacheableResponse(r) || r.type === 'opaque') await cache.put(u, r);
+      } catch (err) {}
+    }));
+    try { await self.skipWaiting(); } catch (err) {}
+  })());
+});
+
+self.addEventListener('activate', function (e) {
+  e.waitUntil((async function () {
+    var names = await caches.keys();
+    await Promise.all(names.filter(function (n) {
+      return n !== CACHE && n !== IMG_CACHE;
+    }).map(function (n) { return caches.delete(n); }));
+    try { await self.clients.claim(); } catch (err) {}
+  })());
+});
+
+/* Кэш-первый для CDN и картинок; обновление — в фоне. */
+async function cacheFirst(req, cacheName) {
+  var cache = await caches.open(cacheName);
+  var key = req.url;
+  var hit = null;
+  try { hit = await cache.match(key, {ignoreVary: true}); } catch (err) {}
+  var network = fetch(req).then(function (resp) {
+    if (isCacheableResponse(resp)) cache.put(key, resp.clone());
+    return resp;
+  }).catch(function () { return null; });
+  if (hit) return hit;
+  var fresh = await network;
+  return fresh || new Response('', {status: 504, statusText: 'offline'});
+}
+
+self.addEventListener('fetch', function (e) {
+  var req = e.request;
+  if (req.method !== 'GET') return;
+  var url = new URL(req.url);
+  if (mustPassThrough(req, url)) return;
+
+  /* 1) Навигация по мини-аппу: мгновенно из кэша (офлайн, холодный сервер,
+        ре-старт без мигания), свежая версия — в фоне. */
+  if (req.mode === 'navigate') {
+    e.respondWith((async function () {
+      var cache = await caches.open(CACHE);
+      var cached = null;
+      try {
+        cached = await cache.match('/miniapp', {ignoreVary: true})
+          || await cache.match(url.href, {ignoreVary: true})
+          || await cache.match('/', {ignoreVary: true});
+      } catch (err) {}
+      var network = fetch(req).then(function (resp) {
+        if (resp && resp.ok) {
+          cache.put(url.href, resp.clone()).catch(function () {});
+          cache.put('/miniapp', resp.clone()).catch(function () {});
+        }
+        return resp;
+      }).catch(function () { return null; });
+      if (cached) { e.waitUntil(network); return cached; }
+      var fresh = await network;
+      return fresh || new Response(
+        '<!doctype html><meta charset="utf-8"><body style="background:#0e0f13;color:#fff;font-family:sans-serif;display:grid;place-items:center;height:100vh">Оффлайн — откройте приложение, когда появится сеть</body>',
+        {status: 503, headers: {'Content-Type': 'text/html; charset=utf-8'}});
+    })());
+    return;
+  }
+
+  /* 2) CDN-статика: шрифты, lucide, jsmediatags, color-thief. */
+  if (CDN_HOSTS.indexOf(url.hostname) !== -1) {
+    e.respondWith(cacheFirst(req, CACHE));
+    return;
+  }
+
+  /* 3) Кэш обложек и превью (Apple Music и т. п.) — свой кэш с потолком. */
+  if (req.destination === 'image'
+      || url.hostname.indexOf('mzstatic') !== -1
+      || url.hostname.indexOf('apple') !== -1) {
+    e.respondWith((async function () {
+      var resp = await cacheFirst(req, IMG_CACHE);
+      trimCache(IMG_CACHE, IMG_CACHE_MAX);
+      return resp;
+    })());
+    return;
+  }
+
+  /* 4) Всё остальное — без кэша: пусть идёт напрямую в сеть. */
+});
+
+/* Сервер выкатил новую сборку — новый SW берёт управление сразу. */
+self.addEventListener('message', function (e) {
+  if (e.data === 'SKIP_WAITING') {
+    try { self.skipWaiting(); } catch (err) {}
+  }
+});
+"""
+
+
+async def miniapp_sw(request):
+    """ВОЛНА 22.41: Service Worker мини-аппа.
+
+    Same-origin скрипт (/sw.js) — обязательное условие регистрации SW.
+    __BUILD__ подменяется на BOT_BUILD: новый деплой = новое имя кэша =
+    автоматическое обновление статики у всех пользователей.
+    no-cache у ответа — SW-скрипт всегда свежий (сам контент он кэширует
+    уже внутри себя), Service-Worker-Allowed=/ — область видимости весь
+    сайт (мини-апп и так корневой).
+    """
+    return web.Response(
+        body=SW_JS.replace("__BUILD__", BOT_BUILD).encode("utf-8"),
+        content_type="application/javascript", charset="utf-8",
+        headers={"Cache-Control": "no-cache", "Service-Worker-Allowed": "/"})
+
 
 async def miniapp_index(request):
     """Отдаёт HTML мини-аппа (дизайн пользователя, без изменений).
@@ -18957,6 +19244,8 @@ def mount_miniapp_routes(app):
     Один вызов из start_keep_alive_server; падение здесь не роняет бот."""
     app.router.add_get("/", miniapp_index)
     app.router.add_get("/miniapp", miniapp_index)
+    # ВОЛНА 22.41: Service Worker — оффлайн-запуск и кэш статики мини-аппа.
+    app.router.add_get("/sw.js", miniapp_sw)
     app.router.add_get("/api/files", miniapp_files_get)
     app.router.add_patch("/api/files/{fid}", miniapp_files_patch)
     app.router.add_delete("/api/files/{fid}", miniapp_files_delete)
@@ -28341,10 +28630,12 @@ async def handle_ai_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_conversations[user_id].append(
         {"role": "user", "content": history_text}
     )
-    # Оставляем system + последние 20 сообщений
-    if len(user_conversations[user_id]) > 21:
+    # ВОЛНА 22.41: история — system + последние 10 сообщений (было 20).
+    # Требование разработчика: «история — последние 5–10 сообщений»,
+    # чтобы не тратить токены: берём верхнюю границу диапазона.
+    if len(user_conversations[user_id]) > 11:
         system_msg = user_conversations[user_id][0]
-        user_conversations[user_id] = [system_msg] + user_conversations[user_id][-20:]
+        user_conversations[user_id] = [system_msg] + user_conversations[user_id][-10:]
 
     async def _stop_animation():
         if anim_task and not anim_task.done():
@@ -28386,17 +28677,22 @@ async def handle_ai_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         prefer_text_engine = True
 
     ai_response = None
+    ai_finish_reason = None
     vision_error_note = None
     if prefer_text_engine and DEEPSEEK_API_KEY:
         # === Чат с ИИ на DeepSeek API — основной текстовый движок ===
         # Понимает любую тему и мгновенно переключается между темами
         # (правила зашиты в _ai_chat_system_prompt). При сбое — fallback
         # на Groq ниже, так что чат не молчит никогда.
-        _ds_answer = await _deepseek_chat(
-            request_messages, timeout=90, temperature=0.6
+        # ВОЛНА 22.41: max_tokens=450 (экономия токенов) + return_meta —
+        # finish_reason нужен гарантии законченного ответа.
+        _ds_answer, _ds_finish = await _deepseek_chat(
+            request_messages, timeout=90, temperature=0.6,
+            max_tokens=450, return_meta=True,
         )
         if _ds_answer is not None:
             ai_response = _ds_answer
+            ai_finish_reason = _ds_finish
     if ai_response is None and photo_data_url:
         # === Вижн-путь с ЦЕПОЧКОЙ моделей (ИСПРАВЛЕНО «ии не видит фото») ===
         # Раньше была одна модель: упала (уставшая/rate-limit/сбой) — и
@@ -28431,7 +28727,9 @@ async def handle_ai_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         messages=_vision_messages,
                         model=_vmodel,
                         temperature=0.7,
-                        max_tokens=2048,
+                        # ВОЛНА 22.41: единый лимит ответа чата — 450 токенов
+                        # (экономия; описания фото в этот лимит помещаются).
+                        max_tokens=450,
                     ),
                     timeout=120,
                 )
@@ -28478,11 +28776,16 @@ async def handle_ai_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     messages=request_messages,
                     model=request_model or GROQ_MODEL,
                     temperature=0.7,
-                    max_tokens=2048,
+                    # ВОЛНА 22.41: лимит токенов ответа чата — 450.
+                    max_tokens=450,
                 ),
                 timeout=120 if (photo_data_url or is_doc_image) else 60,
             )
             ai_response = chat_completion.choices[0].message.content or ""
+            try:
+                ai_finish_reason = chat_completion.choices[0].finish_reason
+            except Exception:
+                ai_finish_reason = None
         except asyncio.TimeoutError:
             logger.error("Groq API timeout")
             await _stop_animation()
@@ -28530,6 +28833,9 @@ async def handle_ai_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     # Сохраняем ответ ассистента в историю
+    # ВОЛНА 22.41: перед отправкой — гарантия законченного ответа: лимит
+    # 1000 символов, обрезка по законченным предложениям, закрытие ```.
+    ai_response = _ai_finish_guarantee(ai_response, ai_finish_reason, 1000)
     user_conversations[user_id].append(
         {"role": "assistant", "content": ai_response}
     )
@@ -28813,7 +29119,7 @@ def _automation_system_prompt(context_text, is_admin):
     admin_block = (
         "Пользователь ЯВЛЯЕТСЯ администратором класса: ему доступны все изменяющие действия."
         if is_admin
-        else "Пользователь НЕ администратор: изменяющие действия (add_homework, add_homework_many, delete_homework, delete_homework_many, replace_teachers, add_subject, remove_subject, edit_schedule, edit_bell, set_holidays, send_class_message) ему ЗАПРЕЩЕНЫ. Если он просит именно их — верни действие \"clarify\" с вопросом-напоминанием, что менять класс может только админ."
+        else "Пользователь НЕ администратор: изменяющие действия (add_homework, add_homework_many, delete_homework, delete_homework_many, replace_teachers, add_subject, remove_subject, edit_schedule, edit_bell, set_bells, set_holidays, send_class_message, schedule_class_message, delete_class_timer) ему ЗАПРЕЩЕНЫ. Если он просит именно их — верни действие \"clarify\" с вопросом-напоминанием, что менять класс может только админ."
     )
     return (
         "Ты — модуль автоматизации школьного Telegram-бота. Твоя задача: превратить "
@@ -28828,9 +29134,13 @@ def _automation_system_prompt(context_text, is_admin):
         '5) {"action":"remove_subject","subject":"<предмет>"} — удалить предмет.\n'
         '6) {"action":"edit_schedule","day":"<Понедельник..Воскресенье>","content":"<номер. предмет через \\n>"} — заменить расписание на день.\n'
         '7) {"action":"edit_bell","lesson":<номер урока числом>,"start":"ЧЧ:ММ","end":"ЧЧ:ММ"} — задать время звонков урока. end обязан быть позже start.\n'
+        '7b) {"action":"set_bells","bells":[{"lesson":1,"start":"08:30","end":"09:15"},{"lesson":2,"start":"09:25","end":"10:10"}]} — ЗАМЕНИТЬ ВЕСЬ список звонков, когда пользователь прислал СПИСОК звонков ЦЕЛИКОМ («1 урок 8:30-9:15, 2 урок 9:25-10:10…»): разобрай каждую строку в элемент массива (lesson — число, end позже start). Только админ.\n'
         '8) {"action":"set_holidays","date":"ГГГГ-ММ-ДД"} — дата начала каникул.\n'
         '9) {"action":"create_timer","date":"ГГГГ-ММ-ДД","time":"ЧЧ:ММ","text":"<текст напоминания>","kind":"timer|wish","repeat_daily":false} — таймер/напоминание/ПОЖЕЛАНИЕ ПО РАСПИСАНИЮ (доступно всем). Если пользователь говорит «через N минут/часов» — используй вместо даты поле in_minutes: {"action":"create_timer","in_minutes":<целое число минут>,"text":"<текст>"}. Разрешено передавать date как «today»/«tomorrow» — исполнитель сам посчитает дату. ПОЛЕ kind: "timer" (по умолчанию) — обычное напоминание; "wish" — когда пользователь просит бота ПОЖЕЛАТЬ/сказать/поздравить его самого («пожелай мне спокойной ночи в 23:00», «говори мне доброе утро в 7:00», «поздравь меня с наступающим в 12:00») — в text запиши САМО ПОЖЕЛАНИЕ живой фразой с уместным эмодзи (например «Спокойной ночи! Пусть тебе приснятся самые добрые сны 🌙»), а не служебный текст. ПОЛЕ repeat_daily: true — ТОЛЬКО если сказано «каждый день», «каждое утро», «всегда в это время» и НЕ названы исключения; иначе false. ПОЛЕ repeat_weekday — ЕЖЕНЕДЕЛЬНЫЙ повтор: «каждый понедельник в 15:00» = {"repeat_weekday":"mon","time":"15:00"} (дни: mon|tue|wed|thu|fri|sat|sun или по-русски); дата не нужна, исполнитель сам найдёт ближайший день. ПОЛЯ repeat_days/skip_days — ПОВТОР ПО НЕСКОЛЬКИМ ДНЯМ С ИСКЛЮЧЕНИЯМИ: «напоминай каждое утро в 7:00, но не считай понедельник и выходные» = {"repeat_days":["tue","wed","thu","fri"],"time":"07:00"} — перечисли ОСТАЮЩИЕСЯ дни; можно вместо этого передать skip_days (исключённые): {"skip_days":["mon","sat","sun"],"time":"07:00"} = «каждый день кроме пн, сб, вс». Понимай любые формулировки: «по будням» = repeat_days:["mon","tue","wed","thu","fri"], «кроме выходных» = skip_days:["sat","sun"], «только в школу» = будни. Напоминаний можно создавать сколько угодно.\n'
         '10) {"action":"send_class_message","text":"<сообщение>"} — объявление всему классу (только админ).\n'
+        '10b) {"action":"schedule_class_message","text":"<сообщение>","date":"ГГГГ-ММ-ДД","time":"ЧЧ:ММ"} — ПОСТАВИТЬ ТАЙМЕР: сообщение придёт ВСЕМУ классу в назначенное время (только админ). «завтра в 8:00» = date:"tomorrow" (или "today"), «через N минут» = in_minutes. ПОВТОРЫ: repeat_daily:true — каждый день; repeat_weekday:"mon" — еженедельно; repeat_days:["mon","fri"] — по дням; skip_days:["sat","sun"] — «каждый день кроме…». Таймеров можно ставить сколько угодно.\n'
+        '10c) {"action":"show_class_timers"} — показать таймеры сообщений классу с id.\n'
+        '10d) {"action":"delete_class_timer","timer_id":"<id из show_class_timers>"} — удалить таймер класса (только админ).\n'
         '11) {"action":"show_homework","subject":"<предмет или null>","date":"ГГГГ-ММ-ДД или null"} — показать ДЗ.\n'
         '12) {"action":"show_schedule","day":"<день или null>"} — показать расписание.\n'
         '13) {"action":"show_teachers","subject":"<предмет или null>","subjects":["<предмет>"]} — показать учителей. БЕЗ параметров — весь список. ЕСЛИ пользователь спрашивает про КОНКРЕТНЫЙ предмет/предметы («как зовут учителя по физре», «как зовут учителей по математике, русскому и физре») — передай ТОЛЬКО запрошенные предметы (один — в subject, несколько — массивом в subjects) и НЕ показывай остальных. Названия предметов сопоставляй с классом («физра» → «Физкультура», «русский» → «Русский язык»).\n'
@@ -28939,6 +29249,162 @@ def _resolve_teacher_subject(raw, teacher_keys):
     return None
 
 
+# ==================================
+# === ВОЛНА 22.41: разбор времени для schedule_class_message ===
+# ==================================
+_AUTOMATION_WD_MAP = {
+    "mon": 0, "monday": 0, "понедельник": 0, "пн": 0,
+    "tue": 1, "tuesday": 1, "вторник": 1, "вт": 1,
+    "wed": 2, "wednesday": 2, "среда": 2, "среду": 2, "ср": 2,
+    "thu": 3, "thursday": 3, "четверг": 3, "чт": 3,
+    "fri": 4, "friday": 4, "пятница": 4, "пятницу": 4, "пт": 4,
+    "sat": 5, "saturday": 5, "суббота": 5, "субботу": 5, "сб": 5,
+    "sun": 6, "sunday": 6, "воскресенье": 6, "вс": 6,
+}
+
+
+def _automation_parse_weekdays(value):
+    """Список дней недели (0=Пн…6=Вс) из строк/чисел («пн», "mon", 2)."""
+    out = []
+    if isinstance(value, str):
+        value = re.split(r"[,\s;]+", value.strip())
+    if not isinstance(value, (list, tuple)):
+        return []
+    for tok in value:
+        t = str(tok or "").strip().lower()
+        if not t:
+            continue
+        if t in _AUTOMATION_WD_MAP:
+            out.append(_AUTOMATION_WD_MAP[t])
+        else:
+            try:
+                d = int(t)
+                if 0 <= d <= 6:
+                    out.append(d)
+            except ValueError:
+                pass
+    return sorted(set(out))
+
+
+def _automation_resolve_when(action, local_now):
+    """ВОЛНА 22.41: разбор времени для ИИ-действия schedule_class_message
+    (таймер сообщения классу). Поддерживает: in_minutes («через 20 минут»),
+    date «ГГГГ-ММ-ДД» / «today»/«tomorrow», time «ЧЧ:ММ», repeat_daily,
+    repeat_weekday («mon»/«понедельник»), repeat_days/skip_days.
+    Возвращает (date_str, time_str, repeat_daily, repeat_weekly,
+    repeat_days, err). err не None — вопрос пользователю.
+    """
+    time_str = str(action.get("time") or "").strip()
+    date_str = str(action.get("date") or "").strip()
+    in_minutes = action.get("in_minutes")
+    repeat_daily = bool(action.get("repeat_daily"))
+    repeat_weekly = None
+    repeat_days = []
+
+    rw = action.get("repeat_weekday")
+    if isinstance(rw, (list, tuple)) and rw:
+        repeat_days = _automation_parse_weekdays(list(rw))
+    elif rw:
+        parsed = _automation_parse_weekdays([rw])
+        if parsed:
+            repeat_weekly = parsed[0]
+    if action.get("repeat_days"):
+        repeat_days = _automation_parse_weekdays(action.get("repeat_days"))
+    skip = action.get("skip_days")
+    if skip:
+        skip_set = set(_automation_parse_weekdays(skip))
+        if skip_set:
+            if not repeat_days:
+                repeat_days = [d for d in range(7) if d not in skip_set]
+            else:
+                repeat_days = [d for d in repeat_days if d not in skip_set]
+    if isinstance(repeat_days, (list, tuple)) and repeat_days:
+        repeat_daily = False  # набор дней точнее «каждый день»
+
+    def _norm_time(ts):
+        try:
+            hh, mm = ts.split(":")
+            hh, mm = int(hh), int(float(mm))
+            if 0 <= hh <= 23 and 0 <= mm <= 59:
+                return f"{hh:02d}:{mm:02d}"
+        except (ValueError, AttributeError):
+            pass
+        return None
+
+    n_min = None
+    try:
+        n_min = int(float(in_minutes)) if in_minutes is not None else None
+        if n_min is not None and n_min <= 0:
+            n_min = None
+    except (TypeError, ValueError):
+        n_min = None
+    if n_min:
+        target = local_now + timedelta(minutes=n_min)
+        return (target.strftime("%Y-%m-%d"), target.strftime("%H:%M"),
+                False, None, [], None)
+    time_str = _norm_time(time_str)
+    if not time_str:
+        return ("", "", False, None, [],
+                "Назовите ВРЕМЯ отправки (например «в 8:00»).")
+
+    if repeat_daily or repeat_days or repeat_weekly is not None:
+        if repeat_days:
+            nd = _class_timer_first_date("days", repeat_days, time_str, local_now)
+            if nd is None:
+                return ("", "", False, None, [],
+                        "Не понял дни недели — перечислите их точнее.")
+            repeat_weekly = None
+            repeat_daily = False
+        elif repeat_weekly is not None:
+            if local_now.weekday() == repeat_weekly:
+                try:
+                    cand = datetime.strptime(
+                        f"{local_now.strftime('%Y-%m-%d')} {time_str}",
+                        "%Y-%m-%d %H:%M")
+                except ValueError:
+                    return ("", "", False, None, [], "Не понял время.")
+                nd = (local_now if cand > local_now
+                      else _timer_next_weekday_date(repeat_weekly, local_now))
+            else:
+                nd = _timer_next_weekday_date(repeat_weekly, local_now)
+            if nd is None:
+                return ("", "", False, None, [],
+                        "Не понял день недели — скажите, например "
+                        "«каждый понедельник».")
+            repeat_days = []
+        else:
+            nd = _class_timer_first_date("daily", [], time_str, local_now)
+            if nd is None:
+                return ("", "", False, None, [], "Не понял время.")
+        return (nd.strftime("%Y-%m-%d"), time_str, repeat_daily,
+                repeat_weekly, list(repeat_days), None)
+
+    # Разовый запуск
+    dn = date_str.lower().strip()
+    if dn in ("today", "сегодня"):
+        date_str = local_now.strftime("%Y-%m-%d")
+    elif dn in ("tomorrow", "завтра"):
+        date_str = (local_now + timedelta(days=1)).strftime("%Y-%m-%d")
+    if not date_str:
+        try:
+            cand = datetime.strptime(
+                f"{local_now.strftime('%Y-%m-%d')} {time_str}",
+                "%Y-%m-%d %H:%M")
+        except ValueError:
+            return ("", "", False, None, [], "Не понял время.")
+        base = local_now if cand > local_now else local_now + timedelta(days=1)
+        date_str = base.strftime("%Y-%m-%d")
+    try:
+        target = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
+    except ValueError:
+        return ("", "", False, None, [],
+                "Не понял дату — назовите её как ГГГГ-ММ-ДД или «завтра».")
+    if target <= local_now:
+        return ("", "", False, None, [],
+                f"Время {date_str} {time_str} уже прошло — назовите будущее.")
+    return (date_str, time_str, False, None, [], None)
+
+
 async def _automation_execute_action(update, context, user, class_obj, action):
     """Исполняет JSON-сценарий от DeepSeek. Возвращает текстовый отчёт.
 
@@ -29001,6 +29467,28 @@ async def _automation_execute_action(update, context, user, class_obj, action):
 
     if name == "show_bells":
         return get_bells_info(class_obj, user), True
+
+    if name == "show_class_timers":
+        # ВОЛНА 22.41: список таймеров сообщений классу (id нужен для
+        # delete_class_timer).
+        if not class_obj:
+            return "🚫 Вы не состоите в классе — таймеры класса не найти.", True
+        timers = load_data(CLASS_TIMERS_FILE, {}) or {}
+        mine = {t: d for t, d in timers.items()
+                if isinstance(d, dict)
+                and d.get('class_code') == class_obj.class_code}
+        if not mine:
+            return ("⏰ Таймеров сообщений классу нет. Админ может поставить "
+                    "словами: «отправь классу завтра в 8:00 …» или через "
+                    "«⏰ Таймер классу» в панели класса."), True
+        lines = [f"⏰ Таймеры сообщений класса {class_obj.class_name}:\n"]
+        for tid, td in sorted(mine.items(),
+                              key=lambda kv: str(kv[1].get('target_date', ''))
+                              + str(kv[1].get('target_time', ''))):
+            status = "🟢" if td.get('is_active') else "⏸"
+            lines.append(f"{status} {tid}: {_class_timer_label(td)}")
+        lines.append("\nУдалить: «удали таймер <id>».")
+        return "\n".join(lines), True
 
     if name == "show_holidays":
         return get_holidays_count(class_obj, user), True
@@ -29815,7 +30303,8 @@ async def _automation_execute_action(update, context, user, class_obj, action):
         "add_homework", "add_homework_many", "delete_homework",
         "delete_homework_many",
         "replace_teachers", "add_subject", "remove_subject", "edit_schedule",
-        "edit_bell", "set_holidays", "send_class_message",
+        "edit_bell", "set_bells", "set_holidays", "send_class_message",
+        "schedule_class_message", "delete_class_timer",
     }:
         if not class_obj:
             return "🚫 Вы не состоите в классе — изменять нечего.", True
@@ -30141,6 +30630,127 @@ async def _automation_execute_action(update, context, user, class_obj, action):
                     failed += 1
             return f"📢 Объявление отправлено: {sent} получено, {failed} не доставлено.", True
 
+        if name == "set_bells":
+            # ВОЛНА 22.41: ЗАМЕНИТЬ ВЕСЬ список звонков одним действием —
+            # пользователь прислал список целиком («1 урок 8:30-9:15,
+            # 2 урок 9:25-10:10 …»), ИИ разобрал в массив bells.
+            bells = action.get("bells")
+            if not isinstance(bells, list) or not bells:
+                return (
+                    "❓ Не распознал список звонков. Пришлите его целиком, "
+                    "например: «1 урок 8:30-9:15, 2 урок 9:25-10:10».", False)
+            new_bells = {}
+            for b in bells:
+                if not isinstance(b, dict):
+                    return f"❓ Звонок «{b}» не распознан.", False
+                try:
+                    lesson = str(int(b.get("lesson")))
+                    start = str(b.get("start") or "").strip()
+                    end = str(b.get("end") or "").strip()
+                    s_t = datetime.strptime(start, "%H:%M")
+                    e_t = datetime.strptime(end, "%H:%M")
+                except (TypeError, ValueError):
+                    return (f"❓ Звонок урока {b.get('lesson')} не распознан "
+                            "(нужно время в формате ЧЧ:ММ).", False)
+                if e_t <= s_t:
+                    return (f"❓ У урока {lesson} конец ({end}) не позже "
+                            f"начала ({start}). Уточните времена.", False)
+                new_bells[lesson] = {"start": start, "end": end}
+            if not new_bells:
+                return "❓ Список звонков пуст.", False
+            class_obj.bells = new_bells
+            classes = load_classes()
+            classes[class_obj.class_code] = class_obj
+            save_classes(classes)
+            try:
+                _info = "; ".join(
+                    f"{l}: {v['start']}–{v['end']}"
+                    for l, v in sorted(new_bells.items(),
+                                       key=lambda kv: int(kv[0])
+                                       if kv[0].isdigit() else 99))
+            except Exception:
+                _info = f"{len(new_bells)} уроков"
+            return f"🔔 Звонки класса заменены целиком ({len(new_bells)} шт.): {_info}.", True
+
+        if name == "schedule_class_message":
+            # ВОЛНА 22.41: ТАЙМЕР сообщения классу через ИИ — «отправь классу
+            # завтра в 8:00 …», «каждый день в 8:00 напоминай про зарядку».
+            # Сообщение уйдёт ВСЕМ участникам класса в назначенное время;
+            # хранится в class_timers.json (+канал-БД), переживает рестарт.
+            text = (action.get("text") or "").strip()
+            if not text:
+                return "❓ О чём сообщить классу? Скажите текст сообщения.", False
+            rejected = await reject_if_forbidden_chars(update, text, AI_AUTOMATION)
+            if rejected is not None:
+                return None, False
+            tz_offset = 3
+            try:
+                _cu = get_user(str(user_id))
+                if _cu is not None:
+                    tz_offset = int(getattr(_cu, 'timezone', 3) or 3)
+            except Exception:
+                pass
+            local_now = _utcnow() + timedelta(hours=tz_offset)
+            date_str, time_str, rep_daily, rep_weekly, rep_days, err = \
+                _automation_resolve_when(action, local_now)
+            if err:
+                return f"❓ {err}", False
+            timers = load_data(CLASS_TIMERS_FILE, {}) or {}
+            tid = generate_class_timer_id()
+            timers[tid] = {
+                "class_code": class_obj.class_code,
+                "text": text,
+                "created_by": str(user_id),
+                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "target_date": date_str,
+                "target_time": time_str,
+                "is_active": True,
+                "repeat_daily": bool(rep_daily),
+                "repeat_weekly": rep_weekly,
+                "repeat_days": list(rep_days) if rep_days else None,
+                "fired_key": "",
+            }
+            save_data(CLASS_TIMERS_FILE, timers)
+            try:
+                schedule_class_timer_job(context.application, tid, timers[tid])
+            except Exception as e:
+                logger.error(f"schedule_class_message: {e}")
+            try:
+                _log_admin_action(str(user_id), class_obj.class_code,
+                                  "Таймер классу (ИИ)",
+                                  f"{date_str} {time_str} · {text[:120]}")
+            except Exception:
+                pass
+            when_line = f"📅 {date_str} в {time_str}"
+            if rep_days:
+                when_line = "🔁 по " + ", ".join(
+                    _WD_SHORT[d] for d in rep_days) + f" в {time_str}"
+            elif rep_weekly is not None:
+                when_line = f"🔁 по {_WD_SHORT[rep_weekly]} в {time_str}"
+            elif rep_daily:
+                when_line = f"🔁 каждый день в {time_str}"
+            return (f"✅ Таймер поставлен ({when_line}): сообщение придёт "
+                    f"классу {class_obj.class_name}. Сохранено в базе данных.", True)
+
+        if name == "delete_class_timer":
+            # ВОЛНА 22.41: удалить таймер класса по id (id виден в
+            # show_class_timers).
+            tid = str(action.get("timer_id") or "").strip()
+            timers = load_data(CLASS_TIMERS_FILE, {}) or {}
+            td = timers.get(tid)
+            if not isinstance(td, dict) or td.get('class_code') != class_obj.class_code:
+                return ("❓ Такой таймер класса не найден. Скажите «покажи "
+                        "таймеры класса», чтобы увидеть id.", False)
+            timers.pop(tid, None)
+            save_data(CLASS_TIMERS_FILE, timers)
+            try:
+                for j in (context.application.job_queue.get_jobs_by_name(
+                        f"class_timer_{tid}") or []):
+                    j.schedule_removal()
+            except Exception:
+                pass
+            return f"🗑 Таймер удалён: {_class_timer_label(td)}.", True
+
         # ВОЛНА 22.4: действие pult_post удалено вместе с Пультом.
 
     return f"Неизвестное действие «{name}».", True
@@ -30158,6 +30768,9 @@ def _automation_help_text():
         "• «Замени учителя по биологии на Смирнову А.А.»\n"
         "• «Учителя: биология — Орлова, география — Николаев, обществознание — Петров»\n"
         "• «Урок 5 начинается в 11:40 и заканчивается в 12:25»\n"
+        "• «Отправь классу завтра в 8:00: приносим учебники» — таймер сообщения классу\n"
+        "• «Каждый день в 8:00 отправляй классу „не забудьте сменку“» — постоянный таймер\n"
+        "• «Звонки: 1) 8:30-9:15, 2) 9:25-10:10, 3) 10:25-11:10» — заменить ВЕСЬ список звонков\n"
         "• «Напомни завтра в 18:00 про секцию» / «Напомни через 20 минут»\n"
         "• «Пожелай мне спокойной ночи в 23:00» — пришлю живое пожелание по расписанию\n"
         "• «Желай мне доброе утро в 7:00 каждый день» — будет повторяться КАЖДЫЙ день\n"
@@ -32137,6 +32750,20 @@ async def _global_cancel_cleanup(update: Update, context: ContextTypes.DEFAULT_T
             user_conversations.pop(user_id, None)
         except Exception:
             pass
+    # 3b) ВОЛНА 22.40/22.41: сбрасываем персистентные флаги ввода
+    #     (список дежурных, ввод таймера классу, список звонков) —
+    #     «отмена» отменяет всё.
+    try:
+        if user is not None:
+            if getattr(user, "duty_pending", None):
+                user.duty_pending = None
+            if getattr(user, "ct_pending", None):
+                user.ct_pending = None
+            if getattr(user, "bells_pending", None):
+                user.bells_pending = None
+            save_user(user)
+    except Exception:
+        pass
     # 4) Ответ + главное меню.
     _lines = ["✅ Готово: вышли в главное меню."]
     if _deleted:
@@ -43403,6 +44030,1026 @@ class _DutyPendingFilter(filters.MessageFilter):
 _DUTY_PENDING_FILTER = _DutyPendingFilter()
 
 
+# ==================================
+# === ВОЛНА 22.41: ТАЙМЕРЫ СООБЩЕНИЙ КЛАССУ ===
+# ==================================
+# Админ ставит таймер, когда сообщение должно прийти ВСЕМУ классу:
+#   • один раз — на конкретную дату и время;
+#   • каждый день — постоянное время;
+#   • по дням недели — например, только будни (набор дней кнопками).
+# Ставится двумя способами: КНОПКАМИ (меню «⏰ Таймер классу» в панели
+# класса) и ЧЕРЕЗ ИИ (🪄 AI Agent: «отправь классу завтра в 8:00 …» →
+# действие schedule_class_message).
+# Хранение: CLASS_TIMERS_FILE + канал-БД (STORAGE_BACKUP_FILES) — таймеры
+# переживают рестарт/деплой. Доставка: JobQueue run_once + страховочный
+# тикер каждые 30 с (та же схема, что у личных таймеров). Анти-дубль —
+# метка fired_key «дата время» (джоба и тикер не отправляют дважды).
+
+_CT_WD_FULL = ("Понедельник", "Вторник", "Среда", "Четверг",
+               "Пятница", "Суббота", "Воскресенье")
+
+
+def generate_class_timer_id():
+    """Уникальный id таймера класса (как generate_timer_id)."""
+    timers = load_data(CLASS_TIMERS_FILE, {})
+    while True:
+        timer_id = ''.join(random.choices(string.ascii_lowercase + string.digits, k=8))
+        if timer_id not in timers:
+            return timer_id
+
+
+def _class_timer_tz(td):
+    """Часовой пояс СОЗДАТЕЛЯ таймера класса (как у личных таймеров)."""
+    tz_offset = 3
+    try:
+        u = get_user(str(td.get('created_by') or ''))
+        if u is not None:
+            tz_offset = int(getattr(u, 'timezone', 3) or 3)
+    except Exception:
+        pass
+    return tz_offset
+
+
+def _class_timer_label(td):
+    """Человекочитаемое описание таймера класса (для списка)."""
+    t = str(td.get('target_time') or '')
+    txt = (td.get('text') or '(без текста)')[:24]
+    rep = td.get('repeat_days')
+    if isinstance(rep, (list, tuple)) and len(rep) > 0:
+        try:
+            days = sorted({int(d) for d in rep if 0 <= int(d) <= 6})
+        except (TypeError, ValueError):
+            days = []
+        if len(days) == 7:
+            rep_str = "каждый день"
+        elif days:
+            rep_str = "по " + ", ".join(_WD_SHORT[d] for d in days)
+        else:
+            rep_str = ""
+    elif td.get('repeat_weekly') is not None and not td.get('repeat_daily'):
+        try:
+            rep_str = "по " + _WD_SHORT[int(td['repeat_weekly'])]
+        except (TypeError, ValueError):
+            rep_str = ""
+    elif td.get('repeat_daily'):
+        rep_str = "каждый день"
+    else:
+        rep_str = ""
+    if rep_str and rep_str != "один раз":
+        return f"{t} · {rep_str} · {txt}"
+    return f"{td.get('target_date')} {t} · {txt}".strip()
+
+
+def _class_timer_is_recurring(td):
+    return bool(td.get('repeat_daily') or td.get('repeat_weekly') is not None
+                or (isinstance(td.get('repeat_days'), (list, tuple))
+                    and len(td.get('repeat_days')) > 0))
+
+
+def _class_timer_first_date(mode, days, time_str, now_local):
+    """Дата ПЕРВОГО запуска постоянного таймера: сегодня, если день
+    подходит и время ещё не прошло, иначе ближайший подходящий день."""
+    try:
+        cand = datetime.strptime(
+            f"{now_local.strftime('%Y-%m-%d')} {time_str}", "%Y-%m-%d %H:%M")
+    except (TypeError, ValueError):
+        return None
+    if mode == "daily":
+        return now_local if cand > now_local else now_local + timedelta(days=1)
+    try:
+        days_set = {int(d) for d in (days or []) if 0 <= int(d) <= 6}
+    except (TypeError, ValueError):
+        return None
+    if not days_set:
+        return None
+    if now_local.weekday() in days_set and cand > now_local:
+        return now_local
+    return _timer_next_days_date(list(days_set), now_local)
+
+
+def schedule_class_timer_job(application, tid, td):
+    """Планирует отправку таймера класса (run_once на ближайший запуск).
+
+    Если время уже прошло (рестарт/деплой) — задача встанет через 5 секунд,
+    и пропущенное сообщение всё равно уйдёт (как у личных таймеров).
+    """
+    try:
+        if not isinstance(td, dict) or not td.get('is_active'):
+            return
+        date_str, time_str = td.get('target_date'), td.get('target_time')
+        if not date_str or not time_str:
+            return
+        if application is None or getattr(application, "job_queue", None) is None:
+            return
+        tz_offset = _class_timer_tz(td)
+        target_local = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
+        when_utc = target_local - timedelta(hours=tz_offset)
+        delay = (when_utc - _utcnow()).total_seconds()
+        if delay <= 0:
+            delay = 5
+        job_name = f"class_timer_{tid}"
+        for j in (application.job_queue.get_jobs_by_name(job_name) or []):
+            j.schedule_removal()
+        application.job_queue.run_once(
+            _send_class_timer_notification,
+            when=delay,
+            data={'timer_id': tid},
+            name=job_name,
+        )
+    except Exception as e:
+        logger.error(f"Ошибка планирования таймера класса {tid}: {e}")
+
+
+async def _send_class_timer_notification(context: ContextTypes.DEFAULT_TYPE):
+    """Колбэк JobQueue: доставить запланированное сообщение классу."""
+    job = context.job
+    data = job.data or {}
+    try:
+        await _class_timer_fire_now(context.application, data.get('timer_id'))
+    except Exception as e:
+        logger.error(f"class_timer job: {e}")
+
+
+async def _class_timer_fire_now(application, tid):
+    """Единая точка отправки таймера класса (джоба И safety-net).
+
+    Анти-дубль: fired_key хранит «дата время» уже отправленного запуска —
+    кто бы ни сработал первым (джоба или тикер), второй увидит метку и
+    пропустит. Повторяющийся таймер сдвигается на следующий запуск
+    (_timer_advance_repeat — общий с личными таймерами).
+    Возвращает число доставленных сообщений (0 — ничего не отправлено).
+    """
+    try:
+        timers = load_data(CLASS_TIMERS_FILE, {}) or {}
+    except Exception:
+        return 0
+    td = timers.get(tid)
+    if not isinstance(td, dict) or not td.get('is_active'):
+        return 0
+    key = f"{td.get('target_date')} {td.get('target_time')}"
+    if str(td.get('fired_key') or '') == key:
+        return 0  # этот запуск уже ушёл
+    class_obj = get_class_by_code(td.get('class_code'))
+    if not class_obj:
+        td['is_active'] = False
+        timers[tid] = td
+        save_data(CLASS_TIMERS_FILE, timers)
+        return 0
+    text = (f"📢 Запланированное сообщение класса {class_obj.class_name}:\n\n"
+            f"{td.get('text') or ''}")
+    members = [m for m in dict.fromkeys(
+        list(class_obj.students or []) + list(class_obj.admins or []))
+        if m not in (class_obj.blocked_users or [])]
+    sent = 0
+    for member_id in members:
+        try:
+            await application.bot.send_message(
+                chat_id=int(member_id), text=text)
+            sent += 1
+        except Exception as e:
+            logger.error(f"class_timer {tid}: не доставлено {member_id}: {e}")
+    td['fired_key'] = key
+    td['last_sent'] = datetime.now().strftime("%Y-%m-%d %H:%M")
+    # Журнал объявлений класса (для «🤒 Я болел(а)») — как у обычной рассылки.
+    try:
+        log_ann = getattr(class_obj, 'announcements', None)
+        if not isinstance(log_ann, list):
+            log_ann = []
+        log_ann.append({
+            "ts": td['last_sent'],
+            "by": str(td.get('created_by') or ''),
+            "name": "⏰ по таймеру",
+            "text": str(td.get('text') or '')[:1000],
+        })
+        class_obj.announcements = log_ann[-300:]
+        save_class(class_obj)
+    except Exception as e:
+        logger.error(f"class_timer {tid}: журнал объявлений не записан: {e}")
+    try:
+        _log_admin_action(str(td.get('created_by') or ''), class_obj.class_code,
+                          "Запланированная рассылка",
+                          str(td.get('text') or '')[:200])
+    except Exception:
+        pass
+    if _class_timer_is_recurring(td) and _timer_advance_repeat(td):
+        timers[tid] = td
+        save_data(CLASS_TIMERS_FILE, timers)
+        schedule_class_timer_job(application, tid, td)
+    else:
+        td['is_active'] = False
+        timers[tid] = td
+        save_data(CLASS_TIMERS_FILE, timers)
+    return sent
+
+
+async def _class_timer_safety_net(context: ContextTypes.DEFAULT_TYPE):
+    """Страховочный тикер таймеров класса (каждые 30 с): если джоба
+    потерялась (рестарт/деплой/фолбэк APScheduler) — доставляем сейчас.
+    Двойной отправки нет: fired_key в записи таймера."""
+    application = context.application
+    try:
+        timers = load_data(CLASS_TIMERS_FILE, {}) or {}
+    except Exception:
+        return
+    if not timers:
+        return
+    now_utc = _utcnow()
+    for tid, td in list(timers.items()):
+        if not isinstance(td, dict) or not td.get('is_active'):
+            continue
+        try:
+            target_local = datetime.strptime(
+                f"{td.get('target_date')} {td.get('target_time')}",
+                "%Y-%m-%d %H:%M")
+        except (TypeError, ValueError):
+            continue
+        when_utc = target_local - timedelta(hours=_class_timer_tz(td))
+        if when_utc <= now_utc:
+            key = f"{td.get('target_date')} {td.get('target_time')}"
+            if str(td.get('fired_key') or '') == key:
+                continue
+            try:
+                await _class_timer_fire_now(application, tid)
+            except Exception as e:
+                logger.error(f"class_timer safety {tid}: {e}")
+
+
+# --- Клавиатуры таймеров класса ---
+
+def _ct_menu_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⚡ Один раз", callback_data="ctm_once"),
+         InlineKeyboardButton("🔁 Каждый день", callback_data="ctm_daily")],
+        [InlineKeyboardButton("📅 По дням недели", callback_data="ctm_days")],
+        [InlineKeyboardButton("📋 Таймеры класса", callback_data="ctm_list")],
+        [InlineKeyboardButton("✖️ Закрыть", callback_data="ctm_close")],
+    ])
+
+
+def _ct_cancel_kb():
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("❌ Отмена", callback_data="ctm_cancel")]])
+
+
+def _ct_days_kb(days):
+    rows, row = [], []
+    for i, name in enumerate(_CT_WD_FULL):
+        mark = "✅" if i in set(days or []) else "▫️"
+        row.append(InlineKeyboardButton(
+            f"{mark} {name[:3]}".replace("Пон", "Пн").replace("Вто", "Вт")
+            .replace("Сре", "Ср").replace("Чет", "Чт").replace("Пят", "Пт")
+            .replace("Суб", "Сб").replace("Воск", "Вс"),
+            callback_data=f"ctm_day_{i}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("✔️ Далее", callback_data="ctm_days_next")])
+    rows.append([InlineKeyboardButton("❌ Отмена", callback_data="ctm_cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _ct_list_kb(timers, class_code):
+    """Список таймеров класса: вкл/выкл/удалить (как «📋 Мои напоминания»)."""
+    kb = []
+    for tid, td in sorted(timers.items(),
+                          key=lambda kv: str(kv[1].get('target_date', ''))
+                          + str(kv[1].get('target_time', ''))):
+        emoji = "🟢" if td.get('is_active', True) else "⏸"
+        kb.append([InlineKeyboardButton(
+            f"{emoji} {_class_timer_label(td)}",
+            callback_data=f"ctm_show_{tid}")])
+        kb.append([InlineKeyboardButton(
+            ("▶️ Включить" if not td.get('is_active', True)
+             else "⏸ Выключить"),
+            callback_data=(f"ctm_on_{tid}" if not td.get('is_active', True)
+                           else f"ctm_off_{tid}")),
+            InlineKeyboardButton("🗑 Удалить", callback_data=f"ctm_del_{tid}")])
+    kb.append([InlineKeyboardButton("➕ Новый таймер", callback_data="ctm_open")])
+    kb.append([InlineKeyboardButton("✖️ Закрыть", callback_data="ctm_close")])
+    return InlineKeyboardMarkup(kb)
+
+
+def _ct_admin_class(query, context):
+    """Класс, который админ настраивает: из FSM (current_admin_class) или
+    единственный класс, где пользователь админ. None — не админ."""
+    uid = str(query.from_user.id)
+    code = None
+    try:
+        code = context.user_data.get('current_admin_class')
+    except Exception:
+        code = None
+    class_obj = get_class_by_code(code) if code else None
+    if not class_obj or uid not in (class_obj.admins or []):
+        cand = get_class_by_user(uid)
+        if cand and uid in (cand.admins or []):
+            class_obj = cand
+        else:
+            return None
+    return class_obj
+
+
+async def ct_buttons_global(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Роутер кнопок таймеров классу (ctm_*).
+
+    Вызывается из handle_callback (когда FSM жив) и из глобального
+    CallbackQueryHandler после потери состояния — как кнопки дежурств.
+    """
+    query = update.callback_query
+    data = query.data or ""
+    uid = str(query.from_user.id)
+    user = get_user(uid)
+    if user is None:
+        user = User(uid)
+
+    class_obj = _ct_admin_class(query, context)
+    if class_obj is None:
+        try:
+            await query.answer("Только для админа класса.", show_alert=True)
+        except Exception:
+            pass
+        return
+    code = class_obj.class_code
+
+    async def _pend_save():
+        save_user(user)
+
+    if data == "ctm_open":
+        user.ct_pending = None
+        await _pend_save()
+        text = ("⏰ Таймер сообщений классу\n\n"
+                f"Класс: {class_obj.class_name}. Сообщение придёт ВСЕМ "
+                "участникам класса в выбранное время.\n\n"
+                "• Один раз — на конкретную дату и время\n"
+                "• Каждый день — постоянное время\n"
+                "• По дням недели — например, только будни\n\n"
+                "💡 Таймер можно ставить и словами через 🪄 AI Agent: "
+                "«отправь классу завтра в 8:00 — физра на улице»")
+        try:
+            await query.message.edit_text(text, reply_markup=_ct_menu_kb())
+        except Exception:
+            await context.bot.send_message(
+                chat_id=int(uid), text=text, reply_markup=_ct_menu_kb())
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        return
+
+    if data == "ctm_close":
+        user.ct_pending = None
+        await _pend_save()
+        try:
+            await query.message.edit_text("⏰ Таймеры классу закрыты.")
+        except Exception:
+            pass
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        return
+
+    if data == "ctm_cancel":
+        user.ct_pending = None
+        await _pend_save()
+        try:
+            await query.message.edit_text(
+                "⏰ Таймер сообщений классу\n\nВыберите вариант:",
+                reply_markup=_ct_menu_kb())
+        except Exception:
+            pass
+        try:
+            await query.answer("Отменено")
+        except Exception:
+            pass
+        return
+
+    if data in ("ctm_once", "ctm_daily", "ctm_days"):
+        if data == "ctm_once":
+            user.ct_pending = {"step": "when", "ts": time.time()}
+            ask = ("📅 Один раз — пришлите дату и время одним сообщением:\n"
+                   "ГГГГ-ММ-ДД ЧЧ:ММ\n(например: 2026-10-01 08:15)\n\n"
+                   "Можно только время (ЧЧ:ММ) — тогда сегодня, а если оно "
+                   "уже прошло — завтра.\n\n«отмена» — отменить.")
+        elif data == "ctm_daily":
+            user.ct_pending = {"step": "time", "mode": "daily", "days": [],
+                               "ts": time.time()}
+            ask = ("🔁 Каждый день — пришлите время в формате ЧЧ:ММ "
+                   "(например 08:00).\n\n«отмена» — отменить.")
+        else:
+            user.ct_pending = {"step": "days", "days": [], "ts": time.time()}
+            ask = "📅 Выберите дни недели, когда отправлять:"
+        await _pend_save()
+        kb = _ct_days_kb([]) if data == "ctm_days" else _ct_cancel_kb()
+        try:
+            await query.message.edit_text(ask, reply_markup=kb)
+        except Exception:
+            await context.bot.send_message(
+                chat_id=int(uid), text=ask, reply_markup=kb)
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        return
+
+    if data.startswith("ctm_day_"):
+        pend = user.ct_pending if isinstance(user.ct_pending, dict) else {}
+        if pend.get("step") != "days":
+            try:
+                await query.answer("Сначала выберите «📅 По дням недели».",
+                                   show_alert=True)
+            except Exception:
+                pass
+            return
+        try:
+            d = int(data.rsplit("_", 1)[-1])
+        except (TypeError, ValueError):
+            d = -1
+        try:
+            days = {int(x) for x in (pend.get("days") or []) if 0 <= int(x) <= 6}
+        except (TypeError, ValueError):
+            days = set()
+        if 0 <= d <= 6:
+            days.symmetric_difference_update({d})
+        pend["days"] = sorted(days)
+        pend["ts"] = time.time()
+        user.ct_pending = pend
+        await _pend_save()
+        try:
+            await query.message.edit_reply_markup(
+                reply_markup=_ct_days_kb(sorted(days)))
+        except Exception:
+            pass
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        return
+
+    if data == "ctm_days_next":
+        pend = user.ct_pending if isinstance(user.ct_pending, dict) else {}
+        try:
+            days = [int(x) for x in (pend.get("days") or []) if 0 <= int(x) <= 6]
+        except (TypeError, ValueError):
+            days = []
+        if pend.get("step") != "days" or not days:
+            try:
+                await query.answer("Выберите хотя бы один день.",
+                                   show_alert=True)
+            except Exception:
+                pass
+            return
+        user.ct_pending = {"step": "time", "mode": "days", "days": days,
+                           "ts": time.time()}
+        await _pend_save()
+        ask = ("⏰ Пришлите время в формате ЧЧ:ММ (например 08:00).\n\n"
+               "«отмена» — отменить.")
+        try:
+            await query.message.edit_text(ask, reply_markup=_ct_cancel_kb())
+        except Exception:
+            await context.bot.send_message(
+                chat_id=int(uid), text=ask, reply_markup=_ct_cancel_kb())
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        return
+
+    if data == "ctm_list":
+        timers = load_data(CLASS_TIMERS_FILE, {}) or {}
+        mine = {t: d for t, d in timers.items()
+                if isinstance(d, dict) and d.get('class_code') == code}
+        if not mine:
+            body = ("📋 Таймеры класса\n\nПока пусто. Поставьте первый — "
+                    "кнопками выше или словами через 🪄 AI Agent.")
+            try:
+                await query.message.edit_text(body, reply_markup=_ct_menu_kb())
+            except Exception:
+                pass
+        else:
+            try:
+                await query.message.edit_text(
+                    f"📋 Таймеры класса {class_obj.class_name} — {len(mine)} шт.\n\n"
+                    "🟢 активен · ⏸ выключен\nСообщение приходит всем участникам класса.",
+                    reply_markup=_ct_list_kb(mine, code))
+            except Exception:
+                await context.bot.send_message(
+                    chat_id=int(uid),
+                    text=f"📋 Таймеры класса {class_obj.class_name} — {len(mine)} шт.",
+                    reply_markup=_ct_list_kb(mine, code))
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        return
+
+    if data.startswith(("ctm_show_", "ctm_on_", "ctm_off_", "ctm_del_")):
+        tid = data.split("_", 2)[2] if data.count("_") >= 2 else ""
+        timers = load_data(CLASS_TIMERS_FILE, {}) or {}
+        td = timers.get(tid)
+        if not isinstance(td, dict) or td.get('class_code') != code:
+            try:
+                await query.answer("Таймер не найден.", show_alert=True)
+            except Exception:
+                pass
+            return
+        if data.startswith("ctm_show_"):
+            try:
+                await query.answer(
+                    f"«{(td.get('text') or '')[:180]}»\n\n"
+                    f"{_class_timer_label(td)}",
+                    show_alert=True)
+            except Exception:
+                pass
+            return
+        if data.startswith("ctm_on_"):
+            td['is_active'] = True
+            td.pop('fired_key', None)
+            if _class_timer_is_recurring(td):
+                now_local = _utcnow() + timedelta(hours=_class_timer_tz(td))
+                mode = ("daily" if td.get('repeat_daily')
+                        else "days" if isinstance(td.get('repeat_days'), (list, tuple))
+                        and td.get('repeat_days') else "weekly")
+                nd = _class_timer_first_date(
+                    mode, td.get('repeat_days') or [], td.get('target_time'),
+                    now_local)
+                if nd is not None:
+                    td['target_date'] = nd.strftime("%Y-%m-%d")
+            timers[tid] = td
+            save_data(CLASS_TIMERS_FILE, timers)
+            schedule_class_timer_job(context.application, tid, td)
+            try:
+                await query.answer("▶️ Включено")
+            except Exception:
+                pass
+        elif data.startswith("ctm_off_"):
+            td['is_active'] = False
+            timers[tid] = td
+            save_data(CLASS_TIMERS_FILE, timers)
+            try:
+                for j in (context.application.job_queue.get_jobs_by_name(
+                        f"class_timer_{tid}") or []):
+                    j.schedule_removal()
+            except Exception:
+                pass
+            try:
+                await query.answer("⏸ Выключено")
+            except Exception:
+                pass
+        else:  # ctm_del_
+            timers.pop(tid, None)
+            save_data(CLASS_TIMERS_FILE, timers)
+            try:
+                for j in (context.application.job_queue.get_jobs_by_name(
+                        f"class_timer_{tid}") or []):
+                    j.schedule_removal()
+            except Exception:
+                pass
+            try:
+                await query.answer("🗑 Удалено")
+            except Exception:
+                pass
+        mine = {t: d for t, d in timers.items()
+                if isinstance(d, dict) and d.get('class_code') == code}
+        try:
+            await query.message.edit_reply_markup(
+                reply_markup=_ct_list_kb(mine, code))
+        except Exception:
+            pass
+        return
+
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+
+def _ct_pending_clear(user):
+    """Сбросить флаг «ждём ввод таймера классу» (если был)."""
+    try:
+        if user is not None and getattr(user, "ct_pending", None):
+            user.ct_pending = None
+            save_user(user)
+    except Exception:
+        pass
+
+
+async def _ct_pending_text_handler(update: Update,
+                                   context: ContextTypes.DEFAULT_TYPE):
+    """Глобальный приёмник ввода таймера класса вне ConversationHandler
+    (тот же паттерн, что у списков дежурных): шаги «дата+время»,
+    «время», «текст сообщения» лежат в user.ct_pending и переживают
+    рестарт сервера."""
+    if not update.message or not update.effective_user:
+        return
+    uid = str(update.effective_user.id)
+    user = get_user(uid)
+    if user is None:
+        return
+    pend = getattr(user, "ct_pending", None)
+    if not isinstance(pend, dict):
+        return
+    try:
+        if str(pend.get("step") or "") not in ("when", "time", "text") \
+                or (time.time() - float(pend.get("ts") or 0)) > 3 * 3600:
+            user.ct_pending = None
+            save_user(user)
+            return
+    except Exception:
+        user.ct_pending = None
+        save_user(user)
+        return
+    raw = (update.message.text or "").strip()
+    if raw.lower() in ("отмена", "cancel", "/cancel"):
+        _ct_pending_clear(user)
+        await update.message.reply_text(
+            "Таймер классу отменён.", reply_markup=None)
+        return
+    step = str(pend.get("step") or "")
+
+    # --- шаг 1: дата+время (один раз) или время (постоянный) ---
+    if step in ("when", "time"):
+        time_str = None
+        date_str = None
+        m = re.match(r"^(\d{4}-\d{2}-\d{2})[ T]+(\d{1,2}:\d{2})$", raw)
+        if m:
+            date_str, time_str = m.group(1), m.group(2)
+        else:
+            m2 = re.match(r"^(\d{1,2}:\d{2})$", raw)
+            if m2:
+                time_str = m2.group(1)
+        if time_str:
+            try:
+                hh, mm = time_str.split(":")
+                time_str = f"{int(hh):02d}:{mm.zfill(2)[:2]}"
+                datetime.strptime(f"2000-01-01 {time_str}", "%Y-%m-%d %H:%M")
+            except (ValueError, TypeError):
+                time_str = None
+        if not time_str or (step == "when" and not date_str
+                            and not re.match(r"^\d{1,2}:\d{2}$", raw)):
+            await update.message.reply_text(
+                "Не понял. Формат: ГГГГ-ММ-ДД ЧЧ:ММ (для «один раз») или "
+                "ЧЧ:ММ (для постоянного). Пример: 2026-10-01 08:15")
+            return
+        tz_offset = _class_timer_tz({"created_by": uid})
+        now_local = _utcnow() + timedelta(hours=tz_offset)
+        if step == "when":
+            if not date_str:
+                try:
+                    cand = datetime.strptime(
+                        f"{now_local.strftime('%Y-%m-%d')} {time_str}",
+                        "%Y-%m-%d %H:%M")
+                except ValueError:
+                    await update.message.reply_text(
+                        "Не понял время. Формат ЧЧ:ММ (например 08:15).")
+                    return
+                base = (now_local if cand > now_local
+                        else now_local + timedelta(days=1))
+                date_str = base.strftime("%Y-%m-%d")
+            try:
+                target = datetime.strptime(f"{date_str} {time_str}",
+                                           "%Y-%m-%d %H:%M")
+            except ValueError:
+                await update.message.reply_text(
+                    "Не понял дату. Формат ГГГГ-ММ-ДД (например 2026-10-01).")
+                return
+            if target <= now_local:
+                await update.message.reply_text(
+                    f"Время {date_str} {time_str} уже прошло "
+                    f"(сейчас {now_local.strftime('%H:%M')}). Назовите время "
+                    "в будущем.")
+                return
+            pend.update({"step": "text", "mode": "once", "when": date_str,
+                         "time": time_str, "days": [], "ts": time.time()})
+        else:
+            mode = str(pend.get("mode") or "daily")
+            days = pend.get("days") or []
+            nd = _class_timer_first_date(mode, days, time_str, now_local)
+            if nd is None:
+                await update.message.reply_text(
+                    "Не смог определить дату первого запуска. Проверьте "
+                    "время и дни.")
+                return
+            pend.update({"step": "text", "mode": mode,
+                         "when": nd.strftime("%Y-%m-%d"), "time": time_str,
+                         "days": list(days), "ts": time.time()})
+        user.ct_pending = pend
+        save_user(user)
+        await update.message.reply_text(
+            "✍️ Теперь пришлите ТЕКСТ сообщения — оно уйдёт классу в "
+            f"выбранное время ({pend['when']} {pend['time']}).\n\n"
+            "«отмена» — отменить.", reply_markup=None)
+        return
+
+    # --- шаг 2: текст сообщения → создать таймер ---
+    if step == "text":
+        # Класс: FSM-код или класс, где пользователь админ (как в кнопках).
+        code = None
+        try:
+            code = context.user_data.get('current_admin_class')
+        except Exception:
+            code = None
+        class_obj = get_class_by_code(code) if code else None
+        if not class_obj or uid not in (class_obj.admins or []):
+            cand = get_class_by_user(uid)
+            if cand and uid in (cand.admins or []):
+                class_obj = cand
+            else:
+                _ct_pending_clear(user)
+                await update.message.reply_text(
+                    "Вы больше не админ класса — настройка таймера прервана.")
+                return
+        rejected = await reject_if_forbidden_chars(update, raw, None)
+        if rejected is not None:
+            return
+        mode = str(pend.get("mode") or "once")
+        days = [int(x) for x in (pend.get("days") or []) if 0 <= int(x) <= 6]
+        tid = generate_class_timer_id()
+        timers = load_data(CLASS_TIMERS_FILE, {}) or {}
+        timers[tid] = {
+            "class_code": class_obj.class_code,
+            "text": raw,
+            "created_by": uid,
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "target_date": str(pend.get("when") or ""),
+            "target_time": str(pend.get("time") or ""),
+            "is_active": True,
+            "repeat_daily": mode == "daily",
+            "repeat_weekly": None,
+            "repeat_days": days if mode == "days" else None,
+            "fired_key": "",
+        }
+        save_data(CLASS_TIMERS_FILE, timers)
+        schedule_class_timer_job(context.application, tid, timers[tid])
+        try:
+            _log_admin_action(uid, class_obj.class_code,
+                              "Создан таймер классу",
+                              f"{timers[tid]['target_date']} "
+                              f"{timers[tid]['target_time']} · {raw[:120]}")
+        except Exception:
+            pass
+        user.ct_pending = None
+        save_user(user)
+        await update.message.reply_text(
+            "✅ Таймер поставлен и сохранён в базе данных:\n"
+            f"🕐 {_class_timer_label(timers[tid])}\n\n"
+            "Сообщение придёт ВСЕМ участникам класса. Управление: "
+            "«⏰ Таймер классу» → «📋 Таймеры класса».\n"
+            "Он сработает даже после перезапуска сервера.")
+        return
+
+
+class _CtPendingFilter(filters.MessageFilter):
+    """ВОЛНА 22.41: текст считается вводом таймера класса, только если
+    админ ранее начал настройку (флаг user.ct_pending жив)."""
+    def filter(self, message):
+        try:
+            if not message.from_user:
+                return False
+            u = get_user(str(message.from_user.id))
+            return bool(u and isinstance(getattr(u, "ct_pending", None), dict))
+        except Exception:
+            return False
+
+
+_CT_PENDING_FILTER = _CtPendingFilter()
+
+
+# ==================================
+# === ВОЛНА 22.41: ЗВОНКИ — ВЕСЬ СПИСОК ВРУЧНУЮ ===
+# ==================================
+# «звонки можно не в ручную ставить, а тоже через ии: пользователь отправляет
+# список звонков — ИИ и ИИ ставит; ИЛИ можно вручную добавить весь список».
+# ИИ-путь — действие set_bells (см. _automation_execute_action). Ручной путь —
+# кнопка «📜 Ввести весь список» в меню звонков: админ присылает список одним
+# сообщением, локальный парсер (БЕЗ ИИ и без расхода токенов) разбирает его,
+# показывается превью → подтверждение → замена class_obj.bells целиком.
+
+_BELLS_RANGE_RE = re.compile(
+    r"(?:(?:урок\s*)?(\d{1,2})(?![\d:.])\s*[)`.:\-]?\s*(?:урок[а-яё]*\s*)?)?"
+    r"(\d{1,2})[:.](\d{2})\s*(?:-|–|—|до|по)\s*(\d{1,2})[:.](\d{2})",
+    re.IGNORECASE)
+# (?![\d:.]) после номера урока обязателен: иначе префикс «съедает» цифру
+# времени («10:20-11:05» разбирался как урок «1» + звонок «0:20–11:05»).
+
+
+def _parse_bells_bulk(raw):
+    """Разбор списка звонков, присланного ОДНИМ сообщением.
+
+    Понимает любые формы: «1) 8:30-9:15», «1 урок: 08:30 – 09:15»,
+    «Урок 2 9:25-10:10», «3 10:20 до 11:05», «8:30-9:15» (номер — по
+    порядку), одной строкой через запятую или списком строк.
+    Возвращает (bells: {урок: {"start","end"}}, errors: [строка]).
+    """
+    bells, errors = {}, []
+    for m in _BELLS_RANGE_RE.finditer(raw or ""):
+        prefix = (raw[m.start():m.start(2)] or "").strip()
+        lesson = None
+        m2 = re.match(r"^(?:урок\s*)?(\d{1,2})\s*[)`.:\-]?\s*(?:урок[а-яё]*)?\s*$",
+                      prefix, re.IGNORECASE)
+        if m2:
+            try:
+                cand = int(m2.group(1))
+                if 1 <= cand <= 15:
+                    lesson = cand
+            except ValueError:
+                lesson = None
+        start = f"{int(m.group(2)):02d}:{m.group(3)}"
+        end = f"{int(m.group(4)):02d}:{m.group(5)}"
+        try:
+            s_t = datetime.strptime(start, "%H:%M")
+            e_t = datetime.strptime(end, "%H:%M")
+        except ValueError:
+            errors.append(f"«{m.group(0).strip()}» — не похоже на время")
+            continue
+        if e_t <= s_t:
+            errors.append(f"«{m.group(0).strip()}» — конец не позже начала")
+            continue
+        if lesson is None:
+            lesson = (max((int(k) for k in bells if str(k).isdigit()),
+                          default=0) + 1)
+        bells[str(lesson)] = {"start": start, "end": end}
+    return bells, errors
+
+
+async def _bells_bulk_start_cb(update: Update,
+                               context: ContextTypes.DEFAULT_TYPE):
+    """«📜 Ввести весь список» в меню звонков: включаем ожидание списка."""
+    query = update.callback_query
+    uid = str(query.from_user.id)
+    user = get_user(uid)
+    if user is None:
+        user = User(uid)
+    class_obj = _ct_admin_class(query, context)
+    if class_obj is None:
+        try:
+            await query.answer("Только для админа класса.", show_alert=True)
+        except Exception:
+            pass
+        return
+    user.bells_pending = {"ts": time.time()}
+    save_user(user)
+    ask = (
+        "📜 Пришлите ВЕСЬ список звонков одним сообщением — я заменю им "
+        "текущее расписание звонков.\n\n"
+        "Понимаю любые формы (номер урока можно не писать — поставлю по "
+        "порядку):\n"
+        "1) 8:30-9:15\n2 урок: 9:25-10:10\n3 10:20 до 11:05\n\n"
+        "Можно одной строкой через запятую.\n\n"
+        "💡 Тот же список можно отдать 🪄 AI Agent — он поставит сам.\n"
+        "«отмена» — не менять звонки.")
+    try:
+        await query.message.edit_text(ask)
+    except Exception:
+        await context.bot.send_message(chat_id=int(uid), text=ask)
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+
+async def _bells_bulk_text_handler(update: Update,
+                                   context: ContextTypes.DEFAULT_TYPE):
+    """Глобальный приёмник списка звонков (вне ConversationHandler):
+    парсит список БЕЗ ИИ, показывает превью и ждёт подтверждения."""
+    if not update.message or not update.effective_user:
+        return
+    uid = str(update.effective_user.id)
+    user = get_user(uid)
+    if user is None:
+        return
+    pend = getattr(user, "bells_pending", None)
+    if not isinstance(pend, dict):
+        return
+    try:
+        if (time.time() - float(pend.get("ts") or 0)) > 3 * 3600:
+            user.bells_pending = None
+            save_user(user)
+            return
+    except Exception:
+        user.bells_pending = None
+        save_user(user)
+        return
+    raw = (update.message.text or "").strip()
+    if raw.lower() in ("отмена", "cancel", "/cancel"):
+        user.bells_pending = None
+        save_user(user)
+        await update.message.reply_text("Замена звонков отменена.")
+        return
+    class_obj = None
+    code = None
+    try:
+        code = context.user_data.get('current_admin_class')
+    except Exception:
+        code = None
+    class_obj = get_class_by_code(code) if code else None
+    if not class_obj or uid not in (class_obj.admins or []):
+        cand = get_class_by_user(uid)
+        if cand and uid in (cand.admins or []):
+            class_obj = cand
+        else:
+            user.bells_pending = None
+            save_user(user)
+            await update.message.reply_text(
+                "Вы больше не админ класса — замена звонков прервана.")
+            return
+    bells, errors = _parse_bells_bulk(raw)
+    if not bells:
+        user.bells_pending = None
+        save_user(user)
+        await update.message.reply_text(
+            "Не нашёл в сообщении ни одного звонка формата «ЧЧ:ММ-ЧЧ:ММ». "
+            "Пришлите список ещё раз, например:\n"
+            "1) 8:30-9:15\n2 урок: 9:25-10:10")
+        return
+    context.user_data['bells_bulk'] = bells
+    user.bells_pending = None
+    save_user(user)
+    lines = [f"🔔 Распознал звонков: {len(bells)}."]
+    for l, v in sorted(bells.items(), key=lambda kv: int(kv[0])):
+        lines.append(f"• {l} урок: {v['start']}–{v['end']}")
+    if errors:
+        lines.append(f"\n⚠️ Пропустил непонятных строк: {len(errors)}:")
+        lines.extend(f"  {e}" for e in errors[:5])
+    lines.append("\nЗаменить текущие звонки целиком?")
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Сохранить", callback_data="bells_bulk_ok"),
+        InlineKeyboardButton("❌ Отмена", callback_data="bells_bulk_no"),
+    ]])
+    await update.message.reply_text("\n".join(lines), reply_markup=kb)
+
+
+async def _bells_bulk_confirm_cb(update: Update,
+                                 context: ContextTypes.DEFAULT_TYPE):
+    """✅ Сохранить / ❌ Отмена под превью списка звонков."""
+    query = update.callback_query
+    data = query.data or ""
+    uid = str(query.from_user.id)
+    class_obj = _ct_admin_class(query, context)
+    if class_obj is None:
+        try:
+            await query.answer("Только для админа класса.", show_alert=True)
+        except Exception:
+            pass
+        return
+    if data == "bells_bulk_no":
+        context.user_data.pop('bells_bulk', None)
+        try:
+            await query.message.edit_text("Замена звонков отменена.")
+        except Exception:
+            pass
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        return
+    bells = context.user_data.get('bells_bulk')
+    if not isinstance(bells, dict) or not bells:
+        try:
+            await query.answer("Список устарел — пришлите его ещё раз.",
+                               show_alert=True)
+        except Exception:
+            pass
+        return
+    class_obj.bells = {str(k): dict(v) for k, v in bells.items()}
+    classes = load_classes()
+    classes[class_obj.class_code] = class_obj
+    save_classes(classes)
+    context.user_data.pop('bells_bulk', None)
+    try:
+        _log_admin_action(uid, class_obj.class_code, "Звонки заменены списком",
+                          f"{len(class_obj.bells)} уроков")
+    except Exception:
+        pass
+    try:
+        await query.message.edit_text(
+            f"✅ Звонки класса заменены ({len(class_obj.bells)} уроков).\n\n"
+            + get_bells_info(class_obj))
+    except Exception:
+        pass
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+
+class _BellsBulkFilter(filters.MessageFilter):
+    """ВОЛНА 22.41: текст — это список звонков, только если админ ранее
+    нажал «📜 Ввести весь список» (флаг user.bells_pending жив)."""
+    def filter(self, message):
+        try:
+            if not message.from_user:
+                return False
+            u = get_user(str(message.from_user.id))
+            return bool(u and isinstance(getattr(u, "bells_pending", None), dict))
+        except Exception:
+            return False
+
+
+_BELLS_BULK_FILTER = _BellsBulkFilter()
+
+
 # === ВОЛНА 22.27/22.28: возрастной гейт 13+ ===
 # 22.28: ДР ОБЯЗАТЕЛЕН — экрана «можно продолжить без даты» (_AGE_ASK_*)
 # больше нет; все без ДР направляются на ввод даты. Экран отказа получил
@@ -44262,6 +45909,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("duty_cns_") or data.startswith("duty_cnn_"):
         # ВОЛНА 22.36: «заболел(а)»/«не будет» для СВОЕГО графика (имена)
         return await duty_custom_mark_cb(update, context)
+    elif data.startswith("ctm_"):
+        # ВОЛНА 22.41: таймеры сообщений классу — кнопки работают и внутри
+        # FSM, и после потери состояния (глобальный хендлер зовёт то же).
+        return await ct_buttons_global(update, context)
     elif data == "more_sick":
         query_duty = update.callback_query
         _user_more = get_user(str(query_duty.from_user.id))
@@ -44431,6 +46082,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await edit_teachers_start(update, context)
     elif data == "edit_bells":
         return await edit_bells_start(update, context)
+    elif data == "edit_bells_bulk":
+        # ВОЛНА 22.41: «весь список вручную» — ожидание списка звонков.
+        return await _bells_bulk_start_cb(update, context)
+    elif data in ("bells_bulk_ok", "bells_bulk_no"):
+        # ВОЛНА 22.41: подтверждение/отмена замены звонков списком.
+        return await _bells_bulk_confirm_cb(update, context)
     elif data == "set_holidays":
         return await set_holidays_start(update, context)
     elif data == "manage_admins":
@@ -49969,6 +51626,17 @@ async def _post_init(application):
     except Exception as e:
         logger.error(f"timers load: {e}")
 
+    # === ШАГ 7b: восстановление ТАЙМЕРОВ СООБЩЕНИЙ КЛАССУ (22.41). ===
+    try:
+        ctimers = load_data(CLASS_TIMERS_FILE, {}) or {}
+        for ct_id, ct_data in ctimers.items():
+            try:
+                schedule_class_timer_job(application, ct_id, ct_data)
+            except Exception as e:
+                logger.error(f"schedule_class_timer_job {ct_id}: {e}")
+    except Exception as e:
+        logger.error(f"class_timers load: {e}")
+
     # === ШАГ 8: safety-net для таймеров. ===
     try:
         if application.job_queue is not None:
@@ -49980,6 +51648,19 @@ async def _post_init(application):
             )
     except Exception as e:
         logger.error(f"timer safety-net регистрация: {e}")
+
+    # === ШАГ 8b: safety-net ТАЙМЕРОВ КЛАССА (22.41) — доставка таймеров
+    # сообщений классу даже после потери джоб (рестарт/деплой). ===
+    try:
+        if application.job_queue is not None:
+            application.job_queue.run_repeating(
+                _class_timer_safety_net,
+                interval=30,
+                first=20,
+                name="class_timer_safety_net",
+            )
+    except Exception as e:
+        logger.error(f"class timer safety-net регистрация: {e}")
 
     # === ШАГ 9: legacy per-user планирование (no-op, для совместимости). ===
     try:
@@ -51257,6 +52938,24 @@ def main():
         filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND
         & _DUTY_PENDING_FILTER,
         _duty_pending_text_handler))
+
+    # ВОЛНА 22.41: таймеры сообщений классу вне FSM (тот же паттерн, что
+    # у дежурств): кнопки ctm_* работают даже когда разговор потерян,
+    # а ввод (дата/время/текст) доходит через персистентный флаг ct_pending
+    # («это тоже должно сохраняться и синхронизироваться в базе данных»).
+    application.add_handler(CallbackQueryHandler(
+        ct_buttons_global, pattern=r"^ctm_"))
+    application.add_handler(MessageHandler(
+        filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND
+        & _CT_PENDING_FILTER,
+        _ct_pending_text_handler))
+
+    # ВОЛНА 22.41: список звонков ЦЕЛИКОМ (кнопка «📜 Ввести весь список»)
+    # тоже вне FSM — переживает потерю состояния (тот же паттерн).
+    application.add_handler(MessageHandler(
+        filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND
+        & _BELLS_BULK_FILTER,
+        _bells_bulk_text_handler))
 
     # ВОЛНА 12: standalone-перехватчик отмены ПОСЛЕ ConversationHandler —
     # срабатывает, когда FSM-состояние ПОТЕРЯНО (state=None после
