@@ -108,6 +108,17 @@
 <!-- Теги/обложки (jsmediatags) и палитра обложки (ColorThief) для музыкального плеера -->
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jsmediatags/3.9.5/jsmediatags.min.js" defer></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/color-thief/2.3.0/color-thief.umd.js" defer></script>
+<script>
+/* Волна 22.41: Service Worker — оффлайн-запуск, быстрый ре-старт в
+   Telegram WebView, меньше трафика (CDN и обложки из кэша), UI рисуется
+   даже при холодном сервере. Регистрация максимально безопасная:
+   любые ошибки молча игнорируются и не влияют на приложение. */
+if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {
+  window.addEventListener('load', function () {
+    try { navigator.serviceWorker.register('/sw.js').catch(function () {}); } catch (e) {}
+  });
+}
+</script>
 
 <style>
 /* ============================================================
