@@ -2529,25 +2529,17 @@ body.vp-lock {
       <div class="sheet-handle"></div>
     </div>
 
-    <h3 style="font-weight:900;font-size:20px;margin-bottom:4px;display:flex;align-items:center;gap:8px">
-      <i data-lucide="lock" style="width:20px;height:20px"></i>Сейф
-    </h3>
-    <p id="safeStatusLine" style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:14px;line-height:1.5">Загружаю…</p>
-
+    <!-- ВОЛНА 22.40: в окне Сейфа ТОЛЬКО строка пароля, кнопка действия
+         («Переместить в сейф» / «Разблокировать») и «Закрыть» — больше ничего -->
     <div style="margin-bottom:14px">
       <label style="font-size:11px;font-weight:800;color:var(--subtext-color);text-transform:uppercase;letter-spacing:0.04em">Пароль Сейфа</label>
       <input type="password" id="safePassword" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;margin-top:4px;outline:none;font-size:15px" placeholder="Пароль">
     </div>
 
     <div style="display:flex;flex-direction:column;gap:8px">
-      <button class="sound-item-btn" onclick="unlockSafe()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
-        <span>Разблокировать</span>
+      <button class="sound-item-btn" id="safeActionBtn" onclick="onSafeAction()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
+        <span id="safeActionLabel">Разблокировать</span>
         <i data-lucide="unlock" style="width:18px;height:18px"></i>
-      </button>
-
-      <button class="sound-item-btn" onclick="lockSafe()">
-        <span>Заблокировать снова</span>
-        <i data-lucide="lock" style="width:18px;height:18px"></i>
       </button>
 
       <button class="sound-item-btn" onclick="closeSafeModal()">
@@ -2555,11 +2547,6 @@ body.vp-lock {
         <i data-lucide="x" style="width:18px;height:18px"></i>
       </button>
     </div>
-
-    <p style="font-size:11px;font-weight:600;color:var(--subtext-color);margin-top:12px;line-height:1.5">
-      Пароль Сейфа нужен, чтобы скачать зашифрованный файл или переместить файл в Сейф из веб-облака.
-      Пароль держится только в памяти страницы и никогда не сохраняется.
-    </p>
   </div>
 </div>
 
@@ -4570,6 +4557,11 @@ async function saveFileName() {
 let VAULT_PW = '';
 let VAULT_SERVER_UNLOCKED = false;
 let PENDING_FILE_ACTION = null;
+/* ВОЛНА 22.40: окно Сейфа контекстное — 'unlock' (просто разблокировать),
+   'to_safe' (кнопка «Переместить в сейф»), 'from_safe' (кнопка «Разблокировать»
+   и достать файл). В окне только пароль, кнопка действия и «Закрыть». */
+let SAFE_MODAL_MODE = 'unlock';
+let SAFE_MODAL_FILE_ID = null;
 
 function vaultHeaders(extra) {
   const h = authHeaders(extra);
@@ -4585,11 +4577,29 @@ function vaultHeaders(extra) {
   return h;
 }
 
-function openSafeModal() {
+function openSafeModal(mode, fileId) {
   const m = document.getElementById('safeModal');
   if (!m) return;
 
-  loadSafeStatus();
+  /* ВОЛНА 22.40: контекстное окно Сейфа — подпись кнопки зависит от действия */
+  SAFE_MODAL_MODE = (mode === 'to_safe' || mode === 'from_safe') ? mode : 'unlock';
+  SAFE_MODAL_FILE_ID = fileId || null;
+
+  const lbl = document.getElementById('safeActionLabel');
+
+  if (lbl) {
+    lbl.textContent = SAFE_MODAL_MODE === 'to_safe'
+      ? 'Переместить в сейф'
+      : 'Разблокировать';
+  }
+
+  const input = document.getElementById('safePassword');
+
+  if (input) {
+    input.value = '';
+    /* автофокус — сразу видно, что нужно ввести пароль */
+    setTimeout(() => { try { input.focus(); } catch (e) {} }, 320);
+  }
 
   openModalEl('safeModal');
 }
@@ -4598,26 +4608,92 @@ function closeSafeModal(e) {
   if (e) e.stopPropagation();
 
   PENDING_FILE_ACTION = null;
+  SAFE_MODAL_FILE_ID = null;
+  SAFE_MODAL_MODE = 'unlock';
 
   closeModalEl('safeModal');
 }
 
-async function loadSafeStatus() {
-  const line = document.getElementById('safeStatusLine');
+/* Кнопка действия в окне Сейфа: разблокировать / переместить в сейф */
+function onSafeAction() {
+  if (SAFE_MODAL_MODE === 'to_safe') {
+    safeDoTransfer('to_safe');
+  } else if (SAFE_MODAL_MODE === 'from_safe') {
+    safeDoTransfer('from_safe');
+  } else {
+    unlockSafe();
+  }
+}
+
+/* ВОЛНА 22.40: перемещение в Сейф и обратно ЧЕРЕЗ окно с паролем.
+   Верный пароль → окно закрывается → справа снизу идёт загрузка
+   (та же пилюля, что у скачивания), чтобы было видно, сколько ждать. */
+async function safeDoTransfer(kind) {
+  const input = document.getElementById('safePassword');
+  const pw = (input && input.value) || '';
+
+  const f = ALL_FILES.find((x) => x.id === SAFE_MODAL_FILE_ID);
+
+  if (!f) {
+    closeSafeModal();
+    return;
+  }
+
+  if (!pw) {
+    showToast('Введите пароль Сейфа');
+    return;
+  }
+
+  /* пароль проверяем сразу: неверный — окно остаётся открытым */
+  try {
+    await apiJson('/api/safe/unlock', {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ password: pw })
+    });
+  } catch (e) {
+    showToast(cloudErrText(e));
+    return;
+  }
+
+  VAULT_PW = pw;
+  VAULT_SERVER_UNLOCKED = true;
+
+  if (input) input.value = '';
+
+  closeSafeModal();
+
+  const tid = 'safe-' + Date.now().toString(36) + '-' +
+    Math.floor(Math.random() * 1e6).toString(36);
+
+  transferStart({
+    id: tid,
+    type: kind === 'to_safe' ? 'safe' : 'safe_out',
+    name: f.name || 'Файл',
+    total: 0
+  });
 
   try {
-    const s = await apiJson('/api/safe/status', { headers: vaultHeaders() });
+    await apiJson('/api/files/' + encodeURIComponent(f.id) + '/' + kind, {
+      method: 'POST',
+      headers: vaultHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({})
+    });
 
-    if (s.unlocked) {
-      VAULT_SERVER_UNLOCKED = true;
-      line.textContent = 'Сейф разблокирован. Файлов в Сейфе: ' + (s.count || 0) + '.';
-    } else {
-      line.textContent =
-        'Сейф заблокирован. Введите пароль Сейфа, чтобы скачивать зашифрованные файлы и переносить файлы в Сейф. Файлов: ' +
-        (s.count || 0) + '.';
-    }
+    transferFinish(tid, true);
+
+    showToast(kind === 'to_safe' ? '🔐 Файл в Сейфе' : '🔓 Файл достан из Сейфа');
+
+    loadFiles(true);
   } catch (e) {
-    line.textContent = cloudErrText(e);
+    transferFinish(tid, false, 'Ошибка');
+
+    if (e.code === 'safe_locked' || e.code === 'wrong_password') {
+      VAULT_PW = '';
+      VAULT_SERVER_UNLOCKED = false;
+    }
+
+    showToast(cloudErrText(e));
   }
 }
 
@@ -4662,22 +4738,6 @@ async function unlockSafe() {
   }
 }
 
-async function lockSafe() {
-  try {
-    await apiJson('/api/safe/lock', {
-      method: 'POST',
-      headers: authHeaders()
-    });
-  } catch (e) {}
-
-  VAULT_PW = '';
-  VAULT_SERVER_UNLOCKED = false;
-
-  showToast('Сейф заблокирован');
-
-  closeSafeModal();
-}
-
 function ensureSafeUnlocked() {
   if (VAULT_PW || VAULT_SERVER_UNLOCKED) return true;
 
@@ -4687,68 +4747,28 @@ function ensureSafeUnlocked() {
   return false;
 }
 
-async function toSafeCurrentFile() {
+/* ВОЛНА 22.40: «Переместить в сейф» — сначала окно с паролем
+   (только пароль + кнопка «Переместить в сейф» + закрыть). */
+function toSafeCurrentFile() {
   const f = ALL_FILES.find((x) => x.id === activeEditingFileId);
 
   closeEditModal();
 
   if (!f) return;
 
-  if (!ensureSafeUnlocked()) return;
-
-  showToast('🔐 Шифрую и переношу в Сейф…');
-
-  try {
-    await apiJson('/api/files/' + encodeURIComponent(f.id) + '/to_safe', {
-      method: 'POST',
-      headers: vaultHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify({})
-    });
-
-    showToast('Файл в Сейфе — теперь он и в чате, и здесь');
-
-    loadFiles(true);
-  } catch (e) {
-    if (e.code === 'safe_locked') {
-      VAULT_PW = '';
-      VAULT_SERVER_UNLOCKED = false;
-      openSafeModal();
-    }
-
-    showToast(cloudErrText(e));
-  }
+  openSafeModal('to_safe', f.id);
 }
 
-async function fromSafeCurrentFile() {
+/* ВОЛНА 22.40: «Достать из сейфа» — окно только с паролем и кнопкой
+   «Разблокировать»; верный пароль закрывает окно и запускает загрузку. */
+function fromSafeCurrentFile() {
   const f = ALL_FILES.find((x) => x.id === activeEditingFileId);
 
   closeEditModal();
 
   if (!f) return;
 
-  if (!ensureSafeUnlocked()) return;
-
-  showToast('🔓 Расшифровываю и возвращаю в облако…');
-
-  try {
-    await apiJson('/api/files/' + encodeURIComponent(f.id) + '/from_safe', {
-      method: 'POST',
-      headers: vaultHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify({})
-    });
-
-    showToast('Файл достан из Сейфа в обычное облако');
-
-    loadFiles(true);
-  } catch (e) {
-    if (e.code === 'safe_locked') {
-      VAULT_PW = '';
-      VAULT_SERVER_UNLOCKED = false;
-      openSafeModal();
-    }
-
-    showToast(cloudErrText(e));
-  }
+  openSafeModal('from_safe', f.id);
 }
 
 const IS_MOBILE = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent || '') || (navigator.maxTouchPoints || 0) > 1;
@@ -5082,7 +5102,8 @@ async function openFileViewer(id) {
   showToast('📂 Открываю файл…');
 
   try {
-    const data = await apiJson('/api/files/' + encodeURIComponent(id) + '/link', {
+    /* ВОЛНА 22.40: disp=inline для просмотра (аудио/видео плееры, PDF) */
+    const data = await apiJson('/api/files/' + encodeURIComponent(id) + '/link?disp=inline', {
       headers: vaultHeaders()
     });
 
@@ -5715,7 +5736,6 @@ function refreshUploadModal() {
   const passInput = document.getElementById('uploadPassword');
 
   const has = pendingFiles.length > 0;
-  const needPw = passwordRequired();
 
   if (info) {
     info.textContent = !has
@@ -5749,9 +5769,31 @@ function refreshUploadModal() {
   if (sendBtn) sendBtn.classList.toggle('hidden', !has);
   if (moreBtn) moreBtn.classList.toggle('hidden', !has);
 
-  if (passRow) passRow.style.display = needPw ? 'block' : 'none';
-  if (plainHint) plainHint.style.display = (!needPw && STORAGE_ENCRYPTED === false) ? 'block' : 'none';
-  if (passInput && !passInput.value) passInput.value = (needPw && VAULT_PW) ? VAULT_PW : '';
+  /* ВОЛНА 22.40: пароль ОБЯЗАТЕЛЕН только когда хранилище шифруется
+     (STORAGE_ENCRYPTED === true). Раньше поле становилось обязательным,
+     если в облаке ЕСТЬ ХОТЬ ОДИН старый vault-файл — «просит пароль хотя
+     шифрование отключено». В режиме «без шифрования» поле видно, но
+     НЕобязательно: ввёл пароль → файл зашифруется и попадёт в Сейф
+     (и в боте, и здесь); оставил пустым → обычная загрузка без пароля. */
+  const pwRequired = STORAGE_ENCRYPTED === true;
+
+  if (passRow) passRow.style.display = 'block';
+  if (plainHint) {
+    plainHint.style.display = pwRequired ? 'none' : 'block';
+    plainHint.textContent = pwRequired
+      ? ''
+      : 'Шифрование отключено — пароль не нужен. Но можете ввести пароль Сейфа: тогда файл зашифруется и появится в Сейфе (в боте и здесь).';
+  }
+
+  if (passInput) {
+    passInput.placeholder = pwRequired
+      ? 'Пароль из бота'
+      : 'Необязательно — для загрузки в Сейф';
+
+    if (!passInput.value) {
+      passInput.value = (pwRequired && VAULT_PW) ? VAULT_PW : '';
+    }
+  }
 }
 
 function openUploadModal() {
@@ -5774,7 +5816,11 @@ function closeUploadModal(e) {
 function confirmUploadFiles() {
   const passInput = document.getElementById('uploadPassword');
 
-  if (passwordRequired()) {
+  /* ВОЛНА 22.40: пароль обязателен ТОЛЬКО при включённом шифровании.
+     В режиме «без шифрования» пустой пароль = обычная загрузка,
+     введённый пароль = зашифровать файл и положить в Сейф
+     (пароль уйдёт в теле upload/init именно этой загрузки). */
+  if (STORAGE_ENCRYPTED === true) {
     const pw = (passInput && passInput.value) || '';
 
     if (!pw) {
@@ -5783,6 +5829,16 @@ function confirmUploadFiles() {
     }
 
     VAULT_PW = pw;
+    UPLOAD_PLAIN_PW = '';
+  } else {
+    const pw = (passInput && passInput.value) || '';
+
+    /* пустое поле НЕ затирает ранее введённый пароль Сейфа —
+       иначе старые зашифрованные файлы перестанут открываться */
+    if (pw) VAULT_PW = pw;
+
+    /* но в Сейф файл попадает только если пароль введён ИМЕННО здесь */
+    UPLOAD_PLAIN_PW = pw;
   }
 
   if (passInput) passInput.value = '';
@@ -5797,6 +5853,10 @@ function confirmUploadFiles() {
 }
 
 let pickerAppend = false;
+/* ВОЛНА 22.40: пароль, введённый В ЭТОМ окне загрузки (для режима
+   «без шифрования»: ввёл — файл шифруется в Сейф; пусто — обычная загрузка).
+   Передаётся В ТЕЛЕ init-запроса — не наследуется от прежних разблокировок. */
+let UPLOAD_PLAIN_PW = '';
 
 function pickUploadFiles() {
   pickerAppend = false;
@@ -6176,7 +6236,9 @@ async function _uploadOneSession(file, reportBytes) {
       body: JSON.stringify({
         name: upName,
         size: +file.size || 0,
-        mime: file.type || ''
+        mime: file.type || '',
+        /* 22.40: пароль именно этой загрузки (для «без шифрования» → Сейф) */
+        password: UPLOAD_PLAIN_PW || ''
       })
     });
 
@@ -6699,10 +6761,21 @@ function ctAggregate() {
 
 function ctSubText(t) {
   if (t.done) {
-    return t.ok
-      ? 'Завершено · ' + fmtSize(t.total || t.loaded || 0)
-      : (t.note || 'Отменено');
+    if (t.ok) {
+      /* для Сейфа байты не считаются — честное «Готово» */
+      if (t.type === 'safe' || t.type === 'safe_out') return 'Готово';
+
+      return 'Завершено · ' + fmtSize(t.total || t.loaded || 0);
+    }
+
+    return (t.note || 'Отменено');
   }
+
+  /* ВОЛНА 22.40: перемещения в Сейф/из Сейфа — без байт, статус текстом,
+     чтобы пользователь видел, что процесс идёт и сколько примерно ждать */
+  if (t.type === 'safe') return 'Шифрую и переношу в Сейф…';
+
+  if (t.type === 'safe_out') return 'Расшифровываю и возвращаю…';
 
   const sec = (Date.now() - t.t0) / 1000;
   const speed = (sec > 0.8 && t.loaded) ? fmtSize(t.loaded / sec) + '/с · ' : '';
@@ -6725,7 +6798,11 @@ function ctRow(t) {
   icon.innerHTML = '<svg viewBox="0 0 24 24">'
     + (t.type === 'upload'
       ? '<path d="M12 19V5"/><path d="m5 12 7-7 7 7"/>'
-      : '<path d="M12 5v14"/><path d="m19 12-7 7-7-7"/>')
+      : t.type === 'safe'
+        ? '<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/>'
+        : t.type === 'safe_out'
+          ? '<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 7.5-2"/><path d="m3 3 18 18"/>'
+          : '<path d="M12 5v14"/><path d="m19 12-7 7-7-7"/>')
     + '</svg>';
 
   const main = document.createElement('div');
@@ -6998,7 +7075,9 @@ async function mpResolveUrl(t) {
   }
 
   try {
-    const data = await apiJson('/api/files/' + encodeURIComponent(t.id) + '/link', {
+    /* ВОЛНА 22.40: disp=inline — честный Content-Type без attachment,
+       чтобы <audio> играл сразу (а не предлагал «скачать») */
+    const data = await apiJson('/api/files/' + encodeURIComponent(t.id) + '/link?disp=inline', {
       headers: vaultHeaders()
     });
 
