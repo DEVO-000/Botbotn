@@ -3628,7 +3628,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.43"
+BOT_BUILD = "22.44"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -13771,9 +13771,17 @@ function confirmAlbumName() {
     return i > 0 ? n.slice(i) : '';
   };
 
-  pendingFiles = pendingFiles.map((f, i) =>
-    Object.assign({}, f, { uploadName: (base + ' ' + (i + 1) + extOf(f)).slice(0, 120) })
-  );
+  /* ВОЛНА 22.44: имя пишем ПРЯМО в объект файла (expando, как _entryKey),
+     а НЕ в Object.assign-копию. У File/Blob size/type/name — геттеры
+     ПРОТОТИПА, Object.assign их НЕ копирует: копия выходила пустым
+     объектом, size = 0 → сервер отвечал «Файл пустой (0 Б)» ровно тогда,
+     когда файл называли. Оригинальный File сохраняет size/slice —
+     загрузка идёт как при именовании, так и без него. */
+  pendingFiles.forEach((f, i) => {
+    try {
+      f.uploadName = (base + ' ' + (i + 1) + extOf(f)).slice(0, 120);
+    } catch (e) {}
+  });
 
   closeModalEl('albumModal');
   startActualUpload();
@@ -13859,9 +13867,14 @@ function nextNameStep() {
 }
 
 function applyCustomNames() {
-  pendingFiles = pendingFiles.map((f) =>
-    f._customName ? Object.assign({}, f, { uploadName: f._customName }) : f
-  );
+  /* ВОЛНА 22.44: то же, что в confirmAlbumName — expando на оригинальном
+     File, НЕ Object.assign-копия (копия теряла size → «Файл пустой (0 Б)»
+     у КАЖДОГО названного файла). */
+  pendingFiles.forEach((f) => {
+    if (f && f._customName) {
+      try { f.uploadName = String(f._customName).slice(0, 120); } catch (e) {}
+    }
+  });
 
   startActualUpload();
 }
@@ -16081,6 +16094,9 @@ let vpWasPinching = false;
 let vpLastCenterTap = 0;
 let vpFullscreen = false;
 let vpForcedLandscape = false;
+/* ВОЛНА 22.44: отложенное снятие чёрной подложки после возврата в портрет
+   (таймер с гардом — повторный переворот в течение 600 мс не теряет подложку) */
+let vpShadowTimer = null;
 let vpLastManualExit = 0;
 let vpIsSeeking = false;
 let vpPlayerEl = null;
@@ -16424,8 +16440,20 @@ function vpForceLandscape(on) {
     modal.style.width = h + 'px';
     modal.style.height = w + 'px';
     modal.style.transform = 'translate(-50%, -50%) rotate(90deg)';
+    /* ВОЛНА 22.44: чёрная подложка из box-shadow едет ВМЕСТЕ с модалкой
+       (применяется мгновенно, без транзишена) и на всём протяжении
+       поворота накрывает экран целиком — вращающийся прямоугольник
+       не открывает углы, и главный экран приложения больше не виден */
+    if (vpShadowTimer) {
+      clearTimeout(vpShadowTimer);
+      vpShadowTimer = null;
+    }
+    modal.style.boxShadow = '0 0 0 100vmax #000';
   } else {
-    /* возврат к портрету — инлайн-стили сбрасываются, transition доигрывает */
+    /* возврат к портрету — инлайн-стили сбрасываются, transition доигрывает;
+       подложку снимаем ТОЛЬКО после возврата (600 мс) — иначе углы снова
+       откроют приложение посреди анимации; гард на случай быстрого
+       повторного переворота */
     modal.style.left = '';
     modal.style.top = '';
     modal.style.right = '';
@@ -16433,6 +16461,12 @@ function vpForceLandscape(on) {
     modal.style.width = '';
     modal.style.height = '';
     modal.style.transform = '';
+    if (vpShadowTimer) clearTimeout(vpShadowTimer);
+    vpShadowTimer = window.setTimeout(() => {
+      vpShadowTimer = null;
+      const m = document.getElementById('videoPlayerModal');
+      if (m && !vpForcedLandscape) m.style.boxShadow = '';
+    }, 600);
   }
 }
 
@@ -42616,8 +42650,13 @@ async def _duty_announce(bot, class_obj, selected, sick_note=None):
     blocked = set(str(b) for b in (class_obj.blocked_users or []))
     members = [m for m in members if m not in blocked]
     names = ", ".join(_duty_member_name(i) for i in selected) if selected else "—"
+    # ВОЛНА 22.44: «🤒 Я заболел(а)» убрана с ГЛАВНОГО ЭКРАНА карточки
+    # дежурного — прячется под «☰ Ещё» (как на админской карточке в 22.42).
+    # «☰ Ещё» (duty_more_me) открывает «🤒 Я заболел(а)» + «⬅️ Назад»;
+    # раскладка живёт до тех пор, пока пользователь сам её не переключит.
+    # Сама замена (duty_sick) не тронута.
     officer_kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("🤒 Я заболел(а)", callback_data="duty_sick")]])
+        InlineKeyboardButton("☰ Ещё", callback_data="duty_more_me")]])
     sent_ok = 0
     for uid in members:
         try:
@@ -42626,8 +42665,9 @@ async def _duty_announce(bot, class_obj, selected, sick_note=None):
                     chat_id=int(uid),
                     text=("📅 <b>Вы сегодня дежурный!</b>\n\n"
                           "Не забудьте про свои обязанности. Хорошего дня!\n\n"
-                          "Если приболели — нажмите кнопку ниже, и дежурство "
-                          "перейдёт следующему, а вы вернётесь в конец очереди.")
+                          "Если приболели — откройте «☰ Ещё» ниже: там кнопка, "
+                          "которая передаст дежурство следующему, а вы вернётесь "
+                          "в конец очереди.")
                           + (f"\n\n{sick_note}" if sick_note else ""),
                     parse_mode=ParseMode.HTML,
                     reply_markup=officer_kb)
@@ -43968,11 +44008,12 @@ async def duty_sick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=int(candidate),
                 text=("📅 <b>Вы сегодня дежурный</b> (замена заболевшего).\n\n"
                       "Не забудьте про обязанности. Если тоже приболели — "
-                      "кнопка ниже передаст дежурство следующему."),
+                      "«☰ Ещё» ниже откроет кнопку передачи дежурства "
+                      "следующему."),
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("🤒 Я заболел(а)",
-                                         callback_data="duty_sick")]]))
+                    InlineKeyboardButton("☰ Ещё",
+                                         callback_data="duty_more_me")]]))
         except Exception:
             pass
     # объявление классу
@@ -44081,6 +44122,61 @@ async def duty_more_toggle_cb(update: Update, context: ContextTypes.DEFAULT_TYPE
         logger.error(f"duty_more_toggle: edit failed: {e}")
         try:
             await query.answer("Не удалось обновить кнопки — сообщение устарело.",
+                               show_alert=True)
+        except Exception:
+            pass
+    return MAIN_MENU
+
+
+async def duty_me_more_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.44: «☰ Ещё» на ЛИЧНОЙ карточке дежурного («Вы сегодня
+    дежурный!») — показывает/прячет «🤒 Я заболел(а)». Кнопка убрана
+    с главного экрана карточки (как на админской в 22.42) и живёт в
+    «Ещё», пока пользователь сам не переключит раскладку («⬅️ Назад»).
+    ЛОГИКА ЗАМЕНЫ НЕ ТРОНУТА — нажатие «🤒 Я заболел(а)» по-прежнему
+    обрабатывает duty_sick_cb."""
+    query = update.callback_query
+    uid = str(query.from_user.id)
+    show_sick = query.data == "duty_more_me"
+    class_obj = get_class_by_user(uid)
+    if not class_obj or not getattr(class_obj, "duty_enabled", False):
+        try:
+            await query.answer("Дежурные в вашем классе выключены.",
+                               show_alert=True)
+        except Exception:
+            pass
+        return MAIN_MENU
+    tz = _duty_tz(class_obj)
+    local_now = _now_utc() + timedelta(hours=tz)
+    occ = local_now.strftime("%Y-%m-%d")
+    today = getattr(class_obj, "duty_today", None)
+    ids = [str(i) for i in (today.get("ids") or [])] \
+        if isinstance(today, dict) and today.get("date") == occ else []
+    if uid not in ids:
+        try:
+            await query.answer("Вы сегодня не в списке дежурных — "
+                               "уведомление устарело.",
+                               show_alert=True)
+        except Exception:
+            pass
+        return MAIN_MENU
+    if show_sick:
+        rows = [[InlineKeyboardButton("🤒 Я заболел(а)",
+                                      callback_data="duty_sick")],
+                [InlineKeyboardButton("⬅️ Назад",
+                                      callback_data="duty_more_me_back")]]
+    else:
+        rows = [[InlineKeyboardButton("☰ Ещё",
+                                      callback_data="duty_more_me")]]
+    try:
+        await query.edit_message_reply_markup(
+            reply_markup=InlineKeyboardMarkup(rows))
+        await query.answer()
+    except Exception as e:
+        logger.error(f"duty_me_more: edit failed: {e}")
+        try:
+            await query.answer("Не удалось обновить кнопки — сообщение "
+                               "устарело.",
                                show_alert=True)
         except Exception:
             pass
@@ -46153,6 +46249,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data in ("duty_more", "duty_more_back", "duty_more_c", "duty_more_back_c"):
         # ВОЛНА 22.42: «болел(а)» спрятана в «☰ Ещё» — показ/возврат раскладки
         return await duty_more_toggle_cb(update, context)
+    elif data in ("duty_more_me", "duty_more_me_back"):
+        # ВОЛНА 22.44: «🤒 Я заболел(а)» спрятана в «☰ Ещё» и на ЛИЧНОЙ
+        # карточке дежурного — показ/возврат раскладки
+        return await duty_me_more_cb(update, context)
     elif data.startswith("fhide_"):
         # ВОЛНА 22.36: кнопка «🙈 Скрыть» под файлом, отправленным мини-аппом
         return await miniapp_hide_file_cb(update, context)
