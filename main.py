@@ -3628,7 +3628,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.41"
+BOT_BUILD = "22.42"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -10168,7 +10168,19 @@ html.low-end #musicPlayer .art-container.mp-switch {
   border-radius: 9999px;
   position: relative;
   cursor: pointer;
-  touch-action: manipulation;
+  touch-action: none;
+}
+
+/* ВОЛНА 22.42: невидимая расширенная зона попадания (по 12px выше и ниже
+   полоски) — сама полоска всего 6px, в Telegram WebView тап по ней часто
+   промахивался и перемотка не срабатывала */
+#musicPlayer .progress-bg::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: -12px;
+  bottom: -12px;
 }
 
 #musicPlayer .progress-fill {
@@ -10320,11 +10332,21 @@ html.low-end #musicPlayer .art-container.mp-switch {
   transition: opacity 0.35s var(--ease-smooth), visibility 0s linear 0.35s;
 }
 
-/* Программный ландшафт: разворачивается ТОЛЬКО ВИДЕО (обёртка #vpRot вокруг
-   <video>), а оболочка плеера — фон, шапка, контролы — остаётся портретной.
-   Приложение больше не «переворачивает весь экран». Плавность: transform +
-   width/height одним транзишеном 0.55s; зум (scale на самом видео) живёт
-   отдельно и compose'ится с поворотом без конфликтов */
+/* Программный ландшафт (ВОЛНА 22.42): переворачивается ВЕСЬ ПЛЕЕР — модалка
+   целиком (видео + шапка + контролы), по фидбеку «при перевороте интерфейс
+   тоже должен переворачиваться». Обёртка #vpRot вокруг <video> остаётся в
+   нейтральном состоянии — размеры/поворот теперь задаёт сама модалка.
+   Плавность: transform + width/height транзишеном 0.55s; зум (scale на самом
+   видео) живёт отдельно и compose'ится без конфликтов */
+#videoPlayerModal {
+  transition:
+    opacity 0.35s var(--ease-smooth),
+    visibility 0s linear 0.35s,
+    transform 0.55s var(--ease-snap),
+    width 0.55s var(--ease-snap),
+    height 0.55s var(--ease-snap);
+}
+
 #vpRot {
   position: absolute;
   top: 50%;
@@ -10346,7 +10368,12 @@ html.low-end #musicPlayer .art-container.mp-switch {
   visibility: visible;
   pointer-events: auto;
   opacity: 1;
-  transition: opacity 0.35s var(--ease-smooth), visibility 0s;
+  transition:
+    opacity 0.35s var(--ease-smooth),
+    visibility 0s,
+    transform 0.55s var(--ease-snap),
+    width 0.55s var(--ease-snap),
+    height 0.55s var(--ease-snap);
 }
 
 body.vp-lock {
@@ -10403,12 +10430,34 @@ body.vp-lock {
   outline: none;
 }
 
+/* ВОЛНА 22.42: заполнение прогресса на ползунке — позиция --vp-pct ставится
+   из JS (vpUpdateSeekFill). Пройденная часть — плотный белый, непройденная —
+   заметная дорожка. Раньше дорожка была rgba(255,255,255,0.3) БЕЗ заполнения:
+   ползунок «прозрачный», и непонятно сколько видео прошло */
 #videoPlayerModal input[type=range]::-webkit-slider-runnable-track {
   width: 100%;
-  height: 4px;
+  height: 5px;
   cursor: pointer;
-  background: rgba(255, 255, 255, 0.3);
-  border-radius: 2px;
+  background: linear-gradient(to right,
+    #ffffff 0%, #ffffff var(--vp-pct, 0%),
+    rgba(255, 255, 255, 0.45) var(--vp-pct, 0%),
+    rgba(255, 255, 255, 0.45) 100%);
+  border-radius: 3px;
+}
+
+#videoPlayerModal input[type=range]::-moz-range-track {
+  width: 100%;
+  height: 5px;
+  cursor: pointer;
+  background: rgba(255, 255, 255, 0.45);
+  border-radius: 3px;
+}
+
+#videoPlayerModal input[type=range]::-moz-range-progress {
+  height: 5px;
+  cursor: pointer;
+  background: #ffffff;
+  border-radius: 3px;
 }
 
 #videoPlayerModal input[type=range]::-webkit-slider-thumb {
@@ -10418,7 +10467,7 @@ body.vp-lock {
   background: #ffffff;
   cursor: pointer;
   -webkit-appearance: none;
-  margin-top: -5px;
+  margin-top: -4.5px;
 }
 
 /* ═══ 22.39: БАННЕР-РЕКОМЕНДАЦИЯ РАЗРАБОТЧИКА — личный приватный канал ═══ */
@@ -15305,6 +15354,7 @@ let mpObjectUrl = null;
 let mpCoverUrl = null;
 let mpBeatRaf = 0;
 let mpTickRaf = 0;
+let mpScrubbing = false;
 const mpEl = {};
 
 /* Web Audio: анализатор — реактивный фон под бит */
@@ -15336,14 +15386,66 @@ function mpCache() {
     mpLoad(+d.dataset.i, mpPlaying());
   });
 
-  mpEl.mpProgressBg.addEventListener('click', (e) => {
-    if (!mpAudioEl || !mpAudioEl.duration) return;
+  /* ВОЛНА 22.42: перемотка ТАПОМ и ПЕРЕТАСКИВАНИЕМ по ползунку. Раньше был
+     только click по полоске высотой 6px — в WebView Telegram он часто
+     промахивался/глотался, и позицию в песне сменить было нельзя.
+     Pointer-события: pointerdown — мгновенный seek (тап), pointermove —
+     предпросмотр при перетаскивании, pointerup — фиксация позиции.
+     Fallback: click для старых WebView без PointerEvent. */
+  const mpSeekFromEvent = (e) => {
+    if (!mpAudioEl || !mpAudioEl.duration || !isFinite(mpAudioEl.duration)) return undefined;
 
     const rect = mpEl.mpProgressBg.getBoundingClientRect();
     const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
 
-    mpAudioEl.currentTime = pct * mpAudioEl.duration;
-  });
+    mpEl.mpProgressFill.style.width = (pct * 100) + '%';
+    mpEl.mpCurrent.textContent = mpFmtTime(pct * mpAudioEl.duration);
+
+    return pct;
+  };
+
+  if (window.PointerEvent) {
+    mpEl.mpProgressBg.addEventListener('pointerdown', (e) => {
+      if (!mpAudioEl || !mpAudioEl.duration || !isFinite(mpAudioEl.duration)) return;
+
+      mpScrubbing = true;
+
+      try { mpEl.mpProgressBg.setPointerCapture(e.pointerId); } catch (err) {}
+
+      const pct = mpSeekFromEvent(e);
+
+      if (pct !== undefined) mpAudioEl.currentTime = pct * mpAudioEl.duration;
+
+      e.preventDefault();
+    });
+
+    mpEl.mpProgressBg.addEventListener('pointermove', (e) => {
+      if (!mpScrubbing) return;
+
+      mpSeekFromEvent(e);
+    });
+
+    mpEl.mpProgressBg.addEventListener('pointerup', (e) => {
+      if (!mpScrubbing) return;
+
+      mpScrubbing = false;
+
+      const pct = mpSeekFromEvent(e);
+
+      if (pct !== undefined && mpAudioEl) mpAudioEl.currentTime = pct * mpAudioEl.duration;
+    });
+
+    mpEl.mpProgressBg.addEventListener('pointercancel', () => { mpScrubbing = false; });
+  } else {
+    mpEl.mpProgressBg.addEventListener('click', (e) => {
+      if (!mpAudioEl || !mpAudioEl.duration) return;
+
+      const rect = mpEl.mpProgressBg.getBoundingClientRect();
+      const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+
+      mpAudioEl.currentTime = pct * mpAudioEl.duration;
+    });
+  }
 
   mpAudioEl.addEventListener('ended', () => mpNextTrack());
   mpAudioEl.addEventListener('play', mpSyncPlayIcon);
@@ -15814,7 +15916,7 @@ function mpBeatLoop() {
 function mpTickLoop() {
   if (!mpOpen) { mpTickRaf = 0; return; }
 
-  if (mpAudioEl && mpAudioEl.duration && isFinite(mpAudioEl.duration)) {
+  if (mpAudioEl && mpAudioEl.duration && isFinite(mpAudioEl.duration) && !mpScrubbing) {
     const pct = (mpAudioEl.currentTime / mpAudioEl.duration) * 100;
 
     mpEl.mpProgressFill.style.width = pct + '%';
@@ -16094,6 +16196,17 @@ function vpOnTimeUpdate() {
   vpSeekEl.value = (vpPlayerEl.currentTime / vpPlayerEl.duration) * 100;
   document.getElementById('vpCur').textContent = vpFormatTime(vpPlayerEl.currentTime);
   document.getElementById('vpDur').textContent = vpFormatTime(vpPlayerEl.duration);
+  vpUpdateSeekFill();
+}
+
+/* ВОЛНА 22.42: заливка пройденной части ползунка — CSS-переменная --vp-pct
+   на инпуте, дорожка красится градиентом (см. ::-webkit-slider-runnable-track) */
+function vpUpdateSeekFill() {
+  if (!vpSeekEl) return;
+
+  const v = Math.max(0, Math.min(100, parseFloat(vpSeekEl.value) || 0));
+
+  vpSeekEl.style.setProperty('--vp-pct', v.toFixed(2) + '%');
 }
 
 function vpShowToast(text) {
@@ -16176,6 +16289,12 @@ function vpPlayVideo(v) {
   vpPlayerEl.style.transform = 'scale(1)';
   vpPlayerEl.style.objectFit = 'contain';
 
+  /* ВОЛНА 22.42: сброс ползунка и заливки под новое видео */
+  if (vpSeekEl) {
+    vpSeekEl.value = 0;
+    vpUpdateSeekFill();
+  }
+
   if ('mediaSession' in navigator) {
     try {
       navigator.mediaSession.metadata = new MediaMetadata({
@@ -16254,32 +16373,48 @@ async function vpToggleOrientation(e) {
   vpShowControls();
 }
 
-/* Программный переворот ВИДЕО в ландшафт: разворачивается только обёртка
-   #vpRot вокруг <video> — фон, шапка и контролы плеера остаются портретными,
-   приложение целиком не вращается (по фидбеку: «поворачиваться должно видео,
-   а не всё приложение»). Направление — по часовой (верх телефона уходит
-   вправо). Плавность: transform + width/height анимируются транзишеном
-   #vpRot (0.55s); обратный поворот играет до конца сам — классы не нужны */
+/* ВОЛНА 22.42: программный переворот разворачивает ВЕСЬ ПЛЕЕР — модалку
+   целиком: видео, шапку, контролы, тап-зоны (по фидбеку: «при перевороте
+   интерфейс тоже должен переворачиваться»). Раньше вращалась только обёртка
+   #vpRot вокруг <video>, а оболочка оставалась портретной. Направление —
+   по часовой (верх телефона уходит вправо), как и было. Обёртка #vpRot
+   остаётся в нейтральном состоянии — размеры/поворот задаёт сама модалка */
 function vpForceLandscape(on) {
+  const modal = document.getElementById('videoPlayerModal');
   const rot = document.getElementById('vpRot');
 
   vpForcedLandscape = !!on;
 
-  if (!rot) return;
+  /* обёртка видео всегда нейтральна — вращается модалка целиком */
+  if (rot) {
+    rot.style.width = '';
+    rot.style.height = '';
+    rot.style.transform = '';
+  }
+
+  if (!modal) return;
 
   if (on) {
     const w = window.innerWidth;
     const h = window.innerHeight;
 
-    /* видео разворачивается: ширина = высоте экрана, высота = ширине */
-    rot.style.width = h + 'px';
-    rot.style.height = w + 'px';
-    rot.style.transform = 'translate(-50%, -50%) rotate(90deg)';
+    /* плеер целиком: ширина = высоте экрана, высота = ширине экрана */
+    modal.style.left = '50%';
+    modal.style.top = '50%';
+    modal.style.right = 'auto';
+    modal.style.bottom = 'auto';
+    modal.style.width = h + 'px';
+    modal.style.height = w + 'px';
+    modal.style.transform = 'translate(-50%, -50%) rotate(90deg)';
   } else {
-    /* возврат к портрету — стили сбрасываются, transition доигрывает сам */
-    rot.style.width = '';
-    rot.style.height = '';
-    rot.style.transform = '';
+    /* возврат к портрету — инлайн-стили сбрасываются, transition доигрывает */
+    modal.style.left = '';
+    modal.style.top = '';
+    modal.style.right = '';
+    modal.style.bottom = '';
+    modal.style.width = '';
+    modal.style.height = '';
+    modal.style.transform = '';
   }
 }
 
@@ -16367,6 +16502,7 @@ function vpShowControls() {
 
 function vpOnSeekInput() {
   vpIsSeeking = true;
+  vpUpdateSeekFill();
   vpShowControls();
 }
 
@@ -16375,6 +16511,7 @@ function vpOnSeekChange() {
     vpPlayerEl.currentTime = (vpSeekEl.value / 100) * vpPlayerEl.duration;
   }
 
+  vpUpdateSeekFill();
   vpIsSeeking = false;
 }
 
@@ -42427,14 +42564,19 @@ async def _duty_announce(bot, class_obj, selected, sick_note=None):
             [str(m) for m in (class_obj.admins or [])])]
         blocked = set(str(b) for b in (class_obj.blocked_users or []))
         members = [m for m in members if m not in blocked]
-        # ВОЛНА 22.36: админам — кнопки замены по индексу в списке дежурных
+        # ВОЛНА 22.42 (по фидбеку «убери кнопку болел(а) в кнопку ещё»):
+        # на карточке — только «🚫 не будет» на каждого дежурного + одна
+        # кнопка «☰ Ещё», которая открывает кнопки «🤒 заболел(а)»
+        # (duty_more_toggle_cb). Логика замены та же (ВОЛНА 22.36).
         admin_rows = []
         for i, nm in enumerate(selected):
             admin_rows.append([
-                InlineKeyboardButton(f"🤒 {str(nm)[:20]} — заболел(а)",
-                                     callback_data=f"duty_cns_{i}"),
-                InlineKeyboardButton(f"🚫 не будет", callback_data=f"duty_cnn_{i}"),
+                InlineKeyboardButton(f"🚫 {str(nm)[:20]} — не будет",
+                                     callback_data=f"duty_cnn_{i}"),
             ])
+        if admin_rows:
+            admin_rows.append([InlineKeyboardButton("☰ Ещё",
+                                                    callback_data="duty_more_c")])
         admin_kb = InlineKeyboardMarkup(admin_rows) if admin_rows else None
         sent_ok = 0
         for uid in members:
@@ -42476,19 +42618,21 @@ async def _duty_announce(bot, class_obj, selected, sick_note=None):
             is_admin = str(uid) in [str(a) for a in (class_obj.admins or [])]
             kb = None
             if is_admin and selected:
-                # ВОЛНА 22.36: у админа на каждого дежурного ДВЕ кнопки —
-                # «заболел(а)» и «не будет» (обе передают дежурство дальше)
+                # ВОЛНА 22.42: на карточке — «🚫 не будет» на каждого дежурного
+                # и одна кнопка «☰ Ещё»; кнопки «🤒 заболел(а)» открываются
+                # через «Ещё» (duty_more_toggle_cb). Логика замены та же
+                # (ВОЛНА 22.36: обе кнопки передают дежурство дальше)
                 rows = []
                 for i in selected:
                     if str(i) == str(uid):
                         continue
                     _nm = _duty_member_name(i)
                     rows.append([InlineKeyboardButton(
-                        f"🤒 {_nm} — заболел(а)",
-                        callback_data=f"duty_sick_uid_{i}"),
-                        InlineKeyboardButton("🚫 не будет",
-                                             callback_data=f"duty_skip_uid_{i}")])
+                        f"🚫 {_nm} — не будет",
+                        callback_data=f"duty_skip_uid_{i}")])
                 if rows:
+                    rows.append([InlineKeyboardButton(
+                        "☰ Ещё", callback_data="duty_more")])
                     kb = InlineKeyboardMarkup(rows)
             await bot.send_message(
                 chat_id=int(uid),
@@ -43835,6 +43979,91 @@ async def duty_sick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=int(m),
                 text=f"🔄 <b>Сегодня дежурный(е): {names}</b>\n{note}",
                 parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+    return MAIN_MENU
+
+
+async def duty_more_toggle_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.42: кнопка «☰ Ещё» / «⬅️ Назад» под утренним сообщением
+    дежурных — раскладка по фидбеку «убери кнопку болел(а) в кнопку ещё»:
+    на карточке видны только «🚫 не будет», а кнопки «🤒 заболел(а)»
+    открываются через «☰ Ещё» и прячутся обратно через «⬅️ Назад».
+    duty_more / duty_more_back — обычный режим (uid-дежурные),
+    duty_more_c / duty_more_back_c — свой график (имена, индексы duty_cns_).
+    ЛОГИКА ЗАМЕН НЕ ТРОНУТА — меняется только раскладка кнопок сообщения."""
+    query = update.callback_query
+    uid = str(query.from_user.id)
+    show_sick = query.data in ("duty_more", "duty_more_c")
+    names_mode = query.data in ("duty_more_c", "duty_more_back_c")
+    class_obj = get_class_by_user(uid)
+    if not class_obj or not getattr(class_obj, "duty_enabled", False):
+        try:
+            await query.answer("Дежурные в вашем классе выключены.", show_alert=True)
+        except Exception:
+            pass
+        return MAIN_MENU
+    if not _duty_is_admin(uid, class_obj):
+        try:
+            await query.answer("Кнопки замены доступны только админам.",
+                               show_alert=True)
+        except Exception:
+            pass
+        return MAIN_MENU
+    tz = _duty_tz(class_obj)
+    local_now = _now_utc() + timedelta(hours=tz)
+    occ = local_now.strftime("%Y-%m-%d")
+    today = getattr(class_obj, "duty_today", None)
+    rows = []
+    if names_mode:
+        names_list = [str(n) for n in ((today or {}).get("names") or [])] \
+            if isinstance(today, dict) and today.get("date") == occ else []
+        if show_sick:
+            for i, nm in enumerate(names_list):
+                rows.append([InlineKeyboardButton(
+                    f"🤒 {nm[:20]} — заболел(а)",
+                    callback_data=f"duty_cns_{i}")])
+        else:
+            for i, nm in enumerate(names_list):
+                rows.append([InlineKeyboardButton(
+                    f"🚫 {nm[:20]} — не будет",
+                    callback_data=f"duty_cnn_{i}")])
+    else:
+        ids = [str(i) for i in ((today or {}).get("ids") or [])] \
+            if isinstance(today, dict) and today.get("date") == occ else []
+        for i in ids:
+            if str(i) == str(uid):
+                continue  # себе админ не ставит кнопки — у него своё сообщение
+            _nm = _duty_member_name(i)
+            if show_sick:
+                rows.append([InlineKeyboardButton(
+                    f"🤒 {_nm} — заболел(а)",
+                    callback_data=f"duty_sick_uid_{i}")])
+            else:
+                rows.append([InlineKeyboardButton(
+                    f"🚫 {_nm} — не будет",
+                    callback_data=f"duty_skip_uid_{i}")])
+    if not rows:
+        try:
+            await query.answer("Сегодня дежурных нет — уведомление устарело.",
+                               show_alert=True)
+        except Exception:
+            pass
+        return MAIN_MENU
+    if show_sick:
+        back_cb = "duty_more_back_c" if names_mode else "duty_more_back"
+        rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=back_cb)])
+    else:
+        more_cb = "duty_more_c" if names_mode else "duty_more"
+        rows.append([InlineKeyboardButton("☰ Ещё", callback_data=more_cb)])
+    try:
+        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(rows))
+        await query.answer()
+    except Exception as e:
+        logger.error(f"duty_more_toggle: edit failed: {e}")
+        try:
+            await query.answer("Не удалось обновить кнопки — сообщение устарело.",
+                               show_alert=True)
         except Exception:
             pass
     return MAIN_MENU
@@ -45903,6 +46132,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "duty_sick" or data.startswith("duty_sick_uid_") \
             or data.startswith("duty_skip_uid_"):
         return await duty_sick_cb(update, context)
+    elif data in ("duty_more", "duty_more_back", "duty_more_c", "duty_more_back_c"):
+        # ВОЛНА 22.42: «болел(а)» спрятана в «☰ Ещё» — показ/возврат раскладки
+        return await duty_more_toggle_cb(update, context)
     elif data.startswith("fhide_"):
         # ВОЛНА 22.36: кнопка «🙈 Скрыть» под файлом, отправленным мини-аппом
         return await miniapp_hide_file_cb(update, context)
