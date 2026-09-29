@@ -3628,7 +3628,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.42"
+BOT_BUILD = "22.43"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -11054,7 +11054,7 @@ body.vp-lock {
         <i data-lucide="skip-forward" style="width:18px;height:18px"></i>
       </button>
 
-      <button class="sound-item-btn" onclick="skipAllNames()">
+      <button class="sound-item-btn" id="nameModalSkipAll" onclick="skipAllNames()">
         <span>Пропустить все</span>
         <i data-lucide="fast-forward" style="width:18px;height:18px"></i>
       </button>
@@ -13683,8 +13683,14 @@ function cancelUpload() {
 }
 
 function openNameChoiceModal() {
-  if (pendingFiles.length < 2) {
-    startActualUpload();
+  /* ВОЛНА 22.43: шаг имени — для ЛЮБОГО количества файлов.
+     Раньше ОДИН файл уходил в загрузку сразу, без возможности назвать;
+     теперь одиночный файл тоже открывает окно «Назовите файл» —
+     можно ввести имя или нажать «Пропустить» (останется оригинальное). */
+  if (!pendingFiles.length) return;
+
+  if (pendingFiles.length === 1) {
+    openNameModal();
     return;
   }
 
@@ -13793,8 +13799,21 @@ function showNameModal() {
     return;
   }
 
+  /* ВОЛНА 22.43: у одиночного файла счётчик «Файл 1 из 1» и кнопка
+     «Пропустить все» (дублирует «Пропустить») не нужны — прячем;
+     у пачки всё как раньше. */
+  const many = pendingFiles.length > 1;
+
   const counter = document.getElementById('nameModalCounter');
-  if (counter) counter.textContent = 'Файл ' + (nameEditIndex + 1) + ' из ' + pendingFiles.length;
+  if (counter) {
+    counter.textContent = many
+      ? 'Файл ' + (nameEditIndex + 1) + ' из ' + pendingFiles.length
+      : '';
+    counter.style.display = many ? 'block' : 'none';
+  }
+
+  const skipAllBtn = document.getElementById('nameModalSkipAll');
+  if (skipAllBtn) skipAllBtn.style.display = many ? 'flex' : 'none';
 
   const orig = document.getElementById('nameModalOriginal');
   if (orig) orig.textContent = 'Текущее имя: ' + (f.name || '');
@@ -14236,11 +14255,10 @@ function confirmUploadFiles() {
 
   closeModalEl('uploadModal');
 
-  if (pendingFiles.length > 1) {
-    openNameChoiceModal();
-  } else {
-    startActualUpload();
-  }
+  /* ВОЛНА 22.43: окно имени открывается для ЛЮБОГО количества файлов —
+     один файл можно назвать или пропустить, пачка — как раньше
+     (альбом / по одному / пропустить всё). */
+  openNameChoiceModal();
 }
 
 let pickerAppend = false;
