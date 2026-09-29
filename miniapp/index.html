@@ -5440,9 +5440,17 @@ function confirmAlbumName() {
     return i > 0 ? n.slice(i) : '';
   };
 
-  pendingFiles = pendingFiles.map((f, i) =>
-    Object.assign({}, f, { uploadName: (base + ' ' + (i + 1) + extOf(f)).slice(0, 120) })
-  );
+  /* ВОЛНА 22.44: имя пишем ПРЯМО в объект файла (expando, как _entryKey),
+     а НЕ в Object.assign-копию. У File/Blob size/type/name — геттеры
+     ПРОТОТИПА, Object.assign их НЕ копирует: копия выходила пустым
+     объектом, size = 0 → сервер отвечал «Файл пустой (0 Б)» ровно тогда,
+     когда файл называли. Оригинальный File сохраняет size/slice —
+     загрузка идёт как при именовании, так и без него. */
+  pendingFiles.forEach((f, i) => {
+    try {
+      f.uploadName = (base + ' ' + (i + 1) + extOf(f)).slice(0, 120);
+    } catch (e) {}
+  });
 
   closeModalEl('albumModal');
   startActualUpload();
@@ -5528,9 +5536,14 @@ function nextNameStep() {
 }
 
 function applyCustomNames() {
-  pendingFiles = pendingFiles.map((f) =>
-    f._customName ? Object.assign({}, f, { uploadName: f._customName }) : f
-  );
+  /* ВОЛНА 22.44: то же, что в confirmAlbumName — expando на оригинальном
+     File, НЕ Object.assign-копия (копия теряла size → «Файл пустой (0 Б)»
+     у КАЖДОГО названного файла). */
+  pendingFiles.forEach((f) => {
+    if (f && f._customName) {
+      try { f.uploadName = String(f._customName).slice(0, 120); } catch (e) {}
+    }
+  });
 
   startActualUpload();
 }
@@ -7750,6 +7763,9 @@ let vpWasPinching = false;
 let vpLastCenterTap = 0;
 let vpFullscreen = false;
 let vpForcedLandscape = false;
+/* ВОЛНА 22.44: отложенное снятие чёрной подложки после возврата в портрет
+   (таймер с гардом — повторный переворот в течение 600 мс не теряет подложку) */
+let vpShadowTimer = null;
 let vpLastManualExit = 0;
 let vpIsSeeking = false;
 let vpPlayerEl = null;
@@ -8093,8 +8109,20 @@ function vpForceLandscape(on) {
     modal.style.width = h + 'px';
     modal.style.height = w + 'px';
     modal.style.transform = 'translate(-50%, -50%) rotate(90deg)';
+    /* ВОЛНА 22.44: чёрная подложка из box-shadow едет ВМЕСТЕ с модалкой
+       (применяется мгновенно, без транзишена) и на всём протяжении
+       поворота накрывает экран целиком — вращающийся прямоугольник
+       не открывает углы, и главный экран приложения больше не виден */
+    if (vpShadowTimer) {
+      clearTimeout(vpShadowTimer);
+      vpShadowTimer = null;
+    }
+    modal.style.boxShadow = '0 0 0 100vmax #000';
   } else {
-    /* возврат к портрету — инлайн-стили сбрасываются, transition доигрывает */
+    /* возврат к портрету — инлайн-стили сбрасываются, transition доигрывает;
+       подложку снимаем ТОЛЬКО после возврата (600 мс) — иначе углы снова
+       откроют приложение посреди анимации; гард на случай быстрого
+       повторного переворота */
     modal.style.left = '';
     modal.style.top = '';
     modal.style.right = '';
@@ -8102,6 +8130,12 @@ function vpForceLandscape(on) {
     modal.style.width = '';
     modal.style.height = '';
     modal.style.transform = '';
+    if (vpShadowTimer) clearTimeout(vpShadowTimer);
+    vpShadowTimer = window.setTimeout(() => {
+      vpShadowTimer = null;
+      const m = document.getElementById('videoPlayerModal');
+      if (m && !vpForcedLandscape) m.style.boxShadow = '';
+    }, 600);
   }
 }
 
