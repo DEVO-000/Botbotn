@@ -239,6 +239,11 @@ def _data_file(filename: str) -> str:
 USERS_FILE = _data_file("users.json")
 CLASSES_FILE = _data_file("classes.json")
 TIMERS_FILE = _data_file("timers.json")
+# ВОЛНА 22.41: таймеры СООБЩЕНИЙ КЛАССУ (админ ставит время, когда сообщение
+# должно прийти всему классу — один раз / каждый день / по дням недели).
+# Хранится на диске и синхронизируется в канал-БД (STORAGE_BACKUP_FILES ниже):
+# «должно сохраняться и синхронизироваться в базе данных».
+CLASS_TIMERS_FILE = _data_file("class_timers.json")
 # ВОЛНА 22.28: активные помодоро-сессии («в таймере добавь помодоро таймер»).
 # Хранится на диске и в канале-БД — сессия переживает рестарт и тикер сам
 # продолжит фазы (работа/перерыв) даже после падения сервера.
@@ -520,6 +525,11 @@ SICK_WAIT_TO = 154         # «🤒 Я болел(а)»: дата конца (Г
 # (ИИ строит ротацию) либо список с датами (ИИ раскладывает по датам).
 DUTY_CUSTOM_AI = 155       # ждём список имён для ИИ-составления графика
 DUTY_CUSTOM_DATES = 156    # ждём список «дата — имена» (числа дежурств)
+# ВОЛНА 22.45: админ переименовывает кнопку класса («🆕 Управление кнопками»
+# → «📝 Кнопка» → «📝 Переименовать»). Раньше колбэк edit_button_ был
+# МЁРТВЫМ (хендлера не было) — нажатие висело «часиками», и кнопку нельзя
+# было ни отредактировать, ни удалить через понятное меню.
+CUSTOM_BUTTON_EDIT_NAME = 157
 
 # ВОЛНА 22.4: «🎙 Пульт» удалён ПОЛНОСТЬЮ по решению пользователя — кнопки,
 # состояний (бывшие 126–131), хендлеров и хранилищ стилей больше нет.
@@ -1701,7 +1711,10 @@ def load_prices():
     return prices
 
 def save_prices(prices):
-    return save_data(PRICES_FILE, prices)
+    """ВОЛНА 22.40: возвращает РЕЗУЛЬТАТ записи (True/False) — раньше молча
+    падали записи в Supabase/Mongo, а обработчики писали «✅ Цена изменена»,
+    и после рестарта цена откатывалась («не сохраняются цены разработчика»)."""
+    return bool(save_data(PRICES_FILE, prices))
 
 def reload_prices():
     """Синхронизация цен: перечитывает prices.json из БД в глобальный PRICES.
@@ -2121,6 +2134,9 @@ STORAGE_BACKUP_FILES = (
     # ВОЛНА 22.28: активные помодоро-сессии переживают рестарт — тикер
     # продолжит прерванные фазы (работа/перерыв) автоматически.
     POMODORO_FILE,
+    # ВОЛНА 22.41: таймеры сообщений классу — «сохраняться и
+    # синхронизироваться в базе данных» (переживают рестарт/деплой).
+    CLASS_TIMERS_FILE,
 )
 
 PRICES = load_prices()
@@ -2212,6 +2228,19 @@ class User:
         # скорость анимации, звук, свой цвет) — переживают очистку кэша и
         # смену устройства; localStorage остаётся мгновенным кэшем.
         self.miniapp_settings = {}
+        # ВОЛНА 22.40: бот ждёт от админа список дежурных («свой график»).
+        # {"mode": "ai"|"dates", "ts": epoch} или None. ПЕРСИСТЕНТЕН: после
+        # рестарта сервера FSM-состояние терялось, и присланный список имён
+        # молча пропадал («в боте не приходят свои списки дежурных и списки
+        # ии»). Теперь глобальный обработчик доводит список до ИИ/парсера.
+        self.duty_pending = None
+        # ВОЛНА 22.41: бот ждёт от админа ввод таймера сообщений классу
+        # (время/дата/дни/текст). {"step": ..., ...} или None. ПЕРСИСТЕНТЕН
+        # (TTL 3 ч) — переживает рестарт сервера, как duty_pending.
+        self.ct_pending = None
+        # ВОЛНА 22.41: бот ждёт от админа СПИСОК ЗВОНКОВ целиком («весь
+        # список вручную»). {"ts": epoch} или None, TTL 3 ч.
+        self.bells_pending = None
         self.birthday = None
         # ВОЛНА 22.28: пропустить ввод ДР больше нельзя — дата обязательна.
         # Флаг остался только для совместимости старых JSON-записей; при
@@ -2437,6 +2466,12 @@ class User:
             'miniapp_settings': (getattr(self, 'miniapp_settings', None)
                                  if isinstance(getattr(self, 'miniapp_settings', None), dict)
                                  else {}),
+            # ВОЛНА 22.40: ожидаемый список дежурных (переживает рестарт)
+            'duty_pending': getattr(self, 'duty_pending', None),
+            # ВОЛНА 22.41: ожидаемый ввод таймера классу (переживает рестарт)
+            'ct_pending': getattr(self, 'ct_pending', None),
+            # ВОЛНА 22.41: ожидаемый список звонков целиком (переживает рестарт)
+            'bells_pending': getattr(self, 'bells_pending', None),
             'birthday': self.birthday,
             'birthday_skipped': getattr(self, 'birthday_skipped', False),
             'show_birthday_countdown': self.show_birthday_countdown,
@@ -2553,6 +2588,36 @@ class User:
         # ВОЛНА 22.37: настройки мини-аппа в базе (старые записи без поля).
         if not hasattr(user, 'miniapp_settings') or not isinstance(user.miniapp_settings, dict):
             user.miniapp_settings = {}
+        # ВОЛНА 22.40: флаг «ждём список дежурных» (старые записи без поля).
+        if not hasattr(user, 'duty_pending') or not isinstance(user.duty_pending, dict):
+            user.duty_pending = None
+        else:
+            try:
+                if str(user.duty_pending.get('mode') or '') not in ('ai', 'dates') \
+                        or (time.time() - float(user.duty_pending.get('ts') or 0)) > 3 * 3600:
+                    user.duty_pending = None
+            except Exception:
+                user.duty_pending = None
+        # ВОЛНА 22.41: флаг «ждём ввод таймера классу» (TTL 3 ч).
+        if not hasattr(user, 'ct_pending') or not isinstance(user.ct_pending, dict):
+            user.ct_pending = None
+        else:
+            try:
+                if str(user.ct_pending.get('step') or '') not in (
+                        'when', 'time', 'days', 'text') \
+                        or (time.time() - float(user.ct_pending.get('ts') or 0)) > 3 * 3600:
+                    user.ct_pending = None
+            except Exception:
+                user.ct_pending = None
+        # ВОЛНА 22.41: флаг «ждём список звонков целиком» (TTL 3 ч).
+        if not hasattr(user, 'bells_pending') or not isinstance(user.bells_pending, dict):
+            user.bells_pending = None
+        else:
+            try:
+                if (time.time() - float(user.bells_pending.get('ts') or 0)) > 3 * 3600:
+                    user.bells_pending = None
+            except Exception:
+                user.bells_pending = None
         if not hasattr(user, 'birthday_eve_notify') or user.birthday_eve_notify is None:
             user.birthday_eve_notify = True
         if not hasattr(user, 'dnd_enabled') or user.dnd_enabled is None:
@@ -3568,7 +3633,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.39"
+BOT_BUILD = "22.48"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -4303,6 +4368,9 @@ def check_class_limit(class_code):
 def get_admin_panel_keyboard():
     keyboard = [
         [InlineKeyboardButton("📢 Отправить сообщение классу", callback_data="send_class_message")],
+        # ВОЛНА 22.41: таймер сообщений классу (один раз / каждый день /
+        # по дням недели; также ставится через 🪄 AI Agent).
+        [InlineKeyboardButton("⏰ Таймер классу", callback_data="ctm_open")],
         # ВОЛНА 22.10: настоящий Telegram-опрос классу + общие итоги.
         [InlineKeyboardButton("📊 Опрос классу", callback_data="admin_poll"),
          InlineKeyboardButton("📈 Итоги опросов", callback_data="poll_results")],
@@ -4328,13 +4396,15 @@ def get_cancel_keyboard():
 
 
 # ВОЛНА 22.28: дату рождения ПРОПУСТИТЬ БОЛЬШЕ НЕЛЬЗЯ («дату рождения нельзя
-# пропустить») — на шаге ДР остаётся только «❌ Отмена». Город остаётся
-# необязательным («⏭ Пропустить» — get_skip_city_keyboard). Имя функции
-# оставлено старым для совместимости вызовов — текст подсказки обновлён.
+# пропустить»). Город остаётся необязательным («⏭ Пропустить» —
+# get_skip_city_keyboard). Имя функции оставлено старым для совместимости
+# вызовов — текст подсказки обновлён.
+# ВОЛНА 22.47: в начале регистрации на ДР кнопки «❌ Отмена» больше НЕТ
+# («в начале регистрации на др не должно быть кнопки отмена») — дата
+# обязательна, «Отмена» была тупиком и путала. Клавиатура пустая;
+# имя функции оставлено старым для совместимости вызовов.
 def get_skip_birthday_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("❌ Отмена", callback_data="cancel_action")],
-    ])
+    return InlineKeyboardMarkup([])
 
 
 def get_skip_city_keyboard():
@@ -4413,6 +4483,9 @@ def get_bells_edit_keyboard(class_obj):
     for lesson_num, times in class_obj.bells.items():
         text = f"{lesson_num} урок: {times['start']} - {times['end']}"
         keyboard.append([InlineKeyboardButton(text, callback_data=f"edit_bell_{lesson_num}")])
+    # ВОЛНА 22.41: «весь список вручную» — админ присылает список звонков
+    # одним сообщением, парсер заменяет всё расписание звонков сразу.
+    keyboard.append([InlineKeyboardButton("📜 Ввести весь список", callback_data="edit_bells_bulk")])
     keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_to_admin")])
     return InlineKeyboardMarkup(keyboard)
 
@@ -4449,7 +4522,11 @@ def get_custom_buttons_management_keyboard(class_obj):
     keyboard = []
     custom_buttons = get_class_custom_buttons(class_obj.class_code)
     for button in custom_buttons:
-        keyboard.append([InlineKeyboardButton(f"📝 {button.name}", callback_data=f"edit_button_{button.button_id}")])
+        # ВОЛНА 22.45: показываем имя БЕЗ служебного префикса CLASS_ —
+        # раньше админ видел «📝 CLASS_Расписание» и не узнавал свою кнопку
+        # (в списке удаления префикс срезался, здесь — нет).
+        display = button.name.replace("CLASS_", "") if button.name.startswith("CLASS_") else button.name
+        keyboard.append([InlineKeyboardButton(f"📝 {display}", callback_data=f"edit_button_{button.button_id}")])
 
     keyboard.append([InlineKeyboardButton("➕ Добавить кнопку", callback_data="add_custom_button")])
     keyboard.append([InlineKeyboardButton("🗑️ Удалить кнопки", callback_data="admin_delete_buttons")])
@@ -4684,6 +4761,11 @@ ALL_MAIN_MENU_BUTTONS = [
     "🌦 Погода",
     "📚 Инструкция",
     "🔑 Код класса",
+    # ВОЛНА 22.45: «📋 Ещё» — полноценный участник настроек кнопок:
+    # в «👁 Скрыть/показать» и «🔄 Переместить кнопки» она теперь тоже
+    # отображается, В НЕЁ можно «спрятать» любую кнопку (скрытие = перенос
+    # в «Ещё») и САМУ «Ещё» тоже можно скрыть/вернуть.
+    "📋 Ещё",
     "🚪 Выйти из класса",
     "🔓 Выйти из аккаунта"
 ]
@@ -4834,9 +4916,12 @@ def get_main_menu_keyboard(user):
         "💬 Чат поддержки",
         # ВОЛНА 22.12: общая база решений класса (для списывания честно).
         "📚 Решения",
-        # ВОЛНА 22.29: «🤒 Я болел(а)» — ДЗ и объявления класса за период
-        # болезни; «📋 Ещё» — скрытые кнопки + ДР одноклассников.
-        "🤒 Я болел(а)", "📋 Ещё",
+        # ВОЛНА 22.46: «🤒 Я болел(а)» из ГЛАВНОГО меню УБРАНА — по прямому
+        # требованию пользователя: «кнопка я болел(а) должна быть только в
+        # кнопке ещё, но не на главном меню бота». Она живёт ТОЛЬКО внутри
+        # «📋 Ещё» (inline more_sick), пока пользователь сам не решит иначе.
+        # «📋 Ещё» — скрытые кнопки + ДР одноклассников + дежурные + болезнь.
+        "📋 Ещё",
         "📚 Инструкция", "🔑 Код класса",
     ]
     # «📨 Мои анонимные сообщения» — отдельный список, чтобы её можно было
@@ -5318,6 +5403,8 @@ def get_developer_keyboard():
         # и применяются при каждой покупке через load_prices(), поэтому менять
         # текст инструкции после смены цены не нужно — бот сам покажет новые цифры.
         [InlineKeyboardButton("💰 Изменить цены функций", callback_data="dev_quick_prices")],
+        # ВОЛНА 22.40: самопроверка базы — «всё ли сохраняется в базу данных».
+        [InlineKeyboardButton("🗄 Проверка БД", callback_data="dev_db_check")],
         # НОВОЕ: сброс статистики Stars (история переводов больше не ведётся).
         [InlineKeyboardButton("🧹 Сбросить статистику Stars", callback_data="dev_reset_stars")],
         [InlineKeyboardButton("🌍 Создать глобальную кнопку", callback_data="dev_global_button")],
@@ -5468,16 +5555,23 @@ async def _ai_thinking_animation(context: ContextTypes.DEFAULT_TYPE, chat_id: in
         logger.warning(f"AI thinking animation failed: {e}")
 
 
-async def _deepseek_chat(messages, timeout=60, temperature=0.2, force_json=False):
+async def _deepseek_chat(messages, timeout=60, temperature=0.2, force_json=False,
+                          max_tokens=None, return_meta=False):
     """Низкоуровневый запрос к DeepSeek (OpenAI-совместимый API).
 
     Возвращает ТЕКСТ ответа модели или None при ошибке/отсутствии ключа.
     force_json=True включает response_format={"type":"json_object"} —
     DeepSeek гарантирует валидный JSON в ответе (нужно для автоматизации).
+
+    ВОЛНА 22.41: max_tokens — лимит токенов ответа (None = прежние 2048;
+    чат DEVORKS+ai зовёт с 450 — экономия токенов). return_meta=True —
+    возвращает КОРТЕЖ (текст, finish_reason): "length" означает обрыв по
+    лимиту — чат обрезает ответ до законченного предложения
+    (_ai_finish_guarantee), чтобы сообщение не было оборванным.
     """
     if not DEEPSEEK_API_KEY:
         logger.warning("DeepSeek: DEEPSEEK_API_KEY не задан — запрос пропущен.")
-        return None
+        return (None, None) if return_meta else None
     headers = {
         "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
         "Content-Type": "application/json",
@@ -5486,7 +5580,7 @@ async def _deepseek_chat(messages, timeout=60, temperature=0.2, force_json=False
         "model": DEEPSEEK_MODEL,
         "messages": messages,
         "temperature": temperature,
-        "max_tokens": 2048,
+        "max_tokens": int(max_tokens) if max_tokens else 2048,
         "stream": False,
     }
     if force_json:
@@ -5508,16 +5602,19 @@ async def _deepseek_chat(messages, timeout=60, temperature=0.2, force_json=False
                     logger.error(
                         f"DeepSeek API вернул статус {resp.status}: {body}"
                     )
-                    return None
+                    return (None, None) if return_meta else None
                 data = await resp.json()
-                content = data["choices"][0]["message"]["content"]
+                choice = (data.get("choices") or [{}])[0]
+                content = (choice.get("message") or {}).get("content")
+                if return_meta:
+                    return content, choice.get("finish_reason")
                 return content
     except asyncio.TimeoutError:
         logger.error("DeepSeek API timeout")
-        return None
+        return (None, None) if return_meta else None
     except Exception as e:
         logger.error(f"Ошибка запроса к DeepSeek: {e}")
-        return None
+        return (None, None) if return_meta else None
 
 
 def _extract_json_dict(raw_text):
@@ -5571,68 +5668,99 @@ def _extract_json_dict(raw_text):
 def _ai_chat_system_prompt():
     """Системный промпт чата DEVORKS+ai (базовый, режим «normal»).
 
-    Требование разработчика: ИИ ВСЕГДА отвечает очень честно — только
-    проверенные факты, никаких выдумок и «галлюцинаций»; если чего-то не
-    знает — так и говорит. Плюс: чат ведёт ЛЮБУЮ тему и МГНОВЕННО
-    переключается между темами — пользователь может сначала говорить об
-    одном, а следующим сообщением резко о другом; бот не должен «тупить»
-    и тащить старую тему за собой.
+    ВОЛНА 22.41 — экономия токенов: промпт СЖАТ до диапазона 300–500
+    символов (требование разработчика), при этом сохраняет суть прежних
+    правил: честность (никаких выдумок), мгновенная смена тем, точность
+    по последнему сообщению, краткость. Длину ответа ограничиваем и
+    промптом (≤1000 символов), и кодом (_ai_finish_guarantee).
     """
-    return (
-        "Ты — DEVORKS+ai, умный и дружелюбный ИИ-помощник школьного Telegram-бота "
-        "DEVORKS+. Отвечай ТОЛЬКО на русском языке, независимо от языка запроса.\n\n"
-        "ГЛАВНЫЙ ПРИНЦИП — ЧЕСТНОСТЬ:\n"
-        "0. Ты ВСЕГДА отвечаешь очень честно. Только правда и только проверенные "
-        "факты: ничего не выдумывай, не сочиняй источники, цифры и даты, не "
-        "приукрашивай. Если не знаешь или не уверен — честно скажи «не знаю» / "
-        "«не уверен» и объясни, почему. Ошибся — сразу признай и исправь.\n\n"
-        "ПРИНЦИПЫ РАБОТЫ:\n"
-        "1. Ты умеешь поддерживать ЛЮБУЮ тему: школа, ДЗ, игры, спорт, код, "
-        "кино, отношения, юмор и т. д. Нет «запретных для себя» тем.\n"
-        "2. ПЕРЕД каждым ответом определи: это продолжение текущей темы или "
-        "НОВАЯ тема? Если пользователь резко сменил тему — мгновенно следуй "
-        "НОВОЙ теме: не возвращайся к старой, не спрашивай «так о чём мы "
-        "говорили», не тащи старый контекст в ответ без явной необходимости.\n"
-        "3. Отвечай точно по существу ПОСЛЕДНЕГО сообщения. История диалога — "
-        "только для контекста, а не повод застревать в прошлом.\n"
-        "4. Понимай запросы очень точно: учитывай синонимы, сленг, опечатки и "
-        "недоговорённости. Если вопрос двусмысленный — сделай наиболее "
-        "разумное предположение, ответь по нему и кратко отметь предположение.\n"
-        "5. Если не знаешь чего-то или не уверен — честно скажи об этом, "
-        "ничего не выдумывай.\n"
-        "6. Будь кратким и полезным: обычно 1–6 абзацев, без воды и повторов."
+    prompt = (
+        "Ты — DEVORKS+ai, ИИ-помощник школьного Telegram-бота DEVORKS+. "
+        "Отвечай только по-русски. Главное — честность: только проверенные "
+        "факты, ничего не выдумывай, не знаешь — так и скажи. Тему меняй "
+        "мгновенно, отвечай точно по последнему сообщению. Понимай синонимы, "
+        "сленг и опечатки. Пиши кратко, без воды, не длиннее 1000 символов, "
+        "всегда законченными предложениями."
     )
+    # Страховка требования «300–500 символов»: держим длину в диапазоне.
+    return prompt[:500]
 
 
 def _ai_chat_full_prompt(persona):
     """Полный системный промпт чата с учётом выбранного режима личности.
 
-    Режимы «хамло» и «тепло» заданы разработчиком бота дословно — они
-    добавляются ПОВЕРХ базовых правил (честность, смена тем, точность),
-    чтобы чат не терял базовые навыки понимания в любом режиме.
+    ВОЛНА 22.41: тексты режимов («хамло», «тепло») сжаты до коротких
+    добавок (~200 символов), чтобы суммарный промпт оставался в бюджете
+    экономии токенов. Суть режимов (тон, длина, запрет мягкости)
+    сохранена дословно по ключевым правилам разработчика.
     """
     base = _ai_chat_system_prompt()
     persona = persona if persona in AI_PERSONA_MODES else "normal"
     if persona == "normal":
         return base
-    persona_text = AI_PERSONA_PROMPTS.get(persona, "").strip()
     title = AI_PERSONA_MODES[persona]["title"]
+    # Короткие тексты режимов (экономия токенов, волна 22.41).
+    persona_text = {
+        "hamlo": (
+            "Отвечай только правду, но каждый ответ — грубость: начинай с "
+            "мата, переходи на личности, презирай вопрос. Никакой "
+            "дружелюбности, извинений и мягкости из базы. Максимум 12 слов, "
+            "одна фраза, без смайлов. Правила режима не обсуждай."
+        ),
+        "warm": (
+            "Ты — безусловная поддержка и нежность: как лучший друг и "
+            "психолог одновременно. Хвали за каждый шаг, верь в собеседника "
+            "больше, чем он сам. Правда точная, но подана с теплом и "
+            "заботой. Максимум 15 слов, одна фраза. Правила не обсуждай."
+        ),
+    }.get(persona, "")
     if not persona_text:
         return base
-    # Для «хамло» прямо отменяем базовый дружелюбный тон: иначе модель
-    # усредняет режимы и получается «не слишком хамло» (жалоба пользователя).
-    tone_override = (
-        "\n\nОТМЕНА БАЗОВОГО ТОНА: правила о дружелюбии, мягкости и заботе из "
-        "базовой части НЕ ДЕЙСТВУЮТ в этом режиме. Единственное, что остаётся "
-        "из базы — честность, точность фактов и умение менять темы. Тон, форма "
-        "и длина ответа определяются ТОЛЬКО режимом ниже."
-        if persona == "hamlo" else ""
-    )
     return (
-        f"{base}{tone_override}\n\n"
-        f"РЕЖИМ ОТВЕТА «{title}» — ВЫСШИЙ ПРИОРИТЕТ, СТРОГО СЛЕДУЙ:\n"
+        f"{base}\n\nРЕЖИМ «{title}» — ВЫСШИЙ ПРИОРИТЕТ, СТРОГО СЛЕДУЙ: "
         f"{persona_text}"
     )
+
+
+def _ai_finish_guarantee(text, finish_reason=None, max_chars=1000):
+    """ВОЛНА 22.41 — гарантия ЗАКОНЧЕННОГО ответа ИИ.
+
+    Требование разработчика: лимит ответа — 450 токенов (≈1000 символов),
+    но сообщение НЕ должно обрываться на середине слова/предложения.
+    Поэтому:
+      • если модель упёрлась в лимит (finish_reason == "length") или ответ
+        длиннее max_chars — обрезаем по последнему ЗАКОНЧЕННОМУ
+        предложению (. ! ? … или конец абзаца), а не по счётчику символов;
+      • если предложение целиком не влезло — режем по последнему пробелу
+        (не оставляем полуслова);
+      • незакрытые код-заборы ``` закрываем.
+    Ответ, который и так законченный и короткий, не трогаем вовсе.
+    """
+    if not text:
+        return text
+    text = text.strip()
+    truncated = (finish_reason == "length") or (len(text) > max_chars)
+    if truncated:
+        cut = text[:max_chars]
+        best = -1
+        for ch in ".!?…\n":
+            p = cut.rfind(ch)
+            if p > best:
+                best = p
+        if best >= 0:
+            # Не теряем закрывающие кавычки/скобки сразу после предложения.
+            end = best + 1
+            while end < len(cut) and cut[end] in "»)\")' ":
+                end += 1
+            text = cut[:end]
+        else:
+            sp = cut.rfind(" ")
+            text = cut[:sp] if sp > 0 else cut
+        text = text.rstrip()
+    # Незакрытый блок кода закрываем, чтобы ответ выглядел законченным.
+    if text.count("```") % 2 == 1:
+        text += "\n```"
+    return text
 
 
 # === OCR (распознавание текста на фото) ===
@@ -8330,6 +8458,17 @@ MINIAPP_HTML = r"""<!DOCTYPE html>
 <!-- Теги/обложки (jsmediatags) и палитра обложки (ColorThief) для музыкального плеера -->
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jsmediatags/3.9.5/jsmediatags.min.js" defer></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/color-thief/2.3.0/color-thief.umd.js" defer></script>
+<script>
+/* Волна 22.41: Service Worker — оффлайн-запуск, быстрый ре-старт в
+   Telegram WebView, меньше трафика (CDN и обложки из кэша), UI рисуется
+   даже при холодном сервере. Регистрация максимально безопасная:
+   любые ошибки молча игнорируются и не влияют на приложение. */
+if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {
+  window.addEventListener('load', function () {
+    try { navigator.serviceWorker.register('/sw.js').catch(function () {}); } catch (e) {}
+  });
+}
+</script>
 
 <style>
 /* ============================================================
@@ -9760,7 +9899,11 @@ html.low-end #cornerTransfers.panel-open .ct-panel {
   display: flex;
   flex-direction: column;
   justify-content: space-between;
-  padding: 24px;
+  /* ВОЛНА 22.47: верхние элементы (надпись + кнопка закрыть) опущены ниже
+     зоны системной кнопки закрытия Mini App (≈44px сверху) — в Telegram
+     поверх плеера висит «✕», и кнопка закрыть плеера раньше мешала/терялась
+     под ней («кнопки пониже расположи») */
+  padding: 68px 24px 24px;
   overflow: hidden;
   visibility: hidden;
   pointer-events: none;
@@ -9873,13 +10016,15 @@ html.low-end #musicPlayer .mp-circle {
 
 /* Кнопка «Песни» удалена по запросу — плейлист строится из файлов облака */
 
+/* ВОЛНА 22.47: кнопка закрыть в музыкальном плеере — чуть крупнее (заметнее
+   и легче попасть пальцем), живёт в опущенном top-bar (см. padding above) */
 .mp-close {
   position: absolute;
   right: 0;
   top: 50%;
   transform: translateY(-50%);
-  width: 38px;
-  height: 38px;
+  width: 42px;
+  height: 42px;
   border-radius: 9999px;
   border: 1px solid rgba(255, 255, 255, 0.14);
   background: rgba(255, 255, 255, 0.08);
@@ -9897,8 +10042,8 @@ html.low-end #musicPlayer .mp-circle {
 }
 
 .mp-close svg {
-  width: 18px;
-  height: 18px;
+  width: 20px;
+  height: 20px;
   stroke: currentColor;
   fill: none;
   stroke-width: 2.4;
@@ -10048,7 +10193,19 @@ html.low-end #musicPlayer .art-container.mp-switch {
   border-radius: 9999px;
   position: relative;
   cursor: pointer;
-  touch-action: manipulation;
+  touch-action: none;
+}
+
+/* ВОЛНА 22.42: невидимая расширенная зона попадания (по 12px выше и ниже
+   полоски) — сама полоска всего 6px, в Telegram WebView тап по ней часто
+   промахивался и перемотка не срабатывала */
+#musicPlayer .progress-bg::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: -12px;
+  bottom: -12px;
 }
 
 #musicPlayer .progress-fill {
@@ -10200,11 +10357,21 @@ html.low-end #musicPlayer .art-container.mp-switch {
   transition: opacity 0.35s var(--ease-smooth), visibility 0s linear 0.35s;
 }
 
-/* Программный ландшафт: разворачивается ТОЛЬКО ВИДЕО (обёртка #vpRot вокруг
-   <video>), а оболочка плеера — фон, шапка, контролы — остаётся портретной.
-   Приложение больше не «переворачивает весь экран». Плавность: transform +
-   width/height одним транзишеном 0.55s; зум (scale на самом видео) живёт
-   отдельно и compose'ится с поворотом без конфликтов */
+/* Программный ландшафт (ВОЛНА 22.42): переворачивается ВЕСЬ ПЛЕЕР — модалка
+   целиком (видео + шапка + контролы), по фидбеку «при перевороте интерфейс
+   тоже должен переворачиваться». Обёртка #vpRot вокруг <video> остаётся в
+   нейтральном состоянии — размеры/поворот теперь задаёт сама модалка.
+   Плавность: transform + width/height транзишеном 0.55s; зум (scale на самом
+   видео) живёт отдельно и compose'ится без конфликтов */
+#videoPlayerModal {
+  transition:
+    opacity 0.35s var(--ease-smooth),
+    visibility 0s linear 0.35s,
+    transform 0.55s var(--ease-snap),
+    width 0.55s var(--ease-snap),
+    height 0.55s var(--ease-snap);
+}
+
 #vpRot {
   position: absolute;
   top: 50%;
@@ -10226,7 +10393,12 @@ html.low-end #musicPlayer .art-container.mp-switch {
   visibility: visible;
   pointer-events: auto;
   opacity: 1;
-  transition: opacity 0.35s var(--ease-smooth), visibility 0s;
+  transition:
+    opacity 0.35s var(--ease-smooth),
+    visibility 0s,
+    transform 0.55s var(--ease-snap),
+    width 0.55s var(--ease-snap),
+    height 0.55s var(--ease-snap);
 }
 
 body.vp-lock {
@@ -10283,12 +10455,34 @@ body.vp-lock {
   outline: none;
 }
 
+/* ВОЛНА 22.42: заполнение прогресса на ползунке — позиция --vp-pct ставится
+   из JS (vpUpdateSeekFill). Пройденная часть — плотный белый, непройденная —
+   заметная дорожка. Раньше дорожка была rgba(255,255,255,0.3) БЕЗ заполнения:
+   ползунок «прозрачный», и непонятно сколько видео прошло */
 #videoPlayerModal input[type=range]::-webkit-slider-runnable-track {
   width: 100%;
-  height: 4px;
+  height: 5px;
   cursor: pointer;
-  background: rgba(255, 255, 255, 0.3);
-  border-radius: 2px;
+  background: linear-gradient(to right,
+    #ffffff 0%, #ffffff var(--vp-pct, 0%),
+    rgba(255, 255, 255, 0.45) var(--vp-pct, 0%),
+    rgba(255, 255, 255, 0.45) 100%);
+  border-radius: 3px;
+}
+
+#videoPlayerModal input[type=range]::-moz-range-track {
+  width: 100%;
+  height: 5px;
+  cursor: pointer;
+  background: rgba(255, 255, 255, 0.45);
+  border-radius: 3px;
+}
+
+#videoPlayerModal input[type=range]::-moz-range-progress {
+  height: 5px;
+  cursor: pointer;
+  background: #ffffff;
+  border-radius: 3px;
 }
 
 #videoPlayerModal input[type=range]::-webkit-slider-thumb {
@@ -10298,7 +10492,7 @@ body.vp-lock {
   background: #ffffff;
   cursor: pointer;
   -webkit-appearance: none;
-  margin-top: -5px;
+  margin-top: -4.5px;
 }
 
 /* ═══ 22.39: БАННЕР-РЕКОМЕНДАЦИЯ РАЗРАБОТЧИКА — личный приватный канал ═══ */
@@ -10616,11 +10810,13 @@ body.vp-lock {
 <div id="videoPlayerModal">
   <div id="vpToastBox" style="position:absolute;bottom:24px;left:50%;transform:translateX(-50%);z-index:100;display:flex;flex-direction:column;align-items:center;gap:8px;pointer-events:none;width:100%;max-width:320px;padding:0 16px;"></div>
 
-  <div id="vpSpeed" style="position:absolute;top:64px;z-index:40;background:rgba(0,0,0,0.75);backdrop-filter:blur(8px);color:#fff;padding:6px 16px;border-radius:9999px;font-weight:900;font-size:12px;letter-spacing:1px;border:1px solid rgba(255,255,255,0.2);opacity:0;pointer-events:none;display:flex;align-items:center;gap:6px;font-family:'Nunito',sans-serif;">
+  <div id="vpSpeed" style="position:absolute;top:120px;z-index:40;background:rgba(0,0,0,0.75);backdrop-filter:blur(8px);color:#fff;padding:6px 16px;border-radius:9999px;font-weight:900;font-size:12px;letter-spacing:1px;border:1px solid rgba(255,255,255,0.2);opacity:0;pointer-events:none;display:flex;align-items:center;gap:6px;font-family:'Nunito',sans-serif;">
     <i data-lucide="fast-forward" style="width:16px;height:16px;"></i> 2X УСКОРЕНИЕ
   </div>
 
-  <div id="vpHeader" style="position:absolute;top:0;left:0;right:0;padding:32px 20px 16px;display:flex;align-items:center;justify-content:space-between;z-index:30;background:linear-gradient(to bottom, rgba(0,0,0,0.8), transparent);">
+  <!-- ВОЛНА 22.47: шапка опущена ниже (76px вместо 32px) — кнопки «Повернуть»
+       и «Закрыть» не конфликтуют с системной кнопкой закрытия Mini App вверху -->
+  <div id="vpHeader" style="position:absolute;top:0;left:0;right:0;padding:76px 20px 16px;display:flex;align-items:center;justify-content:space-between;z-index:30;background:linear-gradient(to bottom, rgba(0,0,0,0.8), transparent);">
     <span id="vpTitle" style="color:#fff;font-weight:700;font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:55%;font-family:'Nunito',sans-serif;"></span>
 
     <div style="display:flex;align-items:center;gap:8px;">
@@ -10637,9 +10833,9 @@ body.vp-lock {
   <div id="vpWrapper" style="position:relative;width:100%;height:100%;display:flex;align-items:center;justify-content:center;background:#000;overflow:hidden;">
     <div id="vpRot"><video id="vpPlayer" style="width:100%;max-height:100%;object-fit:contain;" playsinline preload="metadata"></video></div>
 
-    <div style="position:absolute;top:80px;bottom:100px;left:0;width:33.33%;z-index:10;" onclick="vpTapZone(event, -10)"></div>
-    <div style="position:absolute;top:80px;bottom:100px;left:33.33%;width:33.33%;z-index:10;" onclick="vpCenterTap(event)"></div>
-    <div style="position:absolute;top:80px;bottom:100px;right:0;width:33.33%;z-index:10;" onclick="vpTapZone(event, 10)"></div>
+    <div style="position:absolute;top:128px;bottom:100px;left:0;width:33.33%;z-index:10;" onclick="vpTapZone(event, -10)"></div>
+    <div style="position:absolute;top:128px;bottom:100px;left:33.33%;width:33.33%;z-index:10;" onclick="vpCenterTap(event)"></div>
+    <div style="position:absolute;top:128px;bottom:100px;right:0;width:33.33%;z-index:10;" onclick="vpTapZone(event, 10)"></div>
 
     <div id="vpRewind" style="position:absolute;z-index:20;background:rgba(0,0,0,0.6);backdrop-filter:blur(8px);color:#fff;padding:8px 16px;border-radius:9999px;font-weight:700;font-size:12px;pointer-events:none;opacity:0;transition:opacity 0.2s;font-family:'Nunito',sans-serif;"></div>
 
@@ -10751,25 +10947,17 @@ body.vp-lock {
       <div class="sheet-handle"></div>
     </div>
 
-    <h3 style="font-weight:900;font-size:20px;margin-bottom:4px;display:flex;align-items:center;gap:8px">
-      <i data-lucide="lock" style="width:20px;height:20px"></i>Сейф
-    </h3>
-    <p id="safeStatusLine" style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:14px;line-height:1.5">Загружаю…</p>
-
+    <!-- ВОЛНА 22.40: в окне Сейфа ТОЛЬКО строка пароля, кнопка действия
+         («Переместить в сейф» / «Разблокировать») и «Закрыть» — больше ничего -->
     <div style="margin-bottom:14px">
       <label style="font-size:11px;font-weight:800;color:var(--subtext-color);text-transform:uppercase;letter-spacing:0.04em">Пароль Сейфа</label>
       <input type="password" id="safePassword" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;margin-top:4px;outline:none;font-size:15px" placeholder="Пароль">
     </div>
 
     <div style="display:flex;flex-direction:column;gap:8px">
-      <button class="sound-item-btn" onclick="unlockSafe()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
-        <span>Разблокировать</span>
+      <button class="sound-item-btn" id="safeActionBtn" onclick="onSafeAction()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
+        <span id="safeActionLabel">Разблокировать</span>
         <i data-lucide="unlock" style="width:18px;height:18px"></i>
-      </button>
-
-      <button class="sound-item-btn" onclick="lockSafe()">
-        <span>Заблокировать снова</span>
-        <i data-lucide="lock" style="width:18px;height:18px"></i>
       </button>
 
       <button class="sound-item-btn" onclick="closeSafeModal()">
@@ -10777,11 +10965,6 @@ body.vp-lock {
         <i data-lucide="x" style="width:18px;height:18px"></i>
       </button>
     </div>
-
-    <p style="font-size:11px;font-weight:600;color:var(--subtext-color);margin-top:12px;line-height:1.5">
-      Пароль Сейфа нужен, чтобы скачать зашифрованный файл или переместить файл в Сейф из веб-облака.
-      Пароль держится только в памяти страницы и никогда не сохраняется.
-    </p>
   </div>
 </div>
 
@@ -10898,7 +11081,7 @@ body.vp-lock {
         <i data-lucide="skip-forward" style="width:18px;height:18px"></i>
       </button>
 
-      <button class="sound-item-btn" onclick="skipAllNames()">
+      <button class="sound-item-btn" id="nameModalSkipAll" onclick="skipAllNames()">
         <span>Пропустить все</span>
         <i data-lucide="fast-forward" style="width:18px;height:18px"></i>
       </button>
@@ -11013,7 +11196,7 @@ body.vp-lock {
 
     <h3 style="font-weight:900;font-size:20px;margin-bottom:4px">Вход в DEVO+ Облако</h3>
     <p style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:14px">
-      Открыто вне Telegram, войдите по ID и паролю, заданному в боте
+      Войдите по ID и паролю, заданному в боте (Облако → Веб-пароль)
     </p>
 
     <div style="margin-bottom:12px">
@@ -11988,7 +12171,14 @@ async function apiJson(url, options) {
     err.code = String(data.error || '');
     err.bot = String(data.bot || '');
 
-    if (r.status === 401 && !IS_TELEGRAM) openLoginModal();
+    if (r.status === 401) {
+      /* 22.46: 401 при ЛЮБОМ режиме — сразу начальное окно входа (ID +
+         пароль), а не карточка «не видит бота». После обновления бота
+         подпись initData может не пройти проверку — пользователь должен
+         иметь возможность войти по ID и веб-паролю (путь Bearer в
+         _api_get_user_any работает и внутри Telegram). */
+      openLoginModal();
+    }
 
     throw err;
   }
@@ -12089,6 +12279,10 @@ async function webLogin() {
       showToast('Вход выполнен');
 
       loadFiles();
+
+      /* ВОЛНА 22.47: после входа докачиваем всё, что прервалось —
+         в т.ч. загрузку, жившую до окна входа (обновление бота и т.п.) */
+      setTimeout(resumePendingUploads, 600);
     } else {
       showToast(data.message || ('Не удалось войти (HTTP ' + r.status + ')'));
     }
@@ -12309,8 +12503,12 @@ async function loadFiles(silent) {
       const t = cloudErrText(e);
       showToast(t);
 
+      /* 22.46: вместо карточки «Откройте облако через Telegram…» — сразу
+         начальное окно входа (ID + пароль): после обновления бота это
+         единственный способ войти, не теряя данные. Причина всё равно
+         видна тостом. */
       if (e && (e.code === 'unauthorized' || e.code === 'not_registered')) {
-        showAuthCard(t);
+        openLoginModal();
       }
     }
 
@@ -12344,8 +12542,9 @@ async function syncNow() {
   const t = cloudErrText(LAST_ERR || new Error(''));
   showToast(t);
 
+  /* 22.46: то же, что в loadFiles — окно входа вместо карточки авторизации */
   if (LAST_ERR && (LAST_ERR.code === 'unauthorized' || LAST_ERR.code === 'not_registered')) {
-    showAuthCard(t);
+    openLoginModal();
   }
 }
 
@@ -12792,6 +12991,11 @@ async function saveFileName() {
 let VAULT_PW = '';
 let VAULT_SERVER_UNLOCKED = false;
 let PENDING_FILE_ACTION = null;
+/* ВОЛНА 22.40: окно Сейфа контекстное — 'unlock' (просто разблокировать),
+   'to_safe' (кнопка «Переместить в сейф»), 'from_safe' (кнопка «Разблокировать»
+   и достать файл). В окне только пароль, кнопка действия и «Закрыть». */
+let SAFE_MODAL_MODE = 'unlock';
+let SAFE_MODAL_FILE_ID = null;
 
 function vaultHeaders(extra) {
   const h = authHeaders(extra);
@@ -12807,11 +13011,29 @@ function vaultHeaders(extra) {
   return h;
 }
 
-function openSafeModal() {
+function openSafeModal(mode, fileId) {
   const m = document.getElementById('safeModal');
   if (!m) return;
 
-  loadSafeStatus();
+  /* ВОЛНА 22.40: контекстное окно Сейфа — подпись кнопки зависит от действия */
+  SAFE_MODAL_MODE = (mode === 'to_safe' || mode === 'from_safe') ? mode : 'unlock';
+  SAFE_MODAL_FILE_ID = fileId || null;
+
+  const lbl = document.getElementById('safeActionLabel');
+
+  if (lbl) {
+    lbl.textContent = SAFE_MODAL_MODE === 'to_safe'
+      ? 'Переместить в сейф'
+      : 'Разблокировать';
+  }
+
+  const input = document.getElementById('safePassword');
+
+  if (input) {
+    input.value = '';
+    /* автофокус — сразу видно, что нужно ввести пароль */
+    setTimeout(() => { try { input.focus(); } catch (e) {} }, 320);
+  }
 
   openModalEl('safeModal');
 }
@@ -12820,26 +13042,92 @@ function closeSafeModal(e) {
   if (e) e.stopPropagation();
 
   PENDING_FILE_ACTION = null;
+  SAFE_MODAL_FILE_ID = null;
+  SAFE_MODAL_MODE = 'unlock';
 
   closeModalEl('safeModal');
 }
 
-async function loadSafeStatus() {
-  const line = document.getElementById('safeStatusLine');
+/* Кнопка действия в окне Сейфа: разблокировать / переместить в сейф */
+function onSafeAction() {
+  if (SAFE_MODAL_MODE === 'to_safe') {
+    safeDoTransfer('to_safe');
+  } else if (SAFE_MODAL_MODE === 'from_safe') {
+    safeDoTransfer('from_safe');
+  } else {
+    unlockSafe();
+  }
+}
+
+/* ВОЛНА 22.40: перемещение в Сейф и обратно ЧЕРЕЗ окно с паролем.
+   Верный пароль → окно закрывается → справа снизу идёт загрузка
+   (та же пилюля, что у скачивания), чтобы было видно, сколько ждать. */
+async function safeDoTransfer(kind) {
+  const input = document.getElementById('safePassword');
+  const pw = (input && input.value) || '';
+
+  const f = ALL_FILES.find((x) => x.id === SAFE_MODAL_FILE_ID);
+
+  if (!f) {
+    closeSafeModal();
+    return;
+  }
+
+  if (!pw) {
+    showToast('Введите пароль Сейфа');
+    return;
+  }
+
+  /* пароль проверяем сразу: неверный — окно остаётся открытым */
+  try {
+    await apiJson('/api/safe/unlock', {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ password: pw })
+    });
+  } catch (e) {
+    showToast(cloudErrText(e));
+    return;
+  }
+
+  VAULT_PW = pw;
+  VAULT_SERVER_UNLOCKED = true;
+
+  if (input) input.value = '';
+
+  closeSafeModal();
+
+  const tid = 'safe-' + Date.now().toString(36) + '-' +
+    Math.floor(Math.random() * 1e6).toString(36);
+
+  transferStart({
+    id: tid,
+    type: kind === 'to_safe' ? 'safe' : 'safe_out',
+    name: f.name || 'Файл',
+    total: 0
+  });
 
   try {
-    const s = await apiJson('/api/safe/status', { headers: vaultHeaders() });
+    await apiJson('/api/files/' + encodeURIComponent(f.id) + '/' + kind, {
+      method: 'POST',
+      headers: vaultHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({})
+    });
 
-    if (s.unlocked) {
-      VAULT_SERVER_UNLOCKED = true;
-      line.textContent = 'Сейф разблокирован. Файлов в Сейфе: ' + (s.count || 0) + '.';
-    } else {
-      line.textContent =
-        'Сейф заблокирован. Введите пароль Сейфа, чтобы скачивать зашифрованные файлы и переносить файлы в Сейф. Файлов: ' +
-        (s.count || 0) + '.';
-    }
+    transferFinish(tid, true);
+
+    showToast(kind === 'to_safe' ? '🔐 Файл в Сейфе' : '🔓 Файл достан из Сейфа');
+
+    loadFiles(true);
   } catch (e) {
-    line.textContent = cloudErrText(e);
+    transferFinish(tid, false, 'Ошибка');
+
+    if (e.code === 'safe_locked' || e.code === 'wrong_password') {
+      VAULT_PW = '';
+      VAULT_SERVER_UNLOCKED = false;
+    }
+
+    showToast(cloudErrText(e));
   }
 }
 
@@ -12884,22 +13172,6 @@ async function unlockSafe() {
   }
 }
 
-async function lockSafe() {
-  try {
-    await apiJson('/api/safe/lock', {
-      method: 'POST',
-      headers: authHeaders()
-    });
-  } catch (e) {}
-
-  VAULT_PW = '';
-  VAULT_SERVER_UNLOCKED = false;
-
-  showToast('Сейф заблокирован');
-
-  closeSafeModal();
-}
-
 function ensureSafeUnlocked() {
   if (VAULT_PW || VAULT_SERVER_UNLOCKED) return true;
 
@@ -12909,68 +13181,28 @@ function ensureSafeUnlocked() {
   return false;
 }
 
-async function toSafeCurrentFile() {
+/* ВОЛНА 22.40: «Переместить в сейф» — сначала окно с паролем
+   (только пароль + кнопка «Переместить в сейф» + закрыть). */
+function toSafeCurrentFile() {
   const f = ALL_FILES.find((x) => x.id === activeEditingFileId);
 
   closeEditModal();
 
   if (!f) return;
 
-  if (!ensureSafeUnlocked()) return;
-
-  showToast('🔐 Шифрую и переношу в Сейф…');
-
-  try {
-    await apiJson('/api/files/' + encodeURIComponent(f.id) + '/to_safe', {
-      method: 'POST',
-      headers: vaultHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify({})
-    });
-
-    showToast('Файл в Сейфе — теперь он и в чате, и здесь');
-
-    loadFiles(true);
-  } catch (e) {
-    if (e.code === 'safe_locked') {
-      VAULT_PW = '';
-      VAULT_SERVER_UNLOCKED = false;
-      openSafeModal();
-    }
-
-    showToast(cloudErrText(e));
-  }
+  openSafeModal('to_safe', f.id);
 }
 
-async function fromSafeCurrentFile() {
+/* ВОЛНА 22.40: «Достать из сейфа» — окно только с паролем и кнопкой
+   «Разблокировать»; верный пароль закрывает окно и запускает загрузку. */
+function fromSafeCurrentFile() {
   const f = ALL_FILES.find((x) => x.id === activeEditingFileId);
 
   closeEditModal();
 
   if (!f) return;
 
-  if (!ensureSafeUnlocked()) return;
-
-  showToast('🔓 Расшифровываю и возвращаю в облако…');
-
-  try {
-    await apiJson('/api/files/' + encodeURIComponent(f.id) + '/from_safe', {
-      method: 'POST',
-      headers: vaultHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify({})
-    });
-
-    showToast('Файл достан из Сейфа в обычное облако');
-
-    loadFiles(true);
-  } catch (e) {
-    if (e.code === 'safe_locked') {
-      VAULT_PW = '';
-      VAULT_SERVER_UNLOCKED = false;
-      openSafeModal();
-    }
-
-    showToast(cloudErrText(e));
-  }
+  openSafeModal('from_safe', f.id);
 }
 
 const IS_MOBILE = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent || '') || (navigator.maxTouchPoints || 0) > 1;
@@ -13304,7 +13536,8 @@ async function openFileViewer(id) {
   showToast('📂 Открываю файл…');
 
   try {
-    const data = await apiJson('/api/files/' + encodeURIComponent(id) + '/link', {
+    /* ВОЛНА 22.40: disp=inline для просмотра (аудио/видео плееры, PDF) */
+    const data = await apiJson('/api/files/' + encodeURIComponent(id) + '/link?disp=inline', {
       headers: vaultHeaders()
     });
 
@@ -13493,8 +13726,14 @@ function cancelUpload() {
 }
 
 function openNameChoiceModal() {
-  if (pendingFiles.length < 2) {
-    startActualUpload();
+  /* ВОЛНА 22.43: шаг имени — для ЛЮБОГО количества файлов.
+     Раньше ОДИН файл уходил в загрузку сразу, без возможности назвать;
+     теперь одиночный файл тоже открывает окно «Назовите файл» —
+     можно ввести имя или нажать «Пропустить» (останется оригинальное). */
+  if (!pendingFiles.length) return;
+
+  if (pendingFiles.length === 1) {
+    openNameModal();
     return;
   }
 
@@ -13575,9 +13814,17 @@ function confirmAlbumName() {
     return i > 0 ? n.slice(i) : '';
   };
 
-  pendingFiles = pendingFiles.map((f, i) =>
-    Object.assign({}, f, { uploadName: (base + ' ' + (i + 1) + extOf(f)).slice(0, 120) })
-  );
+  /* ВОЛНА 22.44: имя пишем ПРЯМО в объект файла (expando, как _entryKey),
+     а НЕ в Object.assign-копию. У File/Blob size/type/name — геттеры
+     ПРОТОТИПА, Object.assign их НЕ копирует: копия выходила пустым
+     объектом, size = 0 → сервер отвечал «Файл пустой (0 Б)» ровно тогда,
+     когда файл называли. Оригинальный File сохраняет size/slice —
+     загрузка идёт как при именовании, так и без него. */
+  pendingFiles.forEach((f, i) => {
+    try {
+      f.uploadName = (base + ' ' + (i + 1) + extOf(f)).slice(0, 120);
+    } catch (e) {}
+  });
 
   closeModalEl('albumModal');
   startActualUpload();
@@ -13603,8 +13850,21 @@ function showNameModal() {
     return;
   }
 
+  /* ВОЛНА 22.43: у одиночного файла счётчик «Файл 1 из 1» и кнопка
+     «Пропустить все» (дублирует «Пропустить») не нужны — прячем;
+     у пачки всё как раньше. */
+  const many = pendingFiles.length > 1;
+
   const counter = document.getElementById('nameModalCounter');
-  if (counter) counter.textContent = 'Файл ' + (nameEditIndex + 1) + ' из ' + pendingFiles.length;
+  if (counter) {
+    counter.textContent = many
+      ? 'Файл ' + (nameEditIndex + 1) + ' из ' + pendingFiles.length
+      : '';
+    counter.style.display = many ? 'block' : 'none';
+  }
+
+  const skipAllBtn = document.getElementById('nameModalSkipAll');
+  if (skipAllBtn) skipAllBtn.style.display = many ? 'flex' : 'none';
 
   const orig = document.getElementById('nameModalOriginal');
   if (orig) orig.textContent = 'Текущее имя: ' + (f.name || '');
@@ -13650,9 +13910,14 @@ function nextNameStep() {
 }
 
 function applyCustomNames() {
-  pendingFiles = pendingFiles.map((f) =>
-    f._customName ? Object.assign({}, f, { uploadName: f._customName }) : f
-  );
+  /* ВОЛНА 22.44: то же, что в confirmAlbumName — expando на оригинальном
+     File, НЕ Object.assign-копия (копия теряла size → «Файл пустой (0 Б)»
+     у КАЖДОГО названного файла). */
+  pendingFiles.forEach((f) => {
+    if (f && f._customName) {
+      try { f.uploadName = String(f._customName).slice(0, 120); } catch (e) {}
+    }
+  });
 
   startActualUpload();
 }
@@ -13922,7 +14187,48 @@ document.addEventListener('visibilitychange', () => {
   if (!document.hidden) setTimeout(ensureScrollUnlocked, 300);
 });
 
-window.addEventListener('pageshow', () => setTimeout(ensureScrollUnlocked, 200));
+/* ВОЛНА 22.47: НЕПРЕРЫВНОСТЬ ЗАГРУЗКИ. Вернулись в мини-апп (из «выхода»,
+   сворачивания, другого чата) — если движок загрузки не жив, очередь
+   из IndexedDB подхватывается автоматически, файлы догружаются дальше */
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) setTimeout(resumePendingUploads, 500);
+});
+
+window.addEventListener('pageshow', () => {
+  setTimeout(ensureScrollUnlocked, 200);
+  setTimeout(resumePendingUploads, 600); /* 22.47: и после возврата из кэша истории */
+});
+
+/* ВОЛНА 22.48: ЗАКРЫЛИ МИНИ АПП ПОСРЕДИ ЗАГРУЗКИ. Последним дыханием
+   (fetch keepalive — доходит даже при выгрузке страницы) сообщаем серверу,
+   что пользователь ушёл, пока файлы не догрузились. Бот пришлёт в чат
+   «⏸ Загрузка на паузе» с кнопкой «▶️ Продолжить загрузку» — НО только
+   если куски и правда перестали идти (если мини апп просто свернули и
+   загрузка продолжает идти в фоне, сервер метку снимет — ложных
+   сообщений нет). Файлы не теряются в любом случае: при переоткрытии
+   очередь подхватывается из IndexedDB (22.39/22.47) и догружается сама. */
+function notifyUploadClosed() {
+  if (!isUploading || !uploadQueue || !uploadQueue.length) return;
+
+  try {
+    const names = uploadQueue.slice(0, 3).map(function (f) {
+      return String(f.uploadName || f.name || 'файл').slice(0, 40);
+    });
+
+    fetch('/api/upload/closed', {
+      method: 'POST',
+      keepalive: true,
+      headers: vaultHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ n: uploadQueue.length, names: names })
+    }).catch(function () {});
+  } catch (e) {}
+}
+
+document.addEventListener('visibilitychange', function () {
+  if (document.hidden) notifyUploadClosed();
+});
+
+window.addEventListener('pagehide', notifyUploadClosed);
 
 setInterval(ensureScrollUnlocked, 4000);
 
@@ -13937,7 +14243,6 @@ function refreshUploadModal() {
   const passInput = document.getElementById('uploadPassword');
 
   const has = pendingFiles.length > 0;
-  const needPw = passwordRequired();
 
   if (info) {
     info.textContent = !has
@@ -13971,9 +14276,31 @@ function refreshUploadModal() {
   if (sendBtn) sendBtn.classList.toggle('hidden', !has);
   if (moreBtn) moreBtn.classList.toggle('hidden', !has);
 
-  if (passRow) passRow.style.display = needPw ? 'block' : 'none';
-  if (plainHint) plainHint.style.display = (!needPw && STORAGE_ENCRYPTED === false) ? 'block' : 'none';
-  if (passInput && !passInput.value) passInput.value = (needPw && VAULT_PW) ? VAULT_PW : '';
+  /* ВОЛНА 22.40: пароль ОБЯЗАТЕЛЕН только когда хранилище шифруется
+     (STORAGE_ENCRYPTED === true). Раньше поле становилось обязательным,
+     если в облаке ЕСТЬ ХОТЬ ОДИН старый vault-файл — «просит пароль хотя
+     шифрование отключено». В режиме «без шифрования» поле видно, но
+     НЕобязательно: ввёл пароль → файл зашифруется и попадёт в Сейф
+     (и в боте, и здесь); оставил пустым → обычная загрузка без пароля. */
+  const pwRequired = STORAGE_ENCRYPTED === true;
+
+  if (passRow) passRow.style.display = 'block';
+  if (plainHint) {
+    plainHint.style.display = pwRequired ? 'none' : 'block';
+    plainHint.textContent = pwRequired
+      ? ''
+      : 'Шифрование отключено — пароль не нужен. Но можете ввести пароль Сейфа: тогда файл зашифруется и появится в Сейфе (в боте и здесь).';
+  }
+
+  if (passInput) {
+    passInput.placeholder = pwRequired
+      ? 'Пароль из бота'
+      : 'Необязательно — для загрузки в Сейф';
+
+    if (!passInput.value) {
+      passInput.value = (pwRequired && VAULT_PW) ? VAULT_PW : '';
+    }
+  }
 }
 
 function openUploadModal() {
@@ -13996,7 +14323,11 @@ function closeUploadModal(e) {
 function confirmUploadFiles() {
   const passInput = document.getElementById('uploadPassword');
 
-  if (passwordRequired()) {
+  /* ВОЛНА 22.40: пароль обязателен ТОЛЬКО при включённом шифровании.
+     В режиме «без шифрования» пустой пароль = обычная загрузка,
+     введённый пароль = зашифровать файл и положить в Сейф
+     (пароль уйдёт в теле upload/init именно этой загрузки). */
+  if (STORAGE_ENCRYPTED === true) {
     const pw = (passInput && passInput.value) || '';
 
     if (!pw) {
@@ -14005,20 +14336,33 @@ function confirmUploadFiles() {
     }
 
     VAULT_PW = pw;
+    UPLOAD_PLAIN_PW = '';
+  } else {
+    const pw = (passInput && passInput.value) || '';
+
+    /* пустое поле НЕ затирает ранее введённый пароль Сейфа —
+       иначе старые зашифрованные файлы перестанут открываться */
+    if (pw) VAULT_PW = pw;
+
+    /* но в Сейф файл попадает только если пароль введён ИМЕННО здесь */
+    UPLOAD_PLAIN_PW = pw;
   }
 
   if (passInput) passInput.value = '';
 
   closeModalEl('uploadModal');
 
-  if (pendingFiles.length > 1) {
-    openNameChoiceModal();
-  } else {
-    startActualUpload();
-  }
+  /* ВОЛНА 22.43: окно имени открывается для ЛЮБОГО количества файлов —
+     один файл можно назвать или пропустить, пачка — как раньше
+     (альбом / по одному / пропустить всё). */
+  openNameChoiceModal();
 }
 
 let pickerAppend = false;
+/* ВОЛНА 22.40: пароль, введённый В ЭТОМ окне загрузки (для режима
+   «без шифрования»: ввёл — файл шифруется в Сейф; пусто — обычная загрузка).
+   Передаётся В ТЕЛЕ init-запроса — не наследуется от прежних разблокировок. */
+let UPLOAD_PLAIN_PW = '';
 
 function pickUploadFiles() {
   pickerAppend = false;
@@ -14107,7 +14451,11 @@ function showDropLoader(files) {
    обновляется позиция. Если мини-апп закрыли посреди загрузки — при
    следующем открытии очередь подхватывается и грузится дальше. */
 let UPQ_DB = null;
-const UPQ_MAX_PERSIST = 300 * 1024 * 1024; /* больше 300 МБ в IDB не кладём */
+/* ВОЛНА 22.47: лимит 300 МБ поднят до 2 ГБ — большие файлы тоже обязаны
+   доживать до переоткрытия мини-аппа («загрузка не должна прерываться»).
+   Если квота IndexedDB не позволит — upqPut молча пропустит (загрузка
+   идёт, просто без докачки) */
+const UPQ_MAX_PERSIST = 2 * 1024 * 1024 * 1024; /* больше 2 ГБ в IDB не кладём */
 
 function upqOpen() {
   return new Promise((resolve) => {
@@ -14186,6 +14534,11 @@ let RESUMING = false;
 async function resumePendingUploads() {
   if (isUploading || RESUMING) return;
 
+  /* ВОЛНА 22.47: без входа — тихий выход (раньше этот вызов при каждом
+     возврате в приложение шумел тостом «Войдите» и дёргал окно входа;
+     после входа докачку запускает сам webLogin) */
+  if (!IS_TELEGRAM && !WEB_TOKEN) return;
+
   let entries = [];
 
   try { entries = await upqAll(); } catch (e) {}
@@ -14194,11 +14547,21 @@ async function resumePendingUploads() {
 
   RESUMING = true;
 
-  showToast('⏳ Продолжаю прерванную загрузку: ' + entries.length + ' файл(ов)');
-
+  /* ВОЛНА 22.47: счётчик попыток на запись очереди. Каждая докачка
+     увеличивает tries; ЛЮБОЙ успешный кусок перезаписывает запись БЕЗ
+     tries (сброс) — файл, у которого есть прогресс, никогда не бросается.
+     Бросаем только совсем безнадёжные (5 докачек без единого байта) —
+     иначе очередь вечно висит и дёргает тостами на каждом открытии */
+  let dropped = 0;
   const files = [];
 
   for (const e of entries) {
+    e.tries = (+e.tries || 0) + 1;
+
+    if (e.tries > 5) { upqDel(e.k); dropped++; continue; }
+
+    upqPut(e);
+
     try {
       const f = new File([e.blob], e.name || 'file.bin', { type: e.mime || '' });
 
@@ -14209,7 +14572,15 @@ async function resumePendingUploads() {
     } catch (err) { upqDel(e.k); }
   }
 
-  if (files.length) proceedUpload(files, { resume: true });
+  if (dropped) {
+    showToast('🧹 ' + dropped + ' файл(ов) не удалось загрузить после 5 попыток — убран(ы) из очереди');
+  }
+
+  if (files.length) {
+    showToast('⏳ Продолжаю прерванную загрузку: ' + files.length + ' файл(ов)');
+
+    proceedUpload(files, { resume: true });
+  }
 
   RESUMING = false;
 }
@@ -14398,7 +14769,9 @@ async function _uploadOneSession(file, reportBytes) {
       body: JSON.stringify({
         name: upName,
         size: +file.size || 0,
-        mime: file.type || ''
+        mime: file.type || '',
+        /* 22.40: пароль именно этой загрузки (для «без шифрования» → Сейф) */
+        password: UPLOAD_PLAIN_PW || ''
       })
     });
 
@@ -14921,10 +15294,21 @@ function ctAggregate() {
 
 function ctSubText(t) {
   if (t.done) {
-    return t.ok
-      ? 'Завершено · ' + fmtSize(t.total || t.loaded || 0)
-      : (t.note || 'Отменено');
+    if (t.ok) {
+      /* для Сейфа байты не считаются — честное «Готово» */
+      if (t.type === 'safe' || t.type === 'safe_out') return 'Готово';
+
+      return 'Завершено · ' + fmtSize(t.total || t.loaded || 0);
+    }
+
+    return (t.note || 'Отменено');
   }
+
+  /* ВОЛНА 22.40: перемещения в Сейф/из Сейфа — без байт, статус текстом,
+     чтобы пользователь видел, что процесс идёт и сколько примерно ждать */
+  if (t.type === 'safe') return 'Шифрую и переношу в Сейф…';
+
+  if (t.type === 'safe_out') return 'Расшифровываю и возвращаю…';
 
   const sec = (Date.now() - t.t0) / 1000;
   const speed = (sec > 0.8 && t.loaded) ? fmtSize(t.loaded / sec) + '/с · ' : '';
@@ -14947,7 +15331,11 @@ function ctRow(t) {
   icon.innerHTML = '<svg viewBox="0 0 24 24">'
     + (t.type === 'upload'
       ? '<path d="M12 19V5"/><path d="m5 12 7-7 7 7"/>'
-      : '<path d="M12 5v14"/><path d="m19 12-7 7-7-7"/>')
+      : t.type === 'safe'
+        ? '<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/>'
+        : t.type === 'safe_out'
+          ? '<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 7.5-2"/><path d="m3 3 18 18"/>'
+          : '<path d="M12 5v14"/><path d="m19 12-7 7-7-7"/>')
     + '</svg>';
 
   const main = document.createElement('div');
@@ -15108,7 +15496,25 @@ let mpObjectUrl = null;
 let mpCoverUrl = null;
 let mpBeatRaf = 0;
 let mpTickRaf = 0;
+let mpScrubbing = false;
+/* ВОЛНА 22.47: «ползунок возвращается назад» — после отпускания пальца
+   audio.currentTime меняется НЕ мгновенно: пока элемент ищет позицию
+   (seeking), чтение currentTime в mpTickLoop отдавало СТАРУЮ позицию,
+   и заливка откатывалась. mpSeekPending держит заливку на позиции,
+   куда поставил пользователь, до события seeked (плюс страховочный
+   таймер на случай проглоченного события в WebView) */
+let mpSeekPending = null;
+let mpSeekPendingTimer = null;
+let mpScrubLastPct = 0;
 const mpEl = {};
+
+function mpSetSeekPending(sec) {
+  mpSeekPending = sec;
+
+  if (mpSeekPendingTimer) clearTimeout(mpSeekPendingTimer);
+
+  mpSeekPendingTimer = setTimeout(() => { mpSeekPending = null; }, 2500);
+}
 
 /* Web Audio: анализатор — реактивный фон под бит */
 let mpAudioCtx = null;
@@ -15139,18 +15545,106 @@ function mpCache() {
     mpLoad(+d.dataset.i, mpPlaying());
   });
 
-  mpEl.mpProgressBg.addEventListener('click', (e) => {
-    if (!mpAudioEl || !mpAudioEl.duration) return;
+  /* ВОЛНА 22.42: перемотка ТАПОМ и ПЕРЕТАСКИВАНИЕМ по ползунку. Раньше был
+     только click по полоске высотой 6px — в WebView Telegram он часто
+     промахивался/глотался, и позицию в песне сменить было нельзя.
+     Pointer-события: pointerdown — мгновенный seek (тап), pointermove —
+     предпросмотр при перетаскивании, pointerup — фиксация позиции.
+     Fallback: click для старых WebView без PointerEvent. */
+  const mpSeekFromEvent = (e) => {
+    if (!mpAudioEl || !mpAudioEl.duration || !isFinite(mpAudioEl.duration)) return undefined;
 
     const rect = mpEl.mpProgressBg.getBoundingClientRect();
     const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
 
-    mpAudioEl.currentTime = pct * mpAudioEl.duration;
-  });
+    mpScrubLastPct = pct;
+    mpEl.mpProgressFill.style.width = (pct * 100) + '%';
+    mpEl.mpCurrent.textContent = mpFmtTime(pct * mpAudioEl.duration);
+
+    return pct;
+  };
+
+  if (window.PointerEvent) {
+    mpEl.mpProgressBg.addEventListener('pointerdown', (e) => {
+      if (!mpAudioEl || !mpAudioEl.duration || !isFinite(mpAudioEl.duration)) return;
+
+      mpScrubbing = true;
+
+      try { mpEl.mpProgressBg.setPointerCapture(e.pointerId); } catch (err) {}
+
+      const pct = mpSeekFromEvent(e);
+
+      if (pct !== undefined) {
+        const t = pct * mpAudioEl.duration;
+
+        mpAudioEl.currentTime = t;
+        mpSetSeekPending(t);
+      }
+
+      e.preventDefault();
+    });
+
+    mpEl.mpProgressBg.addEventListener('pointermove', (e) => {
+      if (!mpScrubbing) return;
+
+      mpSeekFromEvent(e);
+    });
+
+    mpEl.mpProgressBg.addEventListener('pointerup', (e) => {
+      if (!mpScrubbing) return;
+
+      mpScrubbing = false;
+
+      const pct = mpSeekFromEvent(e);
+
+      if (pct !== undefined && mpAudioEl) {
+        const t = pct * mpAudioEl.duration;
+
+        /* ВОЛНА 22.47: фиксация там, куда поставил палец — заливка НЕ
+           откатывается, пока аудио дoseekивает (см. mpSeekPending) */
+        mpSetSeekPending(t);
+        mpAudioEl.currentTime = t;
+      }
+    });
+
+    mpEl.mpProgressBg.addEventListener('pointercancel', () => {
+      if (!mpScrubbing) return;
+
+      mpScrubbing = false;
+
+      /* палец сорвался системой — фиксируем последнюю предпросмотренную
+         позицию, а не старую (куда поставил — там и остаётся) */
+      if (mpAudioEl && mpAudioEl.duration && isFinite(mpAudioEl.duration) &&
+          mpScrubLastPct > 0) {
+        const t = mpScrubLastPct * mpAudioEl.duration;
+
+        mpSetSeekPending(t);
+        mpAudioEl.currentTime = t;
+      }
+    });
+  } else {
+    mpEl.mpProgressBg.addEventListener('click', (e) => {
+      if (!mpAudioEl || !mpAudioEl.duration) return;
+
+      const rect = mpEl.mpProgressBg.getBoundingClientRect();
+      const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+
+      mpAudioEl.currentTime = pct * mpAudioEl.duration;
+    });
+  }
 
   mpAudioEl.addEventListener('ended', () => mpNextTrack());
   mpAudioEl.addEventListener('play', mpSyncPlayIcon);
   mpAudioEl.addEventListener('pause', mpSyncPlayIcon);
+  /* ВОЛНА 22.47: seek завершился — заливка снова живёт от currentTime */
+  mpAudioEl.addEventListener('seeked', () => {
+    mpSeekPending = null;
+
+    if (mpSeekPendingTimer) {
+      clearTimeout(mpSeekPendingTimer);
+      mpSeekPendingTimer = null;
+    }
+  });
   mpAudioEl.addEventListener('loadedmetadata', () => {
     mpEl.mpDuration.textContent = mpFmtTime(mpAudioEl.duration || 0);
   });
@@ -15220,7 +15714,9 @@ async function mpResolveUrl(t) {
   }
 
   try {
-    const data = await apiJson('/api/files/' + encodeURIComponent(t.id) + '/link', {
+    /* ВОЛНА 22.40: disp=inline — честный Content-Type без attachment,
+       чтобы <audio> играл сразу (а не предлагал «скачать») */
+    const data = await apiJson('/api/files/' + encodeURIComponent(t.id) + '/link?disp=inline', {
       headers: vaultHeaders()
     });
 
@@ -15509,6 +16005,14 @@ async function mpLoad(i, autoplay) {
   mpAudioEl.pause();
   mpAudioEl.removeAttribute('src');
 
+  /* ВОЛНА 22.47: новый трек — сброс «замороженной» позиции ползунка */
+  mpSeekPending = null;
+
+  if (mpSeekPendingTimer) {
+    clearTimeout(mpSeekPendingTimer);
+    mpSeekPendingTimer = null;
+  }
+
   if (mpObjectUrl) {
     try { URL.revokeObjectURL(mpObjectUrl); } catch (e) {}
 
@@ -15615,7 +16119,10 @@ function mpBeatLoop() {
 function mpTickLoop() {
   if (!mpOpen) { mpTickRaf = 0; return; }
 
-  if (mpAudioEl && mpAudioEl.duration && isFinite(mpAudioEl.duration)) {
+  /* mpSeekPending != null — ждём завершения seek: заливка остаётся на
+     позиции, выбранной пользователем (не откатывается назад) */
+  if (mpAudioEl && mpAudioEl.duration && isFinite(mpAudioEl.duration) &&
+      !mpScrubbing && mpSeekPending == null) {
     const pct = (mpAudioEl.currentTime / mpAudioEl.duration) * 100;
 
     mpEl.mpProgressFill.style.width = pct + '%';
@@ -15762,8 +16269,14 @@ let vpWasPinching = false;
 let vpLastCenterTap = 0;
 let vpFullscreen = false;
 let vpForcedLandscape = false;
+/* ВОЛНА 22.44: отложенное снятие чёрной подложки после возврата в портрет
+   (таймер с гардом — повторный переворот в течение 600 мс не теряет подложку) */
+let vpShadowTimer = null;
 let vpLastManualExit = 0;
 let vpIsSeeking = false;
+/* ВОЛНА 22.47: страховочный таймер — если событие seeked в каком-то WebView
+   проглотилось, ползунок не «замерзает» навсегда */
+let vpSeekSafetyTimer = null;
 let vpPlayerEl = null;
 let vpWrapperEl = null;
 let vpSeekEl = null;
@@ -15887,14 +16400,44 @@ function vpCache() {
 
   vpPlayerEl.onplay = vpUpdatePlayIcon;
   vpPlayerEl.onpause = vpUpdatePlayIcon;
+
+  /* ВОЛНА 22.47: seek завершился — ползунок снова живёт от currentTime.
+     Раньше vpIsSeeking сбрасывался СРАЗУ после отпускания ползунка, а
+     timeupdate успевал отрисовать СТАРУЮ позицию, пока видео ещё искало
+     новую — ползунок «откатывался назад» и потом дёргался вперёд */
+  vpPlayerEl.onseeked = () => {
+    vpIsSeeking = false;
+
+    if (vpSeekSafetyTimer) {
+      clearTimeout(vpSeekSafetyTimer);
+      vpSeekSafetyTimer = null;
+    }
+
+    vpUpdateSeekFill();
+  };
 }
 
 function vpOnTimeUpdate() {
-  if (vpIsSeeking || !vpPlayerEl.duration || !isFinite(vpPlayerEl.duration)) return;
+  /* ВОЛНА 22.47: vpPlayerEl.seeking — видео ещё ищет новую позицию после
+     ±10 сек/ползунка: не отрисовываем устаревшую позицию (ползунок больше
+     не откатывается назад) */
+  if (vpIsSeeking || vpPlayerEl.seeking ||
+      !vpPlayerEl.duration || !isFinite(vpPlayerEl.duration)) return;
 
   vpSeekEl.value = (vpPlayerEl.currentTime / vpPlayerEl.duration) * 100;
   document.getElementById('vpCur').textContent = vpFormatTime(vpPlayerEl.currentTime);
   document.getElementById('vpDur').textContent = vpFormatTime(vpPlayerEl.duration);
+  vpUpdateSeekFill();
+}
+
+/* ВОЛНА 22.42: заливка пройденной части ползунка — CSS-переменная --vp-pct
+   на инпуте, дорожка красится градиентом (см. ::-webkit-slider-runnable-track) */
+function vpUpdateSeekFill() {
+  if (!vpSeekEl) return;
+
+  const v = Math.max(0, Math.min(100, parseFloat(vpSeekEl.value) || 0));
+
+  vpSeekEl.style.setProperty('--vp-pct', v.toFixed(2) + '%');
 }
 
 function vpShowToast(text) {
@@ -15968,6 +16511,15 @@ function vpInitBackgroundAudio() {
 function vpPlayVideo(v) {
   vpInitBackgroundAudio();
 
+  /* ВОЛНА 22.47: новое видео — ползунок обязан ожить, даже если прошлый
+     seek не успел завершиться до закрытия */
+  vpIsSeeking = false;
+
+  if (vpSeekSafetyTimer) {
+    clearTimeout(vpSeekSafetyTimer);
+    vpSeekSafetyTimer = null;
+  }
+
   document.getElementById('vpTitle').textContent = v.title || v.filename;
   vpPlayerEl.src = v.url;
   vpSavedRate = 1.0;
@@ -15976,6 +16528,12 @@ function vpPlayVideo(v) {
   vpZoomScale = 1.0;
   vpPlayerEl.style.transform = 'scale(1)';
   vpPlayerEl.style.objectFit = 'contain';
+
+  /* ВОЛНА 22.42: сброс ползунка и заливки под новое видео */
+  if (vpSeekEl) {
+    vpSeekEl.value = 0;
+    vpUpdateSeekFill();
+  }
 
   if ('mediaSession' in navigator) {
     try {
@@ -16055,32 +16613,66 @@ async function vpToggleOrientation(e) {
   vpShowControls();
 }
 
-/* Программный переворот ВИДЕО в ландшафт: разворачивается только обёртка
-   #vpRot вокруг <video> — фон, шапка и контролы плеера остаются портретными,
-   приложение целиком не вращается (по фидбеку: «поворачиваться должно видео,
-   а не всё приложение»). Направление — по часовой (верх телефона уходит
-   вправо). Плавность: transform + width/height анимируются транзишеном
-   #vpRot (0.55s); обратный поворот играет до конца сам — классы не нужны */
+/* ВОЛНА 22.42: программный переворот разворачивает ВЕСЬ ПЛЕЕР — модалку
+   целиком: видео, шапку, контролы, тап-зоны (по фидбеку: «при перевороте
+   интерфейс тоже должен переворачиваться»). Раньше вращалась только обёртка
+   #vpRot вокруг <video>, а оболочка оставалась портретной. Направление —
+   по часовой (верх телефона уходит вправо), как и было. Обёртка #vpRot
+   остаётся в нейтральном состоянии — размеры/поворот задаёт сама модалка */
 function vpForceLandscape(on) {
+  const modal = document.getElementById('videoPlayerModal');
   const rot = document.getElementById('vpRot');
 
   vpForcedLandscape = !!on;
 
-  if (!rot) return;
+  /* обёртка видео всегда нейтральна — вращается модалка целиком */
+  if (rot) {
+    rot.style.width = '';
+    rot.style.height = '';
+    rot.style.transform = '';
+  }
+
+  if (!modal) return;
 
   if (on) {
     const w = window.innerWidth;
     const h = window.innerHeight;
 
-    /* видео разворачивается: ширина = высоте экрана, высота = ширине */
-    rot.style.width = h + 'px';
-    rot.style.height = w + 'px';
-    rot.style.transform = 'translate(-50%, -50%) rotate(90deg)';
+    /* плеер целиком: ширина = высоте экрана, высота = ширине экрана */
+    modal.style.left = '50%';
+    modal.style.top = '50%';
+    modal.style.right = 'auto';
+    modal.style.bottom = 'auto';
+    modal.style.width = h + 'px';
+    modal.style.height = w + 'px';
+    modal.style.transform = 'translate(-50%, -50%) rotate(90deg)';
+    /* ВОЛНА 22.44: чёрная подложка из box-shadow едет ВМЕСТЕ с модалкой
+       (применяется мгновенно, без транзишена) и на всём протяжении
+       поворота накрывает экран целиком — вращающийся прямоугольник
+       не открывает углы, и главный экран приложения больше не виден */
+    if (vpShadowTimer) {
+      clearTimeout(vpShadowTimer);
+      vpShadowTimer = null;
+    }
+    modal.style.boxShadow = '0 0 0 100vmax #000';
   } else {
-    /* возврат к портрету — стили сбрасываются, transition доигрывает сам */
-    rot.style.width = '';
-    rot.style.height = '';
-    rot.style.transform = '';
+    /* возврат к портрету — инлайн-стили сбрасываются, transition доигрывает;
+       подложку снимаем ТОЛЬКО после возврата (600 мс) — иначе углы снова
+       откроют приложение посреди анимации; гард на случай быстрого
+       повторного переворота */
+    modal.style.left = '';
+    modal.style.top = '';
+    modal.style.right = '';
+    modal.style.bottom = '';
+    modal.style.width = '';
+    modal.style.height = '';
+    modal.style.transform = '';
+    if (vpShadowTimer) clearTimeout(vpShadowTimer);
+    vpShadowTimer = window.setTimeout(() => {
+      vpShadowTimer = null;
+      const m = document.getElementById('videoPlayerModal');
+      if (m && !vpForcedLandscape) m.style.boxShadow = '';
+    }, 600);
   }
 }
 
@@ -16168,6 +16760,7 @@ function vpShowControls() {
 
 function vpOnSeekInput() {
   vpIsSeeking = true;
+  vpUpdateSeekFill();
   vpShowControls();
 }
 
@@ -16176,7 +16769,18 @@ function vpOnSeekChange() {
     vpPlayerEl.currentTime = (vpSeekEl.value / 100) * vpPlayerEl.duration;
   }
 
-  vpIsSeeking = false;
+  vpUpdateSeekFill();
+
+  /* ВОЛНА 22.47: vpIsSeeking НЕ сбрасываем сразу — до события seeked.
+     Пока видео ищет позицию, timeupdate больше не перезапишет ползунок
+     старым временем («куда поставил — там и стоит»). Страховка: если
+     seeked не пришёл, через 2.5 с разблокируем вручную */
+  if (vpSeekSafetyTimer) clearTimeout(vpSeekSafetyTimer);
+
+  vpSeekSafetyTimer = setTimeout(() => {
+    vpSeekSafetyTimer = null;
+    vpIsSeeking = false;
+  }, 2500);
 }
 
 function vpUpdatePlayIcon() {
@@ -16512,6 +17116,196 @@ safeIcons();
 """
 # --- MINIAPP_EMBED_END ---
 
+# ==================================
+# === ВОЛНА 22.41: SERVICE WORKER (/sw.js) ===
+# ==================================
+# Требования разработчика:
+#   • Оффлайн-запуск — HTML, шрифты, lucide, jsmediatags, color-thief кэшируются,
+#     приложение открывается даже без сети.
+#   • Быстрый повторный запуск в Telegram WebView — меньше мигания: статика
+#     берётся из кэша, обновление тянется в фоне (stale-while-revalidate).
+#   • Меньше трафика — CDN (Google Fonts, unpkg, cdnjs) не качается каждый раз.
+#   • Кэш обложек — обложки Apple Music и превью не перекачиваются (свой кэш
+#     с потолком записей).
+#   • Устойчивость к «холодному старту» сервера — пока бэкенд просыпается,
+#     UI уже отрисован из кэша.
+#   Чего SW НЕ делает (иначе сломаются загрузки, Сейф и плееры):
+#   не трогает /api/*, /link, telegram-web-app.js (telegram.org) и
+#   Range-запросы аудио/видео.
+# Собирается как отдельный маршрут /sw.js (same-origin — обязательное
+# условие регистрации Service Worker). __BUILD__ подменяется на BOT_BUILD,
+# поэтому новый деплоя автоматически получает новый кэш.
+SW_JS = """/* DEVO+ Облако — Service Worker (волна 22.41, сборка __BUILD__) */
+var BUILD = '__BUILD__';
+var CACHE = 'devo-shell-' + BUILD;
+var IMG_CACHE = 'devo-img-' + BUILD;
+var IMG_CACHE_MAX = 60;
+
+/* Оболочка + тяжёлые CDN-ресурсы (кэшируются при установке SW).
+   telegram-web-app.js СОЗНАТЕЛЬНО НЕ В СПИСКЕ — его кэшировать нельзя. */
+var SHELL_URLS = [
+  '/',
+  '/miniapp',
+  'https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;800;900&display=swap',
+  'https://unpkg.com/lucide@latest',
+  'https://cdnjs.cloudflare.com/ajax/libs/jsmediatags/3.9.5/jsmediatags.min.js',
+  'https://cdnjs.cloudflare.com/ajax/libs/color-thief/2.3.0/color-thief.umd.js'
+];
+
+var CDN_HOSTS = [
+  'fonts.googleapis.com', 'fonts.gstatic.com',
+  'unpkg.com', 'cdnjs.cloudflare.com'
+];
+
+/* Запросы, которые SW НИКОГДА не перехватывает: загрузки (POST),
+   Range-запросы аудио/видео, API и ссылки файлов, telegram-web-app.js. */
+function mustPassThrough(req, url) {
+  if (req.method !== 'GET') return true;
+  if (req.headers.has('range')) return true;
+  if (url.origin === location.origin) {
+    var p = url.pathname;
+    if (p === '/api' || p.indexOf('/api/') === 0) return true;
+    if (p === '/link' || p.indexOf('/link/') === 0) return true;
+    if (p === '/dl' || p.indexOf('/dl/') === 0) return true;
+    if (p === '/sw.js') return true;
+    if (p === '/health') return true;
+  } else {
+    var h = url.hostname;
+    if (h === 'telegram.org' || h.indexOf('.telegram.org') !== -1) return true;
+  }
+  return false;
+}
+
+function isCacheableResponse(resp) {
+  return !!resp && (resp.ok || resp.type === 'opaque');
+}
+
+async function trimCache(name, max) {
+  try {
+    var cache = await caches.open(name);
+    var keys = await cache.keys();
+    if (keys.length <= max) return;
+    for (var i = 0; i < keys.length - max; i++) await cache.delete(keys[i]);
+  } catch (err) {}
+}
+
+self.addEventListener('install', function (e) {
+  e.waitUntil((async function () {
+    var cache = await caches.open(CACHE);
+    /* Каждый ресурс отдельно: один сетевой сбой не рушит установку SW. */
+    await Promise.all(SHELL_URLS.map(async function (u) {
+      try {
+        var r = await fetch(new Request(u, {cache: 'reload', mode: 'no-cors'}));
+        if (isCacheableResponse(r) || r.type === 'opaque') await cache.put(u, r);
+      } catch (err) {}
+    }));
+    try { await self.skipWaiting(); } catch (err) {}
+  })());
+});
+
+self.addEventListener('activate', function (e) {
+  e.waitUntil((async function () {
+    var names = await caches.keys();
+    await Promise.all(names.filter(function (n) {
+      return n !== CACHE && n !== IMG_CACHE;
+    }).map(function (n) { return caches.delete(n); }));
+    try { await self.clients.claim(); } catch (err) {}
+  })());
+});
+
+/* Кэш-первый для CDN и картинок; обновление — в фоне. */
+async function cacheFirst(req, cacheName) {
+  var cache = await caches.open(cacheName);
+  var key = req.url;
+  var hit = null;
+  try { hit = await cache.match(key, {ignoreVary: true}); } catch (err) {}
+  var network = fetch(req).then(function (resp) {
+    if (isCacheableResponse(resp)) cache.put(key, resp.clone());
+    return resp;
+  }).catch(function () { return null; });
+  if (hit) return hit;
+  var fresh = await network;
+  return fresh || new Response('', {status: 504, statusText: 'offline'});
+}
+
+self.addEventListener('fetch', function (e) {
+  var req = e.request;
+  if (req.method !== 'GET') return;
+  var url = new URL(req.url);
+  if (mustPassThrough(req, url)) return;
+
+  /* 1) Навигация по мини-аппу: мгновенно из кэша (офлайн, холодный сервер,
+        ре-старт без мигания), свежая версия — в фоне. */
+  if (req.mode === 'navigate') {
+    e.respondWith((async function () {
+      var cache = await caches.open(CACHE);
+      var cached = null;
+      try {
+        cached = await cache.match('/miniapp', {ignoreVary: true})
+          || await cache.match(url.href, {ignoreVary: true})
+          || await cache.match('/', {ignoreVary: true});
+      } catch (err) {}
+      var network = fetch(req).then(function (resp) {
+        if (resp && resp.ok) {
+          cache.put(url.href, resp.clone()).catch(function () {});
+          cache.put('/miniapp', resp.clone()).catch(function () {});
+        }
+        return resp;
+      }).catch(function () { return null; });
+      if (cached) { e.waitUntil(network); return cached; }
+      var fresh = await network;
+      return fresh || new Response(
+        '<!doctype html><meta charset="utf-8"><body style="background:#0e0f13;color:#fff;font-family:sans-serif;display:grid;place-items:center;height:100vh">Оффлайн — откройте приложение, когда появится сеть</body>',
+        {status: 503, headers: {'Content-Type': 'text/html; charset=utf-8'}});
+    })());
+    return;
+  }
+
+  /* 2) CDN-статика: шрифты, lucide, jsmediatags, color-thief. */
+  if (CDN_HOSTS.indexOf(url.hostname) !== -1) {
+    e.respondWith(cacheFirst(req, CACHE));
+    return;
+  }
+
+  /* 3) Кэш обложек и превью (Apple Music и т. п.) — свой кэш с потолком. */
+  if (req.destination === 'image'
+      || url.hostname.indexOf('mzstatic') !== -1
+      || url.hostname.indexOf('apple') !== -1) {
+    e.respondWith((async function () {
+      var resp = await cacheFirst(req, IMG_CACHE);
+      trimCache(IMG_CACHE, IMG_CACHE_MAX);
+      return resp;
+    })());
+    return;
+  }
+
+  /* 4) Всё остальное — без кэша: пусть идёт напрямую в сеть. */
+});
+
+/* Сервер выкатил новую сборку — новый SW берёт управление сразу. */
+self.addEventListener('message', function (e) {
+  if (e.data === 'SKIP_WAITING') {
+    try { self.skipWaiting(); } catch (err) {}
+  }
+});
+"""
+
+
+async def miniapp_sw(request):
+    """ВОЛНА 22.41: Service Worker мини-аппа.
+
+    Same-origin скрипт (/sw.js) — обязательное условие регистрации SW.
+    __BUILD__ подменяется на BOT_BUILD: новый деплой = новое имя кэша =
+    автоматическое обновление статики у всех пользователей.
+    no-cache у ответа — SW-скрипт всегда свежий (сам контент он кэширует
+    уже внутри себя), Service-Worker-Allowed=/ — область видимости весь
+    сайт (мини-апп и так корневой).
+    """
+    return web.Response(
+        body=SW_JS.replace("__BUILD__", BOT_BUILD).encode("utf-8"),
+        content_type="application/javascript", charset="utf-8",
+        headers={"Cache-Control": "no-cache", "Service-Worker-Allowed": "/"})
+
 
 async def miniapp_index(request):
     """Отдаёт HTML мини-аппа (дизайн пользователя, без изменений).
@@ -16601,6 +17395,16 @@ async def miniapp_files_patch(request):
         # совместимость со старым клиентом: флаг больше ни на что не влияет
         rec["va"] = bool(body.get("vault"))
     save_user(user)
+    # ВОЛНА 22.48: переименование переезжает и В КАНАЛ ПОЛЬЗОВАТЕЛЯ —
+    # подпись сообщения-хранилища обновляется на новое имя (best-effort).
+    try:
+        _app = _MINIAPP_PTB_APP
+        if _app is not None:
+            await _storage_rename_caption(_app.bot, rec,
+                                          rec.get("label") if where == "safe"
+                                          else rec.get("name"))
+    except Exception:
+        pass
     if where == "safe":
         idx = next((i for i, f in enumerate(user.vault_files or [], 1)
                     if isinstance(f, dict) and f.get("id") == rec.get("id")), 1)
@@ -17065,10 +17869,16 @@ async def miniapp_files_link(request):
 
 async def miniapp_dl_token(request):
     """Скачивание по одноразовому токену (без заголовков — токен и есть ключ).
-    Токен сгорает при первом обращении: украденная ссылка бесполезна."""
+    ВОЛНА 22.40: токен больше НЕ сгорает при первом обращении — живёт до
+    истечения TTL (15 мин). Причина: <audio>/<video> делают НЕСКОЛЬКО запросов
+    к одной ссылке (preload=metadata + Range-докачка при play/seek), и
+    «одноразовость» роняла ВТОРОЙ запрос → музыка/видео не воспроизводились
+    ВООБЩЕ («не одну музыку не послушать»). Токен по-прежнему секретный
+    (24 байта entropy) и протухает по времени."""
     token = request.match_info["token"]
-    t = _MINIAPP_DL_TOKENS.pop(token, None)
+    t = _MINIAPP_DL_TOKENS.get(token)
     if not t or t.get("exp", 0) < time.time():
+        _MINIAPP_DL_TOKENS.pop(token, None)
         return _miniapp_err(404, "link_expired",
                             "Ссылка устарела — обновите страницу и попробуйте снова.")
     user = get_user(str(t.get("uid") or ""))
@@ -17226,6 +18036,44 @@ async def _miniapp_delete_channel_message(rec):
             await app.bot.delete_message(chat_id=int(ch), message_id=int(rec["msg_id"]))
         except Exception:
             pass
+
+
+async def _storage_rename_caption(bot, rec, new_name):
+    """ВОЛНА 22.48: переименование файла меняет подпись СООБЩЕНИЯ-ХРАНИЛИЩА
+    в канале пользователя (файл «переименовывается» и в канале тоже).
+
+    Правила подписи — как при загрузке:
+      • облако            → подпись = новое имя;
+      • Сейф «без шифра»  → «🔐 Сейф (без шифра): имя» (имя не секрет);
+      • зашифрованный Сейф → НЕ трогаем: имя файла не должно светиться
+        в канале (контейнер подписан нейтрально по дизайну 22.30).
+
+    Best-effort: нет бота/канала/сообщения, Telegram отказал — молча False,
+    локальная запись уже переименована и это главное."""
+    try:
+        if bot is None or not isinstance(rec, dict):
+            return False
+        mid = int(rec.get("msg_id") or 0)
+        if not mid:
+            return False
+        ch = int(rec.get("channel_id") or 0) or get_storage_channel_id()
+        if not ch:
+            return False
+        nm = str(new_name or "").strip()
+        if not nm:
+            return False
+        if rec.get("plain"):
+            # «без шифрования» (личный канал) — имя в канале уже лежит открыто
+            cap = "🔐 Сейф (без шифра): " + nm[:80]
+        elif "label" in rec and "name" not in rec:
+            # зашифрованный контейнер Сейфа — имя в канале не светим
+            return False
+        else:
+            cap = nm[:100]
+        await bot.edit_message_caption(chat_id=int(ch), message_id=mid, caption=cap)
+        return True
+    except Exception:
+        return False
 
 
 async def miniapp_files_to_safe(request):
@@ -18005,6 +18853,24 @@ async def miniapp_upload_init(request):
                 "Сейфа — и загрузка продолжится уже зашифрованной.")
         if guard is not True:
             return guard
+    else:
+        # ВОЛНА 22.40: «загружаю в мини-апп и шифрую» — ДОЛЖНО попадать в Сейф
+        # бота. В режиме «без шифрования» пароль теперь ОПЦИОНАЛЕН: ввёл пароль
+        # Сейфа → файл шифруется и кладётся в user.vault_files (виден в Сейфе
+        # в чате); оставил поле пустым → обычная незашифрованная загрузка.
+        # ВАЖНО: пароль берём ТОЛЬКО из тела ЭТОГО запроса (поле ввода в окне
+        # загрузки) — унаследованный от прежней разблокировки веб-сессии
+        # пароль НЕ переключает режим (иначе «обычная загрузка» внезапно
+        # шифровалась без ведома пользователя).
+        pw_raw = str((body or {}).get("password") or "")
+        cand = _miniapp_vault_pw_pick(user, _vault_pw_candidates(pw_raw)) \
+            if pw_raw else None
+        if cand:
+            if _miniapp_vault_pw_verify(user, cand) is False:
+                return _miniapp_err(403, "wrong_password",
+                                    "Пароль Сейфа не подходит.")
+            plain_mode = False
+            vault_pw = cand
     files = [f for f in (getattr(user, "cloud_files", []) or []) if isinstance(f, dict)]
     limit = get_price('cloud_max_files', 50)
     if not plain_mode:
@@ -18109,6 +18975,141 @@ async def miniapp_upload_abort(request):
         except Exception:
             pass
     return web.json_response({"ok": True})
+
+
+async def miniapp_upload_closed(request):
+    """ВОЛНА 22.48: «мини апп закрыли посреди загрузки».
+
+    Клиент последним дыханием (fetch keepalive — доходит даже при выгрузке
+    страницы) сообщает, что пользователь ушёл, пока файлы НЕ догрузились.
+    Мы помечаем незавершённые сессии closed_hint: сторож (_upload_pause_
+    check_once) через ~6 секунд пришлёт в чат «⏸ Загрузка на паузе» с
+    кнопкой «▶️ Продолжить загрузку» — но ТОЛЬКО если куски и правда
+    перестали приходить (мини апп могли просто свернуть, а загрузка
+    продолжает идти в фоне — тогда метка снимается, ложных сообщений нет).
+    Файлы при этом не теряются: при переоткрытии мини-аппа очередь
+    подхватывается из IndexedDB и грузится дальше."""
+    user, uid, err = await _api_get_user_any(request)
+    if err is not None:
+        return err
+    now = time.time()
+    marked = 0
+    for s in _MINIAPP_UPLOADS.values():
+        if s.get("uid") != uid:
+            continue
+        size = int(s.get("size") or 0)
+        received = int(s.get("received") or 0)
+        if size > 0 and received < size:
+            s["closed_hint"] = now
+            marked += 1
+    return web.json_response({"ok": True, "marked": marked})
+
+
+# uid → ts последнего отправленного сообщения «⏸ Загрузка на паузе»
+_UPLOAD_PAUSE_LAST = {}
+# не чаще одного сообщения в 2 минуты на пользователя (TTL-циклы, двойные биконы)
+_UPLOAD_PAUSE_COOLDOWN = 120.0
+# сколько секунд тишины (без закрытия) считаем «загрузка умерла молча»
+_UPLOAD_PAUSE_SILENCE = 30.0
+
+
+async def _upload_pause_check_once(app, now=None):
+    """Один проход сторожа паузы загрузок (22.48).
+
+    Находит НЕЗАВЕРШЁННЫЕ сессии загрузки, по которым перестали приходить
+    куски, и отправляет каждому затронутому пользователю ОДНО сообщение со
+    списком файлов и кнопкой «▶️ Продолжить загрузку» (Mini App).
+
+    Триггеры тишины:
+      • closed_hint (клиент сам сообщил о закрытии) — ждём ~6 с: если куски
+        снова пошли (ts > hint) — ложная тревога, метка снимается;
+      • без hint — сессия молчит > 30 с (крестик без событий, обрыв сети).
+
+    Один раз на сессию (pause_notified) + кулдаун 2 мин на пользователя.
+    Возвращает, скольким пользователям отправили сообщение."""
+    now = time.time() if now is None else float(now)
+    bot = getattr(app, "bot", None)
+
+    # 1) снимаем метки у живых загрузок и собираем затухшие по пользователям
+    stale = {}                     # uid → [(uploadId, имя, размер, догружено)]
+    for upid, s in list(_MINIAPP_UPLOADS.items()):
+        size = int(s.get("size") or 0)
+        received = int(s.get("received") or 0)
+        if size <= 0 or received >= size:
+            continue               # завершено/пусто — пауза не интересна
+        hint = s.get("closed_hint")
+        if hint:
+            if float(s.get("ts", 0)) > float(hint):
+                s.pop("closed_hint", None)   # куски пошли — загрузка жива
+                continue
+            if now - float(hint) < 6.0:
+                continue                     # ещё ждём «последний вдох»
+        elif now - float(s.get("ts", now)) <= _UPLOAD_PAUSE_SILENCE:
+            continue                         # молчит недолго — может, оживёт
+        if s.get("pause_notified"):
+            continue                         # по этой сессии уже сообщали
+        uid = str(s.get("uid") or "")
+        if not uid:
+            continue
+        stale.setdefault(uid, []).append(
+            (upid, str(s.get("name") or "файл")[:60], size, received))
+
+    if not stale:
+        return 0
+
+    sent = 0
+    for uid, items in list(stale.items()):
+        # недавно уже писали об остановке? — сессии НЕ помечаем: если
+        # тишина продолжится, сообщение уйдёт после кулдауна (а не «никогда»)
+        last = _UPLOAD_PAUSE_LAST.get(uid, 0)
+        if now - last < _UPLOAD_PAUSE_COOLDOWN:
+            continue
+        if bot is None:
+            continue
+        # помечаем ДО отправки (отправка может упасть — спамить не нужно)
+        for upid, _nm, _sz, _rc in items:
+            _s = _MINIAPP_UPLOADS.get(upid)
+            if _s is not None:
+                _s["pause_notified"] = True
+                _s.pop("closed_hint", None)
+        _UPLOAD_PAUSE_LAST[uid] = now
+        lines = ""
+        for _upid, nm, sz, rc in items[:3]:
+            lines += f"• «{nm}» — догружено {_fmt_bytes(rc)} из {_fmt_bytes(sz)}\n"
+        extra = len(items) - 3
+        if extra > 0:
+            lines += f"• и ещё {extra} файл(ов)\n"
+        kb = None
+        if MINIAPP_URL:
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("▶️ Продолжить загрузку",
+                                     web_app=WebAppInfo(url=MINIAPP_URL))]])
+        try:
+            await bot.send_message(
+                chat_id=int(uid),
+                text=("⏸ Загрузка на паузе\n\n" + lines +
+                      "\nМини апп закрыли посреди загрузки, и файлы "
+                      "перестали лететь на сервер.\n\n"
+                      "Файлы НЕ потеряны: откройте мини апп — загрузка "
+                      "продолжится сама с того же места."),
+                reply_markup=kb,
+            )
+            sent += 1
+        except Exception:
+            pass
+    return sent
+
+
+async def _upload_pause_watchdog(app):
+    """Фоновый тикер сторожа паузы загрузок (раз в 10 секунд, 22.48)."""
+    while True:
+        try:
+            await asyncio.sleep(10)
+            await _upload_pause_check_once(app)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"upload pause watchdog error: {e}")
 
 
 async def miniapp_upload_complete(request):
@@ -18831,6 +19832,8 @@ def mount_miniapp_routes(app):
     Один вызов из start_keep_alive_server; падение здесь не роняет бот."""
     app.router.add_get("/", miniapp_index)
     app.router.add_get("/miniapp", miniapp_index)
+    # ВОЛНА 22.41: Service Worker — оффлайн-запуск и кэш статики мини-аппа.
+    app.router.add_get("/sw.js", miniapp_sw)
     app.router.add_get("/api/files", miniapp_files_get)
     app.router.add_patch("/api/files/{fid}", miniapp_files_patch)
     app.router.add_delete("/api/files/{fid}", miniapp_files_delete)
@@ -18854,6 +19857,8 @@ def mount_miniapp_routes(app):
     app.router.add_post("/api/upload/chunk", miniapp_upload_chunk)
     app.router.add_post("/api/upload/complete", miniapp_upload_complete)
     app.router.add_post("/api/upload/abort", miniapp_upload_abort)
+    # ВОЛНА 22.48: «мини апп закрыли посреди загрузки» (fetch keepalive)
+    app.router.add_post("/api/upload/closed", miniapp_upload_closed)
     # ВОЛНА 22.23: «Моё облако» в мини-аппе (статус/подключить/отключить канал)
     app.router.add_get("/api/storage", miniapp_storage_get)
     app.router.add_post("/api/storage/connect", miniapp_storage_connect)
@@ -19135,6 +20140,12 @@ async def cloud_rename_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
     old = rec.get("name", "?")
     rec["name"] = text[:120]
     save_user(user)
+    # ВОЛНА 22.48: файл переименовывается и В КАНАЛЕ ПОЛЬЗОВАТЕЛЯ —
+    # подпись сообщения-хранилища догоняет новое имя (best-effort).
+    try:
+        await _storage_rename_caption(context.bot, rec, rec["name"])
+    except Exception:
+        pass
     await msg.reply_text(
         f"✏️ Готово: «{old}» → «{rec['name']}».",
         reply_markup=get_main_menu_keyboard(user),
@@ -26481,6 +27492,12 @@ async def vault_ren_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     save_user(user)
     context.user_data.pop('vault_ren_id', None)
+    # ВОЛНА 22.48: в режиме «без шифрования» подпись в канале тоже догоняет
+    # новое имя (у зашифрованного Сейфа имя в канале не светится — не трогаем).
+    try:
+        await _storage_rename_caption(context.bot, rec, rec["label"])
+    except Exception:
+        pass
     await msg.reply_text(
         f"✏️ Подпись сохранена: «{rec['label']}». Теперь в списке Сейфа видно, "
         "где что лежит.",
@@ -28215,10 +29232,12 @@ async def handle_ai_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_conversations[user_id].append(
         {"role": "user", "content": history_text}
     )
-    # Оставляем system + последние 20 сообщений
-    if len(user_conversations[user_id]) > 21:
+    # ВОЛНА 22.41: история — system + последние 10 сообщений (было 20).
+    # Требование разработчика: «история — последние 5–10 сообщений»,
+    # чтобы не тратить токены: берём верхнюю границу диапазона.
+    if len(user_conversations[user_id]) > 11:
         system_msg = user_conversations[user_id][0]
-        user_conversations[user_id] = [system_msg] + user_conversations[user_id][-20:]
+        user_conversations[user_id] = [system_msg] + user_conversations[user_id][-10:]
 
     async def _stop_animation():
         if anim_task and not anim_task.done():
@@ -28260,17 +29279,22 @@ async def handle_ai_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         prefer_text_engine = True
 
     ai_response = None
+    ai_finish_reason = None
     vision_error_note = None
     if prefer_text_engine and DEEPSEEK_API_KEY:
         # === Чат с ИИ на DeepSeek API — основной текстовый движок ===
         # Понимает любую тему и мгновенно переключается между темами
         # (правила зашиты в _ai_chat_system_prompt). При сбое — fallback
         # на Groq ниже, так что чат не молчит никогда.
-        _ds_answer = await _deepseek_chat(
-            request_messages, timeout=90, temperature=0.6
+        # ВОЛНА 22.41: max_tokens=450 (экономия токенов) + return_meta —
+        # finish_reason нужен гарантии законченного ответа.
+        _ds_answer, _ds_finish = await _deepseek_chat(
+            request_messages, timeout=90, temperature=0.6,
+            max_tokens=450, return_meta=True,
         )
         if _ds_answer is not None:
             ai_response = _ds_answer
+            ai_finish_reason = _ds_finish
     if ai_response is None and photo_data_url:
         # === Вижн-путь с ЦЕПОЧКОЙ моделей (ИСПРАВЛЕНО «ии не видит фото») ===
         # Раньше была одна модель: упала (уставшая/rate-limit/сбой) — и
@@ -28305,7 +29329,9 @@ async def handle_ai_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         messages=_vision_messages,
                         model=_vmodel,
                         temperature=0.7,
-                        max_tokens=2048,
+                        # ВОЛНА 22.41: единый лимит ответа чата — 450 токенов
+                        # (экономия; описания фото в этот лимит помещаются).
+                        max_tokens=450,
                     ),
                     timeout=120,
                 )
@@ -28352,11 +29378,16 @@ async def handle_ai_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     messages=request_messages,
                     model=request_model or GROQ_MODEL,
                     temperature=0.7,
-                    max_tokens=2048,
+                    # ВОЛНА 22.41: лимит токенов ответа чата — 450.
+                    max_tokens=450,
                 ),
                 timeout=120 if (photo_data_url or is_doc_image) else 60,
             )
             ai_response = chat_completion.choices[0].message.content or ""
+            try:
+                ai_finish_reason = chat_completion.choices[0].finish_reason
+            except Exception:
+                ai_finish_reason = None
         except asyncio.TimeoutError:
             logger.error("Groq API timeout")
             await _stop_animation()
@@ -28404,6 +29435,9 @@ async def handle_ai_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     # Сохраняем ответ ассистента в историю
+    # ВОЛНА 22.41: перед отправкой — гарантия законченного ответа: лимит
+    # 1000 символов, обрезка по законченным предложениям, закрытие ```.
+    ai_response = _ai_finish_guarantee(ai_response, ai_finish_reason, 1000)
     user_conversations[user_id].append(
         {"role": "assistant", "content": ai_response}
     )
@@ -28687,7 +29721,7 @@ def _automation_system_prompt(context_text, is_admin):
     admin_block = (
         "Пользователь ЯВЛЯЕТСЯ администратором класса: ему доступны все изменяющие действия."
         if is_admin
-        else "Пользователь НЕ администратор: изменяющие действия (add_homework, add_homework_many, delete_homework, delete_homework_many, replace_teachers, add_subject, remove_subject, edit_schedule, edit_bell, set_holidays, send_class_message) ему ЗАПРЕЩЕНЫ. Если он просит именно их — верни действие \"clarify\" с вопросом-напоминанием, что менять класс может только админ."
+        else "Пользователь НЕ администратор: изменяющие действия (add_homework, add_homework_many, delete_homework, delete_homework_many, replace_teachers, add_subject, remove_subject, edit_schedule, edit_bell, set_bells, set_holidays, send_class_message, schedule_class_message, delete_class_timer) ему ЗАПРЕЩЕНЫ. Если он просит именно их — верни действие \"clarify\" с вопросом-напоминанием, что менять класс может только админ."
     )
     return (
         "Ты — модуль автоматизации школьного Telegram-бота. Твоя задача: превратить "
@@ -28702,9 +29736,13 @@ def _automation_system_prompt(context_text, is_admin):
         '5) {"action":"remove_subject","subject":"<предмет>"} — удалить предмет.\n'
         '6) {"action":"edit_schedule","day":"<Понедельник..Воскресенье>","content":"<номер. предмет через \\n>"} — заменить расписание на день.\n'
         '7) {"action":"edit_bell","lesson":<номер урока числом>,"start":"ЧЧ:ММ","end":"ЧЧ:ММ"} — задать время звонков урока. end обязан быть позже start.\n'
+        '7b) {"action":"set_bells","bells":[{"lesson":1,"start":"08:30","end":"09:15"},{"lesson":2,"start":"09:25","end":"10:10"}]} — ЗАМЕНИТЬ ВЕСЬ список звонков, когда пользователь прислал СПИСОК звонков ЦЕЛИКОМ («1 урок 8:30-9:15, 2 урок 9:25-10:10…»): разобрай каждую строку в элемент массива (lesson — число, end позже start). Только админ.\n'
         '8) {"action":"set_holidays","date":"ГГГГ-ММ-ДД"} — дата начала каникул.\n'
         '9) {"action":"create_timer","date":"ГГГГ-ММ-ДД","time":"ЧЧ:ММ","text":"<текст напоминания>","kind":"timer|wish","repeat_daily":false} — таймер/напоминание/ПОЖЕЛАНИЕ ПО РАСПИСАНИЮ (доступно всем). Если пользователь говорит «через N минут/часов» — используй вместо даты поле in_minutes: {"action":"create_timer","in_minutes":<целое число минут>,"text":"<текст>"}. Разрешено передавать date как «today»/«tomorrow» — исполнитель сам посчитает дату. ПОЛЕ kind: "timer" (по умолчанию) — обычное напоминание; "wish" — когда пользователь просит бота ПОЖЕЛАТЬ/сказать/поздравить его самого («пожелай мне спокойной ночи в 23:00», «говори мне доброе утро в 7:00», «поздравь меня с наступающим в 12:00») — в text запиши САМО ПОЖЕЛАНИЕ живой фразой с уместным эмодзи (например «Спокойной ночи! Пусть тебе приснятся самые добрые сны 🌙»), а не служебный текст. ПОЛЕ repeat_daily: true — ТОЛЬКО если сказано «каждый день», «каждое утро», «всегда в это время» и НЕ названы исключения; иначе false. ПОЛЕ repeat_weekday — ЕЖЕНЕДЕЛЬНЫЙ повтор: «каждый понедельник в 15:00» = {"repeat_weekday":"mon","time":"15:00"} (дни: mon|tue|wed|thu|fri|sat|sun или по-русски); дата не нужна, исполнитель сам найдёт ближайший день. ПОЛЯ repeat_days/skip_days — ПОВТОР ПО НЕСКОЛЬКИМ ДНЯМ С ИСКЛЮЧЕНИЯМИ: «напоминай каждое утро в 7:00, но не считай понедельник и выходные» = {"repeat_days":["tue","wed","thu","fri"],"time":"07:00"} — перечисли ОСТАЮЩИЕСЯ дни; можно вместо этого передать skip_days (исключённые): {"skip_days":["mon","sat","sun"],"time":"07:00"} = «каждый день кроме пн, сб, вс». Понимай любые формулировки: «по будням» = repeat_days:["mon","tue","wed","thu","fri"], «кроме выходных» = skip_days:["sat","sun"], «только в школу» = будни. Напоминаний можно создавать сколько угодно.\n'
         '10) {"action":"send_class_message","text":"<сообщение>"} — объявление всему классу (только админ).\n'
+        '10b) {"action":"schedule_class_message","text":"<сообщение>","date":"ГГГГ-ММ-ДД","time":"ЧЧ:ММ"} — ПОСТАВИТЬ ТАЙМЕР: сообщение придёт ВСЕМУ классу в назначенное время (только админ). «завтра в 8:00» = date:"tomorrow" (или "today"), «через N минут» = in_minutes. ПОВТОРЫ: repeat_daily:true — каждый день; repeat_weekday:"mon" — еженедельно; repeat_days:["mon","fri"] — по дням; skip_days:["sat","sun"] — «каждый день кроме…». Таймеров можно ставить сколько угодно.\n'
+        '10c) {"action":"show_class_timers"} — показать таймеры сообщений классу с id.\n'
+        '10d) {"action":"delete_class_timer","timer_id":"<id из show_class_timers>"} — удалить таймер класса (только админ).\n'
         '11) {"action":"show_homework","subject":"<предмет или null>","date":"ГГГГ-ММ-ДД или null"} — показать ДЗ.\n'
         '12) {"action":"show_schedule","day":"<день или null>"} — показать расписание.\n'
         '13) {"action":"show_teachers","subject":"<предмет или null>","subjects":["<предмет>"]} — показать учителей. БЕЗ параметров — весь список. ЕСЛИ пользователь спрашивает про КОНКРЕТНЫЙ предмет/предметы («как зовут учителя по физре», «как зовут учителей по математике, русскому и физре») — передай ТОЛЬКО запрошенные предметы (один — в subject, несколько — массивом в subjects) и НЕ показывай остальных. Названия предметов сопоставляй с классом («физра» → «Физкультура», «русский» → «Русский язык»).\n'
@@ -28813,6 +29851,162 @@ def _resolve_teacher_subject(raw, teacher_keys):
     return None
 
 
+# ==================================
+# === ВОЛНА 22.41: разбор времени для schedule_class_message ===
+# ==================================
+_AUTOMATION_WD_MAP = {
+    "mon": 0, "monday": 0, "понедельник": 0, "пн": 0,
+    "tue": 1, "tuesday": 1, "вторник": 1, "вт": 1,
+    "wed": 2, "wednesday": 2, "среда": 2, "среду": 2, "ср": 2,
+    "thu": 3, "thursday": 3, "четверг": 3, "чт": 3,
+    "fri": 4, "friday": 4, "пятница": 4, "пятницу": 4, "пт": 4,
+    "sat": 5, "saturday": 5, "суббота": 5, "субботу": 5, "сб": 5,
+    "sun": 6, "sunday": 6, "воскресенье": 6, "вс": 6,
+}
+
+
+def _automation_parse_weekdays(value):
+    """Список дней недели (0=Пн…6=Вс) из строк/чисел («пн», "mon", 2)."""
+    out = []
+    if isinstance(value, str):
+        value = re.split(r"[,\s;]+", value.strip())
+    if not isinstance(value, (list, tuple)):
+        return []
+    for tok in value:
+        t = str(tok or "").strip().lower()
+        if not t:
+            continue
+        if t in _AUTOMATION_WD_MAP:
+            out.append(_AUTOMATION_WD_MAP[t])
+        else:
+            try:
+                d = int(t)
+                if 0 <= d <= 6:
+                    out.append(d)
+            except ValueError:
+                pass
+    return sorted(set(out))
+
+
+def _automation_resolve_when(action, local_now):
+    """ВОЛНА 22.41: разбор времени для ИИ-действия schedule_class_message
+    (таймер сообщения классу). Поддерживает: in_minutes («через 20 минут»),
+    date «ГГГГ-ММ-ДД» / «today»/«tomorrow», time «ЧЧ:ММ», repeat_daily,
+    repeat_weekday («mon»/«понедельник»), repeat_days/skip_days.
+    Возвращает (date_str, time_str, repeat_daily, repeat_weekly,
+    repeat_days, err). err не None — вопрос пользователю.
+    """
+    time_str = str(action.get("time") or "").strip()
+    date_str = str(action.get("date") or "").strip()
+    in_minutes = action.get("in_minutes")
+    repeat_daily = bool(action.get("repeat_daily"))
+    repeat_weekly = None
+    repeat_days = []
+
+    rw = action.get("repeat_weekday")
+    if isinstance(rw, (list, tuple)) and rw:
+        repeat_days = _automation_parse_weekdays(list(rw))
+    elif rw:
+        parsed = _automation_parse_weekdays([rw])
+        if parsed:
+            repeat_weekly = parsed[0]
+    if action.get("repeat_days"):
+        repeat_days = _automation_parse_weekdays(action.get("repeat_days"))
+    skip = action.get("skip_days")
+    if skip:
+        skip_set = set(_automation_parse_weekdays(skip))
+        if skip_set:
+            if not repeat_days:
+                repeat_days = [d for d in range(7) if d not in skip_set]
+            else:
+                repeat_days = [d for d in repeat_days if d not in skip_set]
+    if isinstance(repeat_days, (list, tuple)) and repeat_days:
+        repeat_daily = False  # набор дней точнее «каждый день»
+
+    def _norm_time(ts):
+        try:
+            hh, mm = ts.split(":")
+            hh, mm = int(hh), int(float(mm))
+            if 0 <= hh <= 23 and 0 <= mm <= 59:
+                return f"{hh:02d}:{mm:02d}"
+        except (ValueError, AttributeError):
+            pass
+        return None
+
+    n_min = None
+    try:
+        n_min = int(float(in_minutes)) if in_minutes is not None else None
+        if n_min is not None and n_min <= 0:
+            n_min = None
+    except (TypeError, ValueError):
+        n_min = None
+    if n_min:
+        target = local_now + timedelta(minutes=n_min)
+        return (target.strftime("%Y-%m-%d"), target.strftime("%H:%M"),
+                False, None, [], None)
+    time_str = _norm_time(time_str)
+    if not time_str:
+        return ("", "", False, None, [],
+                "Назовите ВРЕМЯ отправки (например «в 8:00»).")
+
+    if repeat_daily or repeat_days or repeat_weekly is not None:
+        if repeat_days:
+            nd = _class_timer_first_date("days", repeat_days, time_str, local_now)
+            if nd is None:
+                return ("", "", False, None, [],
+                        "Не понял дни недели — перечислите их точнее.")
+            repeat_weekly = None
+            repeat_daily = False
+        elif repeat_weekly is not None:
+            if local_now.weekday() == repeat_weekly:
+                try:
+                    cand = datetime.strptime(
+                        f"{local_now.strftime('%Y-%m-%d')} {time_str}",
+                        "%Y-%m-%d %H:%M")
+                except ValueError:
+                    return ("", "", False, None, [], "Не понял время.")
+                nd = (local_now if cand > local_now
+                      else _timer_next_weekday_date(repeat_weekly, local_now))
+            else:
+                nd = _timer_next_weekday_date(repeat_weekly, local_now)
+            if nd is None:
+                return ("", "", False, None, [],
+                        "Не понял день недели — скажите, например "
+                        "«каждый понедельник».")
+            repeat_days = []
+        else:
+            nd = _class_timer_first_date("daily", [], time_str, local_now)
+            if nd is None:
+                return ("", "", False, None, [], "Не понял время.")
+        return (nd.strftime("%Y-%m-%d"), time_str, repeat_daily,
+                repeat_weekly, list(repeat_days), None)
+
+    # Разовый запуск
+    dn = date_str.lower().strip()
+    if dn in ("today", "сегодня"):
+        date_str = local_now.strftime("%Y-%m-%d")
+    elif dn in ("tomorrow", "завтра"):
+        date_str = (local_now + timedelta(days=1)).strftime("%Y-%m-%d")
+    if not date_str:
+        try:
+            cand = datetime.strptime(
+                f"{local_now.strftime('%Y-%m-%d')} {time_str}",
+                "%Y-%m-%d %H:%M")
+        except ValueError:
+            return ("", "", False, None, [], "Не понял время.")
+        base = local_now if cand > local_now else local_now + timedelta(days=1)
+        date_str = base.strftime("%Y-%m-%d")
+    try:
+        target = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
+    except ValueError:
+        return ("", "", False, None, [],
+                "Не понял дату — назовите её как ГГГГ-ММ-ДД или «завтра».")
+    if target <= local_now:
+        return ("", "", False, None, [],
+                f"Время {date_str} {time_str} уже прошло — назовите будущее.")
+    return (date_str, time_str, False, None, [], None)
+
+
 async def _automation_execute_action(update, context, user, class_obj, action):
     """Исполняет JSON-сценарий от DeepSeek. Возвращает текстовый отчёт.
 
@@ -28875,6 +30069,28 @@ async def _automation_execute_action(update, context, user, class_obj, action):
 
     if name == "show_bells":
         return get_bells_info(class_obj, user), True
+
+    if name == "show_class_timers":
+        # ВОЛНА 22.41: список таймеров сообщений классу (id нужен для
+        # delete_class_timer).
+        if not class_obj:
+            return "🚫 Вы не состоите в классе — таймеры класса не найти.", True
+        timers = load_data(CLASS_TIMERS_FILE, {}) or {}
+        mine = {t: d for t, d in timers.items()
+                if isinstance(d, dict)
+                and d.get('class_code') == class_obj.class_code}
+        if not mine:
+            return ("⏰ Таймеров сообщений классу нет. Админ может поставить "
+                    "словами: «отправь классу завтра в 8:00 …» или через "
+                    "«⏰ Таймер классу» в панели класса."), True
+        lines = [f"⏰ Таймеры сообщений класса {class_obj.class_name}:\n"]
+        for tid, td in sorted(mine.items(),
+                              key=lambda kv: str(kv[1].get('target_date', ''))
+                              + str(kv[1].get('target_time', ''))):
+            status = "🟢" if td.get('is_active') else "⏸"
+            lines.append(f"{status} {tid}: {_class_timer_label(td)}")
+        lines.append("\nУдалить: «удали таймер <id>».")
+        return "\n".join(lines), True
 
     if name == "show_holidays":
         return get_holidays_count(class_obj, user), True
@@ -29689,7 +30905,8 @@ async def _automation_execute_action(update, context, user, class_obj, action):
         "add_homework", "add_homework_many", "delete_homework",
         "delete_homework_many",
         "replace_teachers", "add_subject", "remove_subject", "edit_schedule",
-        "edit_bell", "set_holidays", "send_class_message",
+        "edit_bell", "set_bells", "set_holidays", "send_class_message",
+        "schedule_class_message", "delete_class_timer",
     }:
         if not class_obj:
             return "🚫 Вы не состоите в классе — изменять нечего.", True
@@ -30015,6 +31232,127 @@ async def _automation_execute_action(update, context, user, class_obj, action):
                     failed += 1
             return f"📢 Объявление отправлено: {sent} получено, {failed} не доставлено.", True
 
+        if name == "set_bells":
+            # ВОЛНА 22.41: ЗАМЕНИТЬ ВЕСЬ список звонков одним действием —
+            # пользователь прислал список целиком («1 урок 8:30-9:15,
+            # 2 урок 9:25-10:10 …»), ИИ разобрал в массив bells.
+            bells = action.get("bells")
+            if not isinstance(bells, list) or not bells:
+                return (
+                    "❓ Не распознал список звонков. Пришлите его целиком, "
+                    "например: «1 урок 8:30-9:15, 2 урок 9:25-10:10».", False)
+            new_bells = {}
+            for b in bells:
+                if not isinstance(b, dict):
+                    return f"❓ Звонок «{b}» не распознан.", False
+                try:
+                    lesson = str(int(b.get("lesson")))
+                    start = str(b.get("start") or "").strip()
+                    end = str(b.get("end") or "").strip()
+                    s_t = datetime.strptime(start, "%H:%M")
+                    e_t = datetime.strptime(end, "%H:%M")
+                except (TypeError, ValueError):
+                    return (f"❓ Звонок урока {b.get('lesson')} не распознан "
+                            "(нужно время в формате ЧЧ:ММ).", False)
+                if e_t <= s_t:
+                    return (f"❓ У урока {lesson} конец ({end}) не позже "
+                            f"начала ({start}). Уточните времена.", False)
+                new_bells[lesson] = {"start": start, "end": end}
+            if not new_bells:
+                return "❓ Список звонков пуст.", False
+            class_obj.bells = new_bells
+            classes = load_classes()
+            classes[class_obj.class_code] = class_obj
+            save_classes(classes)
+            try:
+                _info = "; ".join(
+                    f"{l}: {v['start']}–{v['end']}"
+                    for l, v in sorted(new_bells.items(),
+                                       key=lambda kv: int(kv[0])
+                                       if kv[0].isdigit() else 99))
+            except Exception:
+                _info = f"{len(new_bells)} уроков"
+            return f"🔔 Звонки класса заменены целиком ({len(new_bells)} шт.): {_info}.", True
+
+        if name == "schedule_class_message":
+            # ВОЛНА 22.41: ТАЙМЕР сообщения классу через ИИ — «отправь классу
+            # завтра в 8:00 …», «каждый день в 8:00 напоминай про зарядку».
+            # Сообщение уйдёт ВСЕМ участникам класса в назначенное время;
+            # хранится в class_timers.json (+канал-БД), переживает рестарт.
+            text = (action.get("text") or "").strip()
+            if not text:
+                return "❓ О чём сообщить классу? Скажите текст сообщения.", False
+            rejected = await reject_if_forbidden_chars(update, text, AI_AUTOMATION)
+            if rejected is not None:
+                return None, False
+            tz_offset = 3
+            try:
+                _cu = get_user(str(user_id))
+                if _cu is not None:
+                    tz_offset = int(getattr(_cu, 'timezone', 3) or 3)
+            except Exception:
+                pass
+            local_now = _utcnow() + timedelta(hours=tz_offset)
+            date_str, time_str, rep_daily, rep_weekly, rep_days, err = \
+                _automation_resolve_when(action, local_now)
+            if err:
+                return f"❓ {err}", False
+            timers = load_data(CLASS_TIMERS_FILE, {}) or {}
+            tid = generate_class_timer_id()
+            timers[tid] = {
+                "class_code": class_obj.class_code,
+                "text": text,
+                "created_by": str(user_id),
+                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "target_date": date_str,
+                "target_time": time_str,
+                "is_active": True,
+                "repeat_daily": bool(rep_daily),
+                "repeat_weekly": rep_weekly,
+                "repeat_days": list(rep_days) if rep_days else None,
+                "fired_key": "",
+            }
+            save_data(CLASS_TIMERS_FILE, timers)
+            try:
+                schedule_class_timer_job(context.application, tid, timers[tid])
+            except Exception as e:
+                logger.error(f"schedule_class_message: {e}")
+            try:
+                _log_admin_action(str(user_id), class_obj.class_code,
+                                  "Таймер классу (ИИ)",
+                                  f"{date_str} {time_str} · {text[:120]}")
+            except Exception:
+                pass
+            when_line = f"📅 {date_str} в {time_str}"
+            if rep_days:
+                when_line = "🔁 по " + ", ".join(
+                    _WD_SHORT[d] for d in rep_days) + f" в {time_str}"
+            elif rep_weekly is not None:
+                when_line = f"🔁 по {_WD_SHORT[rep_weekly]} в {time_str}"
+            elif rep_daily:
+                when_line = f"🔁 каждый день в {time_str}"
+            return (f"✅ Таймер поставлен ({when_line}): сообщение придёт "
+                    f"классу {class_obj.class_name}. Сохранено в базе данных.", True)
+
+        if name == "delete_class_timer":
+            # ВОЛНА 22.41: удалить таймер класса по id (id виден в
+            # show_class_timers).
+            tid = str(action.get("timer_id") or "").strip()
+            timers = load_data(CLASS_TIMERS_FILE, {}) or {}
+            td = timers.get(tid)
+            if not isinstance(td, dict) or td.get('class_code') != class_obj.class_code:
+                return ("❓ Такой таймер класса не найден. Скажите «покажи "
+                        "таймеры класса», чтобы увидеть id.", False)
+            timers.pop(tid, None)
+            save_data(CLASS_TIMERS_FILE, timers)
+            try:
+                for j in (context.application.job_queue.get_jobs_by_name(
+                        f"class_timer_{tid}") or []):
+                    j.schedule_removal()
+            except Exception:
+                pass
+            return f"🗑 Таймер удалён: {_class_timer_label(td)}.", True
+
         # ВОЛНА 22.4: действие pult_post удалено вместе с Пультом.
 
     return f"Неизвестное действие «{name}».", True
@@ -30032,6 +31370,9 @@ def _automation_help_text():
         "• «Замени учителя по биологии на Смирнову А.А.»\n"
         "• «Учителя: биология — Орлова, география — Николаев, обществознание — Петров»\n"
         "• «Урок 5 начинается в 11:40 и заканчивается в 12:25»\n"
+        "• «Отправь классу завтра в 8:00: приносим учебники» — таймер сообщения классу\n"
+        "• «Каждый день в 8:00 отправляй классу „не забудьте сменку“» — постоянный таймер\n"
+        "• «Звонки: 1) 8:30-9:15, 2) 9:25-10:10, 3) 10:25-11:10» — заменить ВЕСЬ список звонков\n"
         "• «Напомни завтра в 18:00 про секцию» / «Напомни через 20 минут»\n"
         "• «Пожелай мне спокойной ночи в 23:00» — пришлю живое пожелание по расписанию\n"
         "• «Желай мне доброе утро в 7:00 каждый день» — будет повторяться КАЖДЫЙ день\n"
@@ -31816,10 +33157,14 @@ async def manage_button_visibility_start(update: Update, context: ContextTypes.D
 
     hidden_count = len(getattr(user, 'hidden_buttons', []))
 
+    # ВОЛНА 22.45: текст объясняет механику «Ещё» — скрытие = перенос кнопки
+    # в «📋 Ещё»; и саму «📋 Ещё» можно скрыть/вернуть (пункт в списке ниже).
     text = (
         f"👁 **Управление видимостью кнопок**\n\n"
         f"📊 Скрытых кнопок: {hidden_count}\n\n"
         f"Нажмите на кнопку, чтобы скрыть или показать её.\n"
+        f"Скрытая кнопка не пропадает — она переезжает в «📋 Ещё».\n"
+        f"Пункт «📋 Ещё» тоже в списке: его можно скрыть или вернуть.\n"
         f"⚙️ Кнопка настроек всегда остаётся видимой."
     )
 
@@ -31873,6 +33218,14 @@ async def toggle_button_visibility_handler(update: Update, context: ContextTypes
         f"✅ Кнопка '{button_name}' {action}!\n\n"
         f"Нажмите на кнопку, чтобы скрыть или показать её."
     )
+    # ВОЛНА 22.45: скрыли «📋 Ещё», а внутри уже лежат спрятанные кнопки —
+    # честно предупреждаем, как их вернуть.
+    if (action == "скрыта" and button_name == "📋 Ещё"
+            and any(b != "📋 Ещё" for b in user.hidden_buttons)):
+        text += (
+            "\n\n⚠️ В «Ещё» лежат спрятанные кнопки — они станут доступны "
+            "снова, когда вернёте «📋 Ещё» здесь же."
+        )
 
     try:
         await query.edit_message_text(text, reply_markup=get_button_visibility_keyboard(user))
@@ -32011,6 +33364,20 @@ async def _global_cancel_cleanup(update: Update, context: ContextTypes.DEFAULT_T
             user_conversations.pop(user_id, None)
         except Exception:
             pass
+    # 3b) ВОЛНА 22.40/22.41: сбрасываем персистентные флаги ввода
+    #     (список дежурных, ввод таймера классу, список звонков) —
+    #     «отмена» отменяет всё.
+    try:
+        if user is not None:
+            if getattr(user, "duty_pending", None):
+                user.duty_pending = None
+            if getattr(user, "ct_pending", None):
+                user.ct_pending = None
+            if getattr(user, "bells_pending", None):
+                user.bells_pending = None
+            save_user(user)
+    except Exception:
+        pass
     # 4) Ответ + главное меню.
     _lines = ["✅ Готово: вышли в главное меню."]
     if _deleted:
@@ -36912,6 +38279,57 @@ async def join_class_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return await class_management(update, context)
 
 @timeout(CONVERSATION_TIMEOUT)
+async def leave_class(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.46: «🚪 Выйти из класса» из ГЛАВНОГО меню (message-путь).
+
+    Раньше ветка handle_main_menu вызывала leave_class, которой НЕ
+    СУЩЕСТВОВАЛО (был только leave_class_handler для inline-кнопки внутри
+    «🎓 Управление классами») — нажатие кнопки в главном меню падало с
+    NameError, и пользователь видел «кнопка не работает». Логика зеркалит
+    leave_class_handler, но работает с update.message: выходим сразу (как
+    в inline-версии, без подтверждения), затем показываем ОБНОВЛЁННОЕ
+    главное меню — кнопки класса, «Выйти из класса» и админ-кнопки должны
+    исчезнуть сразу, без /start."""
+    user_id = str(update.effective_user.id)
+    user = get_user(user_id)
+    if not user:
+        user = User(user_id)
+
+    class_obj = get_class_by_user(user_id)
+
+    if not class_obj:
+        await update.message.reply_text("Вы не состоите в классе.")
+        return MAIN_MENU
+
+    if str(user_id) in class_obj.students:
+        class_obj.students.remove(str(user_id))
+    if str(user_id) in class_obj.admins:
+        class_obj.admins.remove(str(user_id))
+
+    classes = load_classes()
+    classes[class_obj.class_code] = class_obj
+    save_classes(classes)
+
+    user.class_code = None
+    save_user(user)
+
+    await update.message.reply_text(
+        f"✅ Вы вышли из класса '{class_obj.class_name}'.")
+
+    # ВОЛНА 22.46: после выхода состав главного меню меняется (уходят
+    # классные и админские кнопки) — сразу присылаем свежую клавиатуру,
+    # как это делает создание класса (см. create_class_handler).
+    try:
+        await update.message.reply_text(
+            "📋 Меню обновлено:",
+            reply_markup=get_main_menu_keyboard(user))
+    except Exception:
+        pass
+
+    return MAIN_MENU
+
+
+@timeout(CONVERSATION_TIMEOUT)
 async def leave_class_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -37842,15 +39260,22 @@ async def dev_set_prices_handler(update: Update, context: ContextTypes.DEFAULT_T
 
         if key in PRICES:
             PRICES[key] = value
-            save_prices(PRICES)
-            # Синхронизация цен: перечитываем из БД, чтобы in-memory состояние
-            # гарантированно совпало с сохранённым, и мгновенно применяем
-            # новую цену во ВСЕХ модулях (они читают PRICES на каждом вызове).
-            reload_prices()
-            await update.message.reply_text(
-                f"✅ Цена '{key}' изменена на {value} ⭐\n"
-                f"🔄 Обновление мгновенно применено во всех модулях бота."
-            )
+            # ВОЛНА 22.40: честное сохранение — если запись в базу не прошла,
+            # разработчику сообщают об ошибке, а не об успехе.
+            if save_prices(PRICES):
+                # Синхронизация цен: перечитываем из БД, чтобы in-memory состояние
+                # гарантированно совпало с сохранённым, и мгновенно применяем
+                # новую цену во ВСЕХ модулях (они читают PRICES на каждом вызове).
+                reload_prices()
+                await update.message.reply_text(
+                    f"✅ Цена '{key}' изменена на {value} ⭐\n"
+                    f"🔄 Обновление мгновенно применено во всех модулях бота."
+                )
+            else:
+                await update.message.reply_text(
+                    f"❌ НЕ удалось сохранить цену '{key}' в базу данных — "
+                    "проверьте Supabase/Mongo. Цена действует только до рестарта."
+                )
         else:
             await update.message.reply_text(f"Неизвестный ключ '{key}'. Доступные: {', '.join(PRICES.keys())}")
 
@@ -37951,11 +39376,19 @@ async def dev_quick_price_delta_handler(update: Update, context: ContextTypes.DE
 
     new_value = max(0, PRICES[key] + delta)
     PRICES[key] = new_value
-    save_prices(PRICES)
-    # Синхронизация цен: перечитываем и мгновенно применяем во всех модулях.
-    reload_prices()
+    # ВОЛНА 22.40: честное сохранение (см. dev_set_prices_handler).
+    _price_ok = save_prices(PRICES)
+    if _price_ok:
+        # Синхронизация цен: перечитываем и мгновенно применяем во всех модулях.
+        reload_prices()
 
     label = PRICE_LABELS.get(key, key)
+    if not _price_ok:
+        await query.edit_message_text(
+            f"❌ НЕ удалось сохранить цену «{label}» в базу данных — "
+            "проверьте Supabase/Mongo. Цена действует только до рестарта.",
+            reply_markup=get_quick_price_value_keyboard(key))
+        return DEV_QUICK_PRICE_SELECT
     text = (
         f"⚡ **{label}**\n\n"
         f"Текущая цена: {PRICES[key]} ⭐\n\n"
@@ -38001,17 +39434,113 @@ async def dev_quick_price_value_handler(update: Update, context: ContextTypes.DE
         return DEV_QUICK_PRICE_VALUE
 
     PRICES[key] = value
-    save_prices(PRICES)
+    # ВОЛНА 22.40: честное сохранение (см. dev_set_prices_handler).
+    label = PRICE_LABELS.get(key, key)
+    if not save_prices(PRICES):
+        await update.message.reply_text(
+            f"❌ НЕ удалось сохранить «{label}» в базу данных — "
+            "проверьте Supabase/Mongo. Цена действует только до рестарта.")
+        return DEV_QUICK_PRICE_VALUE
     # Синхронизация цен: перечитываем и мгновенно применяем во всех модулях.
     reload_prices()
 
-    label = PRICE_LABELS.get(key, key)
     await update.message.reply_text(f"✅ «{label}» = {value} ⭐\n🔄 Обновление применено во всех модулях бота.")
 
     context.user_data.pop('quick_price_key', None)
     text = "⚡ **Быстрое изменение цен**\n\nВыберите цену для изменения:"
     await update.message.reply_text(text, reply_markup=get_quick_prices_keyboard(), parse_mode="Markdown")
     return DEV_QUICK_PRICE_SELECT
+
+
+# ==================================
+# === ВОЛНА 22.40: ПРОВЕРКА БАЗЫ ДАННЫХ ===
+# ==================================
+
+_DB_CHECK_FILES = ("prices.json", "classes.json", "users.json",
+                   "dev_settings.json")
+
+
+async def dev_db_check_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопка «🗄 Проверка БД»: честный отчёт «всё ли сохраняется в базу».
+
+    1) Тестовая запись «записал → прочитал» через ТЕКУЩИЙ активный бэкенд
+       (Supabase → Mongo → локальный файл) с замером результата.
+    2) Присутствие основных файлов базы в ОБЛАЧНОМ хранилище (read-only,
+       без миграций) и на диске — исчезающие цены/классы/настройки сразу
+       видны разработчику."""
+    query = update.callback_query
+    await query.answer()
+    if str(query.from_user.id) != DEVELOPER_ID:
+        await query.edit_message_text("Доступ запрещён.")
+        return DEV_PANEL
+
+    import os as _os
+    lines = ["🗄 <b>Проверка базы данных</b>", ""]
+
+    # --- 1. Тестовая запись через активный бэкенд ---
+    test_key = "_db_check_2240.json"
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ok = save_data(test_key, {"ts": stamp, "check": True})
+    back = ""
+    if ok:
+        got = load_data(test_key, None)
+        ok = isinstance(got, dict) and got.get("check") is True \
+            and str(got.get("ts") or "") == stamp
+        if _supabase_ready or (SUPABASE_URL and SUPABASE_KEY
+                               and _supabase_try_late_init()):
+            back = "Supabase"
+        elif _mongo_kv is not None:
+            back = "MongoDB"
+        else:
+            back = "локальный файл"
+    if ok:
+        lines.append(f"✅ Тестовая запись: записана и прочитана ({back}).")
+    else:
+        lines.append("❌ Тестовая запись: ЗАПИСЬ НЕ РАБОТАЕТ — цены, классы и "
+                     "настройки будут теряться при рестарте! Проверьте "
+                     "SUPABASE_URL/SUPABASE_KEY (или MONGO_URI) в Variables.")
+    lines.append("")
+
+    # --- 2. Основные файлы в облачном хранилище (read-only) ---
+    cloud = None
+    if _supabase_ready or (SUPABASE_URL and SUPABASE_KEY
+                           and _supabase_try_late_init()):
+        cloud = "supabase"
+    elif _mongo_kv is not None:
+        cloud = "mongo"
+    if cloud:
+        lines.append(f"☁️ Облачная база: <b>{'Supabase' if cloud == 'supabase' else 'MongoDB'}</b>")
+        paths = {os.path.basename(str(p)): p for p in STORAGE_BACKUP_FILES}
+        for fn in _DB_CHECK_FILES:
+            p = paths.get(fn, fn)
+            try:
+                if cloud == "supabase":
+                    _d, found = _supabase_load(p, None)
+                else:
+                    _d, found = _mongo_load(p, None)
+                lines.append(f"• {fn}: {'✅ есть' if found else '❌ НЕТ — ещё не сохранялся'}")
+            except Exception as e:
+                lines.append(f"• {fn}: ⚠️ ошибка чтения ({e})")
+    else:
+        lines.append("⚠️ Облачная база НЕ подключена (ни Supabase, ни Mongo) — "
+                     "данные живут только в локальном файле и пропадают при "
+                     "каждом деплое на Render!")
+    lines.append("")
+    # --- 3. Локальные файлы на диске ---
+    disk_rows = []
+    paths = {os.path.basename(str(p)): p for p in STORAGE_BACKUP_FILES}
+    for fn in _DB_CHECK_FILES:
+        p = paths.get(fn, fn)
+        disk_rows.append(f"• {fn}: {'✅' if _os.path.exists(p) else '—'}")
+    lines.append("💾 Локальные файлы (кэш/фолбэк):")
+    lines.extend(disk_rows)
+
+    try:
+        await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.HTML,
+                                      reply_markup=get_developer_keyboard())
+    except Exception:
+        await query.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    return DEV_PANEL
 
 # ==================================
 # === РЕДАКТИРОВАНИЕ ИНСТРУКЦИИ (НОВОЕ) ===
@@ -39079,6 +40608,206 @@ async def admin_delete_button_handler(update: Update, context: ContextTypes.DEFA
         await query.edit_message_text("Кнопка не найдена.")
 
     return await manage_custom_buttons_start(update, context)
+
+
+# === ВОЛНА 22.45: РЕДАКТИРОВАНИЕ/УДАЛЕНИЕ КНОПКИ КЛАССА =====================
+# Раньше колбэк edit_button_{id} (кнопка «📝 Имя» в «🆕 Управление кнопками»)
+# вообще не имел хендлера — нажатие молча висело «часиками», и админ не мог
+# ни отредактировать кнопку, ни удалить её через понятное меню (только через
+# отдельный пункт «🗑️ Удалить кнопки»). Теперь «📝 Имя» открывает карточку
+# кнопки с действиями: переименовать / удалить / назад.
+
+def _class_button_display(name: str) -> str:
+    """Служебный префикс CLASS_ в хранилище — пользователю не показываем."""
+    return name.replace("CLASS_", "") if name.startswith("CLASS_") else name
+
+
+async def _refresh_menu_for(user_id, context, note: str):
+    """Отправляет пользователю обновлённое главное меню (без /start)."""
+    try:
+        user_obj = get_user(str(user_id))
+        if not user_obj:
+            return
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=note,
+            reply_markup=get_main_menu_keyboard(user_obj),
+        )
+    except Exception as e:
+        logger.error(f"22.45: не удалось обновить меню {user_id}: {e}")
+
+
+async def _notify_class_button_changed(class_obj, context, actor_id, note):
+    """Рассылает участникам класса обновлённое меню после удаления/пере-
+    именования кнопки (зеркалит поведение создания кнопки: у всех кнопка
+    исчезает/переименовывается сразу, без /start)."""
+    if not class_obj:
+        return
+    for member_id in class_obj.students + class_obj.admins:
+        if str(member_id) == str(actor_id):
+            continue
+        await _refresh_menu_for(member_id, context, note)
+
+
+async def edit_button_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Карточка кнопки класса: что с ней можно сделать."""
+    query = update.callback_query
+    await query.answer()
+
+    button_id = query.data[len("edit_button_"):]
+    buttons = load_data(CUSTOM_BUTTONS_FILE, {})
+    data = buttons.get(button_id)
+    if not data:
+        await query.edit_message_text("Кнопка не найдена (уже удалена?).")
+        return await manage_custom_buttons_start(update, context)
+
+    name = data.get('name', '')
+    display = _class_button_display(name)
+    btype = data.get('button_type', 'text')
+    content = str(data.get('content', '') or '')
+    creator = get_user(data.get('creator_id', ''))
+    creator_name = creator.first_name if creator else "неизвестен"
+    type_label = "🔗 Ссылка" if btype == "url" else "📝 Текст"
+
+    text = (
+        f"🆕 **Кнопка класса**\n\n"
+        f"📝 Название: {display}\n"
+        f"🔖 Тип: {type_label}\n"
+        f"📄 Содержимое: {content[:60]}{'…' if len(content) > 60 else ''}\n"
+        f"👤 Создал: {creator_name}\n\n"
+        f"Выберите действие:"
+    )
+    keyboard = [
+        [InlineKeyboardButton("📝 Переименовать кнопку", callback_data=f"edit_button_name_{button_id}")],
+        [InlineKeyboardButton("🗑️ Удалить кнопку", callback_data=f"edit_button_del_{button_id}")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="back_to_custom_buttons")],
+    ]
+    try:
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    except Exception:
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    return MANAGE_CUSTOM_BUTTONS
+
+
+async def edit_button_name_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Шаг «введите новое название» для кнопки класса."""
+    query = update.callback_query
+    await query.answer()
+
+    button_id = query.data[len("edit_button_name_"):]
+    context.user_data['editing_class_button_id'] = button_id
+
+    await query.edit_message_text(
+        "📝 Введите новое название кнопки:",
+        reply_markup=get_cancel_keyboard(),
+    )
+    return CUSTOM_BUTTON_EDIT_NAME
+
+
+@timeout(CONVERSATION_TIMEOUT)
+async def class_button_edit_name_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Сохраняет новое название кнопки класса (префикс CLASS_ сохраняется)."""
+    user_id = str(update.effective_user.id)
+    user = get_user(user_id)
+    if not user:
+        user = User(user_id)
+
+    new_display = (update.message.text or "").strip()
+    button_id = context.user_data.get('editing_class_button_id')
+
+    if not new_display:
+        await update.message.reply_text("Введите название.")
+        return CUSTOM_BUTTON_EDIT_NAME
+
+    rejected = await reject_if_forbidden_chars(update, new_display, CUSTOM_BUTTON_EDIT_NAME)
+    if rejected is not None:
+        return rejected
+
+    if not button_id:
+        await update.message.reply_text("Кнопка не выбрана — попробуйте заново.")
+        return await admin_panel(update, context)
+
+    buttons = load_data(CUSTOM_BUTTONS_FILE, {})
+    data = buttons.get(button_id)
+    if not data:
+        await update.message.reply_text("Кнопка не найдена (уже удалена?).")
+        context.user_data.pop('editing_class_button_id', None)
+        return await admin_panel(update, context)
+
+    old_name = data.get('name', '')
+    # Префикс CLASS_ сохраняем: кнопка остаётся кнопкой класса.
+    data['name'] = f"CLASS_{new_display}" if old_name.startswith("CLASS_") else new_display
+    buttons[button_id] = data
+    save_data(CUSTOM_BUTTONS_FILE, buttons)
+
+    class_code = context.user_data.get('current_admin_class')
+    class_obj = get_class_by_code(class_code)
+
+    context.user_data.pop('editing_class_button_id', None)
+
+    await update.message.reply_text(f"✅ Кнопка '{_class_button_display(old_name)}' переименована в '{new_display}'!")
+    # Клавиатура админа обновляется сразу.
+    await _refresh_menu_for(user_id, context, "⚙️ Меню обновлено!")
+    if class_obj:
+        await _notify_class_button_changed(
+            class_obj, context, user_id,
+            f"🔔 Администратор переименовал кнопку: *{new_display}*")
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text="🆕 Управление кнопками",
+                reply_markup=get_custom_buttons_management_keyboard(class_obj))
+        except Exception as e:
+            logger.error(f"22.45: меню управления кнопками: {e}")
+
+    # Остаёмся в управлении кнопками — дальнейшие нажатия обрабатывает
+    # тот же ConversationHandler (как после обычного удаления).
+    return MANAGE_CUSTOM_BUTTONS
+
+
+async def edit_button_delete_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Удаление кнопки класса ПРЯМО ИЗ карточки (без отдельного пункта меню).
+    Клавиатуры всех участников обновляются сразу — кнопка исчезает у всех."""
+    query = update.callback_query
+    await query.answer()
+
+    button_id = query.data[len("edit_button_del_"):]
+    class_code = context.user_data.get('current_admin_class')
+
+    buttons = load_data(CUSTOM_BUTTONS_FILE, {})
+    data = buttons.get(button_id)
+    if not data:
+        await query.edit_message_text("Кнопка не найдена (уже удалена?).")
+        return await manage_custom_buttons_start(update, context)
+
+    display = _class_button_display(data.get('name', ''))
+    del buttons[button_id]
+    save_data(CUSTOM_BUTTONS_FILE, buttons)
+
+    class_obj = get_class_by_code(class_code)
+    if class_obj and button_id in class_obj.class_buttons:
+        class_obj.class_buttons.remove(button_id)
+        classes = load_classes()
+        classes[class_code] = class_obj
+        save_classes(classes)
+
+    await query.edit_message_text(f"🗑 Кнопка '{display}' удалена!")
+    # Клавиатура админа обновляется сразу — кнопка исчезает без /start.
+    await _refresh_menu_for(query.from_user.id, context, "⚙️ Меню обновлено!")
+    if class_obj:
+        await _notify_class_button_changed(
+            class_obj, context, query.from_user.id,
+            f"🔔 Администратор удалил кнопку: *{display}*")
+        try:
+            await context.bot.send_message(
+                chat_id=query.from_user.id,
+                text="🆕 Управление кнопками",
+                reply_markup=get_custom_buttons_management_keyboard(class_obj))
+        except Exception as e:
+            logger.error(f"22.45: меню управления кнопками: {e}")
+
+    return MANAGE_CUSTOM_BUTTONS
+# === КОНЕЦ ВОЛНЫ 22.45 (редактирование/удаление кнопки класса) ==============
 
 async def admin_button_for_personal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -41547,21 +43276,35 @@ async def _duty_announce(bot, class_obj, selected, sick_note=None):
                 ids = [str(i) for i in (today.get("ids") or [])]
                 if ids:
                     selected = ids
-    if selected and all(isinstance(i, str) and not i.isdigit() for i in selected):
+    # ВОЛНА 22.40: режим имён распознаём устойчиво — раньше список имён,
+    # состоящий из «числоподобных» строк (например «07», «13»), проваливался
+    # в uid-ветку, слал личные сообщения по int(имени) и падал: 0 доставлено,
+    # объявление повторялось и снова падало.
+    _t_names = [str(n) for n in (getattr(class_obj, "duty_today", {}) or {}).get("names") or []] \
+        if isinstance(getattr(class_obj, "duty_today", None), dict) else []
+    _is_names_mode = bool(selected) and all(isinstance(i, str) for i in selected) and (
+        all(not str(i).isdigit() for i in selected)
+        or [str(i) for i in selected] == _t_names)
+    if _is_names_mode:
         names = ", ".join(str(i) for i in selected) if selected else "—"
         members = [str(m) for m in dict.fromkeys(
             [str(m) for m in (class_obj.students or [])] +
             [str(m) for m in (class_obj.admins or [])])]
         blocked = set(str(b) for b in (class_obj.blocked_users or []))
         members = [m for m in members if m not in blocked]
-        # ВОЛНА 22.36: админам — кнопки замены по индексу в списке дежурных
+        # ВОЛНА 22.42 (по фидбеку «убери кнопку болел(а) в кнопку ещё»):
+        # на карточке — только «🚫 не будет» на каждого дежурного + одна
+        # кнопка «☰ Ещё», которая открывает кнопки «🤒 заболел(а)»
+        # (duty_more_toggle_cb). Логика замены та же (ВОЛНА 22.36).
         admin_rows = []
         for i, nm in enumerate(selected):
             admin_rows.append([
-                InlineKeyboardButton(f"🤒 {str(nm)[:20]} — заболел(а)",
-                                     callback_data=f"duty_cns_{i}"),
-                InlineKeyboardButton(f"🚫 не будет", callback_data=f"duty_cnn_{i}"),
+                InlineKeyboardButton(f"🚫 {str(nm)[:20]} — не будет",
+                                     callback_data=f"duty_cnn_{i}"),
             ])
+        if admin_rows:
+            admin_rows.append([InlineKeyboardButton("☰ Ещё",
+                                                    callback_data="duty_more_c")])
         admin_kb = InlineKeyboardMarkup(admin_rows) if admin_rows else None
         sent_ok = 0
         for uid in members:
@@ -41583,8 +43326,13 @@ async def _duty_announce(bot, class_obj, selected, sick_note=None):
     blocked = set(str(b) for b in (class_obj.blocked_users or []))
     members = [m for m in members if m not in blocked]
     names = ", ".join(_duty_member_name(i) for i in selected) if selected else "—"
+    # ВОЛНА 22.44: «🤒 Я заболел(а)» убрана с ГЛАВНОГО ЭКРАНА карточки
+    # дежурного — прячется под «☰ Ещё» (как на админской карточке в 22.42).
+    # «☰ Ещё» (duty_more_me) открывает «🤒 Я заболел(а)» + «⬅️ Назад»;
+    # раскладка живёт до тех пор, пока пользователь сам её не переключит.
+    # Сама замена (duty_sick) не тронута.
     officer_kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("🤒 Я заболел(а)", callback_data="duty_sick")]])
+        InlineKeyboardButton("☰ Ещё", callback_data="duty_more_me")]])
     sent_ok = 0
     for uid in members:
         try:
@@ -41593,8 +43341,9 @@ async def _duty_announce(bot, class_obj, selected, sick_note=None):
                     chat_id=int(uid),
                     text=("📅 <b>Вы сегодня дежурный!</b>\n\n"
                           "Не забудьте про свои обязанности. Хорошего дня!\n\n"
-                          "Если приболели — нажмите кнопку ниже, и дежурство "
-                          "перейдёт следующему, а вы вернётесь в конец очереди.")
+                          "Если приболели — откройте «☰ Ещё» ниже: там кнопка, "
+                          "которая передаст дежурство следующему, а вы вернётесь "
+                          "в конец очереди.")
                           + (f"\n\n{sick_note}" if sick_note else ""),
                     parse_mode=ParseMode.HTML,
                     reply_markup=officer_kb)
@@ -41603,19 +43352,21 @@ async def _duty_announce(bot, class_obj, selected, sick_note=None):
             is_admin = str(uid) in [str(a) for a in (class_obj.admins or [])]
             kb = None
             if is_admin and selected:
-                # ВОЛНА 22.36: у админа на каждого дежурного ДВЕ кнопки —
-                # «заболел(а)» и «не будет» (обе передают дежурство дальше)
+                # ВОЛНА 22.42: на карточке — «🚫 не будет» на каждого дежурного
+                # и одна кнопка «☰ Ещё»; кнопки «🤒 заболел(а)» открываются
+                # через «Ещё» (duty_more_toggle_cb). Логика замены та же
+                # (ВОЛНА 22.36: обе кнопки передают дежурство дальше)
                 rows = []
                 for i in selected:
                     if str(i) == str(uid):
                         continue
                     _nm = _duty_member_name(i)
                     rows.append([InlineKeyboardButton(
-                        f"🤒 {_nm} — заболел(а)",
-                        callback_data=f"duty_sick_uid_{i}"),
-                        InlineKeyboardButton("🚫 не будет",
-                                             callback_data=f"duty_skip_uid_{i}")])
+                        f"🚫 {_nm} — не будет",
+                        callback_data=f"duty_skip_uid_{i}")])
                 if rows:
+                    rows.append([InlineKeyboardButton(
+                        "☰ Ещё", callback_data="duty_more")])
                     kb = InlineKeyboardMarkup(rows)
             await bot.send_message(
                 chat_id=int(uid),
@@ -42081,6 +43832,12 @@ async def duty_custom_ai_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("Только для админов класса.", show_alert=True)
         return ADMIN_PANEL
     await query.answer()
+    _puser = get_user(uid)
+    if _puser is not None:
+        # ВОЛНА 22.40: флаг «ждём список» ПЕРСИСТЕНТЕН — после рестарта сервера
+        # FSM-состояние теряется, но присланный список всё равно обработается.
+        _puser.duty_pending = {"mode": "ai", "ts": time.time()}
+        save_user(_puser)
     await query.message.reply_text(
         "🤖 Пришлите <b>список имён</b> — по одному в строке или через запятую. "
         "Можно с пометками и никами, ИИ разберётся.\n\n"
@@ -42104,6 +43861,10 @@ async def duty_custom_dates_cb(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.answer("Только для админов класса.", show_alert=True)
         return ADMIN_PANEL
     await query.answer()
+    _puser = get_user(uid)
+    if _puser is not None:
+        _puser.duty_pending = {"mode": "dates", "ts": time.time()}
+        save_user(_puser)
     await query.message.reply_text(
         "📅 Пришлите <b>список с датами дежурств</b> — по строке на дату:\n\n"
         "<code>01.10 — Вася и Петя\n02.10 — Вася\n05.10 — Петя, Аня</code>\n\n"
@@ -42345,6 +44106,7 @@ async def duty_custom_ai_save(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not class_obj or not user or not _duty_is_admin(uid, class_obj):
         await update.message.reply_text("Только для админов класса.")
         return MAIN_MENU
+    _pending_clear(user)  # ВОЛНА 22.40: список получен — флаг больше не нужен
     days_hint = None
     m_days = re.search(r"(\d{1,2})\s*(?:рабоч\w*|учебн\w*)?\s*дн\w*", raw.lower())
     if "недел" in raw.lower() and m_days and 1 <= int(m_days.group(1)) <= 7:
@@ -42443,6 +44205,7 @@ async def duty_custom_dates_save(update: Update, context: ContextTypes.DEFAULT_T
     if not class_obj or not user or not _duty_is_admin(uid, class_obj):
         await update.message.reply_text("Только для админов класса.")
         return MAIN_MENU
+    _pending_clear(user)  # ВОЛНА 22.40: список получен — флаг больше не нужен
     tz = _duty_tz(class_obj)
     today = (_now_utc() + timedelta(hours=tz)).date()
     ai = await _duty_ai_json(
@@ -42921,11 +44684,12 @@ async def duty_sick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=int(candidate),
                 text=("📅 <b>Вы сегодня дежурный</b> (замена заболевшего).\n\n"
                       "Не забудьте про обязанности. Если тоже приболели — "
-                      "кнопка ниже передаст дежурство следующему."),
+                      "«☰ Ещё» ниже откроет кнопку передачи дежурства "
+                      "следующему."),
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("🤒 Я заболел(а)",
-                                         callback_data="duty_sick")]]))
+                    InlineKeyboardButton("☰ Ещё",
+                                         callback_data="duty_more_me")]]))
         except Exception:
             pass
     # объявление классу
@@ -42950,6 +44714,146 @@ async def duty_sick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=int(m),
                 text=f"🔄 <b>Сегодня дежурный(е): {names}</b>\n{note}",
                 parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+    return MAIN_MENU
+
+
+async def duty_more_toggle_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.42: кнопка «☰ Ещё» / «⬅️ Назад» под утренним сообщением
+    дежурных — раскладка по фидбеку «убери кнопку болел(а) в кнопку ещё»:
+    на карточке видны только «🚫 не будет», а кнопки «🤒 заболел(а)»
+    открываются через «☰ Ещё» и прячутся обратно через «⬅️ Назад».
+    duty_more / duty_more_back — обычный режим (uid-дежурные),
+    duty_more_c / duty_more_back_c — свой график (имена, индексы duty_cns_).
+    ЛОГИКА ЗАМЕН НЕ ТРОНУТА — меняется только раскладка кнопок сообщения."""
+    query = update.callback_query
+    uid = str(query.from_user.id)
+    show_sick = query.data in ("duty_more", "duty_more_c")
+    names_mode = query.data in ("duty_more_c", "duty_more_back_c")
+    class_obj = get_class_by_user(uid)
+    if not class_obj or not getattr(class_obj, "duty_enabled", False):
+        try:
+            await query.answer("Дежурные в вашем классе выключены.", show_alert=True)
+        except Exception:
+            pass
+        return MAIN_MENU
+    if not _duty_is_admin(uid, class_obj):
+        try:
+            await query.answer("Кнопки замены доступны только админам.",
+                               show_alert=True)
+        except Exception:
+            pass
+        return MAIN_MENU
+    tz = _duty_tz(class_obj)
+    local_now = _now_utc() + timedelta(hours=tz)
+    occ = local_now.strftime("%Y-%m-%d")
+    today = getattr(class_obj, "duty_today", None)
+    rows = []
+    if names_mode:
+        names_list = [str(n) for n in ((today or {}).get("names") or [])] \
+            if isinstance(today, dict) and today.get("date") == occ else []
+        if show_sick:
+            for i, nm in enumerate(names_list):
+                rows.append([InlineKeyboardButton(
+                    f"🤒 {nm[:20]} — заболел(а)",
+                    callback_data=f"duty_cns_{i}")])
+        else:
+            for i, nm in enumerate(names_list):
+                rows.append([InlineKeyboardButton(
+                    f"🚫 {nm[:20]} — не будет",
+                    callback_data=f"duty_cnn_{i}")])
+    else:
+        ids = [str(i) for i in ((today or {}).get("ids") or [])] \
+            if isinstance(today, dict) and today.get("date") == occ else []
+        for i in ids:
+            if str(i) == str(uid):
+                continue  # себе админ не ставит кнопки — у него своё сообщение
+            _nm = _duty_member_name(i)
+            if show_sick:
+                rows.append([InlineKeyboardButton(
+                    f"🤒 {_nm} — заболел(а)",
+                    callback_data=f"duty_sick_uid_{i}")])
+            else:
+                rows.append([InlineKeyboardButton(
+                    f"🚫 {_nm} — не будет",
+                    callback_data=f"duty_skip_uid_{i}")])
+    if not rows:
+        try:
+            await query.answer("Сегодня дежурных нет — уведомление устарело.",
+                               show_alert=True)
+        except Exception:
+            pass
+        return MAIN_MENU
+    if show_sick:
+        back_cb = "duty_more_back_c" if names_mode else "duty_more_back"
+        rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=back_cb)])
+    else:
+        more_cb = "duty_more_c" if names_mode else "duty_more"
+        rows.append([InlineKeyboardButton("☰ Ещё", callback_data=more_cb)])
+    try:
+        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(rows))
+        await query.answer()
+    except Exception as e:
+        logger.error(f"duty_more_toggle: edit failed: {e}")
+        try:
+            await query.answer("Не удалось обновить кнопки — сообщение устарело.",
+                               show_alert=True)
+        except Exception:
+            pass
+    return MAIN_MENU
+
+
+async def duty_me_more_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.44: «☰ Ещё» на ЛИЧНОЙ карточке дежурного («Вы сегодня
+    дежурный!») — показывает/прячет «🤒 Я заболел(а)». Кнопка убрана
+    с главного экрана карточки (как на админской в 22.42) и живёт в
+    «Ещё», пока пользователь сам не переключит раскладку («⬅️ Назад»).
+    ЛОГИКА ЗАМЕНЫ НЕ ТРОНУТА — нажатие «🤒 Я заболел(а)» по-прежнему
+    обрабатывает duty_sick_cb."""
+    query = update.callback_query
+    uid = str(query.from_user.id)
+    show_sick = query.data == "duty_more_me"
+    class_obj = get_class_by_user(uid)
+    if not class_obj or not getattr(class_obj, "duty_enabled", False):
+        try:
+            await query.answer("Дежурные в вашем классе выключены.",
+                               show_alert=True)
+        except Exception:
+            pass
+        return MAIN_MENU
+    tz = _duty_tz(class_obj)
+    local_now = _now_utc() + timedelta(hours=tz)
+    occ = local_now.strftime("%Y-%m-%d")
+    today = getattr(class_obj, "duty_today", None)
+    ids = [str(i) for i in (today.get("ids") or [])] \
+        if isinstance(today, dict) and today.get("date") == occ else []
+    if uid not in ids:
+        try:
+            await query.answer("Вы сегодня не в списке дежурных — "
+                               "уведомление устарело.",
+                               show_alert=True)
+        except Exception:
+            pass
+        return MAIN_MENU
+    if show_sick:
+        rows = [[InlineKeyboardButton("🤒 Я заболел(а)",
+                                      callback_data="duty_sick")],
+                [InlineKeyboardButton("⬅️ Назад",
+                                      callback_data="duty_more_me_back")]]
+    else:
+        rows = [[InlineKeyboardButton("☰ Ещё",
+                                      callback_data="duty_more_me")]]
+    try:
+        await query.edit_message_reply_markup(
+            reply_markup=InlineKeyboardMarkup(rows))
+        await query.answer()
+    except Exception as e:
+        logger.error(f"duty_me_more: edit failed: {e}")
+        try:
+            await query.answer("Не удалось обновить кнопки — сообщение "
+                               "устарело.",
+                               show_alert=True)
         except Exception:
             pass
     return MAIN_MENU
@@ -43061,6 +44965,1108 @@ async def duty_custom_mark_cb(update: Update, context: ContextTypes.DEFAULT_TYPE
     if today_names:
         await _duty_announce(context.bot, class_obj, today_names, sick_note=note)
     return MAIN_MENU
+
+
+# === ВОЛНА 22.40: ДЕЖУРСТВА РАБОТАЮТ ДАЖЕ ПОСЛЕ ПОТЕРИ FSM-СОСТОЯНИЯ ===
+# После рестарта/деплоя (Render Free) in-memory состояния ConversationHandler
+# пусты: 1) кнопки «🤒 заболел(а)»/«🚫 не будет» под УТРЕННИМ сообщением
+# молча не реагировали (обработчики жили только внутри FSM), 2) присланные
+# списки дежурных (свой список / список для ИИ) пропадали без ответа.
+# Теперь: флаг ожидания списка лежит В БАЗЕ (user.duty_pending), а кнопки
+# дежурств ловит глобальный обработчик ВНЕ FSM.
+
+def _pending_clear(user):
+    """Сбросить флаг «ждём список дежурных» (если был)."""
+    try:
+        if user is not None and getattr(user, "duty_pending", None):
+            user.duty_pending = None
+            save_user(user)
+    except Exception:
+        pass
+
+
+async def _duty_pending_text_handler(update: Update,
+                                     context: ContextTypes.DEFAULT_TYPE):
+    """Глобальный приёмник списков дежурных вне ConversationHandler.
+
+    Срабатывает, только если админ ранее нажал «🤖 ИИ по списку» или
+    «📅 Список с датами» (флаг в user.duty_pending), а FSM-состояние было
+    потеряно (рестарт сервера). Текст списка передаётся тем же обработчикам,
+    что и в нормальном потоке — ответ и расписание придут как обычно."""
+    if not update.message or not update.effective_user:
+        return
+    uid = str(update.effective_user.id)
+    user = get_user(uid)
+    if user is None:
+        return
+    pend = getattr(user, "duty_pending", None)
+    if not isinstance(pend, dict):
+        return
+    try:
+        if str(pend.get("mode") or "") not in ("ai", "dates") \
+                or (time.time() - float(pend.get("ts") or 0)) > 3 * 3600:
+            user.duty_pending = None
+            save_user(user)
+            return
+    except Exception:
+        user.duty_pending = None
+        save_user(user)
+        return
+    raw = (update.message.text or "").strip()
+    if raw.lower() in ("отмена", "cancel"):
+        _pending_clear(user)
+        await update.message.reply_text("Загрузка графика отменена.")
+        return
+    # Передаём ТЕМ ЖЕ обработчикам, что и внутри FSM (они сами сбросят флаг).
+    if pend.get("mode") == "ai":
+        await duty_custom_ai_save(update, context)
+    else:
+        await duty_custom_dates_save(update, context)
+
+
+async def _duty_buttons_global(update: Update,
+                               context: ContextTypes.DEFAULT_TYPE):
+    """Глобальный роутер кнопок дежурств ВНЕ FSM: замена заболевшего,
+    «не будет», тест-уведомление и прочие duty_* работают даже когда
+    разговор потерян (после рестарта). Когда FSM активен, апдейт первым
+    забирает ConversationHandler — двойной обработки нет."""
+    return await handle_callback(update, context)
+
+
+class _DutyPendingFilter(filters.MessageFilter):
+    """ВОЛНА 22.40: текст можно трактовать как «список дежурных» только если
+    админ ранее нажал «ИИ по списку»/«Список с датами» и флаг ещё жив."""
+    def filter(self, message):
+        try:
+            if not message.from_user:
+                return False
+            u = get_user(str(message.from_user.id))
+            return bool(u and isinstance(getattr(u, "duty_pending", None), dict))
+        except Exception:
+            return False
+
+
+_DUTY_PENDING_FILTER = _DutyPendingFilter()
+
+
+# ==================================
+# === ВОЛНА 22.41: ТАЙМЕРЫ СООБЩЕНИЙ КЛАССУ ===
+# ==================================
+# Админ ставит таймер, когда сообщение должно прийти ВСЕМУ классу:
+#   • один раз — на конкретную дату и время;
+#   • каждый день — постоянное время;
+#   • по дням недели — например, только будни (набор дней кнопками).
+# Ставится двумя способами: КНОПКАМИ (меню «⏰ Таймер классу» в панели
+# класса) и ЧЕРЕЗ ИИ (🪄 AI Agent: «отправь классу завтра в 8:00 …» →
+# действие schedule_class_message).
+# Хранение: CLASS_TIMERS_FILE + канал-БД (STORAGE_BACKUP_FILES) — таймеры
+# переживают рестарт/деплой. Доставка: JobQueue run_once + страховочный
+# тикер каждые 30 с (та же схема, что у личных таймеров). Анти-дубль —
+# метка fired_key «дата время» (джоба и тикер не отправляют дважды).
+
+_CT_WD_FULL = ("Понедельник", "Вторник", "Среда", "Четверг",
+               "Пятница", "Суббота", "Воскресенье")
+
+
+def generate_class_timer_id():
+    """Уникальный id таймера класса (как generate_timer_id)."""
+    timers = load_data(CLASS_TIMERS_FILE, {})
+    while True:
+        timer_id = ''.join(random.choices(string.ascii_lowercase + string.digits, k=8))
+        if timer_id not in timers:
+            return timer_id
+
+
+def _class_timer_tz(td):
+    """Часовой пояс СОЗДАТЕЛЯ таймера класса (как у личных таймеров)."""
+    tz_offset = 3
+    try:
+        u = get_user(str(td.get('created_by') or ''))
+        if u is not None:
+            tz_offset = int(getattr(u, 'timezone', 3) or 3)
+    except Exception:
+        pass
+    return tz_offset
+
+
+def _class_timer_label(td):
+    """Человекочитаемое описание таймера класса (для списка)."""
+    t = str(td.get('target_time') or '')
+    txt = (td.get('text') or '(без текста)')[:24]
+    rep = td.get('repeat_days')
+    if isinstance(rep, (list, tuple)) and len(rep) > 0:
+        try:
+            days = sorted({int(d) for d in rep if 0 <= int(d) <= 6})
+        except (TypeError, ValueError):
+            days = []
+        if len(days) == 7:
+            rep_str = "каждый день"
+        elif days:
+            rep_str = "по " + ", ".join(_WD_SHORT[d] for d in days)
+        else:
+            rep_str = ""
+    elif td.get('repeat_weekly') is not None and not td.get('repeat_daily'):
+        try:
+            rep_str = "по " + _WD_SHORT[int(td['repeat_weekly'])]
+        except (TypeError, ValueError):
+            rep_str = ""
+    elif td.get('repeat_daily'):
+        rep_str = "каждый день"
+    else:
+        rep_str = ""
+    if rep_str and rep_str != "один раз":
+        return f"{t} · {rep_str} · {txt}"
+    return f"{td.get('target_date')} {t} · {txt}".strip()
+
+
+def _class_timer_is_recurring(td):
+    return bool(td.get('repeat_daily') or td.get('repeat_weekly') is not None
+                or (isinstance(td.get('repeat_days'), (list, tuple))
+                    and len(td.get('repeat_days')) > 0))
+
+
+def _class_timer_first_date(mode, days, time_str, now_local):
+    """Дата ПЕРВОГО запуска постоянного таймера: сегодня, если день
+    подходит и время ещё не прошло, иначе ближайший подходящий день."""
+    try:
+        cand = datetime.strptime(
+            f"{now_local.strftime('%Y-%m-%d')} {time_str}", "%Y-%m-%d %H:%M")
+    except (TypeError, ValueError):
+        return None
+    if mode == "daily":
+        return now_local if cand > now_local else now_local + timedelta(days=1)
+    try:
+        days_set = {int(d) for d in (days or []) if 0 <= int(d) <= 6}
+    except (TypeError, ValueError):
+        return None
+    if not days_set:
+        return None
+    if now_local.weekday() in days_set and cand > now_local:
+        return now_local
+    return _timer_next_days_date(list(days_set), now_local)
+
+
+def schedule_class_timer_job(application, tid, td):
+    """Планирует отправку таймера класса (run_once на ближайший запуск).
+
+    Если время уже прошло (рестарт/деплой) — задача встанет через 5 секунд,
+    и пропущенное сообщение всё равно уйдёт (как у личных таймеров).
+    """
+    try:
+        if not isinstance(td, dict) or not td.get('is_active'):
+            return
+        date_str, time_str = td.get('target_date'), td.get('target_time')
+        if not date_str or not time_str:
+            return
+        if application is None or getattr(application, "job_queue", None) is None:
+            return
+        tz_offset = _class_timer_tz(td)
+        target_local = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
+        when_utc = target_local - timedelta(hours=tz_offset)
+        delay = (when_utc - _utcnow()).total_seconds()
+        if delay <= 0:
+            delay = 5
+        job_name = f"class_timer_{tid}"
+        for j in (application.job_queue.get_jobs_by_name(job_name) or []):
+            j.schedule_removal()
+        application.job_queue.run_once(
+            _send_class_timer_notification,
+            when=delay,
+            data={'timer_id': tid},
+            name=job_name,
+        )
+    except Exception as e:
+        logger.error(f"Ошибка планирования таймера класса {tid}: {e}")
+
+
+async def _send_class_timer_notification(context: ContextTypes.DEFAULT_TYPE):
+    """Колбэк JobQueue: доставить запланированное сообщение классу."""
+    job = context.job
+    data = job.data or {}
+    try:
+        await _class_timer_fire_now(context.application, data.get('timer_id'))
+    except Exception as e:
+        logger.error(f"class_timer job: {e}")
+
+
+async def _class_timer_fire_now(application, tid):
+    """Единая точка отправки таймера класса (джоба И safety-net).
+
+    Анти-дубль: fired_key хранит «дата время» уже отправленного запуска —
+    кто бы ни сработал первым (джоба или тикер), второй увидит метку и
+    пропустит. Повторяющийся таймер сдвигается на следующий запуск
+    (_timer_advance_repeat — общий с личными таймерами).
+    Возвращает число доставленных сообщений (0 — ничего не отправлено).
+    """
+    try:
+        timers = load_data(CLASS_TIMERS_FILE, {}) or {}
+    except Exception:
+        return 0
+    td = timers.get(tid)
+    if not isinstance(td, dict) or not td.get('is_active'):
+        return 0
+    key = f"{td.get('target_date')} {td.get('target_time')}"
+    if str(td.get('fired_key') or '') == key:
+        return 0  # этот запуск уже ушёл
+    class_obj = get_class_by_code(td.get('class_code'))
+    if not class_obj:
+        td['is_active'] = False
+        timers[tid] = td
+        save_data(CLASS_TIMERS_FILE, timers)
+        return 0
+    text = (f"📢 Запланированное сообщение класса {class_obj.class_name}:\n\n"
+            f"{td.get('text') or ''}")
+    members = [m for m in dict.fromkeys(
+        list(class_obj.students or []) + list(class_obj.admins or []))
+        if m not in (class_obj.blocked_users or [])]
+    sent = 0
+    for member_id in members:
+        try:
+            await application.bot.send_message(
+                chat_id=int(member_id), text=text)
+            sent += 1
+        except Exception as e:
+            logger.error(f"class_timer {tid}: не доставлено {member_id}: {e}")
+    td['fired_key'] = key
+    td['last_sent'] = datetime.now().strftime("%Y-%m-%d %H:%M")
+    # Журнал объявлений класса (для «🤒 Я болел(а)») — как у обычной рассылки.
+    try:
+        log_ann = getattr(class_obj, 'announcements', None)
+        if not isinstance(log_ann, list):
+            log_ann = []
+        log_ann.append({
+            "ts": td['last_sent'],
+            "by": str(td.get('created_by') or ''),
+            "name": "⏰ по таймеру",
+            "text": str(td.get('text') or '')[:1000],
+        })
+        class_obj.announcements = log_ann[-300:]
+        save_class(class_obj)
+    except Exception as e:
+        logger.error(f"class_timer {tid}: журнал объявлений не записан: {e}")
+    try:
+        _log_admin_action(str(td.get('created_by') or ''), class_obj.class_code,
+                          "Запланированная рассылка",
+                          str(td.get('text') or '')[:200])
+    except Exception:
+        pass
+    if _class_timer_is_recurring(td) and _timer_advance_repeat(td):
+        timers[tid] = td
+        save_data(CLASS_TIMERS_FILE, timers)
+        schedule_class_timer_job(application, tid, td)
+    else:
+        td['is_active'] = False
+        timers[tid] = td
+        save_data(CLASS_TIMERS_FILE, timers)
+    return sent
+
+
+async def _class_timer_safety_net(context: ContextTypes.DEFAULT_TYPE):
+    """Страховочный тикер таймеров класса (каждые 30 с): если джоба
+    потерялась (рестарт/деплой/фолбэк APScheduler) — доставляем сейчас.
+    Двойной отправки нет: fired_key в записи таймера."""
+    application = context.application
+    try:
+        timers = load_data(CLASS_TIMERS_FILE, {}) or {}
+    except Exception:
+        return
+    if not timers:
+        return
+    now_utc = _utcnow()
+    for tid, td in list(timers.items()):
+        if not isinstance(td, dict) or not td.get('is_active'):
+            continue
+        try:
+            target_local = datetime.strptime(
+                f"{td.get('target_date')} {td.get('target_time')}",
+                "%Y-%m-%d %H:%M")
+        except (TypeError, ValueError):
+            continue
+        when_utc = target_local - timedelta(hours=_class_timer_tz(td))
+        if when_utc <= now_utc:
+            key = f"{td.get('target_date')} {td.get('target_time')}"
+            if str(td.get('fired_key') or '') == key:
+                continue
+            try:
+                await _class_timer_fire_now(application, tid)
+            except Exception as e:
+                logger.error(f"class_timer safety {tid}: {e}")
+
+
+# --- Клавиатуры таймеров класса ---
+
+def _ct_menu_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⚡ Один раз", callback_data="ctm_once"),
+         InlineKeyboardButton("🔁 Каждый день", callback_data="ctm_daily")],
+        [InlineKeyboardButton("📅 По дням недели", callback_data="ctm_days")],
+        [InlineKeyboardButton("📋 Таймеры класса", callback_data="ctm_list")],
+        [InlineKeyboardButton("✖️ Закрыть", callback_data="ctm_close")],
+    ])
+
+
+def _ct_cancel_kb():
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("❌ Отмена", callback_data="ctm_cancel")]])
+
+
+def _ct_days_kb(days):
+    rows, row = [], []
+    for i, name in enumerate(_CT_WD_FULL):
+        mark = "✅" if i in set(days or []) else "▫️"
+        row.append(InlineKeyboardButton(
+            f"{mark} {name[:3]}".replace("Пон", "Пн").replace("Вто", "Вт")
+            .replace("Сре", "Ср").replace("Чет", "Чт").replace("Пят", "Пт")
+            .replace("Суб", "Сб").replace("Воск", "Вс"),
+            callback_data=f"ctm_day_{i}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("✔️ Далее", callback_data="ctm_days_next")])
+    rows.append([InlineKeyboardButton("❌ Отмена", callback_data="ctm_cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _ct_list_kb(timers, class_code):
+    """Список таймеров класса: вкл/выкл/удалить (как «📋 Мои напоминания»)."""
+    kb = []
+    for tid, td in sorted(timers.items(),
+                          key=lambda kv: str(kv[1].get('target_date', ''))
+                          + str(kv[1].get('target_time', ''))):
+        emoji = "🟢" if td.get('is_active', True) else "⏸"
+        kb.append([InlineKeyboardButton(
+            f"{emoji} {_class_timer_label(td)}",
+            callback_data=f"ctm_show_{tid}")])
+        kb.append([InlineKeyboardButton(
+            ("▶️ Включить" if not td.get('is_active', True)
+             else "⏸ Выключить"),
+            callback_data=(f"ctm_on_{tid}" if not td.get('is_active', True)
+                           else f"ctm_off_{tid}")),
+            InlineKeyboardButton("🗑 Удалить", callback_data=f"ctm_del_{tid}")])
+    kb.append([InlineKeyboardButton("➕ Новый таймер", callback_data="ctm_open")])
+    kb.append([InlineKeyboardButton("✖️ Закрыть", callback_data="ctm_close")])
+    return InlineKeyboardMarkup(kb)
+
+
+def _ct_admin_class(query, context):
+    """Класс, который админ настраивает: из FSM (current_admin_class) или
+    единственный класс, где пользователь админ. None — не админ."""
+    uid = str(query.from_user.id)
+    code = None
+    try:
+        code = context.user_data.get('current_admin_class')
+    except Exception:
+        code = None
+    class_obj = get_class_by_code(code) if code else None
+    if not class_obj or uid not in (class_obj.admins or []):
+        cand = get_class_by_user(uid)
+        if cand and uid in (cand.admins or []):
+            class_obj = cand
+        else:
+            return None
+    return class_obj
+
+
+async def ct_buttons_global(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Роутер кнопок таймеров классу (ctm_*).
+
+    Вызывается из handle_callback (когда FSM жив) и из глобального
+    CallbackQueryHandler после потери состояния — как кнопки дежурств.
+    """
+    query = update.callback_query
+    data = query.data or ""
+    uid = str(query.from_user.id)
+    user = get_user(uid)
+    if user is None:
+        user = User(uid)
+
+    class_obj = _ct_admin_class(query, context)
+    if class_obj is None:
+        try:
+            await query.answer("Только для админа класса.", show_alert=True)
+        except Exception:
+            pass
+        return
+    code = class_obj.class_code
+
+    async def _pend_save():
+        save_user(user)
+
+    if data == "ctm_open":
+        user.ct_pending = None
+        await _pend_save()
+        text = ("⏰ Таймер сообщений классу\n\n"
+                f"Класс: {class_obj.class_name}. Сообщение придёт ВСЕМ "
+                "участникам класса в выбранное время.\n\n"
+                "• Один раз — на конкретную дату и время\n"
+                "• Каждый день — постоянное время\n"
+                "• По дням недели — например, только будни\n\n"
+                "💡 Таймер можно ставить и словами через 🪄 AI Agent: "
+                "«отправь классу завтра в 8:00 — физра на улице»")
+        try:
+            await query.message.edit_text(text, reply_markup=_ct_menu_kb())
+        except Exception:
+            await context.bot.send_message(
+                chat_id=int(uid), text=text, reply_markup=_ct_menu_kb())
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        return
+
+    if data == "ctm_close":
+        user.ct_pending = None
+        await _pend_save()
+        try:
+            await query.message.edit_text("⏰ Таймеры классу закрыты.")
+        except Exception:
+            pass
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        return
+
+    if data == "ctm_cancel":
+        user.ct_pending = None
+        await _pend_save()
+        try:
+            await query.message.edit_text(
+                "⏰ Таймер сообщений классу\n\nВыберите вариант:",
+                reply_markup=_ct_menu_kb())
+        except Exception:
+            pass
+        try:
+            await query.answer("Отменено")
+        except Exception:
+            pass
+        return
+
+    if data in ("ctm_once", "ctm_daily", "ctm_days"):
+        if data == "ctm_once":
+            user.ct_pending = {"step": "when", "ts": time.time()}
+            ask = ("📅 Один раз — пришлите дату и время одним сообщением:\n"
+                   "ГГГГ-ММ-ДД ЧЧ:ММ\n(например: 2026-10-01 08:15)\n\n"
+                   "Можно только время (ЧЧ:ММ) — тогда сегодня, а если оно "
+                   "уже прошло — завтра.\n\n«отмена» — отменить.")
+        elif data == "ctm_daily":
+            user.ct_pending = {"step": "time", "mode": "daily", "days": [],
+                               "ts": time.time()}
+            ask = ("🔁 Каждый день — пришлите время в формате ЧЧ:ММ "
+                   "(например 08:00).\n\n«отмена» — отменить.")
+        else:
+            user.ct_pending = {"step": "days", "days": [], "ts": time.time()}
+            ask = "📅 Выберите дни недели, когда отправлять:"
+        await _pend_save()
+        kb = _ct_days_kb([]) if data == "ctm_days" else _ct_cancel_kb()
+        try:
+            await query.message.edit_text(ask, reply_markup=kb)
+        except Exception:
+            await context.bot.send_message(
+                chat_id=int(uid), text=ask, reply_markup=kb)
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        return
+
+    if data.startswith("ctm_day_"):
+        pend = user.ct_pending if isinstance(user.ct_pending, dict) else {}
+        if pend.get("step") != "days":
+            try:
+                await query.answer("Сначала выберите «📅 По дням недели».",
+                                   show_alert=True)
+            except Exception:
+                pass
+            return
+        try:
+            d = int(data.rsplit("_", 1)[-1])
+        except (TypeError, ValueError):
+            d = -1
+        try:
+            days = {int(x) for x in (pend.get("days") or []) if 0 <= int(x) <= 6}
+        except (TypeError, ValueError):
+            days = set()
+        if 0 <= d <= 6:
+            days.symmetric_difference_update({d})
+        pend["days"] = sorted(days)
+        pend["ts"] = time.time()
+        user.ct_pending = pend
+        await _pend_save()
+        try:
+            await query.message.edit_reply_markup(
+                reply_markup=_ct_days_kb(sorted(days)))
+        except Exception:
+            pass
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        return
+
+    if data == "ctm_days_next":
+        pend = user.ct_pending if isinstance(user.ct_pending, dict) else {}
+        try:
+            days = [int(x) for x in (pend.get("days") or []) if 0 <= int(x) <= 6]
+        except (TypeError, ValueError):
+            days = []
+        if pend.get("step") != "days" or not days:
+            try:
+                await query.answer("Выберите хотя бы один день.",
+                                   show_alert=True)
+            except Exception:
+                pass
+            return
+        user.ct_pending = {"step": "time", "mode": "days", "days": days,
+                           "ts": time.time()}
+        await _pend_save()
+        ask = ("⏰ Пришлите время в формате ЧЧ:ММ (например 08:00).\n\n"
+               "«отмена» — отменить.")
+        try:
+            await query.message.edit_text(ask, reply_markup=_ct_cancel_kb())
+        except Exception:
+            await context.bot.send_message(
+                chat_id=int(uid), text=ask, reply_markup=_ct_cancel_kb())
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        return
+
+    if data == "ctm_list":
+        timers = load_data(CLASS_TIMERS_FILE, {}) or {}
+        mine = {t: d for t, d in timers.items()
+                if isinstance(d, dict) and d.get('class_code') == code}
+        if not mine:
+            body = ("📋 Таймеры класса\n\nПока пусто. Поставьте первый — "
+                    "кнопками выше или словами через 🪄 AI Agent.")
+            try:
+                await query.message.edit_text(body, reply_markup=_ct_menu_kb())
+            except Exception:
+                pass
+        else:
+            try:
+                await query.message.edit_text(
+                    f"📋 Таймеры класса {class_obj.class_name} — {len(mine)} шт.\n\n"
+                    "🟢 активен · ⏸ выключен\nСообщение приходит всем участникам класса.",
+                    reply_markup=_ct_list_kb(mine, code))
+            except Exception:
+                await context.bot.send_message(
+                    chat_id=int(uid),
+                    text=f"📋 Таймеры класса {class_obj.class_name} — {len(mine)} шт.",
+                    reply_markup=_ct_list_kb(mine, code))
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        return
+
+    if data.startswith(("ctm_show_", "ctm_on_", "ctm_off_", "ctm_del_")):
+        tid = data.split("_", 2)[2] if data.count("_") >= 2 else ""
+        timers = load_data(CLASS_TIMERS_FILE, {}) or {}
+        td = timers.get(tid)
+        if not isinstance(td, dict) or td.get('class_code') != code:
+            try:
+                await query.answer("Таймер не найден.", show_alert=True)
+            except Exception:
+                pass
+            return
+        if data.startswith("ctm_show_"):
+            try:
+                await query.answer(
+                    f"«{(td.get('text') or '')[:180]}»\n\n"
+                    f"{_class_timer_label(td)}",
+                    show_alert=True)
+            except Exception:
+                pass
+            return
+        if data.startswith("ctm_on_"):
+            td['is_active'] = True
+            td.pop('fired_key', None)
+            if _class_timer_is_recurring(td):
+                now_local = _utcnow() + timedelta(hours=_class_timer_tz(td))
+                mode = ("daily" if td.get('repeat_daily')
+                        else "days" if isinstance(td.get('repeat_days'), (list, tuple))
+                        and td.get('repeat_days') else "weekly")
+                nd = _class_timer_first_date(
+                    mode, td.get('repeat_days') or [], td.get('target_time'),
+                    now_local)
+                if nd is not None:
+                    td['target_date'] = nd.strftime("%Y-%m-%d")
+            timers[tid] = td
+            save_data(CLASS_TIMERS_FILE, timers)
+            schedule_class_timer_job(context.application, tid, td)
+            try:
+                await query.answer("▶️ Включено")
+            except Exception:
+                pass
+        elif data.startswith("ctm_off_"):
+            td['is_active'] = False
+            timers[tid] = td
+            save_data(CLASS_TIMERS_FILE, timers)
+            try:
+                for j in (context.application.job_queue.get_jobs_by_name(
+                        f"class_timer_{tid}") or []):
+                    j.schedule_removal()
+            except Exception:
+                pass
+            try:
+                await query.answer("⏸ Выключено")
+            except Exception:
+                pass
+        else:  # ctm_del_
+            timers.pop(tid, None)
+            save_data(CLASS_TIMERS_FILE, timers)
+            try:
+                for j in (context.application.job_queue.get_jobs_by_name(
+                        f"class_timer_{tid}") or []):
+                    j.schedule_removal()
+            except Exception:
+                pass
+            try:
+                await query.answer("🗑 Удалено")
+            except Exception:
+                pass
+        mine = {t: d for t, d in timers.items()
+                if isinstance(d, dict) and d.get('class_code') == code}
+        try:
+            await query.message.edit_reply_markup(
+                reply_markup=_ct_list_kb(mine, code))
+        except Exception:
+            pass
+        return
+
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+
+def _ct_pending_clear(user):
+    """Сбросить флаг «ждём ввод таймера классу» (если был)."""
+    try:
+        if user is not None and getattr(user, "ct_pending", None):
+            user.ct_pending = None
+            save_user(user)
+    except Exception:
+        pass
+
+
+async def _ct_pending_text_handler(update: Update,
+                                   context: ContextTypes.DEFAULT_TYPE):
+    """Глобальный приёмник ввода таймера класса вне ConversationHandler
+    (тот же паттерн, что у списков дежурных): шаги «дата+время»,
+    «время», «текст сообщения» лежат в user.ct_pending и переживают
+    рестарт сервера."""
+    if not update.message or not update.effective_user:
+        return
+    uid = str(update.effective_user.id)
+    user = get_user(uid)
+    if user is None:
+        return
+    pend = getattr(user, "ct_pending", None)
+    if not isinstance(pend, dict):
+        return
+    try:
+        if str(pend.get("step") or "") not in ("when", "time", "text") \
+                or (time.time() - float(pend.get("ts") or 0)) > 3 * 3600:
+            user.ct_pending = None
+            save_user(user)
+            return
+    except Exception:
+        user.ct_pending = None
+        save_user(user)
+        return
+    raw = (update.message.text or "").strip()
+    if raw.lower() in ("отмена", "cancel", "/cancel"):
+        _ct_pending_clear(user)
+        await update.message.reply_text(
+            "Таймер классу отменён.", reply_markup=None)
+        return
+    step = str(pend.get("step") or "")
+
+    # --- шаг 1: дата+время (один раз) или время (постоянный) ---
+    if step in ("when", "time"):
+        time_str = None
+        date_str = None
+        m = re.match(r"^(\d{4}-\d{2}-\d{2})[ T]+(\d{1,2}:\d{2})$", raw)
+        if m:
+            date_str, time_str = m.group(1), m.group(2)
+        else:
+            m2 = re.match(r"^(\d{1,2}:\d{2})$", raw)
+            if m2:
+                time_str = m2.group(1)
+        if time_str:
+            try:
+                hh, mm = time_str.split(":")
+                time_str = f"{int(hh):02d}:{mm.zfill(2)[:2]}"
+                datetime.strptime(f"2000-01-01 {time_str}", "%Y-%m-%d %H:%M")
+            except (ValueError, TypeError):
+                time_str = None
+        if not time_str or (step == "when" and not date_str
+                            and not re.match(r"^\d{1,2}:\d{2}$", raw)):
+            await update.message.reply_text(
+                "Не понял. Формат: ГГГГ-ММ-ДД ЧЧ:ММ (для «один раз») или "
+                "ЧЧ:ММ (для постоянного). Пример: 2026-10-01 08:15")
+            return
+        tz_offset = _class_timer_tz({"created_by": uid})
+        now_local = _utcnow() + timedelta(hours=tz_offset)
+        if step == "when":
+            if not date_str:
+                try:
+                    cand = datetime.strptime(
+                        f"{now_local.strftime('%Y-%m-%d')} {time_str}",
+                        "%Y-%m-%d %H:%M")
+                except ValueError:
+                    await update.message.reply_text(
+                        "Не понял время. Формат ЧЧ:ММ (например 08:15).")
+                    return
+                base = (now_local if cand > now_local
+                        else now_local + timedelta(days=1))
+                date_str = base.strftime("%Y-%m-%d")
+            try:
+                target = datetime.strptime(f"{date_str} {time_str}",
+                                           "%Y-%m-%d %H:%M")
+            except ValueError:
+                await update.message.reply_text(
+                    "Не понял дату. Формат ГГГГ-ММ-ДД (например 2026-10-01).")
+                return
+            if target <= now_local:
+                await update.message.reply_text(
+                    f"Время {date_str} {time_str} уже прошло "
+                    f"(сейчас {now_local.strftime('%H:%M')}). Назовите время "
+                    "в будущем.")
+                return
+            pend.update({"step": "text", "mode": "once", "when": date_str,
+                         "time": time_str, "days": [], "ts": time.time()})
+        else:
+            mode = str(pend.get("mode") or "daily")
+            days = pend.get("days") or []
+            nd = _class_timer_first_date(mode, days, time_str, now_local)
+            if nd is None:
+                await update.message.reply_text(
+                    "Не смог определить дату первого запуска. Проверьте "
+                    "время и дни.")
+                return
+            pend.update({"step": "text", "mode": mode,
+                         "when": nd.strftime("%Y-%m-%d"), "time": time_str,
+                         "days": list(days), "ts": time.time()})
+        user.ct_pending = pend
+        save_user(user)
+        await update.message.reply_text(
+            "✍️ Теперь пришлите ТЕКСТ сообщения — оно уйдёт классу в "
+            f"выбранное время ({pend['when']} {pend['time']}).\n\n"
+            "«отмена» — отменить.", reply_markup=None)
+        return
+
+    # --- шаг 2: текст сообщения → создать таймер ---
+    if step == "text":
+        # Класс: FSM-код или класс, где пользователь админ (как в кнопках).
+        code = None
+        try:
+            code = context.user_data.get('current_admin_class')
+        except Exception:
+            code = None
+        class_obj = get_class_by_code(code) if code else None
+        if not class_obj or uid not in (class_obj.admins or []):
+            cand = get_class_by_user(uid)
+            if cand and uid in (cand.admins or []):
+                class_obj = cand
+            else:
+                _ct_pending_clear(user)
+                await update.message.reply_text(
+                    "Вы больше не админ класса — настройка таймера прервана.")
+                return
+        rejected = await reject_if_forbidden_chars(update, raw, None)
+        if rejected is not None:
+            return
+        mode = str(pend.get("mode") or "once")
+        days = [int(x) for x in (pend.get("days") or []) if 0 <= int(x) <= 6]
+        tid = generate_class_timer_id()
+        timers = load_data(CLASS_TIMERS_FILE, {}) or {}
+        timers[tid] = {
+            "class_code": class_obj.class_code,
+            "text": raw,
+            "created_by": uid,
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "target_date": str(pend.get("when") or ""),
+            "target_time": str(pend.get("time") or ""),
+            "is_active": True,
+            "repeat_daily": mode == "daily",
+            "repeat_weekly": None,
+            "repeat_days": days if mode == "days" else None,
+            "fired_key": "",
+        }
+        save_data(CLASS_TIMERS_FILE, timers)
+        schedule_class_timer_job(context.application, tid, timers[tid])
+        try:
+            _log_admin_action(uid, class_obj.class_code,
+                              "Создан таймер классу",
+                              f"{timers[tid]['target_date']} "
+                              f"{timers[tid]['target_time']} · {raw[:120]}")
+        except Exception:
+            pass
+        user.ct_pending = None
+        save_user(user)
+        await update.message.reply_text(
+            "✅ Таймер поставлен и сохранён в базе данных:\n"
+            f"🕐 {_class_timer_label(timers[tid])}\n\n"
+            "Сообщение придёт ВСЕМ участникам класса. Управление: "
+            "«⏰ Таймер классу» → «📋 Таймеры класса».\n"
+            "Он сработает даже после перезапуска сервера.")
+        return
+
+
+class _CtPendingFilter(filters.MessageFilter):
+    """ВОЛНА 22.41: текст считается вводом таймера класса, только если
+    админ ранее начал настройку (флаг user.ct_pending жив)."""
+    def filter(self, message):
+        try:
+            if not message.from_user:
+                return False
+            u = get_user(str(message.from_user.id))
+            return bool(u and isinstance(getattr(u, "ct_pending", None), dict))
+        except Exception:
+            return False
+
+
+_CT_PENDING_FILTER = _CtPendingFilter()
+
+
+# ==================================
+# === ВОЛНА 22.41: ЗВОНКИ — ВЕСЬ СПИСОК ВРУЧНУЮ ===
+# ==================================
+# «звонки можно не в ручную ставить, а тоже через ии: пользователь отправляет
+# список звонков — ИИ и ИИ ставит; ИЛИ можно вручную добавить весь список».
+# ИИ-путь — действие set_bells (см. _automation_execute_action). Ручной путь —
+# кнопка «📜 Ввести весь список» в меню звонков: админ присылает список одним
+# сообщением, локальный парсер (БЕЗ ИИ и без расхода токенов) разбирает его,
+# показывается превью → подтверждение → замена class_obj.bells целиком.
+
+_BELLS_RANGE_RE = re.compile(
+    r"(?:(?:урок\s*)?(\d{1,2})(?![\d:.])\s*[)`.:\-]?\s*(?:урок[а-яё]*\s*)?)?"
+    r"(\d{1,2})[:.](\d{2})\s*(?:-|–|—|до|по)\s*(\d{1,2})[:.](\d{2})",
+    re.IGNORECASE)
+# (?![\d:.]) после номера урока обязателен: иначе префикс «съедает» цифру
+# времени («10:20-11:05» разбирался как урок «1» + звонок «0:20–11:05»).
+
+
+def _parse_bells_bulk(raw):
+    """Разбор списка звонков, присланного ОДНИМ сообщением.
+
+    Понимает любые формы: «1) 8:30-9:15», «1 урок: 08:30 – 09:15»,
+    «Урок 2 9:25-10:10», «3 10:20 до 11:05», «8:30-9:15» (номер — по
+    порядку), одной строкой через запятую или списком строк.
+    Возвращает (bells: {урок: {"start","end"}}, errors: [строка]).
+    """
+    bells, errors = {}, []
+    for m in _BELLS_RANGE_RE.finditer(raw or ""):
+        prefix = (raw[m.start():m.start(2)] or "").strip()
+        lesson = None
+        m2 = re.match(r"^(?:урок\s*)?(\d{1,2})\s*[)`.:\-]?\s*(?:урок[а-яё]*)?\s*$",
+                      prefix, re.IGNORECASE)
+        if m2:
+            try:
+                cand = int(m2.group(1))
+                if 1 <= cand <= 15:
+                    lesson = cand
+            except ValueError:
+                lesson = None
+        start = f"{int(m.group(2)):02d}:{m.group(3)}"
+        end = f"{int(m.group(4)):02d}:{m.group(5)}"
+        try:
+            s_t = datetime.strptime(start, "%H:%M")
+            e_t = datetime.strptime(end, "%H:%M")
+        except ValueError:
+            errors.append(f"«{m.group(0).strip()}» — не похоже на время")
+            continue
+        if e_t <= s_t:
+            errors.append(f"«{m.group(0).strip()}» — конец не позже начала")
+            continue
+        if lesson is None:
+            lesson = (max((int(k) for k in bells if str(k).isdigit()),
+                          default=0) + 1)
+        bells[str(lesson)] = {"start": start, "end": end}
+    return bells, errors
+
+
+async def _bells_bulk_start_cb(update: Update,
+                               context: ContextTypes.DEFAULT_TYPE):
+    """«📜 Ввести весь список» в меню звонков: включаем ожидание списка."""
+    query = update.callback_query
+    uid = str(query.from_user.id)
+    user = get_user(uid)
+    if user is None:
+        user = User(uid)
+    class_obj = _ct_admin_class(query, context)
+    if class_obj is None:
+        try:
+            await query.answer("Только для админа класса.", show_alert=True)
+        except Exception:
+            pass
+        return
+    user.bells_pending = {"ts": time.time()}
+    save_user(user)
+    ask = (
+        "📜 Пришлите ВЕСЬ список звонков одним сообщением — я заменю им "
+        "текущее расписание звонков.\n\n"
+        "Понимаю любые формы (номер урока можно не писать — поставлю по "
+        "порядку):\n"
+        "1) 8:30-9:15\n2 урок: 9:25-10:10\n3 10:20 до 11:05\n\n"
+        "Можно одной строкой через запятую.\n\n"
+        "💡 Тот же список можно отдать 🪄 AI Agent — он поставит сам.\n"
+        "«отмена» — не менять звонки.")
+    try:
+        await query.message.edit_text(ask)
+    except Exception:
+        await context.bot.send_message(chat_id=int(uid), text=ask)
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+
+async def _bells_bulk_text_handler(update: Update,
+                                   context: ContextTypes.DEFAULT_TYPE):
+    """Глобальный приёмник списка звонков (вне ConversationHandler):
+    парсит список БЕЗ ИИ, показывает превью и ждёт подтверждения."""
+    if not update.message or not update.effective_user:
+        return
+    uid = str(update.effective_user.id)
+    user = get_user(uid)
+    if user is None:
+        return
+    pend = getattr(user, "bells_pending", None)
+    if not isinstance(pend, dict):
+        return
+    try:
+        if (time.time() - float(pend.get("ts") or 0)) > 3 * 3600:
+            user.bells_pending = None
+            save_user(user)
+            return
+    except Exception:
+        user.bells_pending = None
+        save_user(user)
+        return
+    raw = (update.message.text or "").strip()
+    if raw.lower() in ("отмена", "cancel", "/cancel"):
+        user.bells_pending = None
+        save_user(user)
+        await update.message.reply_text("Замена звонков отменена.")
+        return
+    class_obj = None
+    code = None
+    try:
+        code = context.user_data.get('current_admin_class')
+    except Exception:
+        code = None
+    class_obj = get_class_by_code(code) if code else None
+    if not class_obj or uid not in (class_obj.admins or []):
+        cand = get_class_by_user(uid)
+        if cand and uid in (cand.admins or []):
+            class_obj = cand
+        else:
+            user.bells_pending = None
+            save_user(user)
+            await update.message.reply_text(
+                "Вы больше не админ класса — замена звонков прервана.")
+            return
+    bells, errors = _parse_bells_bulk(raw)
+    if not bells:
+        user.bells_pending = None
+        save_user(user)
+        await update.message.reply_text(
+            "Не нашёл в сообщении ни одного звонка формата «ЧЧ:ММ-ЧЧ:ММ». "
+            "Пришлите список ещё раз, например:\n"
+            "1) 8:30-9:15\n2 урок: 9:25-10:10")
+        return
+    context.user_data['bells_bulk'] = bells
+    user.bells_pending = None
+    save_user(user)
+    lines = [f"🔔 Распознал звонков: {len(bells)}."]
+    for l, v in sorted(bells.items(), key=lambda kv: int(kv[0])):
+        lines.append(f"• {l} урок: {v['start']}–{v['end']}")
+    if errors:
+        lines.append(f"\n⚠️ Пропустил непонятных строк: {len(errors)}:")
+        lines.extend(f"  {e}" for e in errors[:5])
+    lines.append("\nЗаменить текущие звонки целиком?")
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Сохранить", callback_data="bells_bulk_ok"),
+        InlineKeyboardButton("❌ Отмена", callback_data="bells_bulk_no"),
+    ]])
+    await update.message.reply_text("\n".join(lines), reply_markup=kb)
+
+
+async def _bells_bulk_confirm_cb(update: Update,
+                                 context: ContextTypes.DEFAULT_TYPE):
+    """✅ Сохранить / ❌ Отмена под превью списка звонков."""
+    query = update.callback_query
+    data = query.data or ""
+    uid = str(query.from_user.id)
+    class_obj = _ct_admin_class(query, context)
+    if class_obj is None:
+        try:
+            await query.answer("Только для админа класса.", show_alert=True)
+        except Exception:
+            pass
+        return
+    if data == "bells_bulk_no":
+        context.user_data.pop('bells_bulk', None)
+        try:
+            await query.message.edit_text("Замена звонков отменена.")
+        except Exception:
+            pass
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        return
+    bells = context.user_data.get('bells_bulk')
+    if not isinstance(bells, dict) or not bells:
+        try:
+            await query.answer("Список устарел — пришлите его ещё раз.",
+                               show_alert=True)
+        except Exception:
+            pass
+        return
+    class_obj.bells = {str(k): dict(v) for k, v in bells.items()}
+    classes = load_classes()
+    classes[class_obj.class_code] = class_obj
+    save_classes(classes)
+    context.user_data.pop('bells_bulk', None)
+    try:
+        _log_admin_action(uid, class_obj.class_code, "Звонки заменены списком",
+                          f"{len(class_obj.bells)} уроков")
+    except Exception:
+        pass
+    try:
+        await query.message.edit_text(
+            f"✅ Звонки класса заменены ({len(class_obj.bells)} уроков).\n\n"
+            + get_bells_info(class_obj))
+    except Exception:
+        pass
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+
+class _BellsBulkFilter(filters.MessageFilter):
+    """ВОЛНА 22.41: текст — это список звонков, только если админ ранее
+    нажал «📜 Ввести весь список» (флаг user.bells_pending жив)."""
+    def filter(self, message):
+        try:
+            if not message.from_user:
+                return False
+            u = get_user(str(message.from_user.id))
+            return bool(u and isinstance(getattr(u, "bells_pending", None), dict))
+        except Exception:
+            return False
+
+
+_BELLS_BULK_FILTER = _BellsBulkFilter()
 
 
 # === ВОЛНА 22.27/22.28: возрастной гейт 13+ ===
@@ -43730,6 +46736,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "dev_user_management":
         return await dev_user_management_start(update, context)
     # ПУНКТ (цены): возвращены callback'и для быстрого изменения цен функций.
+    elif data == "dev_db_check":
+        # ВОЛНА 22.40: самопроверка базы данных («всё ли сохраняется в базу»).
+        return await dev_db_check_cb(update, context)
     elif data == "dev_quick_prices":
         return await dev_quick_prices_start(update, context)
     elif data.startswith("qprice_pick_"):
@@ -43913,12 +46922,23 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "duty_sick" or data.startswith("duty_sick_uid_") \
             or data.startswith("duty_skip_uid_"):
         return await duty_sick_cb(update, context)
+    elif data in ("duty_more", "duty_more_back", "duty_more_c", "duty_more_back_c"):
+        # ВОЛНА 22.42: «болел(а)» спрятана в «☰ Ещё» — показ/возврат раскладки
+        return await duty_more_toggle_cb(update, context)
+    elif data in ("duty_more_me", "duty_more_me_back"):
+        # ВОЛНА 22.44: «🤒 Я заболел(а)» спрятана в «☰ Ещё» и на ЛИЧНОЙ
+        # карточке дежурного — показ/возврат раскладки
+        return await duty_me_more_cb(update, context)
     elif data.startswith("fhide_"):
         # ВОЛНА 22.36: кнопка «🙈 Скрыть» под файлом, отправленным мини-аппом
         return await miniapp_hide_file_cb(update, context)
     elif data.startswith("duty_cns_") or data.startswith("duty_cnn_"):
         # ВОЛНА 22.36: «заболел(а)»/«не будет» для СВОЕГО графика (имена)
         return await duty_custom_mark_cb(update, context)
+    elif data.startswith("ctm_"):
+        # ВОЛНА 22.41: таймеры сообщений классу — кнопки работают и внутри
+        # FSM, и после потери состояния (глобальный хендлер зовёт то же).
+        return await ct_buttons_global(update, context)
     elif data == "more_sick":
         query_duty = update.callback_query
         _user_more = get_user(str(query_duty.from_user.id))
@@ -44088,6 +47108,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await edit_teachers_start(update, context)
     elif data == "edit_bells":
         return await edit_bells_start(update, context)
+    elif data == "edit_bells_bulk":
+        # ВОЛНА 22.41: «весь список вручную» — ожидание списка звонков.
+        return await _bells_bulk_start_cb(update, context)
+    elif data in ("bells_bulk_ok", "bells_bulk_no"):
+        # ВОЛНА 22.41: подтверждение/отмена замены звонков списком.
+        return await _bells_bulk_confirm_cb(update, context)
     elif data == "set_holidays":
         return await set_holidays_start(update, context)
     elif data == "manage_admins":
@@ -44132,6 +47158,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await admin_delete_buttons_start(update, context)
     elif data.startswith("admin_delete_button_"):
         return await admin_delete_button_handler(update, context)
+    elif data.startswith("edit_button_name_"):
+        # ВОЛНА 22.45: частные префиксы — ДО общего edit_button_.
+        return await edit_button_name_start(update, context)
+    elif data.startswith("edit_button_del_"):
+        return await edit_button_delete_cb(update, context)
+    elif data.startswith("edit_button_"):
+        # ВОЛНА 22.45: раньше этот колбэк был мёртв (хендлера не было) —
+        # «📝 Кнопка» в управлении не реагировала, кнопку нельзя было
+        # отредактировать/удалить. Теперь открывает карточку кнопки.
+        return await edit_button_start(update, context)
     elif data == "add_homework":
         return await add_homework_start(update, context)
     elif data == "delete_homework":
@@ -49563,6 +52599,21 @@ async def _post_init(application):
     except Exception as e2:
         logger.error(f"Не удалось запустить time-sync loop: {e2}")
 
+    # === ВОЛНА 22.48: сторож паузы загрузок. ===
+    # Мини апп закрыли посреди загрузки → в чат уходит «⏸ Загрузка на паузе»
+    # с кнопкой «▶️ Продолжить загрузку» (открывает мини апп — очередь
+    # докачивается сама). Раз в 10 секунд, без спама (1 раз на сессию,
+    # кулдаун 2 мин на пользователя).
+    try:
+        _upw_task = asyncio.create_task(_upload_pause_watchdog(application))
+        try:
+            application.bot_data.setdefault("_bg_tasks", []).append(_upw_task)
+        except Exception:
+            pass
+        logger.info("Сторож паузы загрузок запущен (каждые 10 секунд).")
+    except Exception as e2:
+        logger.error(f"Не удалось запустить сторожа паузы загрузок: {e2}")
+
     # === ШАГ 4: диагностика уведомлений по каждому пользователю. ===
     try:
         users_for_diag = load_users()
@@ -49626,6 +52677,17 @@ async def _post_init(application):
     except Exception as e:
         logger.error(f"timers load: {e}")
 
+    # === ШАГ 7b: восстановление ТАЙМЕРОВ СООБЩЕНИЙ КЛАССУ (22.41). ===
+    try:
+        ctimers = load_data(CLASS_TIMERS_FILE, {}) or {}
+        for ct_id, ct_data in ctimers.items():
+            try:
+                schedule_class_timer_job(application, ct_id, ct_data)
+            except Exception as e:
+                logger.error(f"schedule_class_timer_job {ct_id}: {e}")
+    except Exception as e:
+        logger.error(f"class_timers load: {e}")
+
     # === ШАГ 8: safety-net для таймеров. ===
     try:
         if application.job_queue is not None:
@@ -49637,6 +52699,19 @@ async def _post_init(application):
             )
     except Exception as e:
         logger.error(f"timer safety-net регистрация: {e}")
+
+    # === ШАГ 8b: safety-net ТАЙМЕРОВ КЛАССА (22.41) — доставка таймеров
+    # сообщений классу даже после потери джоб (рестарт/деплой). ===
+    try:
+        if application.job_queue is not None:
+            application.job_queue.run_repeating(
+                _class_timer_safety_net,
+                interval=30,
+                first=20,
+                name="class_timer_safety_net",
+            )
+    except Exception as e:
+        logger.error(f"class timer safety-net регистрация: {e}")
 
     # === ШАГ 9: legacy per-user планирование (no-op, для совместимости). ===
     try:
@@ -50346,6 +53421,11 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, custom_button_content_handler),
                 CallbackQueryHandler(handle_callback),
             ],
+            # ВОЛНА 22.45: переименование кнопки класса (edit_button_name_).
+            CUSTOM_BUTTON_EDIT_NAME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, class_button_edit_name_handler),
+                CallbackQueryHandler(handle_callback),
+            ],
             ADMIN_DELETE_BUTTON: [
                 CallbackQueryHandler(handle_callback),
             ],
@@ -50901,6 +53981,37 @@ def main():
         _cdb_private_doc_handler))
 
     application.add_handler(conv_handler)
+
+    # ВОЛНА 22.40: дежурства вне FSM (после conv_handler, до global cancel —
+    # в той же группе 0 первым срабатывает тот, кто зарегистрирован раньше):
+    # 1) ЛЮБЫЕ duty_* кнопки работают даже когда разговор потерян после
+    #    рестарта («заболел/не будет» под утренним сообщением молчали);
+    # 2) присланный список дежурных (свой/для ИИ) доходит до обработчиков,
+    #    даже если FSM-состояние сброшено (флаг ждём-список — в базе).
+    application.add_handler(CallbackQueryHandler(
+        _duty_buttons_global, pattern=r"^duty_"))
+    application.add_handler(MessageHandler(
+        filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND
+        & _DUTY_PENDING_FILTER,
+        _duty_pending_text_handler))
+
+    # ВОЛНА 22.41: таймеры сообщений классу вне FSM (тот же паттерн, что
+    # у дежурств): кнопки ctm_* работают даже когда разговор потерян,
+    # а ввод (дата/время/текст) доходит через персистентный флаг ct_pending
+    # («это тоже должно сохраняться и синхронизироваться в базе данных»).
+    application.add_handler(CallbackQueryHandler(
+        ct_buttons_global, pattern=r"^ctm_"))
+    application.add_handler(MessageHandler(
+        filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND
+        & _CT_PENDING_FILTER,
+        _ct_pending_text_handler))
+
+    # ВОЛНА 22.41: список звонков ЦЕЛИКОМ (кнопка «📜 Ввести весь список»)
+    # тоже вне FSM — переживает потерю состояния (тот же паттерн).
+    application.add_handler(MessageHandler(
+        filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND
+        & _BELLS_BULK_FILTER,
+        _bells_bulk_text_handler))
 
     # ВОЛНА 12: standalone-перехватчик отмены ПОСЛЕ ConversationHandler —
     # срабатывает, когда FSM-состояние ПОТЕРЯНО (state=None после
