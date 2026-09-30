@@ -525,6 +525,11 @@ SICK_WAIT_TO = 154         # «🤒 Я болел(а)»: дата конца (Г
 # (ИИ строит ротацию) либо список с датами (ИИ раскладывает по датам).
 DUTY_CUSTOM_AI = 155       # ждём список имён для ИИ-составления графика
 DUTY_CUSTOM_DATES = 156    # ждём список «дата — имена» (числа дежурств)
+# ВОЛНА 22.45: админ переименовывает кнопку класса («🆕 Управление кнопками»
+# → «📝 Кнопка» → «📝 Переименовать»). Раньше колбэк edit_button_ был
+# МЁРТВЫМ (хендлера не было) — нажатие висело «часиками», и кнопку нельзя
+# было ни отредактировать, ни удалить через понятное меню.
+CUSTOM_BUTTON_EDIT_NAME = 157
 
 # ВОЛНА 22.4: «🎙 Пульт» удалён ПОЛНОСТЬЮ по решению пользователя — кнопки,
 # состояний (бывшие 126–131), хендлеров и хранилищ стилей больше нет.
@@ -3628,7 +3633,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.44"
+BOT_BUILD = "22.45"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -4515,7 +4520,11 @@ def get_custom_buttons_management_keyboard(class_obj):
     keyboard = []
     custom_buttons = get_class_custom_buttons(class_obj.class_code)
     for button in custom_buttons:
-        keyboard.append([InlineKeyboardButton(f"📝 {button.name}", callback_data=f"edit_button_{button.button_id}")])
+        # ВОЛНА 22.45: показываем имя БЕЗ служебного префикса CLASS_ —
+        # раньше админ видел «📝 CLASS_Расписание» и не узнавал свою кнопку
+        # (в списке удаления префикс срезался, здесь — нет).
+        display = button.name.replace("CLASS_", "") if button.name.startswith("CLASS_") else button.name
+        keyboard.append([InlineKeyboardButton(f"📝 {display}", callback_data=f"edit_button_{button.button_id}")])
 
     keyboard.append([InlineKeyboardButton("➕ Добавить кнопку", callback_data="add_custom_button")])
     keyboard.append([InlineKeyboardButton("🗑️ Удалить кнопки", callback_data="admin_delete_buttons")])
@@ -4750,6 +4759,11 @@ ALL_MAIN_MENU_BUTTONS = [
     "🌦 Погода",
     "📚 Инструкция",
     "🔑 Код класса",
+    # ВОЛНА 22.45: «📋 Ещё» — полноценный участник настроек кнопок:
+    # в «👁 Скрыть/показать» и «🔄 Переместить кнопки» она теперь тоже
+    # отображается, В НЕЁ можно «спрятать» любую кнопку (скрытие = перенос
+    # в «Ещё») и САМУ «Ещё» тоже можно скрыть/вернуть.
+    "📋 Ещё",
     "🚪 Выйти из класса",
     "🔓 Выйти из аккаунта"
 ]
@@ -32744,10 +32758,14 @@ async def manage_button_visibility_start(update: Update, context: ContextTypes.D
 
     hidden_count = len(getattr(user, 'hidden_buttons', []))
 
+    # ВОЛНА 22.45: текст объясняет механику «Ещё» — скрытие = перенос кнопки
+    # в «📋 Ещё»; и саму «📋 Ещё» можно скрыть/вернуть (пункт в списке ниже).
     text = (
         f"👁 **Управление видимостью кнопок**\n\n"
         f"📊 Скрытых кнопок: {hidden_count}\n\n"
         f"Нажмите на кнопку, чтобы скрыть или показать её.\n"
+        f"Скрытая кнопка не пропадает — она переезжает в «📋 Ещё».\n"
+        f"Пункт «📋 Ещё» тоже в списке: его можно скрыть или вернуть.\n"
         f"⚙️ Кнопка настроек всегда остаётся видимой."
     )
 
@@ -32801,6 +32819,14 @@ async def toggle_button_visibility_handler(update: Update, context: ContextTypes
         f"✅ Кнопка '{button_name}' {action}!\n\n"
         f"Нажмите на кнопку, чтобы скрыть или показать её."
     )
+    # ВОЛНА 22.45: скрыли «📋 Ещё», а внутри уже лежат спрятанные кнопки —
+    # честно предупреждаем, как их вернуть.
+    if (action == "скрыта" and button_name == "📋 Ещё"
+            and any(b != "📋 Ещё" for b in user.hidden_buttons)):
+        text += (
+            "\n\n⚠️ В «Ещё» лежат спрятанные кнопки — они станут доступны "
+            "снова, когда вернёте «📋 Ещё» здесь же."
+        )
 
     try:
         await query.edit_message_text(text, reply_markup=get_button_visibility_keyboard(user))
@@ -40133,6 +40159,206 @@ async def admin_delete_button_handler(update: Update, context: ContextTypes.DEFA
 
     return await manage_custom_buttons_start(update, context)
 
+
+# === ВОЛНА 22.45: РЕДАКТИРОВАНИЕ/УДАЛЕНИЕ КНОПКИ КЛАССА =====================
+# Раньше колбэк edit_button_{id} (кнопка «📝 Имя» в «🆕 Управление кнопками»)
+# вообще не имел хендлера — нажатие молча висело «часиками», и админ не мог
+# ни отредактировать кнопку, ни удалить её через понятное меню (только через
+# отдельный пункт «🗑️ Удалить кнопки»). Теперь «📝 Имя» открывает карточку
+# кнопки с действиями: переименовать / удалить / назад.
+
+def _class_button_display(name: str) -> str:
+    """Служебный префикс CLASS_ в хранилище — пользователю не показываем."""
+    return name.replace("CLASS_", "") if name.startswith("CLASS_") else name
+
+
+async def _refresh_menu_for(user_id, context, note: str):
+    """Отправляет пользователю обновлённое главное меню (без /start)."""
+    try:
+        user_obj = get_user(str(user_id))
+        if not user_obj:
+            return
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=note,
+            reply_markup=get_main_menu_keyboard(user_obj),
+        )
+    except Exception as e:
+        logger.error(f"22.45: не удалось обновить меню {user_id}: {e}")
+
+
+async def _notify_class_button_changed(class_obj, context, actor_id, note):
+    """Рассылает участникам класса обновлённое меню после удаления/пере-
+    именования кнопки (зеркалит поведение создания кнопки: у всех кнопка
+    исчезает/переименовывается сразу, без /start)."""
+    if not class_obj:
+        return
+    for member_id in class_obj.students + class_obj.admins:
+        if str(member_id) == str(actor_id):
+            continue
+        await _refresh_menu_for(member_id, context, note)
+
+
+async def edit_button_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Карточка кнопки класса: что с ней можно сделать."""
+    query = update.callback_query
+    await query.answer()
+
+    button_id = query.data[len("edit_button_"):]
+    buttons = load_data(CUSTOM_BUTTONS_FILE, {})
+    data = buttons.get(button_id)
+    if not data:
+        await query.edit_message_text("Кнопка не найдена (уже удалена?).")
+        return await manage_custom_buttons_start(update, context)
+
+    name = data.get('name', '')
+    display = _class_button_display(name)
+    btype = data.get('button_type', 'text')
+    content = str(data.get('content', '') or '')
+    creator = get_user(data.get('creator_id', ''))
+    creator_name = creator.first_name if creator else "неизвестен"
+    type_label = "🔗 Ссылка" if btype == "url" else "📝 Текст"
+
+    text = (
+        f"🆕 **Кнопка класса**\n\n"
+        f"📝 Название: {display}\n"
+        f"🔖 Тип: {type_label}\n"
+        f"📄 Содержимое: {content[:60]}{'…' if len(content) > 60 else ''}\n"
+        f"👤 Создал: {creator_name}\n\n"
+        f"Выберите действие:"
+    )
+    keyboard = [
+        [InlineKeyboardButton("📝 Переименовать кнопку", callback_data=f"edit_button_name_{button_id}")],
+        [InlineKeyboardButton("🗑️ Удалить кнопку", callback_data=f"edit_button_del_{button_id}")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="back_to_custom_buttons")],
+    ]
+    try:
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    except Exception:
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    return MANAGE_CUSTOM_BUTTONS
+
+
+async def edit_button_name_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Шаг «введите новое название» для кнопки класса."""
+    query = update.callback_query
+    await query.answer()
+
+    button_id = query.data[len("edit_button_name_"):]
+    context.user_data['editing_class_button_id'] = button_id
+
+    await query.edit_message_text(
+        "📝 Введите новое название кнопки:",
+        reply_markup=get_cancel_keyboard(),
+    )
+    return CUSTOM_BUTTON_EDIT_NAME
+
+
+@timeout(CONVERSATION_TIMEOUT)
+async def class_button_edit_name_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Сохраняет новое название кнопки класса (префикс CLASS_ сохраняется)."""
+    user_id = str(update.effective_user.id)
+    user = get_user(user_id)
+    if not user:
+        user = User(user_id)
+
+    new_display = (update.message.text or "").strip()
+    button_id = context.user_data.get('editing_class_button_id')
+
+    if not new_display:
+        await update.message.reply_text("Введите название.")
+        return CUSTOM_BUTTON_EDIT_NAME
+
+    rejected = await reject_if_forbidden_chars(update, new_display, CUSTOM_BUTTON_EDIT_NAME)
+    if rejected is not None:
+        return rejected
+
+    if not button_id:
+        await update.message.reply_text("Кнопка не выбрана — попробуйте заново.")
+        return await admin_panel(update, context)
+
+    buttons = load_data(CUSTOM_BUTTONS_FILE, {})
+    data = buttons.get(button_id)
+    if not data:
+        await update.message.reply_text("Кнопка не найдена (уже удалена?).")
+        context.user_data.pop('editing_class_button_id', None)
+        return await admin_panel(update, context)
+
+    old_name = data.get('name', '')
+    # Префикс CLASS_ сохраняем: кнопка остаётся кнопкой класса.
+    data['name'] = f"CLASS_{new_display}" if old_name.startswith("CLASS_") else new_display
+    buttons[button_id] = data
+    save_data(CUSTOM_BUTTONS_FILE, buttons)
+
+    class_code = context.user_data.get('current_admin_class')
+    class_obj = get_class_by_code(class_code)
+
+    context.user_data.pop('editing_class_button_id', None)
+
+    await update.message.reply_text(f"✅ Кнопка '{_class_button_display(old_name)}' переименована в '{new_display}'!")
+    # Клавиатура админа обновляется сразу.
+    await _refresh_menu_for(user_id, context, "⚙️ Меню обновлено!")
+    if class_obj:
+        await _notify_class_button_changed(
+            class_obj, context, user_id,
+            f"🔔 Администратор переименовал кнопку: *{new_display}*")
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text="🆕 Управление кнопками",
+                reply_markup=get_custom_buttons_management_keyboard(class_obj))
+        except Exception as e:
+            logger.error(f"22.45: меню управления кнопками: {e}")
+
+    # Остаёмся в управлении кнопками — дальнейшие нажатия обрабатывает
+    # тот же ConversationHandler (как после обычного удаления).
+    return MANAGE_CUSTOM_BUTTONS
+
+
+async def edit_button_delete_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Удаление кнопки класса ПРЯМО ИЗ карточки (без отдельного пункта меню).
+    Клавиатуры всех участников обновляются сразу — кнопка исчезает у всех."""
+    query = update.callback_query
+    await query.answer()
+
+    button_id = query.data[len("edit_button_del_"):]
+    class_code = context.user_data.get('current_admin_class')
+
+    buttons = load_data(CUSTOM_BUTTONS_FILE, {})
+    data = buttons.get(button_id)
+    if not data:
+        await query.edit_message_text("Кнопка не найдена (уже удалена?).")
+        return await manage_custom_buttons_start(update, context)
+
+    display = _class_button_display(data.get('name', ''))
+    del buttons[button_id]
+    save_data(CUSTOM_BUTTONS_FILE, buttons)
+
+    class_obj = get_class_by_code(class_code)
+    if class_obj and button_id in class_obj.class_buttons:
+        class_obj.class_buttons.remove(button_id)
+        classes = load_classes()
+        classes[class_code] = class_obj
+        save_classes(classes)
+
+    await query.edit_message_text(f"🗑 Кнопка '{display}' удалена!")
+    # Клавиатура админа обновляется сразу — кнопка исчезает без /start.
+    await _refresh_menu_for(query.from_user.id, context, "⚙️ Меню обновлено!")
+    if class_obj:
+        await _notify_class_button_changed(
+            class_obj, context, query.from_user.id,
+            f"🔔 Администратор удалил кнопку: *{display}*")
+        try:
+            await context.bot.send_message(
+                chat_id=query.from_user.id,
+                text="🆕 Управление кнопками",
+                reply_markup=get_custom_buttons_management_keyboard(class_obj))
+        except Exception as e:
+            logger.error(f"22.45: меню управления кнопками: {e}")
+
+    return MANAGE_CUSTOM_BUTTONS
+# === КОНЕЦ ВОЛНЫ 22.45 (редактирование/удаление кнопки класса) ==============
+
 async def admin_button_for_personal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -46482,6 +46708,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await admin_delete_buttons_start(update, context)
     elif data.startswith("admin_delete_button_"):
         return await admin_delete_button_handler(update, context)
+    elif data.startswith("edit_button_name_"):
+        # ВОЛНА 22.45: частные префиксы — ДО общего edit_button_.
+        return await edit_button_name_start(update, context)
+    elif data.startswith("edit_button_del_"):
+        return await edit_button_delete_cb(update, context)
+    elif data.startswith("edit_button_"):
+        # ВОЛНА 22.45: раньше этот колбэк был мёртв (хендлера не было) —
+        # «📝 Кнопка» в управлении не реагировала, кнопку нельзя было
+        # отредактировать/удалить. Теперь открывает карточку кнопки.
+        return await edit_button_start(update, context)
     elif data == "add_homework":
         return await add_homework_start(update, context)
     elif data == "delete_homework":
@@ -52718,6 +52954,11 @@ def main():
             ],
             CUSTOM_BUTTON_CONTENT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, custom_button_content_handler),
+                CallbackQueryHandler(handle_callback),
+            ],
+            # ВОЛНА 22.45: переименование кнопки класса (edit_button_name_).
+            CUSTOM_BUTTON_EDIT_NAME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, class_button_edit_name_handler),
                 CallbackQueryHandler(handle_callback),
             ],
             ADMIN_DELETE_BUTTON: [
