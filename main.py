@@ -4396,12 +4396,15 @@ def get_cancel_keyboard():
 
 
 # ВОЛНА 22.28: дату рождения ПРОПУСТИТЬ БОЛЬШЕ НЕЛЬЗЯ («дату рождения нельзя
-# пропустить»). ВОЛНА 22.47: и кнопки «❌ Отмена» на шаге ДР больше НЕТ —
-# в начале регистрации ничего отменять нельзя, пользователь просто вводит
-# дату. Город остаётся необязательным («⏭ Пропустить» — get_skip_city_keyboard).
-# Имя функции оставлено старым для совместимости всех вызовов (их 8).
+# пропустить»). Город остаётся необязательным («⏭ Пропустить» —
+# get_skip_city_keyboard). Имя функции оставлено старым для совместимости
+# вызовов — текст подсказки обновлён.
+# ВОЛНА 22.47: в начале регистрации на ДР кнопки «❌ Отмена» больше НЕТ
+# («в начале регистрации на др не должно быть кнопки отмена») — дата
+# обязательна, «Отмена» была тупиком и путала. Клавиатура пустая;
+# имя функции оставлено старым для совместимости вызовов.
 def get_skip_birthday_keyboard():
-    return None
+    return InlineKeyboardMarkup([])
 
 
 def get_skip_city_keyboard():
@@ -9896,9 +9899,10 @@ html.low-end #cornerTransfers.panel-open .ct-panel {
   display: flex;
   flex-direction: column;
   justify-content: space-between;
-  /* ВОЛНА 22.47: сверху 68px (вместо 24px) — «Сейчас играет» и кнопка
-     «закрыть» уходят НИЖЕ плавающей кнопки закрытия мини-аппа Telegram,
-     которая иначе перекрывает верхние кнопки плеера */
+  /* ВОЛНА 22.47: верхние элементы (надпись + кнопка закрыть) опущены ниже
+     зоны системной кнопки закрытия Mini App (≈44px сверху) — в Telegram
+     поверх плеера висит «✕», и кнопка закрыть плеера раньше мешала/терялась
+     под ней («кнопки пониже расположи») */
   padding: 68px 24px 24px;
   overflow: hidden;
   visibility: hidden;
@@ -10012,13 +10016,15 @@ html.low-end #musicPlayer .mp-circle {
 
 /* Кнопка «Песни» удалена по запросу — плейлист строится из файлов облака */
 
+/* ВОЛНА 22.47: кнопка закрыть в музыкальном плеере — чуть крупнее (заметнее
+   и легче попасть пальцем), живёт в опущенном top-bar (см. padding above) */
 .mp-close {
   position: absolute;
   right: 0;
   top: 50%;
   transform: translateY(-50%);
-  width: 38px;
-  height: 38px;
+  width: 42px;
+  height: 42px;
   border-radius: 9999px;
   border: 1px solid rgba(255, 255, 255, 0.14);
   background: rgba(255, 255, 255, 0.08);
@@ -10036,8 +10042,8 @@ html.low-end #musicPlayer .mp-circle {
 }
 
 .mp-close svg {
-  width: 18px;
-  height: 18px;
+  width: 20px;
+  height: 20px;
   stroke: currentColor;
   fill: none;
   stroke-width: 2.4;
@@ -10804,11 +10810,13 @@ body.vp-lock {
 <div id="videoPlayerModal">
   <div id="vpToastBox" style="position:absolute;bottom:24px;left:50%;transform:translateX(-50%);z-index:100;display:flex;flex-direction:column;align-items:center;gap:8px;pointer-events:none;width:100%;max-width:320px;padding:0 16px;"></div>
 
-  <div id="vpSpeed" style="position:absolute;top:92px;z-index:40;background:rgba(0,0,0,0.75);backdrop-filter:blur(8px);color:#fff;padding:6px 16px;border-radius:9999px;font-weight:900;font-size:12px;letter-spacing:1px;border:1px solid rgba(255,255,255,0.2);opacity:0;pointer-events:none;display:flex;align-items:center;gap:6px;font-family:'Nunito',sans-serif;">
+  <div id="vpSpeed" style="position:absolute;top:120px;z-index:40;background:rgba(0,0,0,0.75);backdrop-filter:blur(8px);color:#fff;padding:6px 16px;border-radius:9999px;font-weight:900;font-size:12px;letter-spacing:1px;border:1px solid rgba(255,255,255,0.2);opacity:0;pointer-events:none;display:flex;align-items:center;gap:6px;font-family:'Nunito',sans-serif;">
     <i data-lucide="fast-forward" style="width:16px;height:16px;"></i> 2X УСКОРЕНИЕ
   </div>
 
-  <div id="vpHeader" style="position:absolute;top:0;left:0;right:0;padding:58px 20px 16px;display:flex;align-items:center;justify-content:space-between;z-index:30;background:linear-gradient(to bottom, rgba(0,0,0,0.8), transparent);">
+  <!-- ВОЛНА 22.47: шапка опущена ниже (76px вместо 32px) — кнопки «Повернуть»
+       и «Закрыть» не конфликтуют с системной кнопкой закрытия Mini App вверху -->
+  <div id="vpHeader" style="position:absolute;top:0;left:0;right:0;padding:76px 20px 16px;display:flex;align-items:center;justify-content:space-between;z-index:30;background:linear-gradient(to bottom, rgba(0,0,0,0.8), transparent);">
     <span id="vpTitle" style="color:#fff;font-weight:700;font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:55%;font-family:'Nunito',sans-serif;"></span>
 
     <div style="display:flex;align-items:center;gap:8px;">
@@ -10825,9 +10833,9 @@ body.vp-lock {
   <div id="vpWrapper" style="position:relative;width:100%;height:100%;display:flex;align-items:center;justify-content:center;background:#000;overflow:hidden;">
     <div id="vpRot"><video id="vpPlayer" style="width:100%;max-height:100%;object-fit:contain;" playsinline preload="metadata"></video></div>
 
-    <div style="position:absolute;top:80px;bottom:100px;left:0;width:33.33%;z-index:10;" onclick="vpTapZone(event, -10)"></div>
-    <div style="position:absolute;top:80px;bottom:100px;left:33.33%;width:33.33%;z-index:10;" onclick="vpCenterTap(event)"></div>
-    <div style="position:absolute;top:80px;bottom:100px;right:0;width:33.33%;z-index:10;" onclick="vpTapZone(event, 10)"></div>
+    <div style="position:absolute;top:128px;bottom:100px;left:0;width:33.33%;z-index:10;" onclick="vpTapZone(event, -10)"></div>
+    <div style="position:absolute;top:128px;bottom:100px;left:33.33%;width:33.33%;z-index:10;" onclick="vpCenterTap(event)"></div>
+    <div style="position:absolute;top:128px;bottom:100px;right:0;width:33.33%;z-index:10;" onclick="vpTapZone(event, 10)"></div>
 
     <div id="vpRewind" style="position:absolute;z-index:20;background:rgba(0,0,0,0.6);backdrop-filter:blur(8px);color:#fff;padding:8px 16px;border-radius:9999px;font-weight:700;font-size:12px;pointer-events:none;opacity:0;transition:opacity 0.2s;font-family:'Nunito',sans-serif;"></div>
 
@@ -12272,10 +12280,9 @@ async function webLogin() {
 
       loadFiles();
 
-      /* ВОЛНА 22.47: вход выполнен — сразу подхватываем прерванную загрузку
-         (раньше после входа через окно логина IndexedDB-очередь не
-         поднималась и загрузка «пропадала» после закрытия мини-аппа) */
-      resumePendingUploads();
+      /* ВОЛНА 22.47: после входа докачиваем всё, что прервалось —
+         в т.ч. загрузку, жившую до окна входа (обновление бота и т.п.) */
+      setTimeout(resumePendingUploads, 600);
     } else {
       showToast(data.message || ('Не удалось войти (HTTP ' + r.status + ')'));
     }
@@ -14180,7 +14187,17 @@ document.addEventListener('visibilitychange', () => {
   if (!document.hidden) setTimeout(ensureScrollUnlocked, 300);
 });
 
-window.addEventListener('pageshow', () => setTimeout(ensureScrollUnlocked, 200));
+/* ВОЛНА 22.47: НЕПРЕРЫВНОСТЬ ЗАГРУЗКИ. Вернулись в мини-апп (из «выхода»,
+   сворачивания, другого чата) — если движок загрузки не жив, очередь
+   из IndexedDB подхватывается автоматически, файлы догружаются дальше */
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) setTimeout(resumePendingUploads, 500);
+});
+
+window.addEventListener('pageshow', () => {
+  setTimeout(ensureScrollUnlocked, 200);
+  setTimeout(resumePendingUploads, 600); /* 22.47: и после возврата из кэша истории */
+});
 
 setInterval(ensureScrollUnlocked, 4000);
 
@@ -14403,7 +14420,11 @@ function showDropLoader(files) {
    обновляется позиция. Если мини-апп закрыли посреди загрузки — при
    следующем открытии очередь подхватывается и грузится дальше. */
 let UPQ_DB = null;
-const UPQ_MAX_PERSIST = 300 * 1024 * 1024; /* больше 300 МБ в IDB не кладём */
+/* ВОЛНА 22.47: лимит 300 МБ поднят до 2 ГБ — большие файлы тоже обязаны
+   доживать до переоткрытия мини-аппа («загрузка не должна прерываться»).
+   Если квота IndexedDB не позволит — upqPut молча пропустит (загрузка
+   идёт, просто без докачки) */
+const UPQ_MAX_PERSIST = 2 * 1024 * 1024 * 1024; /* больше 2 ГБ в IDB не кладём */
 
 function upqOpen() {
   return new Promise((resolve) => {
@@ -14482,6 +14503,11 @@ let RESUMING = false;
 async function resumePendingUploads() {
   if (isUploading || RESUMING) return;
 
+  /* ВОЛНА 22.47: без входа — тихий выход (раньше этот вызов при каждом
+     возврате в приложение шумел тостом «Войдите» и дёргал окно входа;
+     после входа докачку запускает сам webLogin) */
+  if (!IS_TELEGRAM && !WEB_TOKEN) return;
+
   let entries = [];
 
   try { entries = await upqAll(); } catch (e) {}
@@ -14490,11 +14516,21 @@ async function resumePendingUploads() {
 
   RESUMING = true;
 
-  showToast('⏳ Продолжаю прерванную загрузку: ' + entries.length + ' файл(ов)');
-
+  /* ВОЛНА 22.47: счётчик попыток на запись очереди. Каждая докачка
+     увеличивает tries; ЛЮБОЙ успешный кусок перезаписывает запись БЕЗ
+     tries (сброс) — файл, у которого есть прогресс, никогда не бросается.
+     Бросаем только совсем безнадёжные (5 докачек без единого байта) —
+     иначе очередь вечно висит и дёргает тостами на каждом открытии */
+  let dropped = 0;
   const files = [];
 
   for (const e of entries) {
+    e.tries = (+e.tries || 0) + 1;
+
+    if (e.tries > 5) { upqDel(e.k); dropped++; continue; }
+
+    upqPut(e);
+
     try {
       const f = new File([e.blob], e.name || 'file.bin', { type: e.mime || '' });
 
@@ -14505,7 +14541,15 @@ async function resumePendingUploads() {
     } catch (err) { upqDel(e.k); }
   }
 
-  if (files.length) proceedUpload(files, { resume: true });
+  if (dropped) {
+    showToast('🧹 ' + dropped + ' файл(ов) не удалось загрузить после 5 попыток — убран(ы) из очереди');
+  }
+
+  if (files.length) {
+    showToast('⏳ Продолжаю прерванную загрузку: ' + files.length + ' файл(ов)');
+
+    proceedUpload(files, { resume: true });
+  }
 
   RESUMING = false;
 }
@@ -15422,13 +15466,24 @@ let mpCoverUrl = null;
 let mpBeatRaf = 0;
 let mpTickRaf = 0;
 let mpScrubbing = false;
-/* ВОЛНА 22.47: фиксация перемотки — ползунок обязан остаться там, куда его
-   поставили. mpScrubPct — последняя предпросмотренная позиция пальца,
-   mpPin — «пин» визуальной позиции до момента, пока audio.currentTime
-   реально не доедет до цели (или не истечёт страховочный таймаут). */
-let mpScrubPct = -1;
-let mpPin = null;
+/* ВОЛНА 22.47: «ползунок возвращается назад» — после отпускания пальца
+   audio.currentTime меняется НЕ мгновенно: пока элемент ищет позицию
+   (seeking), чтение currentTime в mpTickLoop отдавало СТАРУЮ позицию,
+   и заливка откатывалась. mpSeekPending держит заливку на позиции,
+   куда поставил пользователь, до события seeked (плюс страховочный
+   таймер на случай проглоченного события в WebView) */
+let mpSeekPending = null;
+let mpSeekPendingTimer = null;
+let mpScrubLastPct = 0;
 const mpEl = {};
+
+function mpSetSeekPending(sec) {
+  mpSeekPending = sec;
+
+  if (mpSeekPendingTimer) clearTimeout(mpSeekPendingTimer);
+
+  mpSeekPendingTimer = setTimeout(() => { mpSeekPending = null; }, 2500);
+}
 
 /* Web Audio: анализатор — реактивный фон под бит */
 let mpAudioCtx = null;
@@ -15471,6 +15526,7 @@ function mpCache() {
     const rect = mpEl.mpProgressBg.getBoundingClientRect();
     const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
 
+    mpScrubLastPct = pct;
     mpEl.mpProgressFill.style.width = (pct * 100) + '%';
     mpEl.mpCurrent.textContent = mpFmtTime(pct * mpAudioEl.duration);
 
@@ -15485,12 +15541,14 @@ function mpCache() {
 
       try { mpEl.mpProgressBg.setPointerCapture(e.pointerId); } catch (err) {}
 
-      /* ВОЛНА 22.47: на pointerdown больше НЕ дёргаем currentTime — только
-         предпросмотр. Реальный seek — ОДИН раз при отпускании: иначе WebView
-         при движении пальца глотал часть присвоений и ползунок «откатывался» */
       const pct = mpSeekFromEvent(e);
 
-      if (pct !== undefined) mpScrubPct = pct;
+      if (pct !== undefined) {
+        const t = pct * mpAudioEl.duration;
+
+        mpAudioEl.currentTime = t;
+        mpSetSeekPending(t);
+      }
 
       e.preventDefault();
     });
@@ -15498,9 +15556,7 @@ function mpCache() {
     mpEl.mpProgressBg.addEventListener('pointermove', (e) => {
       if (!mpScrubbing) return;
 
-      const pct = mpSeekFromEvent(e);
-
-      if (pct !== undefined) mpScrubPct = pct;
+      mpSeekFromEvent(e);
     });
 
     mpEl.mpProgressBg.addEventListener('pointerup', (e) => {
@@ -15510,26 +15566,30 @@ function mpCache() {
 
       const pct = mpSeekFromEvent(e);
 
-      mpCommitScrub(pct !== undefined ? pct : mpScrubPct);
+      if (pct !== undefined && mpAudioEl) {
+        const t = pct * mpAudioEl.duration;
+
+        /* ВОЛНА 22.47: фиксация там, куда поставил палец — заливка НЕ
+           откатывается, пока аудио дoseekивает (см. mpSeekPending) */
+        mpSetSeekPending(t);
+        mpAudioEl.currentTime = t;
+      }
     });
 
-    /* ВОЛНА 22.47: pointercancel/lostpointercapture больше НЕ бросают
-       перемотку — фиксируем последнюю предпросмотренную позицию (раньше
-       WebView срывал жест в скролл, seek терялся и ползунок откатывался) */
     mpEl.mpProgressBg.addEventListener('pointercancel', () => {
       if (!mpScrubbing) return;
 
       mpScrubbing = false;
 
-      mpCommitScrub(mpScrubPct);
-    });
+      /* палец сорвался системой — фиксируем последнюю предпросмотренную
+         позицию, а не старую (куда поставил — там и остаётся) */
+      if (mpAudioEl && mpAudioEl.duration && isFinite(mpAudioEl.duration) &&
+          mpScrubLastPct > 0) {
+        const t = mpScrubLastPct * mpAudioEl.duration;
 
-    mpEl.mpProgressBg.addEventListener('lostpointercapture', () => {
-      if (!mpScrubbing) return;
-
-      mpScrubbing = false;
-
-      mpCommitScrub(mpScrubPct);
+        mpSetSeekPending(t);
+        mpAudioEl.currentTime = t;
+      }
     });
   } else {
     mpEl.mpProgressBg.addEventListener('click', (e) => {
@@ -15538,13 +15598,22 @@ function mpCache() {
       const rect = mpEl.mpProgressBg.getBoundingClientRect();
       const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
 
-      mpCommitScrub(pct);
+      mpAudioEl.currentTime = pct * mpAudioEl.duration;
     });
   }
 
   mpAudioEl.addEventListener('ended', () => mpNextTrack());
   mpAudioEl.addEventListener('play', mpSyncPlayIcon);
   mpAudioEl.addEventListener('pause', mpSyncPlayIcon);
+  /* ВОЛНА 22.47: seek завершился — заливка снова живёт от currentTime */
+  mpAudioEl.addEventListener('seeked', () => {
+    mpSeekPending = null;
+
+    if (mpSeekPendingTimer) {
+      clearTimeout(mpSeekPendingTimer);
+      mpSeekPendingTimer = null;
+    }
+  });
   mpAudioEl.addEventListener('loadedmetadata', () => {
     mpEl.mpDuration.textContent = mpFmtTime(mpAudioEl.duration || 0);
   });
@@ -15900,14 +15969,18 @@ async function mpLoad(i, autoplay) {
   mpEl.mpCurrent.textContent = '0:00';
   mpEl.mpDuration.textContent = '0:00';
 
-  /* ВОЛНА 22.47: новый трек — сбрасываем пин перемотки прошлого трека */
-  mpPin = null;
-  mpScrubPct = -1;
-
   mpSyncDots();
 
   mpAudioEl.pause();
   mpAudioEl.removeAttribute('src');
+
+  /* ВОЛНА 22.47: новый трек — сброс «замороженной» позиции ползунка */
+  mpSeekPending = null;
+
+  if (mpSeekPendingTimer) {
+    clearTimeout(mpSeekPendingTimer);
+    mpSeekPendingTimer = null;
+  }
 
   if (mpObjectUrl) {
     try { URL.revokeObjectURL(mpObjectUrl); } catch (e) {}
@@ -16012,60 +16085,18 @@ function mpBeatLoop() {
   mpBeatRaf = requestAnimationFrame(mpBeatLoop);
 }
 
-/* ВОЛНА 22.47: фиксация перемотки — позиция «пиннится» до момента, пока
-   currentTime реально не доедет до цели (или 3 с страховки). Если WebView
-   проигнорировал присвоение (метаданные ещё не готовы) — повторяем до 3 раз.
-   Так ползунок стоит там, куда его поставили, а не откатывается назад. */
-function mpCommitScrub(pct) {
-  mpScrubPct = -1;
-
-  if (pct == null || pct < 0) return;
-
-  pct = Math.max(0, Math.min(1, pct));
-
-  mpPin = { pct: pct, until: Date.now() + 3000, retries: 0, lastTry: Date.now() };
-
-  if (mpAudioEl && mpAudioEl.duration && isFinite(mpAudioEl.duration)) {
-    mpEl.mpProgressFill.style.width = (pct * 100) + '%';
-    mpEl.mpCurrent.textContent = mpFmtTime(pct * mpAudioEl.duration);
-
-    try { mpAudioEl.currentTime = pct * mpAudioEl.duration; } catch (err) {}
-  }
-}
-
 function mpTickLoop() {
   if (!mpOpen) { mpTickRaf = 0; return; }
 
-  if (mpAudioEl && mpAudioEl.duration && isFinite(mpAudioEl.duration)) {
-    const dur = mpAudioEl.duration;
+  /* mpSeekPending != null — ждём завершения seek: заливка остаётся на
+     позиции, выбранной пользователем (не откатывается назад) */
+  if (mpAudioEl && mpAudioEl.duration && isFinite(mpAudioEl.duration) &&
+      !mpScrubbing && mpSeekPending == null) {
+    const pct = (mpAudioEl.currentTime / mpAudioEl.duration) * 100;
 
-    mpEl.mpDuration.textContent = mpFmtTime(dur);
-
-    if (mpPin) {
-      const target = mpPin.pct * dur;
-      const near = Math.abs(mpAudioEl.currentTime - target) <= Math.max(0.35, dur * 0.004);
-
-      if (near || Date.now() > mpPin.until) {
-        /* доехали (или страховка истекла) — ползунок снова следует за песней */
-        mpPin = null;
-      } else {
-        /* держим ползунок там, куда поставил пользователь */
-        mpEl.mpProgressFill.style.width = (mpPin.pct * 100) + '%';
-        mpEl.mpCurrent.textContent = mpFmtTime(target);
-
-        if (mpPin.retries < 3 && Date.now() - mpPin.lastTry >= 800) {
-          mpPin.lastTry = Date.now();
-          mpPin.retries++;
-
-          try { mpAudioEl.currentTime = target; } catch (err) {}
-        }
-      }
-    }
-
-    if (!mpPin && !mpScrubbing) {
-      mpEl.mpProgressFill.style.width = ((mpAudioEl.currentTime / dur) * 100) + '%';
-      mpEl.mpCurrent.textContent = mpFmtTime(mpAudioEl.currentTime);
-    }
+    mpEl.mpProgressFill.style.width = pct + '%';
+    mpEl.mpCurrent.textContent = mpFmtTime(mpAudioEl.currentTime);
+    mpEl.mpDuration.textContent = mpFmtTime(mpAudioEl.duration);
   }
 
   mpTickRaf = requestAnimationFrame(mpTickLoop);
@@ -16212,6 +16243,9 @@ let vpForcedLandscape = false;
 let vpShadowTimer = null;
 let vpLastManualExit = 0;
 let vpIsSeeking = false;
+/* ВОЛНА 22.47: страховочный таймер — если событие seeked в каком-то WebView
+   проглотилось, ползунок не «замерзает» навсегда */
+let vpSeekSafetyTimer = null;
 let vpPlayerEl = null;
 let vpWrapperEl = null;
 let vpSeekEl = null;
@@ -16225,20 +16259,6 @@ function vpCache() {
   vpPlayerEl = document.getElementById('vpPlayer');
   vpWrapperEl = document.getElementById('vpWrapper');
   vpSeekEl = document.getElementById('vpSeek');
-
-  /* ВОЛНА 22.47: страховка фиксации перемотки — коммитим и на pointerup/
-     pointercancel (change в части WebView не приходит до blur), и по 'seeked' */
-  vpSeekEl.addEventListener('pointerup', () => { if (vpIsSeeking) vpCommitSeek(); });
-  vpSeekEl.addEventListener('pointercancel', () => { if (vpIsSeeking) vpCommitSeek(); });
-
-  vpPlayerEl.onseeked = () => {
-    if (vpIsSeeking && vpPendingSeek != null &&
-        Math.abs(vpPlayerEl.currentTime - vpPendingSeek) <=
-        Math.max(0.6, (vpPlayerEl.duration || 1) * 0.004)) {
-      vpIsSeeking = false;
-      vpPendingSeek = null;
-    }
-  };
 
   vpWrapperEl.addEventListener('mousedown', vpStartPress);
   vpWrapperEl.addEventListener('mouseup', vpEndPress);
@@ -16349,33 +16369,29 @@ function vpCache() {
 
   vpPlayerEl.onplay = vpUpdatePlayIcon;
   vpPlayerEl.onpause = vpUpdatePlayIcon;
+
+  /* ВОЛНА 22.47: seek завершился — ползунок снова живёт от currentTime.
+     Раньше vpIsSeeking сбрасывался СРАЗУ после отпускания ползунка, а
+     timeupdate успевал отрисовать СТАРУЮ позицию, пока видео ещё искало
+     новую — ползунок «откатывался назад» и потом дёргался вперёд */
+  vpPlayerEl.onseeked = () => {
+    vpIsSeeking = false;
+
+    if (vpSeekSafetyTimer) {
+      clearTimeout(vpSeekSafetyTimer);
+      vpSeekSafetyTimer = null;
+    }
+
+    vpUpdateSeekFill();
+  };
 }
 
 function vpOnTimeUpdate() {
-  if (!vpPlayerEl.duration || !isFinite(vpPlayerEl.duration)) return;
-
-  /* ВОЛНА 22.47: пока перемотка не доехала до цели — ползунок стоит там,
-     куда его поставили. Раньше «change» терялся (часть WebView шлёт его
-     только при blur) или seek игнорировался сервером без Range — и ползунок
-     откатывался назад. Теперь пин держит позицию до фактического доезда. */
-  if (vpIsSeeking && vpPendingSeek != null) {
-    const near = Math.abs(vpPlayerEl.currentTime - vpPendingSeek) <=
-      Math.max(0.6, vpPlayerEl.duration * 0.004);
-
-    if (near || Date.now() > vpSeekPinUntil) {
-      /* доехали (или страховка истекла) — ползунок снова следует за видео */
-      vpIsSeeking = false;
-      vpPendingSeek = null;
-    } else {
-      vpSeekEl.value = (vpPendingSeek / vpPlayerEl.duration) * 100;
-      vpUpdateSeekFill();
-      document.getElementById('vpCur').textContent = vpFormatTime(vpPendingSeek);
-      return;
-    }
-  } else if (vpIsSeeking) {
-    /* драг без зафиксированной цели — ничего не перезаписываем */
-    return;
-  }
+  /* ВОЛНА 22.47: vpPlayerEl.seeking — видео ещё ищет новую позицию после
+     ±10 сек/ползунка: не отрисовываем устаревшую позицию (ползунок больше
+     не откатывается назад) */
+  if (vpIsSeeking || vpPlayerEl.seeking ||
+      !vpPlayerEl.duration || !isFinite(vpPlayerEl.duration)) return;
 
   vpSeekEl.value = (vpPlayerEl.currentTime / vpPlayerEl.duration) * 100;
   document.getElementById('vpCur').textContent = vpFormatTime(vpPlayerEl.currentTime);
@@ -16464,6 +16480,15 @@ function vpInitBackgroundAudio() {
 function vpPlayVideo(v) {
   vpInitBackgroundAudio();
 
+  /* ВОЛНА 22.47: новое видео — ползунок обязан ожить, даже если прошлый
+     seek не успел завершиться до закрытия */
+  vpIsSeeking = false;
+
+  if (vpSeekSafetyTimer) {
+    clearTimeout(vpSeekSafetyTimer);
+    vpSeekSafetyTimer = null;
+  }
+
   document.getElementById('vpTitle').textContent = v.title || v.filename;
   vpPlayerEl.src = v.url;
   vpSavedRate = 1.0;
@@ -16477,10 +16502,6 @@ function vpPlayVideo(v) {
   if (vpSeekEl) {
     vpSeekEl.value = 0;
     vpUpdateSeekFill();
-    /* ВОЛНА 22.47: новое видео — сбрасываем пин перемотки прошлого */
-    vpIsSeeking = false;
-    vpPendingSeek = null;
-    clearTimeout(vpSeekRetryTimer);
   }
 
   if ('mediaSession' in navigator) {
@@ -16712,47 +16733,23 @@ function vpOnSeekInput() {
   vpShowControls();
 }
 
-/* ВОЛНА 22.47: фиксация перемотки видео — ползунок обязан остаться там, куда
-   его поставили. Цель «пиннится» (vpPendingSeek, страховка 3 с) до момента,
-   пока video.currentTime реально не доедет; если WebView проигнорировал
-   присвоение — повторяем (800 мс). Часть WebView шлёт 'change' у range
-   только при blur — поэтому коммитим ещё и на pointerup/pointercancel. */
-let vpPendingSeek = null;
-let vpSeekPinUntil = 0;
-let vpSeekRetryTimer = 0;
-
-function vpCommitSeek() {
-  if (!vpPlayerEl || !vpSeekEl) return;
-
-  const v = Math.max(0, Math.min(100, parseFloat(vpSeekEl.value) || 0));
-
-  if (!vpPlayerEl.duration || !isFinite(vpPlayerEl.duration)) {
-    vpIsSeeking = false;
-    vpPendingSeek = null;
-    vpUpdateSeekFill();
-    return;
+function vpOnSeekChange() {
+  if (vpPlayerEl.duration) {
+    vpPlayerEl.currentTime = (vpSeekEl.value / 100) * vpPlayerEl.duration;
   }
-
-  vpPendingSeek = (v / 100) * vpPlayerEl.duration;
-  vpSeekPinUntil = Date.now() + 3000;
-  vpIsSeeking = true;
 
   vpUpdateSeekFill();
 
-  try { vpPlayerEl.currentTime = vpPendingSeek; } catch (err) {}
+  /* ВОЛНА 22.47: vpIsSeeking НЕ сбрасываем сразу — до события seeked.
+     Пока видео ищет позицию, timeupdate больше не перезапишет ползунок
+     старым временем («куда поставил — там и стоит»). Страховка: если
+     seeked не пришёл, через 2.5 с разблокируем вручную */
+  if (vpSeekSafetyTimer) clearTimeout(vpSeekSafetyTimer);
 
-  clearTimeout(vpSeekRetryTimer);
-  vpSeekRetryTimer = setTimeout(() => {
-    if (vpPendingSeek == null || !vpPlayerEl.duration || !isFinite(vpPlayerEl.duration)) return;
-
-    if (Math.abs(vpPlayerEl.currentTime - vpPendingSeek) > 0.6) {
-      try { vpPlayerEl.currentTime = vpPendingSeek; } catch (err) {}
-    }
-  }, 800);
-}
-
-function vpOnSeekChange() {
-  vpCommitSeek();
+  vpSeekSafetyTimer = setTimeout(() => {
+    vpSeekSafetyTimer = null;
+    vpIsSeeking = false;
+  }, 2500);
 }
 
 function vpUpdatePlayIcon() {
@@ -16782,20 +16779,7 @@ function vpRewindSec(seconds, e) {
     if (e.cancelable) e.preventDefault();
   }
 
-  /* ВОЛНА 22.47: ±10 с тоже пинним — на больших видео без Range раньше
-     откатывало назад; теперь позиция держится до фактического доезда */
-  if (vpPlayerEl.duration && isFinite(vpPlayerEl.duration)) {
-    const target = Math.max(0, Math.min(vpPlayerEl.duration, vpPlayerEl.currentTime + seconds));
-
-    vpPendingSeek = target;
-    vpSeekPinUntil = Date.now() + 2000;
-    vpIsSeeking = true;
-
-    try { vpPlayerEl.currentTime = target; } catch (err) {}
-  } else {
-    vpPlayerEl.currentTime += seconds;
-  }
-
+  vpPlayerEl.currentTime += seconds;
   vpRewindFeedback(seconds > 0 ? '+10 сек' : '-10 сек');
   vpShowControls();
 }
@@ -17087,14 +17071,10 @@ if (!IS_TELEGRAM) {
         loadFiles(true);
       }, 4000);
     }
-  }).catch(function () {});
 
-  /* 22.39/22.47: докачка прерванных загрузок после открытия мини-аппа —
-     ВСЕГДА, независимо от результата loadFiles (раньше если первый запрос
-     падал — бот обновлялся/сеть — очередь IndexedDB молча не поднималась,
-     и загрузка считалась прерванной навсегда; после входа через окно
-     логина resume отдельно вызовет webLogin) */
-  setTimeout(resumePendingUploads, 800);
+    /* 22.39: докачка прерванных загрузок после открытия мини-аппа */
+    setTimeout(resumePendingUploads, 800);
+  });
 }
 
 safeIcons();
@@ -17560,47 +17540,6 @@ async def _mt_doc_for_rec(client, rec):
     return None, None, 0
 
 
-def _miniapp_parse_range(request, size):
-    """ВОЛНА 22.47: парсинг заголовка Range (bytes=N-M / N- / -N).
-    Возвращает (start, end) ВКЛЮЧИТЕЛЬНО, строку 'invalid' (start >= size —
-    нужен ответ 416) или None (Range нет/неподдерживаемый — отдадим 200).
-    Мультирейнджи (запятые) не поддерживаем — плееры их не шлют."""
-    if not size or size <= 0:
-        return None
-    raw = str(request.headers.get("Range") or "").strip()
-    if not raw or "," in raw or not raw.lower().startswith("bytes="):
-        return None
-    spec = raw[6:].strip()
-    if not spec or "-" not in spec:
-        return None
-    s, _, e = spec.partition("-")
-    s = s.strip()
-    e = e.strip()
-    try:
-        if not s and e:
-            # bytes=-N — последние N байт
-            n = int(e)
-            if n <= 0:
-                return None
-            start = max(0, size - n)
-            end = size - 1
-        elif s and not e:
-            start = int(s)
-            end = size - 1
-        else:
-            start = int(s)
-            end = int(e)
-    except ValueError:
-        return None
-    if start < 0:
-        start = 0
-    if end >= size:
-        end = size - 1
-    if start >= size or end < start:
-        return "invalid"
-    return (start, end)
-
-
 async def _miniapp_serve_file(request, user, rec, where, pw_override=None,
                               inline=False):
     """ВОЛНА 22.30: отдаёт файл ПОТОКОМ (Cloud: Bot API ≤20 МБ / MTProto до
@@ -17639,31 +17578,12 @@ async def _miniapp_serve_file(request, user, rec, where, pw_override=None,
                     return _miniapp_err(403, "wrong_password",
                                         f"Не удалось расшифровать: {e}.")
                 name = str(meta.get("n") or rec.get("label") or "file")
-                # ВОЛНА 22.47: Range-перемотка и для расшифрованных Сейф-файлов
-                rng = _miniapp_parse_range(request, len(payload))
-                if rng == "invalid":
-                    return web.Response(
-                        status=416, headers={"Content-Range":
-                                             f"bytes */{len(payload)}"})
-                if rng is not None:
-                    rs, re_ = rng
-                    return web.Response(
-                        status=206,
-                        body=payload[rs:re_ + 1],
-                        content_type=_serve_mime_for(rec, name),
-                        headers={
-                            "Content-Disposition": _miniapp_content_disposition(name, inline),
-                            "Cache-Control": "no-store",
-                            "Accept-Ranges": "bytes",
-                            "Content-Range": f"bytes {rs}-{re_}/{len(payload)}",
-                        })
                 return web.Response(
                     body=payload,
                     content_type=_serve_mime_for(rec, name),
                     headers={
                         "Content-Disposition": _miniapp_content_disposition(name, inline),
                         "Cache-Control": "no-store",
-                        "Accept-Ranges": "bytes",
                     })
             # DVF2 (>20 МБ): поток MTProto → _Dvf2Decryptor → клиент
             return await _miniapp_stream_dvf2(request, user, rec, password,
@@ -17680,34 +17600,12 @@ async def _miniapp_serve_file(request, user, rec, where, pw_override=None,
         try:
             tg_file = await app.bot.get_file(fid)
             buf = await tg_file.download_as_bytearray()
-            data = bytes(buf)
-            total = len(data)
-            # ВОЛНА 22.47: HTTP Range (206 Partial Content) — без него WebView
-            # при перемотке видео/аудио получал 200 и НАЧИНАЛ СНАЧАЛА:
-            # ползунок «возвращался назад» в обоих плеерах.
-            rng = _miniapp_parse_range(request, total)
-            if rng == "invalid":
-                return web.Response(status=416, headers={
-                    "Content-Range": f"bytes */{total}"})
-            if rng is not None:
-                rs, re_ = rng
-                return web.Response(
-                    status=206,
-                    body=data[rs:re_ + 1],
-                    content_type=_serve_mime_for(cloud_like, name),
-                    headers={
-                        "Content-Disposition": _miniapp_content_disposition(name, inline),
-                        "Cache-Control": "no-store",
-                        "Accept-Ranges": "bytes",
-                        "Content-Range": f"bytes {rs}-{re_}/{total}",
-                    })
             return web.Response(
-                body=data,
+                body=bytes(buf),
                 content_type=_serve_mime_for(cloud_like, name),
                 headers={
                     "Content-Disposition": _miniapp_content_disposition(name, inline),
                     "Cache-Control": "no-store",
-                    "Accept-Ranges": "bytes",
                 })
         except Exception as e:
             logger.warning(f"miniapp download: Bot API не отдал файл ({e}); пробую MTProto")
@@ -17734,39 +17632,10 @@ async def _miniapp_serve_file(request, user, rec, where, pw_override=None,
             await _mt_download_stream(
                 client, doc, doc_size,
                 lambda chunk: sink_file.write(chunk))
-        # ВОЛНА 22.47: Range и для больших (MTProto) файлов — файл уже в tmp,
-        # отдаём запрошенный кусок со статусом 206 + Content-Range.
-        rng = _miniapp_parse_range(request, doc_size)
-        if rng == "invalid":
-            return web.Response(status=416, headers={
-                "Content-Range": f"bytes */{doc_size}"})
-        if rng is not None:
-            rs, re_ = rng
-            response = web.StreamResponse(status=206, headers={
-                "Content-Type": _serve_mime_for(cloud_like, name),
-                "Content-Disposition": _miniapp_content_disposition(name, inline),
-                "Cache-Control": "no-store",
-                "Accept-Ranges": "bytes",
-                "Content-Range": f"bytes {rs}-{re_}/{doc_size}",
-            })
-            response.content_length = re_ - rs + 1
-            await response.prepare(request)
-            with open(tmppath, "rb") as f:
-                f.seek(rs)
-                remaining = re_ - rs + 1
-                while remaining > 0:
-                    chunk = f.read(min(1024 * 1024, remaining))
-                    if not chunk:
-                        break
-                    remaining -= len(chunk)
-                    await response.write(chunk)
-            await response.write_eof()
-            return response
         response = web.StreamResponse(status=200, headers={
             "Content-Type": _serve_mime_for(cloud_like, name),
             "Content-Disposition": _miniapp_content_disposition(name, inline),
             "Cache-Control": "no-store",
-            "Accept-Ranges": "bytes",
         })
         if doc_size:
             response.content_length = doc_size
