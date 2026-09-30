@@ -2838,7 +2838,7 @@ body.vp-lock {
 
     <h3 style="font-weight:900;font-size:20px;margin-bottom:4px">Вход в DEVO+ Облако</h3>
     <p style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:14px">
-      Открыто вне Telegram, войдите по ID и паролю, заданному в боте
+      Войдите по ID и паролю, заданному в боте (Облако → Веб-пароль)
     </p>
 
     <div style="margin-bottom:12px">
@@ -3813,7 +3813,14 @@ async function apiJson(url, options) {
     err.code = String(data.error || '');
     err.bot = String(data.bot || '');
 
-    if (r.status === 401 && !IS_TELEGRAM) openLoginModal();
+    if (r.status === 401) {
+      /* 22.46: 401 при ЛЮБОМ режиме — сразу начальное окно входа (ID +
+         пароль), а не карточка «не видит бота». После обновления бота
+         подпись initData может не пройти проверку — пользователь должен
+         иметь возможность войти по ID и веб-паролю (путь Bearer в
+         _api_get_user_any работает и внутри Telegram). */
+      openLoginModal();
+    }
 
     throw err;
   }
@@ -4134,8 +4141,12 @@ async function loadFiles(silent) {
       const t = cloudErrText(e);
       showToast(t);
 
+      /* 22.46: вместо карточки «Откройте облако через Telegram…» — сразу
+         начальное окно входа (ID + пароль): после обновления бота это
+         единственный способ войти, не теряя данные. Причина всё равно
+         видна тостом. */
       if (e && (e.code === 'unauthorized' || e.code === 'not_registered')) {
-        showAuthCard(t);
+        openLoginModal();
       }
     }
 
@@ -4169,8 +4180,9 @@ async function syncNow() {
   const t = cloudErrText(LAST_ERR || new Error(''));
   showToast(t);
 
+  /* 22.46: то же, что в loadFiles — окно входа вместо карточки авторизации */
   if (LAST_ERR && (LAST_ERR.code === 'unauthorized' || LAST_ERR.code === 'not_registered')) {
-    showAuthCard(t);
+    openLoginModal();
   }
 }
 
