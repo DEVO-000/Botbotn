@@ -3633,7 +3633,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.45"
+BOT_BUILD = "22.46"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -4914,9 +4914,12 @@ def get_main_menu_keyboard(user):
         "💬 Чат поддержки",
         # ВОЛНА 22.12: общая база решений класса (для списывания честно).
         "📚 Решения",
-        # ВОЛНА 22.29: «🤒 Я болел(а)» — ДЗ и объявления класса за период
-        # болезни; «📋 Ещё» — скрытые кнопки + ДР одноклассников.
-        "🤒 Я болел(а)", "📋 Ещё",
+        # ВОЛНА 22.46: «🤒 Я болел(а)» из ГЛАВНОГО меню УБРАНА — по прямому
+        # требованию пользователя: «кнопка я болел(а) должна быть только в
+        # кнопке ещё, но не на главном меню бота». Она живёт ТОЛЬКО внутри
+        # «📋 Ещё» (inline more_sick), пока пользователь сам не решит иначе.
+        # «📋 Ещё» — скрытые кнопки + ДР одноклассников + дежурные + болезнь.
+        "📋 Ещё",
         "📚 Инструкция", "🔑 Код класса",
     ]
     # «📨 Мои анонимные сообщения» — отдельный список, чтобы её можно было
@@ -11183,7 +11186,7 @@ body.vp-lock {
 
     <h3 style="font-weight:900;font-size:20px;margin-bottom:4px">Вход в DEVO+ Облако</h3>
     <p style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:14px">
-      Открыто вне Telegram, войдите по ID и паролю, заданному в боте
+      Войдите по ID и паролю, заданному в боте (Облако → Веб-пароль)
     </p>
 
     <div style="margin-bottom:12px">
@@ -12158,7 +12161,14 @@ async function apiJson(url, options) {
     err.code = String(data.error || '');
     err.bot = String(data.bot || '');
 
-    if (r.status === 401 && !IS_TELEGRAM) openLoginModal();
+    if (r.status === 401) {
+      /* 22.46: 401 при ЛЮБОМ режиме — сразу начальное окно входа (ID +
+         пароль), а не карточка «не видит бота». После обновления бота
+         подпись initData может не пройти проверку — пользователь должен
+         иметь возможность войти по ID и веб-паролю (путь Bearer в
+         _api_get_user_any работает и внутри Telegram). */
+      openLoginModal();
+    }
 
     throw err;
   }
@@ -12479,8 +12489,12 @@ async function loadFiles(silent) {
       const t = cloudErrText(e);
       showToast(t);
 
+      /* 22.46: вместо карточки «Откройте облако через Telegram…» — сразу
+         начальное окно входа (ID + пароль): после обновления бота это
+         единственный способ войти, не теряя данные. Причина всё равно
+         видна тостом. */
       if (e && (e.code === 'unauthorized' || e.code === 'not_registered')) {
-        showAuthCard(t);
+        openLoginModal();
       }
     }
 
@@ -12514,8 +12528,9 @@ async function syncNow() {
   const t = cloudErrText(LAST_ERR || new Error(''));
   showToast(t);
 
+  /* 22.46: то же, что в loadFiles — окно входа вместо карточки авторизации */
   if (LAST_ERR && (LAST_ERR.code === 'unauthorized' || LAST_ERR.code === 'not_registered')) {
-    showAuthCard(t);
+    openLoginModal();
   }
 }
 
@@ -37878,6 +37893,57 @@ async def join_class_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     await update.message.reply_text(f"✅ Вы присоединились к классу '{class_obj.class_name}'!")
     return await class_management(update, context)
+
+@timeout(CONVERSATION_TIMEOUT)
+async def leave_class(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.46: «🚪 Выйти из класса» из ГЛАВНОГО меню (message-путь).
+
+    Раньше ветка handle_main_menu вызывала leave_class, которой НЕ
+    СУЩЕСТВОВАЛО (был только leave_class_handler для inline-кнопки внутри
+    «🎓 Управление классами») — нажатие кнопки в главном меню падало с
+    NameError, и пользователь видел «кнопка не работает». Логика зеркалит
+    leave_class_handler, но работает с update.message: выходим сразу (как
+    в inline-версии, без подтверждения), затем показываем ОБНОВЛЁННОЕ
+    главное меню — кнопки класса, «Выйти из класса» и админ-кнопки должны
+    исчезнуть сразу, без /start."""
+    user_id = str(update.effective_user.id)
+    user = get_user(user_id)
+    if not user:
+        user = User(user_id)
+
+    class_obj = get_class_by_user(user_id)
+
+    if not class_obj:
+        await update.message.reply_text("Вы не состоите в классе.")
+        return MAIN_MENU
+
+    if str(user_id) in class_obj.students:
+        class_obj.students.remove(str(user_id))
+    if str(user_id) in class_obj.admins:
+        class_obj.admins.remove(str(user_id))
+
+    classes = load_classes()
+    classes[class_obj.class_code] = class_obj
+    save_classes(classes)
+
+    user.class_code = None
+    save_user(user)
+
+    await update.message.reply_text(
+        f"✅ Вы вышли из класса '{class_obj.class_name}'.")
+
+    # ВОЛНА 22.46: после выхода состав главного меню меняется (уходят
+    # классные и админские кнопки) — сразу присылаем свежую клавиатуру,
+    # как это делает создание класса (см. create_class_handler).
+    try:
+        await update.message.reply_text(
+            "📋 Меню обновлено:",
+            reply_markup=get_main_menu_keyboard(user))
+    except Exception:
+        pass
+
+    return MAIN_MENU
+
 
 @timeout(CONVERSATION_TIMEOUT)
 async def leave_class_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
