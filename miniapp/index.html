@@ -5849,6 +5849,37 @@ window.addEventListener('pageshow', () => {
   setTimeout(resumePendingUploads, 600); /* 22.47: и после возврата из кэша истории */
 });
 
+/* ВОЛНА 22.48: ЗАКРЫЛИ МИНИ АПП ПОСРЕДИ ЗАГРУЗКИ. Последним дыханием
+   (fetch keepalive — доходит даже при выгрузке страницы) сообщаем серверу,
+   что пользователь ушёл, пока файлы не догрузились. Бот пришлёт в чат
+   «⏸ Загрузка на паузе» с кнопкой «▶️ Продолжить загрузку» — НО только
+   если куски и правда перестали идти (если мини апп просто свернули и
+   загрузка продолжает идти в фоне, сервер метку снимет — ложных
+   сообщений нет). Файлы не теряются в любом случае: при переоткрытии
+   очередь подхватывается из IndexedDB (22.39/22.47) и догружается сама. */
+function notifyUploadClosed() {
+  if (!isUploading || !uploadQueue || !uploadQueue.length) return;
+
+  try {
+    const names = uploadQueue.slice(0, 3).map(function (f) {
+      return String(f.uploadName || f.name || 'файл').slice(0, 40);
+    });
+
+    fetch('/api/upload/closed', {
+      method: 'POST',
+      keepalive: true,
+      headers: vaultHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ n: uploadQueue.length, names: names })
+    }).catch(function () {});
+  } catch (e) {}
+}
+
+document.addEventListener('visibilitychange', function () {
+  if (document.hidden) notifyUploadClosed();
+});
+
+window.addEventListener('pagehide', notifyUploadClosed);
+
 setInterval(ensureScrollUnlocked, 4000);
 
 function refreshUploadModal() {
