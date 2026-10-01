@@ -3641,7 +3641,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.51"
+BOT_BUILD = "22.52"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -8372,6 +8372,8 @@ def _miniapp_cleanup_uploads():
         s = _MINIAPP_UPLOADS.get(k)
         if not s or (now - s.get("ts", now)) > _MINIAPP_UPLOADS_TTL or not os.path.exists(s.get("path", "")):
             if s:
+                # ВОЛНА 22.52: метаданные с диска тоже (сессия снята)
+                _upload_session_unpersist(s)
                 try:
                     os.remove(s["path"])
                 except Exception:
@@ -8387,17 +8389,27 @@ def _miniapp_sweep_orphan_parts():
     """ВОЛНА 22.49: чистка СИРОТСКИХ .part-файлов. Сессии живут в RAM —
     после рестарта сервера все недокачанные .part (до ~2 ГБ каждый) навсегда
     теряли «хозяина» и лежали на диске, пока не закончится место. Удаляем
-    .part старше часа, на которые не ссылается живая сессия."""
+    .part старше часа, на которые не ссылается живая сессия.
+    ВОЛНА 22.52: .part, рядом с которым есть .json-метаданные сессии,
+    НЕ сирота (восстановится при рестарте/уже восстановлен); заодно чистим
+    .json без парного .part и .json старше суток."""
     try:
         d = _miniapp_tmpdir()
         live = {os.path.basename(str(s.get("path") or ""))
                 for s in _MINIAPP_UPLOADS.values()}
         now = time.time()
         for fn in os.listdir(d):
-            if not fn.endswith(".part") or fn in live:
-                continue
             p = os.path.join(d, fn)
             try:
+                if fn.endswith(".json"):
+                    pp = p[:-5] + ".part"
+                    if not os.path.exists(pp) or now - os.path.getmtime(p) > 86400:
+                        os.remove(p)
+                    continue
+                if not fn.endswith(".part") or fn in live:
+                    continue
+                if os.path.exists(p[:-5] + ".json"):
+                    continue    # сессия с метаданными — восстановится/жива
                 if now - os.path.getmtime(p) > 3600:
                     os.remove(p)
             except OSError:
@@ -10295,6 +10307,49 @@ html.low-end #musicPlayer .art-container.mp-switch {
   transform: translateY(-50%) scale(1);
 }
 
+/* ═══ ВОЛНА 22.52: СПИННЕР ЗАГРУЗКИ НА КНОПКЕ PLAY ═══
+   «Плееры должны сразу открываться и уже там загружаться — загрузка на
+   кнопке»: модалка открывается мгновенно, медиа докачивается в плеере,
+   а прогресс виден на большой кнопке (кольцо-спиннер). */
+.pld-spin {
+  display: inline-block;
+  width: 22px;
+  height: 22px;
+  border: 3px solid rgba(0, 0, 0, 0.18);
+  border-top-color: #000;
+  border-radius: 50%;
+  animation: pldSpin 0.8s linear infinite;
+  will-change: transform;
+  flex-shrink: 0;
+}
+
+/* светлый вариант — на тёмном фоне (фотопросмотрщик) */
+.pld-spin.pld-spin-light {
+  border-color: rgba(255, 255, 255, 0.25);
+  border-top-color: #fff;
+}
+
+@keyframes pldSpin {
+  to { transform: rotate(360deg); }
+}
+
+#vpPlayBtn.loading,
+#mpPlayBtn.loading {
+  opacity: 0.92;
+}
+
+/* ВОЛНА 22.52: уважаем системную настройку «меньше движений» —
+   декоративные бесконечные анимации отключаем (плавность без лагов) */
+@media (prefers-reduced-motion: reduce) {
+  #musicPlayer .art-container.playing .art-fallback {
+    animation: none;
+  }
+
+  .pld-spin {
+    animation-duration: 1.6s;
+  }
+}
+
 #musicPlayer .time-row {
   display: flex;
   justify-content: space-between;
@@ -10936,6 +10991,8 @@ body.vp-lock {
   </div>
   <div id="photoStage">
     <img id="photoImg" alt="">
+    <!-- ВОЛНА 22.52: спиннер загрузки фото (пока качается из сети) -->
+    <span id="pmSpin" class="pld-spin pld-spin-light" style="position:absolute;top:50%;left:50%;margin:-13px 0 0 -13px;opacity:0;pointer-events:none;transition:opacity .2s;z-index:5;"></span>
   </div>
   <div class="pm-footer">
     <button class="pm-btn" onclick="pmNav(-1,event)" title="Предыдущее">
@@ -11680,6 +11737,15 @@ try {
   LOW_END = (mem > 0 && mem <= 2) || (cores > 0 && cores <= 3);
 } catch (e) {}
 
+/* ВОЛНА 22.52: «все анимации плавные без лагов на любом устройстве» —
+   уважаем системный «минимум движений»: декоративный фон-анимация выключается */
+let REDUCED_MOTION = false;
+
+try {
+  REDUCED_MOTION = !!(window.matchMedia &&
+    window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+} catch (e) {}
+
 if (LOW_END) {
   try { document.documentElement.classList.add('low-end'); } catch (e) {}
 }
@@ -11993,7 +12059,7 @@ function blobLoop(ts) {
 function startBlobAnimation() {
   stopBlobAnimation();
 
-  if (!blobsEnabled || document.hidden) return;
+  if (!blobsEnabled || REDUCED_MOTION || document.hidden) return;
 
   updateBlobViewport();
   blobRafId = requestAnimationFrame(blobLoop);
@@ -12564,7 +12630,11 @@ async function loadFiles(silent) {
     CONN.build = String(data.build || CONN.build || '');
 
     if (typeof data.plain === 'boolean') STORAGE_ENCRYPTED = !data.plain;
-    else if (ALL_FILES.some((f) => f.vault)) STORAGE_ENCRYPTED = true;
+    /* ВОЛНА 22.52: зашифрованными считаем только НЕ-plain файлы Сейфа.
+       Раньше existence ЛЮБОГО vault-файла (включая «без шифра») включало
+       «шифрование» для всего интерфейса — пароль спрашивался даже там,
+       где файл лежит в канале открыто. */
+    else if (ALL_FILES.some((f) => f.vault && !f.plain)) STORAGE_ENCRYPTED = true;
 
     LAST_ERR = null;
     LAST_SYNC = Date.now();
@@ -12938,7 +13008,7 @@ function renderFiles(files) {
         ${checkHtml}
 
         <div class="icon-wrap" style="flex-shrink:0">
-          <i data-lucide="${f.vault ? 'lock' : iconFor(f.kind)}" style="width:20px;height:20px"></i>
+          <i data-lucide="${(f.vault && !f.plain) ? 'lock' : iconFor(f.kind)}" style="width:20px;height:20px"></i>
         </div>
 
         <div style="flex:1;min-width:0">
@@ -13348,9 +13418,16 @@ function openExternalLink(abs) {
   else window.open(abs, '_blank', 'noopener');
 }
 
-async function fetchFileBlob(absUrl, name) {
+async function fetchFileBlob(absUrl, name, onProgress) {
   const ctrl = ('AbortController' in window) ? new AbortController() : null;
   const tid = 'dl-' + Date.now().toString(36) + '-' + Math.floor(Math.random() * 1e6).toString(36);
+
+  /* ВОЛНА 22.52: onProgress(got, total) — прогресс загрузки НА КНОПКЕ плеера */
+  const _prog = (typeof onProgress === 'function')
+    ? (got, total) => {
+        try { onProgress(total ? (got / total) * 100 : 0, got, total); } catch (eP) {}
+      }
+    : null;
 
   let r;
 
@@ -13393,6 +13470,8 @@ async function fetchFileBlob(absUrl, name) {
       got += part.value.length;
 
       transferProgress(tid, got);
+
+      if (_prog) _prog(got, total);
     }
   } catch (e) {
     transferFinish(tid, false, 'Отменено');
@@ -13583,12 +13662,18 @@ async function mediaCacheTrim() {
 
 /* Главная точка входа: блоб файла — из кэша (мгновенно) или скачиванием
    (с честной панелью прогресса, см. fetchFileBlob) с последующим кэшем. */
-async function mediaBlobFor(f, name, resolveAbsUrl) {
+async function mediaBlobFor(f, name, resolveAbsUrl, onProgress) {
   const key = mediaCacheKey(f);
 
   const cached = await mediaCacheGet(key);
 
-  if (cached) return cached;
+  if (cached) {
+    if (typeof onProgress === 'function') {
+      try { onProgress(100); } catch (eP) {}
+    }
+
+    return cached;
+  }
 
   const abs = (typeof resolveAbsUrl === 'function')
     ? await resolveAbsUrl()
@@ -13596,7 +13681,7 @@ async function mediaBlobFor(f, name, resolveAbsUrl) {
 
   if (!abs) throw new Error('нет ссылки на файл');
 
-  const blob = await fetchFileBlob(abs, name);
+  const blob = await fetchFileBlob(abs, name, onProgress);
 
   mediaCachePut(key, blob);
 
@@ -13709,7 +13794,9 @@ async function downloadCurrentFile() {
 
   if (!f) return;
 
-  if (f.vault && !VAULT_PW && !VAULT_SERVER_UNLOCKED) {
+  /* ВОЛНА 22.52: plain-файл Сейфа («без шифра») открывается БЕЗ пароля —
+   «шифр не должен оставаться нигде, если отмечено без шифрования» */
+  if (f.vault && !f.plain && !VAULT_PW && !VAULT_SERVER_UNLOCKED) {
     PENDING_FILE_ACTION = { type: 'download', id: f.id };
 
     ensureSafeUnlocked();
@@ -13729,7 +13816,8 @@ async function sendCurrentFileToChat() {
 
   if (!f) return;
 
-  if (f.vault && !VAULT_PW && !VAULT_SERVER_UNLOCKED) {
+  /* ВОЛНА 22.52: plain-файл Сейфа — без пароля */
+  if (f.vault && !f.plain && !VAULT_PW && !VAULT_SERVER_UNLOCKED) {
     PENDING_FILE_ACTION = { type: 'download', id: f.id };
 
     ensureSafeUnlocked();
@@ -13772,7 +13860,8 @@ async function downloadSelected() {
 
     if (!f) return;
 
-    if (f.vault && !VAULT_PW && !VAULT_SERVER_UNLOCKED) {
+    /* ВОЛНА 22.52: plain-файл Сейфа — без пароля */
+    if (f.vault && !f.plain && !VAULT_PW && !VAULT_SERVER_UNLOCKED) {
       PENDING_FILE_ACTION = { type: 'download', id: f.id };
 
       ensureSafeUnlocked();
@@ -13819,7 +13908,10 @@ function viewCurrentFile() {
 
   if (!f) return;
 
-  const needPw = f.vault || STORAGE_ENCRYPTED === true;
+  /* ВОЛНА 22.52: пароль нужен ТОЛЬКО на настоящий шифр (vault без plain).
+   Раньше STORAGE_ENCRYPTED включал пароль даже на обычные файлы облака —
+   «в мини апп шифр остаётся, хотя отмечено без шифрования» */
+  const needPw = (f.vault && !f.plain);
 
   closeEditModal();
 
@@ -13853,6 +13945,42 @@ async function openFileViewer(id) {
 
   showToast('📂 Открываю файл…');
 
+  /* ВОЛНА 22.52: видео ≤200 МБ — плеер открывается ЕЩЁ ДО запроса ссылки:
+     тап → модалка + спиннер на кнопке, затем ссылка → блоб качается прямо
+     в плеере (прогресс на кнопке). Никакого «нажимаю — и ничего». */
+  if (isVideo && (+f.size || 0) > 0 && (+f.size || 0) <= MEDIA_VIDEO_BLOB_LIMIT) {
+    openVideoPlayer(f.id, '', { deferred: true });
+
+    try {
+      const vdata = await apiJson('/api/files/' + encodeURIComponent(id) + '/link?disp=inline', {
+        headers: vaultHeaders()
+      });
+
+      const vabs = new URL(vdata.url, location.origin).href;
+
+      await vpFeedDeferred(f, vabs);
+    } catch (eV52) {
+      const modal = document.getElementById('videoPlayerModal');
+
+      if (eV52 && eV52.code === 'safe_locked') {
+        VAULT_PW = '';
+        VAULT_SERVER_UNLOCKED = false;
+
+        PENDING_FILE_ACTION = { type: 'view', id: id };
+
+        openSafeModal();
+      } else if (eV52 && (eV52.name === 'AbortError' || /abort/i.test(String(eV52.message || '')))) {
+        showToast('⏹ Скачивание отменено');
+      } else if (modal && modal.classList.contains('open')) {
+        showToast('Не удалось открыть: ' + cloudErrText(eV52));
+      }
+
+      vpCloseModal();
+    }
+
+    return;
+  }
+
   try {
     /* ВОЛНА 22.40: disp=inline для просмотра (аудио/видео плееры, PDF) */
     const data = await apiJson('/api/files/' + encodeURIComponent(id) + '/link?disp=inline', {
@@ -13868,24 +13996,6 @@ async function openFileViewer(id) {
     if (isAudio) { openMusicPlayer(f.id, abs); return; }
 
     if (isVideo) {
-      if ((+f.size || 0) > 0 && (+f.size || 0) <= MEDIA_VIDEO_BLOB_LIMIT) {
-        try {
-          const vblob = await mediaBlobFor(f, f.name || 'видео', abs);
-
-          if (vpObjectUrl) {
-            try { URL.revokeObjectURL(vpObjectUrl); } catch (eV) {}
-
-            vpObjectUrl = null;
-          }
-
-          vpObjectUrl = URL.createObjectURL(vblob);
-
-          openVideoPlayer(f.id, vpObjectUrl);
-
-          return;
-        } catch (eVid) { /* не скачался — играем потоком ниже */ }
-      }
-
       openVideoPlayer(f.id, abs);
 
       return;
@@ -14282,7 +14392,8 @@ function startActualUpload() {
 let STORAGE_ENCRYPTED = null;
 
 function passwordRequired() {
-  return STORAGE_ENCRYPTED === true || ALL_FILES.some((f) => f.vault);
+  /* ВОЛНА 22.52: plain-файлы Сейфа не включают обязательный пароль */
+  return STORAGE_ENCRYPTED === true || ALL_FILES.some((f) => f.vault && !f.plain);
 }
 
 async function detectStorageMode() {
@@ -16041,10 +16152,19 @@ let mpScrubbing = false;
 let mpSeekPending = null;
 let mpSeekPendingTimer = null;
 let mpScrubLastPct = 0;
+/* ВОЛНА 22.52: «плеер должен открываться сразу, а загрузка — на кнопке».
+   mpLoading — трек ещё доставается (спиннер на большой кнопке);
+   mpDeferredAutoplay — тап по кнопке ВО время загрузки = «после готовности
+   НЕ включать» (пауза). */
+let mpLoading = false;
+let mpDeferredAutoplay = true;
 const mpEl = {};
 
 function mpSetSeekPending(sec) {
   mpSeekPending = sec;
+
+  /* ВОЛНА 22.52: после ручной перемотки тикер обязан перерисовать позицию */
+  mpTickLoop._lastPct = undefined;
 
   if (mpSeekPendingTimer) clearTimeout(mpSeekPendingTimer);
 
@@ -16526,6 +16646,10 @@ async function mpLoad(i, autoplay) {
   const t = mpList[idx];
   const token = ++mpLoadToken;
 
+  /* ВОЛНА 22.52: плеер уже открыт, трек доставается — СПИННЕР НА КНОПКЕ */
+  mpDeferredAutoplay = !!autoplay;
+  mpSetLoading(true);
+
   mpAnimateSwitch();
 
   mpEl.mpTitle.textContent = t.title;
@@ -16536,6 +16660,11 @@ async function mpLoad(i, autoplay) {
   mpEl.mpProgressFill.style.width = '0%';
   mpEl.mpCurrent.textContent = '0:00';
   mpEl.mpDuration.textContent = '0:00';
+
+  /* ВОЛНА 22.52: сброс кэша экономного тикера — следующий кадр перерисует */
+  mpTickLoop._lastPct = 0;
+  mpTickLoop._lastCur = '';
+  mpTickLoop._lastDur = '';
 
   mpSyncDots();
 
@@ -16569,6 +16698,7 @@ async function mpLoad(i, autoplay) {
        дёргая окно входа при каждом 401 */
     mpBrokenStreak++;
 
+    mpSetLoading(false);
     mpSyncPlayIcon();
 
     if (autoplay && mpOpen && mpList.length
@@ -16611,12 +16741,16 @@ async function mpLoad(i, autoplay) {
     }
   }
 
+  /* ВОЛНА 22.52: загрузка завершена (или играем потоком) — спиннер с кнопки */
+  mpSetLoading(false);
+
   mpAudioEl.src = playUrl;
 
   /* теги/обложка читаем параллельно — не ждём начала воспроизведения */
   mpReadTags(t, token);
 
-  if (autoplay) {
+  /* mpDeferredAutoplay: тапнули по кнопке во время загрузки — без автоплея */
+  if (autoplay && mpDeferredAutoplay) {
     mpPlay();
   } else {
     mpSyncPlayIcon();
@@ -16703,15 +16837,65 @@ function mpTickLoop() {
       !mpScrubbing && mpSeekPending == null) {
     const pct = (mpAudioEl.currentTime / mpAudioEl.duration) * 100;
 
-    mpEl.mpProgressFill.style.width = pct + '%';
-    mpEl.mpCurrent.textContent = mpFmtTime(mpAudioEl.currentTime);
-    mpEl.mpDuration.textContent = mpFmtTime(mpAudioEl.duration);
+    /* ВОЛНА 22.52: плавность на ЛЮБОМ устройстве — layout полоски трогаем
+       только при реальном изменении позиции (>0.15%), текст времени — при
+       смене отображаемой секунды. Раньше: 60–120 layout/сек даже на
+       стоячем треке — на слабых WebView это и были «лаги анимаций». */
+    if (mpTickLoop._lastPct === undefined ||
+        Math.abs(pct - mpTickLoop._lastPct) > 0.15) {
+      mpTickLoop._lastPct = pct;
+
+      mpEl.mpProgressFill.style.width = pct + '%';
+    }
+
+    const cur = mpFmtTime(mpAudioEl.currentTime);
+
+    if (cur !== mpTickLoop._lastCur) {
+      mpTickLoop._lastCur = cur;
+
+      mpEl.mpCurrent.textContent = cur;
+    }
+
+    const dur = mpFmtTime(mpAudioEl.duration);
+
+    if (dur !== mpTickLoop._lastDur) {
+      mpTickLoop._lastDur = dur;
+
+      mpEl.mpDuration.textContent = dur;
+    }
   }
 
   mpTickRaf = requestAnimationFrame(mpTickLoop);
 }
 
+function mpSetLoading(on) {
+  mpLoading = !!on;
+
+  if (mpEl.mpPlayBtn) {
+    mpEl.mpPlayBtn.classList.toggle('loading', mpLoading);
+
+    let sp = mpEl.mpPlayBtn.querySelector('.pld-spin');
+
+    if (mpLoading && !sp) {
+      sp = document.createElement('span');
+
+      sp.className = 'pld-spin';
+
+      mpEl.mpPlayBtn.appendChild(sp);
+    } else if (!mpLoading && sp) {
+      sp.remove();
+    }
+  }
+
+  if (mpEl.mpPlayIcon) {
+    mpEl.mpPlayIcon.style.display = mpLoading ? 'none' : '';
+  }
+}
+
 function mpSyncPlayIcon() {
+  /* ВОЛНА 22.52: пока идёт загрузка, на кнопке спиннер — иконку не трогаем */
+  if (mpLoading) return;
+
   const playing = mpPlaying();
 
   mpEl.mpPlayIcon.innerHTML = playing ? MP_ICONS.pause : MP_ICONS.play;
@@ -16740,6 +16924,16 @@ function mpPlay() {
 
 function mpTogglePlay() {
   if (!mpAudioEl) return;
+
+  /* ВОЛНА 22.52: тап во время загрузки = «пауза после готовности» —
+   кнопка живая даже пока трек качается */
+  if (mpLoading) {
+    mpDeferredAutoplay = false;
+
+    showToast('⏳ Трек ещё загружается — после готовности будет пауза');
+
+    return;
+  }
 
   if (mpAudioEl.paused) {
     if (!mpAudioEl.src) mpLoad(mpIndex, true);
@@ -16798,6 +16992,10 @@ function openMusicPlayer(fileId, forcedUrl) {
   document.getElementById('musicPlayer').classList.add('open');
   document.body.classList.add('mp-lock');
 
+  /* ВОЛНА 22.52: фоновые blobs за полноэкранным плеером не видны, а rAF-цикл
+     жжёт GPU/батарею — на время плеера ставим их на паузу */
+  stopBlobAnimation();
+
   /* ВОЛНА 22.49: новый запуск плеера — счётчик битых сброшен */
   mpBrokenStreak = 0;
 
@@ -16848,8 +17046,15 @@ function closeMusicPlayer() {
   if (mpBeatRaf) { cancelAnimationFrame(mpBeatRaf); mpBeatRaf = 0; }
   if (mpTickRaf) { cancelAnimationFrame(mpTickRaf); mpTickRaf = 0; }
 
+  /* ВОЛНА 22.52: спиннер загрузки с кнопки + возврат фоновых blobs
+     (за полноэкранным плеером они всё равно не видны — берегём батарею) */
+  mpSetLoading(false);
+  mpLoadToken++;
+
   setTimeout(() => {
     if (!mpOpen) document.body.classList.remove('mp-lock');
+
+    startBlobAnimation();
   }, 450);
 }
 
@@ -16868,6 +17073,13 @@ let vpLastTapSide = null;
 let vpAudioCtx = null;
 let vpOsc = null;   /* ВОЛНА 22.49: ссылка на осциллятор фонового тишины */
 let vpObjectUrl = null;   /* ВОЛНА 22.51: blob-URL видео из кэша */
+/* ВОЛНА 22.52: «плеер открывается сразу, видео грузится в нём, прогресс на
+   кнопке». vpLoadToken отменяет отложенную загрузку при закрытии плеера;
+   vpDeferredAutoplay — тап по кнопке ВО время загрузки = пауза после
+   готовности. */
+let vpLoadToken = 0;
+let vpLoading = false;
+let vpDeferredAutoplay = true;
 let vpSavedRate = 1.0;
 let vpPressTimer = null;
 let vpLongPressing = false;
@@ -17069,14 +17281,19 @@ function vpFormatTime(sec) {
   return (m < 10 ? '0' : '') + m + ':' + (s < 10 ? '0' : '') + s;
 }
 
-function openVideoPlayer(fileId, forcedUrl) {
+function openVideoPlayer(fileId, forcedUrl, opts) {
   const f = ALL_FILES.find((x) => x.id === fileId);
 
   if (!f) return;
 
+  /* ВОЛНА 22.52: deferred-режим — модалка открывается СРАЗУ (пустое видео +
+     спиннер на кнопке), а блоб докачивается прямо в плеере. Раньше
+     openFileViewer ждал скачивания ДОЛЬШЕ МИНУТЫ, и только потом открывал
+     плеер — «при нажатии ничего не происходит». */
+  const deferred = !!(opts && opts.deferred);
   const url = forcedUrl || '';
 
-  if (!url) {
+  if (!url && !deferred) {
     showToast('Не удалось открыть видео');
     return;
   }
@@ -17094,8 +17311,140 @@ function openVideoPlayer(fileId, forcedUrl) {
   document.getElementById('videoPlayerModal').classList.add('open');
   document.body.classList.add('vp-lock');
 
+  /* ВОЛНА 22.52: фоновые blobs за полноэкранным плеером — на паузу */
+  stopBlobAnimation();
+
   safeIcons();
+
+  if (deferred) {
+    /* ВОЛНА 22.52: интерфейс «загрузки на кнопке» мгновенно; если ссылка
+       уже есть (opts.abs) — качаем сразу, иначе openFileViewer пришлёт её
+       следом через vpFeedDeferred (плеер уже открыт) */
+    vpSetLoading(true, 0);
+
+    if (vpSeekEl) vpSeekEl.value = 0;
+    if (vpSeekEl) vpUpdateSeekFill();
+
+    if (opts && opts.abs) vpFeedDeferred(f, opts.abs);
+    return;
+  }
+
+  vpSetLoading(false);
   vpPlayVideo(vpVideos[0]);
+}
+
+/* ─── ВОЛНА 22.52: ЗАГРУЗКА НА КНОПКЕ ─────────────────────────────
+   vpSetLoading(true, pct): спиннер вместо иконки play на большой белой
+   кнопке + подпись «⬇ N%» над контролами. Тап по кнопке в этот момент —
+   «после готовности НЕ включать» (пауза). vpFeedDeferred качает блог
+   через кэш (mediaBlobFor) и по готовности запускает vpPlayVideo; при
+   сбое — честный поток с сервера (сервер 22.51 умеет Range/206). */
+function vpSetLoading(on, pct) {
+  vpLoading = !!on;
+
+  const wrap = document.getElementById('vpPlayIconWrap');
+  const btn = document.getElementById('vpPlayBtn');
+
+  if (btn) btn.classList.toggle('loading', vpLoading);
+
+  if (wrap) {
+    if (vpLoading) {
+      wrap.innerHTML = '<span class="pld-spin"></span>';
+    } else {
+      wrap.innerHTML = '<i data-lucide="' +
+        (vpPlayerEl && vpPlayerEl.paused ? 'play' : 'pause') +
+        '" style="width:24px;height:24px;fill:#000;margin-left:2px;"></i>';
+
+      safeIcons();
+    }
+  }
+
+  let lbl = document.getElementById('vpLoadLabel');
+
+  if (!lbl) {
+    lbl = document.createElement('div');
+
+    lbl.id = 'vpLoadLabel';
+    lbl.style.cssText = 'position:absolute;left:50%;transform:translateX(-50%);bottom:150px;z-index:31;background:rgba(0,0,0,0.7);color:#fff;padding:6px 14px;border-radius:9999px;font-weight:800;font-size:12px;letter-spacing:.3px;pointer-events:none;opacity:0;transition:opacity .2s;font-family:"Nunito",sans-serif;';
+
+    const wr = document.getElementById('vpWrapper');
+
+    if (wr) wr.appendChild(lbl);
+  }
+
+  lbl.textContent = vpLoading ? ('⬇ ' + Math.round(pct || 0) + '%') : '';
+  lbl.style.opacity = vpLoading ? '1' : '0';
+}
+
+function vpStartDeferredLoad(f, abs) {
+  /* ВОЛНА 22.52: точка входа «ссылка уже есть» — сам плеер уже открыт. */
+  const token = ++vpLoadToken;
+
+  vpDeferredAutoplay = true;
+
+  vpSetLoading(true, 0);
+
+  if (vpSeekEl) vpSeekEl.value = 0;
+  if (vpSeekEl) vpUpdateSeekFill();
+
+  return vpFeedDeferred(f, abs, token);
+}
+
+/* Качает блоб в УЖЕ ОТКРЫТЫЙ плеер (кнопка показывает прогресс).
+   token — защита от отмены (закрытие плеера / новое видео). */
+async function vpFeedDeferred(f, abs, tokenIn) {
+  const token = tokenIn || ++vpLoadToken;
+
+  try {
+    const vblob = await mediaBlobFor(f, f.name || 'видео', abs,
+      (p) => {
+        if (token === vpLoadToken) vpSetLoading(true, p);
+      });
+
+    if (token !== vpLoadToken) return;
+
+    if (vpObjectUrl) {
+      try { URL.revokeObjectURL(vpObjectUrl); } catch (eV) {}
+    }
+
+    vpObjectUrl = URL.createObjectURL(vblob);
+
+    vpSetLoading(false);
+
+    const modal = document.getElementById('videoPlayerModal');
+
+    if (!modal || !modal.classList.contains('open')) return;
+
+    vpPlayVideo({
+      id: f.id,
+      title: String(f.name || 'Видео').replace(/\.[^/.]+$/, ''),
+      filename: f.name || '',
+      url: vpObjectUrl,
+      size: +f.size || 0
+    });
+
+    /* тапнули по кнопке во время загрузки — после готовности на паузе */
+    if (!vpDeferredAutoplay) {
+      try { vpPlayerEl.pause(); } catch (eP) {}
+    }
+  } catch (eDef) {
+    if (token !== vpLoadToken) return;
+
+    /* блоб не скачался (сеть/отмена) — честный поток, сервер с Range 206 */
+    vpSetLoading(false);
+
+    const modal = document.getElementById('videoPlayerModal');
+
+    if (!modal || !modal.classList.contains('open')) return;
+
+    vpPlayVideo({
+      id: f.id,
+      title: String(f.name || 'Видео').replace(/\.[^/.]+$/, ''),
+      filename: f.name || '',
+      url: abs,
+      size: +f.size || 0
+    });
+  }
 }
 
 function vpInitBackgroundAudio() {
@@ -17372,12 +17721,16 @@ function vpShowControls() {
 }
 
 function vpOnSeekInput() {
+  if (vpLoading) return;   /* ВОЛНА 22.52: ползунок живёт после готовности */
+
   vpIsSeeking = true;
   vpUpdateSeekFill();
   vpShowControls();
 }
 
 function vpOnSeekChange() {
+  if (vpLoading) return;   /* ВОЛНА 22.52: ползунок живёт после готовности */
+
   /* ВОЛНА 22.49: isFinite-гард — duration===Infinity (webm/MediaRecorder
      до метаданных) давал currentTime = x*Infinity */
   if (vpPlayerEl.duration && isFinite(vpPlayerEl.duration)) {
@@ -17399,6 +17752,9 @@ function vpOnSeekChange() {
 }
 
 function vpUpdatePlayIcon() {
+  /* ВОЛНА 22.52: пока грузится — на кнопке спиннер, иконку не трогаем */
+  if (vpLoading) return;
+
   const container = document.getElementById('vpPlayIconWrap');
 
   if (!container) return;
@@ -17413,6 +17769,16 @@ function vpUpdatePlayIcon() {
 function vpTogglePlay(e) {
   if (e) e.stopPropagation();
 
+  /* ВОЛНА 22.52: тап во время загрузки = «после готовности — пауза».
+   Кнопка не мёртвая, пока видео качается */
+  if (vpLoading) {
+    vpDeferredAutoplay = false;
+
+    showToast('⏳ Видео ещё загружается — после готовности будет пауза');
+
+    return;
+  }
+
   if (vpPlayerEl.paused) vpPlayerEl.play();
   else vpPlayerEl.pause();
 
@@ -17425,6 +17791,9 @@ function vpRewindSec(seconds, e) {
     if (e.cancelable) e.preventDefault();
   }
 
+  /* ВОЛНА 22.52: во время загрузки мотать нечего — видео ещё не на кнопке */
+  if (vpLoading) return;
+
   vpPlayerEl.currentTime += seconds;
   vpRewindFeedback(seconds > 0 ? '+10 сек' : '-10 сек');
   vpShowControls();
@@ -17432,6 +17801,11 @@ function vpRewindSec(seconds, e) {
 
 function vpCloseModal(e) {
   if (e) e.stopPropagation();
+
+  /* ВОЛНА 22.52: отменяем отложенную загрузку (закрыли плеер — качать некуда
+     визуально, докачанный блок останется в кэше) + снимаем спиннер */
+  vpLoadToken++;
+  vpSetLoading(false);
 
   vpPlayerEl.pause();
 
@@ -17477,6 +17851,9 @@ function vpCloseModal(e) {
 
   if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
   vpForceLandscape(false);
+
+  /* ВОЛНА 22.52: возвращаем фоновые blobs после закрытия плеера */
+  startBlobAnimation();
 }
 
 /* ═══ КОНЕЦ ВИДЕОПЛЕЕРА ═══ */
@@ -17525,6 +17902,9 @@ async function pmOpen(f) {
   document.getElementById('photoModal').classList.add('open');
   document.getElementById('pmTitle').textContent = f.name || 'Фото';
 
+  /* ВОЛНА 22.52: фоновые blobs за полноэкранным просмотрщиком — на паузу */
+  stopBlobAnimation();
+
   safeIcons();
   pmApplyZoom(1.0, false);
   await pmShowCurrent();
@@ -17551,6 +17931,11 @@ async function pmShowCurrent() {
 
   img.style.opacity = '0.35';
 
+  /* ВОЛНА 22.52: спиннер на время загрузки фото (из кэша — мигнёт) */
+  const _spin = document.getElementById('pmSpin');
+
+  if (_spin) _spin.style.opacity = '1';
+
   try {
     const data = await apiJson('/api/files/' + encodeURIComponent(f.id) + '/link?disp=inline', {
       headers: vaultHeaders()
@@ -17573,8 +17958,12 @@ async function pmShowCurrent() {
     pmCurUrl = URL.createObjectURL(blob);
     img.src = pmCurUrl;
     img.style.opacity = '1';
+
+    if (_spin) _spin.style.opacity = '0';
   } catch (e) {
     img.style.opacity = '1';
+
+    if (_spin) _spin.style.opacity = '0';
 
     if (e && (e.name === 'AbortError' || /abort/i.test(String(e.message || '')))) {
       showToast('⏹ Скачивание отменено');
@@ -17612,6 +18001,13 @@ function pmClose(e) {
   pmRevoke();
   pmLoading = false;
   pmApplyZoom(1.0, false);
+
+  const _spin = document.getElementById('pmSpin');
+
+  if (_spin) _spin.style.opacity = '0';
+
+  /* ВОЛНА 22.52: возвращаем фоновые blobs после закрытия */
+  startBlobAnimation();
 }
 
 async function pmDownload(e) {
@@ -19949,6 +20345,9 @@ async def miniapp_upload_init(request):
         # работает даже если клиент шлёт куски нестандартного размера.
         "chunk": _MINIAPP_CHUNK,
     }
+    # ВОЛНА 22.52: метаданные сессии — на диск сразу (рестарт бота не убьёт
+    # начатую загрузку)
+    _upload_session_persist(_MINIAPP_UPLOADS[upload_id])
     # пароль пригодится и следующим операциям веб-сессии (RAM)
     if vault_pw:
         sess = _miniapp_session_of(request)
@@ -19968,7 +20367,10 @@ async def miniapp_upload_chunk(request):
     user, uid, err = await _api_get_user_any(request)
     if err is not None:
         return err
-    s = _MINIAPP_UPLOADS.get(request.query.get("uploadId", ""))
+    # ВОЛНА 22.52: uploadId сохраняем в переменную — нужен отложенной
+    # автодогрузке после принятия ПОСЛЕДНЕГО куска
+    upid = str(request.query.get("uploadId") or "")
+    s = _MINIAPP_UPLOADS.get(upid)
     if not s or s.get("uid") != uid:
         return _miniapp_err(404, "session_not_found",
                             "Загрузка не найдена или устарела — начните заново.")
@@ -20026,6 +20428,17 @@ async def miniapp_upload_chunk(request):
     if _idx >= 0:
         parts.add(_idx)
     s["ts"] = time.time()
+    # ВОЛНА 22.52: метаданные сессии — на диск (загрузка переживает рестарт
+    # бота и «продолжается через самого бота»)
+    _upload_session_persist(s)
+    # ВОЛНА 22.52: ФИНАЛИЗАЦИЯ НА ПОСЛЕДНЕМ КУСКЕ — все байты на сервере,
+    # клиента дожидаться не обязательно. Через 2.5 с (клиент обычно успевает
+    # позвать complete сам — тогда задача просто не сработает) бот ЗАКАНЧИВАЕТ
+    # загрузку сам: шифрует/заливает в канал, пишет базу, сообщает пользователю.
+    if s["received"] >= s["size"] and not s.get("completing") \
+            and not s.get("auto_scheduled"):
+        s["auto_scheduled"] = True
+        asyncio.create_task(_upload_auto_complete_delayed(upid, 2.5))
     return web.json_response({"received": s["received"], "size": s["size"]})
 
 
@@ -20044,6 +20457,7 @@ async def miniapp_upload_abort(request):
     s = _MINIAPP_UPLOADS.get(upid)
     if not s or s.get("uid") != uid:
         return web.json_response({"ok": True})
+    _upload_session_unpersist(s)   # ДО pop — путь берём из сессии
     _MINIAPP_UPLOADS.pop(upid, None)
     try:
         os.remove(s["path"])
@@ -20257,8 +20671,9 @@ def _upload_autocomplete_candidates(now: float):
         received = int(s.get("received") or 0)
         if size <= 0 or received < size:
             continue                      # байтов не хватает — ждать клиента
-        if s.get("completing") or s.get("auto_done") or s.get("auto_giveup"):
-            continue                      # уже в работе / закрыта / клиент решает
+        if s.get("completing") or s.get("auto_done") or s.get("auto_giveup") \
+                or s.get("auto_scheduled"):
+            continue              # уже в работе / отложено / закрыта / клиент решает
         if int(s.get("auto_fail_n") or 0) >= 3:
             continue                      # три неудачи — не долбим
         if now - float(s.get("ts", now)) < 20.0:
@@ -20296,6 +20711,9 @@ async def _upload_auto_complete_task(app, upid):
     # даём клиенту шанс (он мог просто опоздать с complete), но считаем попытки
     if s is not None:
         s["auto_fail_n"] = int(s.get("auto_fail_n") or 0) + 1
+        # ВОЛНА 22.52: сбрасываем флаг отложенного запуска — сторож сможет
+        # повторить попытку позже (если это не клиентский код-отказ)
+        s["auto_scheduled"] = False
     code = str((payload or {}).get("error") or "")
     if code in ("empty_file", "incomplete_disk", "already_processing",
                 "incomplete", "safe_locked", "wrong_password"):
@@ -20335,6 +20753,139 @@ async def _upload_autocomplete_pass(app, now=None):
     now = time.time() if now is None else float(now)
     for upid, _s in _upload_autocomplete_candidates(now):
         asyncio.create_task(_upload_auto_complete_task(app, upid))
+
+
+# === ВОЛНА 22.52: ФИНАЛИЗАЦИЯ НА ПОСЛЕДНЕМ КУСКЕ + ПЕРСИСТЕНТНОСТЬ СЕССИЙ ===
+# Пользователь: «файлы должны загружаться через самого бота, даже если
+# закрыл мини апп». Раньше бот ждал, пока КЛИЕНТ позовёт /complete, а сторож
+# автодогрузки тикал раз в 10 секунд. Теперь:
+#   1) ПОСЛЕДНИЙ кусок сам запускает финализацию через 2.5 с (клиент обычно
+#      успевает сам — тогда задача просто не сработает);
+#   2) метаданные сессии пишутся НА ДИСК рядом с .part — после РЕСТАРТА БОТА
+#      сессии восстанавливаются, и бот догружает файлы сам (пароль Сейфа на
+#      диск НЕ пишется никогда — зашифрованные сессии ждут клиента).
+
+
+async def _upload_auto_complete_delayed(upid, delay=2.5):
+    """Отложенная серверная финализация: последний кусок принят, клиент мог
+    не успеть позвать /complete (закрыл мини апп / умер интернет)."""
+    try:
+        await asyncio.sleep(float(delay))
+        s = _MINIAPP_UPLOADS.get(upid)
+        if s is None or s.get("completing") or s.get("auto_done"):
+            return
+        await _upload_auto_complete_task(_MINIAPP_PTB_APP, upid)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.error(f"upload auto-complete delayed {upid}: {e}")
+
+
+def _upload_session_meta_path(s):
+    """Путь персистентных метаданных сессии (рядом с .part)."""
+    return os.path.splitext(str(s.get("path") or ""))[0] + ".json"
+
+
+def _upload_session_persist(s):
+    """ВОЛНА 22.52: метаданные сессии загрузки — на диск (загрузка переживает
+    рестарт бота: «продолжается через самого бота»). Пароль Сейфа НЕ пишется
+    никогда (политика zero-knowledge): plain-сессии бот догрузит сам,
+    зашифрованные — дождутся клиента (клиент пришлёт пароль с complete)."""
+    try:
+        meta = {
+            "uid": str(s.get("uid") or ""),
+            "name": str(s.get("name") or ""),
+            "mime": str(s.get("mime") or ""),
+            "size": int(s.get("size") or 0),
+            "received": int(s.get("received") or 0),
+            "chunk": int(s.get("chunk") or _MINIAPP_CHUNK),
+            "plain": bool(s.get("plain")),
+            "parts": sorted(int(i) for i in (s.get("parts") or ())),
+            "ts": float(s.get("ts") or time.time()),
+        }
+        _parts = s.get("parts")
+        with open(_upload_session_meta_path(s), "w", encoding="utf-8") as f:
+            json.dump(meta, f)
+    except Exception:
+        pass
+
+
+def _upload_session_unpersist(s_or_upid):
+    """Метаданные сессии стёрты (финализация/аборт/снятие). Принимает и
+    сессию, и её uploadId (сам находит путь по сессии)."""
+    s = (s_or_upid if isinstance(s_or_upid, dict)
+         else _MINIAPP_UPLOADS.get(str(s_or_upid)))
+    if s is not None:
+        try:
+            os.remove(_upload_session_meta_path(s))
+        except OSError:
+            pass
+
+
+def _miniapp_restore_upload_sessions():
+    """ВОЛНА 22.52: восстановление сессий загрузки после рестарта сервера.
+    Раньше сессии жили только в RAM: рестарт бота = все недогруженные файлы
+    «исчезали», а .part-ы становились сиротами (чистка 22.49). Теперь
+    метаданные читаются с диска, сессии снова живы: клиент докачает только
+    недостающие куски, а plain-сессии, где байты ВСЕ, бот догрузит сам.
+    Возвращает (сколько_восстановлено, [uploadId для автодогрузки]).
+    Задачи автодогрузки создаёт ВЫЗЫВАЮЩИЙ (внутри event loop)."""
+    restored = 0
+    auto_upids = []
+    try:
+        d = _miniapp_tmpdir()
+        now = time.time()
+        for fn in os.listdir(d):
+            if not fn.endswith(".json"):
+                continue
+            jp = os.path.join(d, fn)
+            pp = jp[:-5] + ".part"
+            try:
+                if not os.path.exists(pp):
+                    os.remove(jp)
+                    continue
+                if now - os.path.getmtime(jp) > 86400:
+                    os.remove(jp)
+                    continue
+                with open(jp, "r", encoding="utf-8") as f:
+                    meta = json.load(f)
+                upid = fn[:-5]
+                if not isinstance(meta, dict) or not upid:
+                    continue
+                if upid in _MINIAPP_UPLOADS:
+                    continue
+                _parts = meta.get("parts")
+                s = {
+                    "path": pp,
+                    "name": _dvf2_safe_name(str(meta.get("name") or "file.bin")),
+                    "mime": str(meta.get("mime") or ""),
+                    "size": int(meta.get("size") or 0),
+                    "uid": str(meta.get("uid") or ""),
+                    "received": int(meta.get("received") or 0),
+                    "ts": float(meta.get("ts") or now),
+                    "vault_pw": "",          # на диск не пишем и не читаем
+                    "plain": bool(meta.get("plain")),
+                    "chunk": int(meta.get("chunk") or _MINIAPP_CHUNK),
+                    "parts": set(int(i) for i in (_parts or [])
+                                 if isinstance(i, (int, float))),
+                    "restored": True,
+                }
+                if s["size"] <= 0 or s["received"] <= 0:
+                    # пустая сессия без байтов — мусор после рестарта
+                    continue
+                _MINIAPP_UPLOADS[upid] = s
+                restored += 1
+                if s["plain"] and s["received"] >= s["size"]:
+                    s["auto_scheduled"] = True
+                    auto_upids.append(upid)
+            except Exception as e:
+                logger.warning(f"upload session restore {fn}: {e}")
+    except Exception:
+        pass
+    if restored:
+        logger.info(f"ВОЛНА 22.52: восстановлено сессий загрузки после "
+                    f"рестарта: {restored} (автодогрузка: {len(auto_upids)})")
+    return restored, auto_upids
 
 
 # ВОЛНА 22.50: напоминание «файлы ещё не догружены» при ЛЮБОМ сообщении боту.
@@ -20636,6 +21187,7 @@ async def _miniapp_upload_finalize(user, uid, upid, s, pw_raw="",
         # сессия остаётся — досыл кусков / повтор complete продолжит БЕЗ
         # перекачки файла заново.
         if _finished:
+            _upload_session_unpersist(s)   # ВОЛНА 22.52: метаданные с диска
             _MINIAPP_UPLOADS.pop(upid, None)
             for p in (s["path"], mt_renamed):
                 try:
@@ -23023,9 +23575,43 @@ def _vault_menu_text(user):
         storage_line = f"☁️ Хранилище: ВАШ личный канал «{_uch[1]}»"
     else:
         storage_line = f"☁️ Каналов-хранилищ: {channels_n}"
+    # ВОЛНА 22.52: «шифр остаётся, хотя отмечено без шифрования». Меню Сейфа
+    # ВСЕГДА писало «шифрованное хранилище • зашифровано X» — даже когда
+    # пользователь включил режим «без шифра» и все новые файлы лежат в его
+    # канале открыто. Считаем честно: сколько файлов под шифром, сколько —
+    # без, и весим только настоящие шифры.
+    _plain_n = sum(1 for f in files if f.get("plain"))
+    _enc_n = len(files) - _plain_n
+    if _plain_n and not _enc_n:
+        files_line = (f"🔓 Файлов: {len(files)} • БЕЗ шифра "
+                      f"{_fmt_bytes(sum(int(f.get('size_orig', 0) or 0) for f in files))} "
+                      "(режим «без шифрования»)")
+    elif _plain_n:
+        files_line = (f"🔒 Под шифром: {_enc_n} • {_fmt_bytes(total_enc)} • "
+                      f"🔓 Без шифра: {_plain_n}")
+    else:
+        files_line = f"🔒 Файлов: {len(files)} • зашифровано {_fmt_bytes(total_enc)}"
+    if _plain_n and not _enc_n:
+        return (
+            "🔐 Сейф — хранилище (режим БЕЗ шифра)\n\n"
+            f"{files_line}\n"
+            f"{storage_line}\n\n"
+            "Шифрование ВЫКЛЮЧЕНО Вами в 🔗 Моём облаке: новые файлы уходят в "
+            "ВАШ канал КАК ЕСТЬ, с исходными именами, открываются БЕЗ пароля "
+            "(и здесь, и в мини-аппе — никаких «замков» у них нет). Уже "
+            "зашифрованные раньше файлы, если появятся, останутся под шифром.\n\n"
+            "🔑 Пароль Сейфа нужен только для старых зашифрованных файлов и "
+            "восстановления.\n\n"
+            "❌ После распаковки файл исчезает из чата кнопкой «Отменить» "
+            "В КЛАВИАТУРЕ снизу (отключить — в ⚙️ Настройках).\n\n"
+            "⚖️ Сейф и Облако вы используете на свой риск: даже при сбоях бота "
+            "разработчик не отвечает за ваши данные. Полные условия — «⚖️ "
+            "Правовая информация» в ⚙️ Настройках.\n\n"
+            "Выберите действие:"
+        )
     return (
         "🔐 Сейф — шифрованное хранилище\n\n"
-        f"🔒 Файлов: {len(files)} • зашифровано {_fmt_bytes(total_enc)}\n"
+        f"{files_line}\n"
         f"{storage_line}\n\n"
         "ОДИН ПАРОЛЬ открывает весь Сейф. Файлы шифруются им (AES-256, ключ "
         "выводится 600 000 раундами) и уходят в канал только шифром — открыть "
@@ -54260,6 +54846,21 @@ async def _post_init(application):
         logger.info("Сторож паузы загрузок запущен (каждые 10 секунд).")
     except Exception as e2:
         logger.error(f"Не удалось запустить сторожа паузы загрузок: {e2}")
+
+    # === ВОЛНА 22.52: восстановление сессий загрузки после рестарта. ===
+    # «Загрузка должна продолжаться через самого бота» — теперь и ПОВЕРХ
+    # рестартов: метаданные сессий лежат на диске рядом с .part, бот сам
+    # догружает plain-сессии, где все байты уже на сервере, а клиент
+    # докачивает только недостающие куски (status → parts).
+    try:
+        _restored, _auto_upids = _miniapp_restore_upload_sessions()
+        if _restored:
+            logger.info(f"ВОЛНА 22.52: сессий загрузки восстановлено: {_restored}")
+        for _a_upid in _auto_upids:
+            # бот сам догружает plain-сессии, где все байты уже на сервере
+            asyncio.create_task(_upload_auto_complete_delayed(_a_upid, 3.0))
+    except Exception as e2:
+        logger.error(f"Не удалось восстановить сессии загрузки: {e2}")
 
     # === ШАГ 4: диагностика уведомлений по каждому пользователю. ===
     try:
