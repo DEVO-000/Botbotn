@@ -3641,7 +3641,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.50"
+BOT_BUILD = "22.51"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -13404,6 +13404,210 @@ async function fetchFileBlob(absUrl, name) {
   return new Blob(chunks, { type: type });
 }
 
+/* ═══ ВОЛНА 22.51: КЭШ МЕДИА — «посмотреть фото/музыку и потом ЕЩЁ РАЗ
+   БЕЗ ЗАДЕРЖЕК» ═══
+   Открытые фото, треки и видео сохраняются в Cache API (диск телефона) и
+   дублируются в памяти. Повторное открытие включается МГНОВЕННО — без
+   повторного скачивания из Telegram. Плюс блоб-воспроизведение: у blob-
+   URL перемотка работает идеально (ползунок не срывает playback). */
+const MEDIA_CACHE_NAME = 'devo-media-v1';
+const MEDIA_BLOB_LIMIT = 80 * 1024 * 1024;        /* музыка/фото: до 80 МБ в блоб */
+const MEDIA_VIDEO_BLOB_LIMIT = 200 * 1024 * 1024; /* видео: до 200 МБ в блоб */
+const MEDIA_CACHE_MAX_BYTES = 350 * 1024 * 1024;  /* потолок дискового кэша */
+const MEDIA_CACHE_IDX = 'devo-media-idx';
+const mediaMem = new Map();          /* key -> Blob (быстрая память сессии) */
+const mediaMemOrder = [];            /* LRU-порядок использования */
+let mediaCacheDb = null;             /* caches.open() — лениво */
+let mediaIdxDirty = false;
+
+function mediaCacheOn() {
+  return typeof caches !== 'undefined' && !!caches.open;
+}
+
+function mediaCacheKey(f) {
+  /* ключ = id файла + размер: переименованный файл остаётся в кэше,
+     а перезалитый (новый id) — честно качается заново */
+  return 'm_' + String((f && f.id) || 'x') + '_' + (+((f && f.size) || 0));
+}
+
+function mediaIdxLoad() {
+  try {
+    const raw = localStorage.getItem(MEDIA_CACHE_IDX);
+
+    return raw ? (JSON.parse(raw) || {}) : {};
+  } catch (e) {
+    return {};
+  }
+}
+
+function mediaIdxSave(idx) {
+  if (mediaIdxDirty) return;
+
+  mediaIdxDirty = true;
+
+  setTimeout(() => {
+    mediaIdxDirty = false;
+
+    safeSet(MEDIA_CACHE_IDX, JSON.stringify(idx));
+  }, 700);
+}
+
+function mediaMemTouch(key, blob) {
+  if (mediaMem.has(key)) {
+    const i = mediaMemOrder.indexOf(key);
+
+    if (i >= 0) mediaMemOrder.splice(i, 1);
+  } else {
+    mediaMemOrder.push(key);
+  }
+
+  mediaMem.set(key, blob);
+
+  /* память сессии: держим не больше ~12 последних (диск — отдельный лимит) */
+  while (mediaMemOrder.length > 12) {
+    const old = mediaMemOrder.shift();
+
+    mediaMem.delete(old);
+  }
+}
+
+async function mediaCacheOpen() {
+  if (!mediaCacheOn()) return null;
+
+  if (!mediaCacheDb) {
+    try {
+      mediaCacheDb = await caches.open(MEDIA_CACHE_NAME);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  return mediaCacheDb;
+}
+
+function mediaReq(key) {
+  return new Request('/__devo-media__/' + key, { method: 'GET' });
+}
+
+async function mediaCacheGet(key) {
+  const mem = mediaMem.get(key);
+
+  if (mem) return mem;
+
+  const cache = await mediaCacheOpen();
+
+  if (!cache) return null;
+
+  try {
+    const hit = await cache.match(mediaReq(key));
+
+    if (hit) {
+      const blob = await hit.blob();
+
+      mediaMemTouch(key, blob);
+
+      /* отметка использования (для LRU-вытеснения) */
+      const idx = mediaIdxLoad();
+
+      if (idx[key]) {
+        idx[key].ts = Date.now();
+
+        mediaIdxSave(idx);
+      }
+
+      return blob;
+    }
+  } catch (e) {}
+
+  return null;
+}
+
+async function mediaCachePut(key, blob) {
+  mediaMemTouch(key, blob);
+
+  const cache = await mediaCacheOpen();
+
+  const idx = mediaIdxLoad();
+
+  if (!cache) return;
+
+  try {
+    await cache.put(mediaReq(key), new Response(blob, {
+      headers: { 'Content-Type': blob.type || 'application/octet-stream' }
+    }));
+
+    idx[key] = { ts: Date.now(), size: +blob.size || 0 };
+
+    mediaIdxSave(idx);
+    mediaCacheTrim();
+  } catch (e) {
+    /* квота/приватный режим — живём только памятью сессии */
+  }
+}
+
+async function mediaCacheTrim() {
+  const cache = await mediaCacheOpen();
+
+  if (!cache) return;
+
+  const idx = mediaIdxLoad();
+  const keys = Object.keys(idx);
+  const entries = keys.map((k) => ({ k: k, ts: +idx[k].ts || 0, sz: +idx[k].size || 0 }));
+  const total = entries.reduce((s, e) => s + e.sz, 0);
+
+  if (total <= MEDIA_CACHE_MAX_BYTES && entries.length <= 90) return;
+
+  entries.sort((a, b) => a.ts - b.ts);  /* старые — первыми */
+
+  let need = Math.max(total - MEDIA_CACHE_MAX_BYTES, 0);
+  let removed = 0;
+
+  for (const e of entries) {
+    if (need <= 0 && removed >= 10) break;
+
+    try { await cache.delete(mediaReq(e.k)); } catch (err) {}
+
+    delete idx[e.k];
+    mediaMem.delete(e.k);
+
+    const oi = mediaMemOrder.indexOf(e.k);
+
+    if (oi >= 0) mediaMemOrder.splice(oi, 1);
+
+    need -= e.sz;
+    removed++;
+  }
+
+  mediaIdxSave(idx);
+}
+
+/* Главная точка входа: блоб файла — из кэша (мгновенно) или скачиванием
+   (с честной панелью прогресса, см. fetchFileBlob) с последующим кэшем. */
+async function mediaBlobFor(f, name, resolveAbsUrl) {
+  const key = mediaCacheKey(f);
+
+  const cached = await mediaCacheGet(key);
+
+  if (cached) return cached;
+
+  const abs = (typeof resolveAbsUrl === 'function')
+    ? await resolveAbsUrl()
+    : resolveAbsUrl;
+
+  if (!abs) throw new Error('нет ссылки на файл');
+
+  const blob = await fetchFileBlob(abs, name);
+
+  mediaCachePut(key, blob);
+
+  return blob;
+}
+
+function mediaCachedHint(f) {
+  /* есть ли файл в кэше (для мгновенных решений UI) */
+  return mediaMem.has(mediaCacheKey(f));
+}
+
 async function saveBlobToPhone(blob, name) {
   let file;
 
@@ -13657,9 +13861,35 @@ async function openFileViewer(id) {
 
     const abs = new URL(data.url, location.origin).href;
 
-    /* Аудио и видео открываем во встроенных плеерах */
+    /* Аудио и видео открываем во встроенных плеерах.
+       ВОЛНА 22.51: видео ≤200 МБ играет из блоба (скачанного в кэш) —
+       мгновенный старт и честная перемотка; большее — потоком с сервера
+       (сервер теперь отвечает 206 на Range — перемотка без рестарта). */
     if (isAudio) { openMusicPlayer(f.id, abs); return; }
-    if (isVideo) { openVideoPlayer(f.id, abs); return; }
+
+    if (isVideo) {
+      if ((+f.size || 0) > 0 && (+f.size || 0) <= MEDIA_VIDEO_BLOB_LIMIT) {
+        try {
+          const vblob = await mediaBlobFor(f, f.name || 'видео', abs);
+
+          if (vpObjectUrl) {
+            try { URL.revokeObjectURL(vpObjectUrl); } catch (eV) {}
+
+            vpObjectUrl = null;
+          }
+
+          vpObjectUrl = URL.createObjectURL(vblob);
+
+          openVideoPlayer(f.id, vpObjectUrl);
+
+          return;
+        } catch (eVid) { /* не скачался — играем потоком ниже */ }
+      }
+
+      openVideoPlayer(f.id, abs);
+
+      return;
+    }
 
     if (IS_TELEGRAM && tg && tg.openLink) {
       tg.openLink(abs);
@@ -14916,13 +15146,39 @@ async function _uploadOneSession(file, reportBytes) {
   const key = file._entryKey || null;
 
   let uploadId = file._resumeId || '';
+  let serverParts = null;   /* ВОЛНА 22.51: куски, которые сервер УЖЕ имеет */
 
   if (uploadId) {
     /* продолжаем ПОСЛЕ закрытия мини-аппа... или повторяем complete
        после ввода пароля Сейфа (22.49, _retryComplete): куски уже на
        сервере, init не нужен — сразу complete */
     file._resumeId = '';
-  } else {
+
+    /* ВОЛНА 22.51: узнаём у сервера, что он уже имеет:
+       • completed — бот ДОГРУЗИЛ САМ (авто-догрузка) — честный успех БЕЗ
+         перекачки, файл уже в облаке/Сейфе;
+       • ready + parts — пересылаем ТОЛЬКО недостающие куски (трафик);
+       • gone — сессия умерла, открываем новую (init ниже). */
+    try {
+      const st0 = await apiJson('/api/upload/status?uploadId=' +
+        encodeURIComponent(uploadId), { headers: authHeaders() });
+
+      if (st0 && st0.state === 'completed' && st0.resp) {
+        if (key) upqDel(key);
+
+        return (st0.resp && st0.resp.file) || st0.resp;
+      }
+
+      if (st0 && st0.state === 'ready' &&
+          Array.isArray(st0.parts) && st0.parts.length) {
+        serverParts = new Set(st0.parts);
+      }
+
+      if (st0 && st0.state === 'gone') uploadId = '';
+    } catch (e0) { /* статус не узнали — докачиваем как раньше */ }
+  }
+
+  if (!uploadId) {
     const initData = await apiJson('/api/upload/init', {
       method: 'POST',
       headers: vaultHeaders({ 'Content-Type': 'application/json' }),
@@ -14959,6 +15215,20 @@ async function _uploadOneSession(file, reportBytes) {
   let nextIndex = 0;                  /* следующий кусок для отправки */
   const chunkGot = new Map();         /* idx -> принятых байт куска (прогресс) */
 
+  /* ВОЛНА 22.51: куски, уже принятые сервером, — в прогресс докачки */
+  if (serverParts) {
+    let preBytes = 0;
+
+    for (const pi of serverParts) {
+      const po = pi * CHUNK_SIZE;
+      const pe = Math.min(po + CHUNK_SIZE, +file.size || 0);
+
+      if (po < pe) { chunkGot.set(pi, pe - po); preBytes += pe - po; }
+    }
+
+    if (preBytes) reportBytes(preBytes);
+  }
+
   const reportChunk = (idx, n) => {
     chunkGot.set(idx, n);
 
@@ -14980,6 +15250,10 @@ async function _uploadOneSession(file, reportBytes) {
       if (idx >= totalChunks) return null;
 
       nextIndex++;
+
+      /* ВОЛНА 22.51: этот кусок сервер уже принял в прошлой сессии —
+         не перекачиваем (экономия трафика телефона) */
+      if (serverParts && serverParts.has(idx)) continue;
 
       const off = idx * CHUNK_SIZE;
       const end = Math.min(off + CHUNK_SIZE, file.size);
@@ -16309,7 +16583,35 @@ async function mpLoad(i, autoplay) {
 
   mpBrokenStreak = 0;
 
-  mpAudioEl.src = url;
+  /* ВОЛНА 22.51: трек качается ЦЕЛИКОМ в кэш (первый раз) и играет из блоба:
+     перемотка мгновенная и БЕЗ «запуска песни заново» (серверные Range 206
+     поддерживаем тоже, но блоб — самый надёжный путь в WebView). Кэш →
+     повторное прослушивание без единого байта из сети. */
+  let playUrl = url;
+
+  if (!t.localFile && (+((t.file && t.file.size) || 0)) > 0
+      && (+((t.file && t.file.size) || 0)) <= MEDIA_BLOB_LIMIT) {
+    try {
+      const tblob = await mediaBlobFor(t.file, t.title || t.file.name, url);
+
+      if (token !== mpLoadToken || !mpOpen) return;
+
+      if (tblob) {
+        if (mpObjectUrl) {
+          try { URL.revokeObjectURL(mpObjectUrl); } catch (e1) {}
+
+          mpObjectUrl = null;
+        }
+
+        playUrl = URL.createObjectURL(tblob);
+        mpObjectUrl = playUrl;
+      }
+    } catch (eCache) {
+      /* не скачался блоб (сеть/отмена) — играем потоком (сервер уже с Range) */
+    }
+  }
+
+  mpAudioEl.src = playUrl;
 
   /* теги/обложка читаем параллельно — не ждём начала воспроизведения */
   mpReadTags(t, token);
@@ -16565,6 +16867,7 @@ let vpLastTapTime = 0;
 let vpLastTapSide = null;
 let vpAudioCtx = null;
 let vpOsc = null;   /* ВОЛНА 22.49: ссылка на осциллятор фонового тишины */
+let vpObjectUrl = null;   /* ВОЛНА 22.51: blob-URL видео из кэша */
 let vpSavedRate = 1.0;
 let vpPressTimer = null;
 let vpLongPressing = false;
@@ -17139,6 +17442,14 @@ function vpCloseModal(e) {
     vpPlayerEl.load();
   } catch (e2) {}
 
+  /* ВОЛНА 22.51: освобождаем blob-URL видео из кэша (сам блоб остаётся
+     в кэше — повторное открытие будет мгновенным) */
+  if (vpObjectUrl) {
+    try { URL.revokeObjectURL(vpObjectUrl); } catch (e5) {}
+
+    vpObjectUrl = null;
+  }
+
   /* ВОЛНА 22.49: гасим бесконечный фоновый осциллятор — раньше он рендерил
      440 Гц ДО КОНЦА СЕССИИ после закрытия плеера (CPU/батарея в WebView) */
   if (vpOsc) {
@@ -17254,7 +17565,9 @@ async function pmShowCurrent() {
       return;
     }
 
-    const blob = await fetchFileBlob(abs, f.name || 'фото');
+    /* ВОЛНА 22.51: фото из кэша открывается мгновенно; при первом просмотре
+       качается (с панелью прогресса) и сохраняется в кэш телефона */
+    const blob = await mediaBlobFor(f, f.name || 'фото', abs);
 
     pmCurBlob = blob;
     pmCurUrl = URL.createObjectURL(blob);
@@ -17914,6 +18227,126 @@ async def _mt_doc_for_rec(client, rec):
     return None, None, 0
 
 
+# === ВОЛНА 22.51: HTTP Range (206 Partial Content) для аудио/видео ===
+# Раньше сервер ВСЕГДА отвечал 200 «с нуля»: WebView при перемотке просил
+# байты «с середины», получал ВЕСЬ файл сначала и ЗАПУСКАЛ ВОСПРОИЗВЕДЕНИЕ
+# ЗАНОВО — «двигаю ползунок, а песня/видео начинается сначала». Плюс
+# Accept-Ranges давал браузеру понять, что позицию можно держать.
+
+
+def _parse_http_range(request, total: int):
+    """Range-заголовок запроса → (start, end) включительно, None (нет/не
+    разобрали — отдаём целиком) или 'bad' (неудовлетворимый → 416).
+    Понимаем только ОДИН диапазон (браузеры так и просят): bytes=a-b,
+    bytes=a- и bytes=-n (последние n байт)."""
+    h = (request.headers.get("Range") or "").strip()
+    if not h or not h.lower().startswith("bytes="):
+        return None
+    spec = h[6:].split(",")[0].strip()
+    if not spec:
+        return None
+    if total <= 0:
+        return None
+    if spec.startswith("-"):
+        # bytes=-n → последние n байт
+        try:
+            n = int(spec[1:])
+        except (TypeError, ValueError):
+            return None
+        if n <= 0:
+            return "bad"
+        start = max(0, total - n)
+        return (start, total - 1)
+    parts = spec.split("-", 1)
+    try:
+        start = int(parts[0].strip())
+    except (TypeError, ValueError):
+        return None
+    end = total - 1
+    if len(parts) == 2 and parts[1].strip():
+        try:
+            end = min(int(parts[1].strip()), total - 1)
+        except (TypeError, ValueError):
+            return None
+    if start < 0 or start >= total:
+        return "bad"
+    if end < start:
+        return "bad"
+    return (start, end)
+
+
+def _range_headers(start: int, end: int, total: int) -> dict:
+    """Заголовки 206 Partial Content (+Accept-Ranges для будущих запросов)."""
+    return {
+        "Accept-Ranges": "bytes",
+        "Content-Range": f"bytes {start}-{end}/{total}",
+        "Cache-Control": "no-store",
+    }
+
+
+def _range_unsatisfiable(total: int):
+    return web.Response(
+        status=416,
+        headers={"Content-Range": f"bytes */{max(0, total)}"},
+        text="Запрошенный диапазон вне файла",
+    )
+
+
+async def _mt_download_window(client, doc, doc_size: int, start: int, end: int,
+                              sink) -> int:
+    """ВОЛНА 22.51: качает из Telegram ТОЛЬКО байты [start..end] включительно
+    (iter_download с выровненным offset — как в _mt_download_stream) и скармливает
+    sink(). Скачивание 206-диапазона вместо целого файла = быстрая перемотка
+    больших видео без ожидания полной перекачки. Возвращает байт скачано."""
+    target = end - start + 1
+    if target <= 0:
+        return 0
+    got = 0
+    attempts = 0
+    while got < target:
+        # позиция в файле, откуда продолжаем (при повторах — с выравниванием)
+        cur = start + got
+        cur_al = cur - (cur % 4096)
+        skip = cur - cur_al
+        try:
+            async for chunk in client.iter_download(
+                doc, offset=cur_al, request_size=524288,
+                file_size=int(doc_size or 0),
+            ):
+                if skip:
+                    if len(chunk) <= skip:
+                        skip -= len(chunk)
+                        continue
+                    chunk = chunk[skip:]
+                    skip = 0
+                if got + len(chunk) >= target:
+                    chunk = chunk[:target - got]
+                    _res = sink(chunk)
+                    if asyncio.iscoroutine(_res):
+                        await _res
+                    got += len(chunk)
+                    break
+                _res = sink(chunk)
+                if asyncio.iscoroutine(_res):
+                    await _res
+                got += len(chunk)
+            break
+        except _FloodWaitError as e:
+            attempts += 1
+            wait = min(int(getattr(e, "seconds", 30) or 30) + 1, 900)
+            logger.warning(f"mtproto: FloodWait {wait} с при 206-окне (попытка {attempts})")
+            if attempts > 6:
+                raise RuntimeError("Telegram просит слишком долгую паузу")
+            await asyncio.sleep(wait)
+        except (ConnectionError, asyncio.TimeoutError, TimeoutError) as e:
+            attempts += 1
+            logger.warning(f"mtproto: обрыв 206-окна ({e}), попытка {attempts}")
+            if attempts > 5:
+                raise RuntimeError("не удалось докачать диапазон (сеть)")
+            await asyncio.sleep(min(3 * attempts, 15))
+    return got
+
+
 async def _miniapp_serve_file(request, user, rec, where, pw_override=None,
                               inline=False):
     """ВОЛНА 22.30: отдаёт файл ПОТОКОМ (Cloud: Bot API ≤20 МБ / MTProto до
@@ -17952,12 +18385,27 @@ async def _miniapp_serve_file(request, user, rec, where, pw_override=None,
                     return _miniapp_err(403, "wrong_password",
                                         f"Не удалось расшифровать: {e}.")
                 name = str(meta.get("n") or rec.get("label") or "file")
+                # ВОЛНА 22.51: Range и для расшифрованных DVF1-файлов Сейфа —
+                # перемотка музыки из Сейфа не запускает воспроизведение заново.
+                _po = len(payload)
+                _rg1 = _parse_http_range(request, _po)
+                if _rg1 == "bad":
+                    return _range_unsatisfiable(_po)
+                if _rg1 is not None:
+                    return web.Response(
+                        status=206, body=payload[_rg1[0]:_rg1[1] + 1],
+                        content_type=_serve_mime_for(rec, name),
+                        headers={
+                            **_range_headers(_rg1[0], _rg1[1], _po),
+                            "Content-Disposition": _miniapp_content_disposition(name, inline),
+                        })
                 return web.Response(
                     body=payload,
                     content_type=_serve_mime_for(rec, name),
                     headers={
                         "Content-Disposition": _miniapp_content_disposition(name, inline),
                         "Cache-Control": "no-store",
+                        "Accept-Ranges": "bytes",
                     })
             # DVF2 (>20 МБ): поток MTProto → _Dvf2Decryptor → клиент
             return await _miniapp_stream_dvf2(request, user, rec, password,
@@ -17967,19 +18415,37 @@ async def _miniapp_serve_file(request, user, rec, where, pw_override=None,
         name = str(cloud_like.get("name") or "file")
 
     size = int(cloud_like.get("size_orig") or cloud_like.get("size") or 0)
+    # ВОЛНА 22.51: разбираем Range ОДИН раз (по размеру записи; для MTProto
+    # уточним по фактическому doc_size ниже).
+    rng = _parse_http_range(request, size)
+    if rng == "bad":
+        return _range_unsatisfiable(size)
     app = _MINIAPP_PTB_APP
     fid = cloud_like.get("file_id")
     # Путь 1: Bot API — быстрый, для файлов ≤20 МБ (или размер неизвестен).
     if app is not None and fid and (not size or size <= VAULT_MAX_FILE_BYTES):
         try:
             tg_file = await app.bot.get_file(fid)
-            buf = await tg_file.download_as_bytearray()
+            buf = bytes(await tg_file.download_as_bytearray())
+            _bt = len(buf)
+            if rng is not None and _bt:
+                if rng[0] >= _bt:
+                    return _range_unsatisfiable(_bt)
+                _re = min(rng[1], _bt - 1)
+                return web.Response(
+                    status=206, body=buf[rng[0]:_re + 1],
+                    content_type=_serve_mime_for(cloud_like, name),
+                    headers={
+                        **_range_headers(rng[0], _re, _bt),
+                        "Content-Disposition": _miniapp_content_disposition(name, inline),
+                    })
             return web.Response(
-                body=bytes(buf),
+                body=buf,
                 content_type=_serve_mime_for(cloud_like, name),
                 headers={
                     "Content-Disposition": _miniapp_content_disposition(name, inline),
                     "Cache-Control": "no-store",
+                    "Accept-Ranges": "bytes",
                 })
         except Exception as e:
             logger.warning(f"miniapp download: Bot API не отдал файл ({e}); пробую MTProto")
@@ -18002,6 +18468,32 @@ async def _miniapp_serve_file(request, user, rec, where, pw_override=None,
         if doc is None:
             raise RuntimeError("в сообщении канала нет документа")
         doc_size = int(_dsz or getattr(doc, "size", 0) or size or 0)
+        # ВОЛНА 22.51: 206 Partial Content — качаем из Telegram ТОЛЬКО
+        # запрошенное окно: перемотка больших видео отвечает мгновенно,
+        # а не «сначала докачаю весь фильм». Порядок байт честный:
+        # Content-Range в ПЛАЙНТЕКСТОВЫХ координатах (= байты документа).
+        if rng is not None and doc_size > 0:
+            if rng[0] >= doc_size:
+                return _range_unsatisfiable(doc_size)
+            _re = min(rng[1], doc_size - 1)
+            response = web.StreamResponse(status=206, headers={
+                "Content-Type": _serve_mime_for(cloud_like, name),
+                "Content-Disposition": _miniapp_content_disposition(name, inline),
+                **_range_headers(rng[0], _re, doc_size),
+            })
+            response.content_length = _re - rng[0] + 1
+            await response.prepare(request)
+
+            def _rng_sink(chunk):
+                return response.write(chunk)
+
+            try:
+                await _mt_download_window(client, doc, doc_size,
+                                          rng[0], _re, _rng_sink)
+                await response.write_eof()
+            except Exception:
+                pass  # клиент отвалился посреди потока — это нормально
+            return response
         with open(tmppath, "wb") as sink_file:
             await _mt_download_stream(
                 client, doc, doc_size,
@@ -18010,6 +18502,7 @@ async def _miniapp_serve_file(request, user, rec, where, pw_override=None,
             "Content-Type": _serve_mime_for(cloud_like, name),
             "Content-Disposition": _miniapp_content_disposition(name, inline),
             "Cache-Control": "no-store",
+            "Accept-Ranges": "bytes",
         })
         if doc_size:
             response.content_length = doc_size
@@ -18067,6 +18560,128 @@ async def _miniapp_fetch_container_bytes(user, rec):
     return bytes(buf)
 
 
+async def _dvf2_open_header(client, doc, doc_size, password):
+    """ВОЛНА 22.51: читает и расшифровывает ЗАГОЛОВОК DVF2-контейнера.
+    Возвращает (meta, hdr_total, bs, key, np_) либо бросает ValueError
+    («неверный пароль» / «повреждённый контейнер»). hdr_total — длина шапки
+    в байтах шифра (33 + hdr_ct)."""
+    buf = bytearray()
+
+    def _sink(chunk):
+        buf.extend(chunk)
+
+    await _mt_download_window(client, doc, doc_size, 0, 65535, _sink)
+    if len(buf) < 33:
+        raise ValueError("повреждённый контейнер (шапка не читается)")
+    if bytes(buf[:4]) != VAULT_DVF2_MAGIC:
+        raise ValueError("это не контейнер Сейфа")
+    if buf[4] != VAULT_DVF2_VERSION:
+        raise ValueError(f"неизвестная версия контейнера: {buf[4]}")
+    iters = int.from_bytes(bytes(buf[5:9]), "big")
+    salt = bytes(buf[9:25])
+    np_ = bytes(buf[25:29])
+    hdr_len = int.from_bytes(bytes(buf[29:33]), "big")
+    if hdr_len <= 0 or hdr_len > 1024 * 1024:
+        raise ValueError("повреждённый контейнер")
+    hdr_total = 33 + hdr_len
+    if len(buf) < hdr_total:
+        buf.clear()
+        await _mt_download_window(client, doc, doc_size, 0, hdr_total - 1, _sink)
+    key = await asyncio.to_thread(_vault_derive_key, password, salt, iters)
+    hdr_ct = bytes(buf[33:hdr_total])
+    try:
+        plain = await asyncio.to_thread(
+            AESGCM(key).decrypt, np_ + b"\xff" * 8, hdr_ct,
+            VAULT_DVF2_MAGIC + bytes([VAULT_DVF2_VERSION]))
+    except Exception:
+        raise ValueError("неверный пароль")
+    try:
+        meta = json.loads(plain.decode("utf-8"))
+    except Exception:
+        meta = {}
+    if not isinstance(meta, dict):
+        meta = {}
+    bs = int(meta.get("bs") or VAULT_DVF2_BLOCK)
+    return meta, hdr_total, bs, key, np_
+
+
+async def _miniapp_stream_dvf2_range(request, client, rec, doc, doc_size,
+                                     password, rng, inline=False):
+    """ВОЛНА 22.51: 206 Partial Content для DVF2 — расшифровываем и отдаём
+    ТОЛЬКО запрошенные блоки (каждый блок DVF2 шифруется СВОИМ nonce, поэтому
+    случайный доступ честный: ставим блоки back-to-back и режем крайние).
+    Перемотка музыки/видео из Сейфа больше не запускает файл заново."""
+    try:
+        meta, hdr_total, bs, key, np_ = await _dvf2_open_header(
+            client, doc, doc_size, password)
+    except ValueError as e:
+        code = "wrong_password" if "пароль" in str(e) else "vault_failed"
+        return _miniapp_err(403 if code == "wrong_password" else 502,
+                            code, f"Не удалось открыть контейнер Сейфа: {e}.")
+    sz = int(meta.get("sz") or rec.get("size_orig") or 0)
+    if sz <= 0:
+        return _miniapp_err(502, "vault_failed", "Контейнер без размера — перемотка недоступна.")
+    start, end = rng
+    if start >= sz:
+        return _range_unsatisfiable(sz)
+    end = min(end, sz - 1)
+    first_b = start // bs
+    last_b = end // bs
+    ct_start = hdr_total + first_b * (bs + VAULT_DVF2_TAG)
+    ct_end = hdr_total + (last_b + 1) * (bs + VAULT_DVF2_TAG) - 1
+    doc_total = int(doc_size or 0)
+    if doc_total and ct_end >= doc_total:
+        ct_end = doc_total - 1
+    name = str(rec.get("label") or "file")
+    response = web.StreamResponse(status=206, headers={
+        "Content-Type": _serve_mime_for(rec, name),
+        "Content-Disposition": _miniapp_content_disposition(name, inline),
+        **_range_headers(start, end, sz),
+    })
+    response.content_length = end - start + 1
+    await response.prepare(request)
+
+    buf = bytearray()
+    idx = first_b
+    written = 0
+
+    def _push_block(ct_block, bidx):
+        nonce = np_ + bidx.to_bytes(8, "big")
+        return AESGCM(key).decrypt(nonce, ct_block, b"DVF2-B" + bidx.to_bytes(8, "big"))
+
+    async def _flush(final=False):
+        nonlocal idx, written
+        need = bs + VAULT_DVF2_TAG
+        while len(buf) >= need or (final and buf):
+            ct_block = bytes(buf[:need]) if len(buf) >= need else bytes(buf)
+            del buf[:len(ct_block)]
+            pt = await asyncio.to_thread(_push_block, ct_block, idx)
+            idx += 1
+            # режем крайние блоки под запрошенный диапазон
+            b_start = (idx - 1) * bs
+            b_end = b_start + len(pt) - 1
+            lo = max(start, b_start) - b_start
+            hi = min(end, b_end) - b_start
+            if hi >= lo:
+                piece = pt[lo:hi + 1]
+                written += len(piece)
+                await response.write(piece)
+
+    async def _win_sink(chunk):
+        buf.extend(chunk)
+        # расшифровываем на ходу, чтобы не копить весь диапазон в ОЗУ
+        await _flush()
+
+    try:
+        await _mt_download_window(client, doc, doc_size, ct_start, ct_end,
+                                  _win_sink)
+        await _flush(final=True)
+        await response.write_eof()
+    except Exception:
+        pass  # клиент отвалился посреди 206-потока — не ошибка
+    return response
+
+
 async def _miniapp_stream_dvf2(request, user, rec, password, to_file=False,
                                inline=False):
     """ВОЛНА 22.30: потоковая выдача/расшифровка DVF2 (>20 МБ, до 2 ГБ).
@@ -18091,6 +18706,18 @@ async def _miniapp_stream_dvf2(request, user, rec, password, to_file=False,
         doc_size = int(_dsz or getattr(doc, "size", 0) or rec.get("size_enc") or 0)
         dec = _Dvf2Decryptor(password)
         meta_holder = {}
+
+        # ВОЛНА 22.51: Range для зашифрованных DVF2-файлов — отдаём и
+        # расшифровываем только запрошенные блоки (перемотка без рестарта).
+        if not to_file:
+            _rng = _parse_http_range(
+                request, int(rec.get("size_orig") or 0))
+            if _rng == "bad":
+                return _range_unsatisfiable(int(rec.get("size_orig") or 0))
+            if _rng is not None:
+                return await _miniapp_stream_dvf2_range(
+                    request, client, rec, doc, doc_size, password, _rng,
+                    inline=inline)
 
         if to_file:
             out_fh = open(to_file, "wb")
@@ -18118,6 +18745,7 @@ async def _miniapp_stream_dvf2(request, user, rec, password, to_file=False,
                 "Content-Type": _serve_mime_for(rec, name),
                 "Content-Disposition": _miniapp_content_disposition(name, inline),
                 "Cache-Control": "no-store",
+                "Accept-Ranges": "bytes",
             })
             if rec.get("size_orig"):
                 response.content_length = int(rec["size_orig"])
@@ -19484,10 +20112,17 @@ async def miniapp_upload_status(request):
                 "received": int(s.get("received") or 0),
                 "size": int(s.get("size") or 0),
             })
+        # ВОЛНА 22.51: parts — индексы УЖЕ ПРИНЯТЫХ кусков (клиентские, по
+        # 6 МиБ): докачка после закрытия мини апп шлёт только НЕДОСТАЮЩИЕ
+        # куски, а не перекачивает весь файл заново (экономия трафика).
+        _parts = s.get("parts")
         return web.json_response({
             "state": "ready",
             "received": int(s.get("received") or 0),
             "size": int(s.get("size") or 0),
+            "name": str(s.get("name") or ""),
+            "chunk": int(s.get("chunk") or _MINIAPP_CHUNK),
+            "parts": sorted(int(i) for i in _parts) if isinstance(_parts, (set, list)) else [],
         })
     return web.json_response({"state": "gone"})
 
@@ -19588,15 +20223,118 @@ async def _upload_pause_check_once(app, now=None):
 
 
 async def _upload_pause_watchdog(app):
-    """Фоновый тикер сторожа паузы загрузок (раз в 10 секунд, 22.48)."""
+    """Фоновый тикер сторожа паузы загрузок (раз в 10 секунд, 22.48).
+    ВОЛНА 22.51: тут же — проход АВТО-ДОГРУЗКИ (бот сам завершает загрузки,
+    у которых все байты уже на сервере, а клиент молчит)."""
     while True:
         try:
             await asyncio.sleep(10)
             await _upload_pause_check_once(app)
+            await _upload_autocomplete_pass(app)
         except asyncio.CancelledError:
             raise
         except Exception as e:
             logger.error(f"upload pause watchdog error: {e}")
+
+
+# === ВОЛНА 22.51: АВТО-ДОГРУЗКА СИЛАМИ БОТА («продолжается через бота») ===
+# Сценарий: пользователь закрыл мини апп (и даже вышел из Telegram) ПОСЛЕ
+# того, как ПОСЛЕДНИЙ байт файла доехал до сервера. Раньше файл просто лежал
+# на диске .part-ом, пока клиент не позовёт /complete — «загрузка висела».
+# Теперь сторож видит: received == size, клиент молчит ≥ 20 секунд — бот
+# САМ шифрует/заливает файл в канал и пишет пользователю честное «догрузил».
+# Если байты ещё НЕ все — увы, их физически нет на сервере: остаётся
+# напоминание 22.48/22.50 и докачка с того же места при возвращении.
+_UPLOAD_AUTO_LAST = {}          # uid → ts последнего «сам догрузил»
+_UPLOAD_AUTO_COOLDOWN = 90.0    # не спамим: не чаще раза в 1.5 минуты
+
+
+def _upload_autocomplete_candidates(now: float):
+    """Незавершённые сессии, где ВСЕ байты уже на сервере и клиент молчит."""
+    out = []
+    for upid, s in list(_MINIAPP_UPLOADS.items()):
+        size = int(s.get("size") or 0)
+        received = int(s.get("received") or 0)
+        if size <= 0 or received < size:
+            continue                      # байтов не хватает — ждать клиента
+        if s.get("completing") or s.get("auto_done") or s.get("auto_giveup"):
+            continue                      # уже в работе / закрыта / клиент решает
+        if int(s.get("auto_fail_n") or 0) >= 3:
+            continue                      # три неудачи — не долбим
+        if now - float(s.get("ts", now)) < 20.0:
+            continue                      # клиент ещё может прислать complete сам
+        out.append((upid, s))
+    return out
+
+
+async def _upload_auto_complete_task(app, upid):
+    """Фоновая финализация одной сессии без клиента (авто-догрузка ботом)."""
+    s = _MINIAPP_UPLOADS.get(upid)
+    if s is None or s.get("completing"):
+        return
+    uid = str(s.get("uid") or "")
+    user = get_user(uid)
+    if not user:
+        return
+    ok, payload = await _miniapp_upload_finalize(
+        user, uid, upid, s,
+        pw_raw=str(s.get("vault_pw") or ""),
+        http_request=None)
+    s = _MINIAPP_UPLOADS.get(upid)
+    if ok:
+        logger.info(f"upload auto-complete: {upid} догружен сервером для {uid}")
+        if s is not None:
+            s["auto_done"] = True
+            _MINIAPP_UPLOADS.pop(upid, None)
+            try:
+                os.remove(s["path"])
+            except Exception:
+                pass
+        _notify_auto_complete(uid, s if s is not None else {}, payload, ok=True)
+        return
+    # неудача: incomplete_disk/empty — сессия уже снята ядром; остальное —
+    # даём клиенту шанс (он мог просто опоздать с complete), но считаем попытки
+    if s is not None:
+        s["auto_fail_n"] = int(s.get("auto_fail_n") or 0) + 1
+    code = str((payload or {}).get("error") or "")
+    if code in ("empty_file", "incomplete_disk", "already_processing",
+                "incomplete", "safe_locked", "wrong_password"):
+        # эти состояния клиент решает сам (досыл/пароль) — автоповтор не нужен
+        s = _MINIAPP_UPLOADS.get(upid)
+        if s is not None:
+            s["auto_giveup"] = True
+
+
+def _notify_auto_complete(uid, s, payload, ok=True):
+    """Одно честное сообщение «бот сам догрузил ваш файл» (с кулдауном)."""
+    now = time.time()
+    if now - float(_UPLOAD_AUTO_LAST.get(uid, 0)) < _UPLOAD_AUTO_COOLDOWN:
+        return
+    _UPLOAD_AUTO_LAST[uid] = now
+    app = _MINIAPP_PTB_APP
+    bot = getattr(app, "bot", None) if app is not None else None
+    if bot is None:
+        return
+    f = (payload or {}).get("file") or {}
+    nm = str(f.get("name") or f.get("label") or (s or {}).get("name") or "Файл")[:60]
+    to_safe = bool((payload or {}).get("safe"))
+    where = "Сейф" if to_safe else "облако"
+    try:
+        asyncio.ensure_future(bot.send_message(
+            chat_id=int(uid),
+            text=("🤖 Догрузил без вас: «" + nm + "» — файл уже в " + where +
+                  ".\nМини апп был закрыт после передачи файла, поэтому "
+                  "загрузку закончил сам бот.")))
+    except Exception:
+        pass
+
+
+async def _upload_autocomplete_pass(app, now=None):
+    """Один проход поиска «байты все, клиента нет» → фоновые задачи догрузки.
+    Ядро _miniapp_upload_finalize само атомарно ставит completing=True."""
+    now = time.time() if now is None else float(now)
+    for upid, _s in _upload_autocomplete_candidates(now):
+        asyncio.create_task(_upload_auto_complete_task(app, upid))
 
 
 # ВОЛНА 22.50: напоминание «файлы ещё не догружены» при ЛЮБОМ сообщении боту.
@@ -19679,7 +20417,10 @@ async def miniapp_upload_complete(request):
     ВОЛНА 22.32: при включённом шифровании (как в чате) файл из веба
     ШИФРУЕТСЯ паролем Сейфа (DVF1/DVF2 прямо с диска) и попадает в ТОТ ЖЕ
     Сейф, что и загрузки из чата: user.vault_files. Незашифрованных копий
-    нигде не остаётся — временный .part стирается в finally."""
+    нигде не остаётся — временный .part стирается в finally.
+    ВОЛНА 22.51: вся логика переехала в _miniapp_upload_finalize — её же
+    вызывает серверная АВТО-ДОГРУЗКА (мини апп закрыли после последнего
+    куска — бот заканчивает загрузку сам, «продолжается через бота»)."""
     user, uid, err = await _api_get_user_any(request)
     if err is not None:
         return err
@@ -19688,28 +20429,56 @@ async def miniapp_upload_complete(request):
     except Exception:
         body = {}
     upid = str(body.get("uploadId") or "")
+    s = _MINIAPP_UPLOADS.get(upid)
+    if not s or s.get("uid") != uid:
+        # сессии нет: возможно, файл уже догрузился сервером — честный
+        # ответ из кэша завершённых (иначе клиент рисует ложную ошибку)
+        _done = _MINIAPP_COMPLETED.get(upid)
+        if _done and _done.get("uid") == uid and \
+                time.time() - float(_done.get("ts", 0)) < 3600:
+            return web.json_response(_done["resp"])
+        return _miniapp_err(404, "session_not_found",
+                            "Загрузка не найдена или устарела — начните заново.")
+    vault_pw_raw = _miniapp_vault_pw_from(request, body, upload_sess=s)
+    ok, payload = await _miniapp_upload_finalize(user, uid, upid, s,
+                                                 pw_raw=vault_pw_raw,
+                                                 http_request=request)
+    if ok:
+        return web.json_response(payload)
+    return _payload_as_response(payload)
 
+
+def _payload_as_response(payload):
+    """dict ошибки → web.Response с тем же статусом (для кодов 4xx/5xx)."""
+    code = str((payload or {}).get("error") or "")
+    status = {"safe_locked": 423, "wrong_password": 403, "weak_password": 400,
+              "no_crypto": 503, "already_processing": 409,
+              "session_not_found": 404, "empty_file": 400,
+              "incomplete_disk": 400, "incomplete": 400, "no_bot": 503,
+              "mt_unavailable": 503, "upload_failed": 502,
+              "failed": 502}.get(code, 502)
+    return web.json_response(payload, status=status)
+
+
+async def _miniapp_upload_finalize(user, uid, upid, s, pw_raw="",
+                                   http_request=None):
+    """ВОЛНА 22.51: ОБЩЕЕ ЯДРО завершения загрузки (валидация размеров →
+    шифрование в Сейф / заливка в канал → запись в базу).
+    Вызывается из двух мест: HTTP-обработчик /api/upload/complete и сторож
+    АВТО-ДОГРУЗКИ (_upload_auto_complete_task), когда клиент закрылся, а все
+    байты уже на сервере — «загрузка продолжается через бота».
+    Возвращает (ok: bool, payload: dict) — payload это JSON-тело ответа."""
     # ВОЛНА 22.49: идемпотентный complete — если первый запрос УСПЕШНО создал
     # файл, но ответ потерялся (обрыв сети/таймаут прокси), повторный запрос
     # возвращает ТОТ ЖЕ результат вместо дубля записи в Сейфе.
     _done = _MINIAPP_COMPLETED.get(upid)
     if _done and _done.get("uid") == uid and \
             time.time() - float(_done.get("ts", 0)) < 3600:
-        return web.json_response(_done["resp"])
+        return True, dict(_done["resp"])
 
-    # ВОЛНА 22.49: сессию НЕ снимаем до успешной валидации — раньше ЛЮБАЯ
-    # ошибка (не досланы куски, пароль не введён, Telegram отказал) уничтожала
-    # сессию и .part: почти загруженный файл приходилось качать ЗАНОВО.
-    # Теперь: incomplete/safe_locked — сессия ЖИВА (дослали куски / ввели
-    # пароль → complete просто повторяется); снимаем только при успехе или
-    # при неисправимой порче (empty/incomplete_disk).
-    s = _MINIAPP_UPLOADS.get(upid)
-    if not s or s.get("uid") != uid:
-        return _miniapp_err(404, "session_not_found",
-                            "Загрузка не найдена или устарела — начните заново.")
     if s.get("completing"):
-        return _miniapp_err(409, "already_processing",
-                            "Загрузка уже обрабатывается — подождите.")
+        return False, {"error": "already_processing",
+                       "message": "Загрузка уже обрабатывается — подождите."}
     s["completing"] = True
     # ВАЖНО: _mt_upload_container может ПЕРЕИМЕНОВАТЬ временный файл — чистим оба пути.
     mt_renamed = os.path.join(os.path.dirname(s["path"]), s["name"] or "file.bin")
@@ -19719,10 +20488,9 @@ async def miniapp_upload_complete(request):
             # ВОЛНА 22.38: 0-байтовые файлы невозможны (init их отвергает;
             # здесь страховка от повреждённой сессии).
             _finished = True
-            return _miniapp_err(
-                400, "empty_file",
-                "Файл пустой (0 Б) — запись не создана. Попробуйте загрузить "
-                "файл заново.")
+            return False, {"error": "empty_file",
+                           "message": "Файл пустой (0 Б) — запись не создана. "
+                                      "Попробуйте загрузить файл заново."}
         _disk_size = 0
         try:
             _disk_size = os.path.getsize(s["path"])
@@ -19733,51 +20501,55 @@ async def miniapp_upload_complete(request):
             # иначе получаются «файлы 0б / повреждённые». ВОЛНА 22.49:
             # порча диска неисправима (куски уже лежат криво) — сессию закрываем.
             _finished = True
-            return _miniapp_err(
-                400, "incomplete_disk",
-                f"Файл получен не полностью (на диске {_disk_size} из "
-                f"{s['size']} байт) — начните загрузку заново.")
+            return False, {"error": "incomplete_disk",
+                           "message": f"Файл получен не полностью (на диске "
+                                      f"{_disk_size} из {s['size']} байт) — "
+                                      "начните загрузку заново."}
         if s["received"] != s["size"]:
             # ВОЛНА 22.49: сессию НЕ снимаем — клиент досылает недостающие
             # куски в ЭТУ ЖЕ сессию (без перекачки всего файла).
-            return _miniapp_err(
-                400, "incomplete",
-                f"Получено {s['received']} из {s['size']} байт — загрузка не завершена.")
+            return False, {"error": "incomplete",
+                           "message": f"Получено {s['received']} из "
+                                      f"{s['size']} байт — загрузка не завершена."}
         name = s["name"]
         size = s["size"]
         # === ВОЛНА 22.32: ШИФРОВАННАЯ ЗАГРУЗКА (режим по умолчанию) ===
         if not s.get("plain"):
-            vault_pw_raw = _miniapp_vault_pw_from(request, body, upload_sess=s)
-            # ВОЛНА 22.35: резолвим URL-кодированный не-Latin1 пароль из заголовка
-            # ВОЛНА 22.49: pick/guard — в worker-потоке (PBKDF2 600k).
+            # ВОЛНА 22.51: pw_raw приходит ИЗ ТЕЛА/ЗАГОЛОВОВ (HTTP-путь) или
+            # из самой сессии s["vault_pw"] (авто-догрузка без клиента).
             vault_pw = await asyncio.to_thread(
-                _miniapp_vault_pw_pick, user, _vault_pw_candidates(vault_pw_raw)) \
-                if vault_pw_raw else None
+                _miniapp_vault_pw_pick, user, _vault_pw_candidates(pw_raw)) \
+                if pw_raw else None
             guard = await asyncio.to_thread(_miniapp_vault_pw_guard, user, vault_pw)
             if guard is None:
-                return _miniapp_err(
-                    423, "safe_locked",
-                    "🔒 Введите пароль Сейфа — файлы из веба шифруются им "
-                    "(как в чате).")
+                return False, {"error": "safe_locked",
+                               "message": "🔒 Введите пароль Сейфа — файлы из "
+                                          "веба шифруются им (как в чате)."}
             if guard is not True:
-                return guard
+                try:
+                    _gj = json.loads(guard.text)
+                except Exception:
+                    _gj = {}
+                return False, {"error": str(_gj.get("error") or "failed"),
+                               "message": str(_gj.get("message") or
+                                              "Пароль Сейфа не подошёл.")}
             kind = _miniapp_kind_from(s["mime"], name)
             try:
                 new_rec = await _miniapp_encrypt_local_to_safe(
                     user, s["path"], size, name[:120], kind,
                     s["mime"], vault_pw)
             except RuntimeError as e:
-                return _miniapp_err(502, "upload_failed", str(e))
+                return False, {"error": "upload_failed", "message": str(e)}
             except Exception as e:
                 logger.error(f"miniapp upload encrypt: {e}")
-                return _miniapp_err(
-                    502, "upload_failed",
-                    f"Не удалось зашифровать файл ({e}). Попробуйте ещё раз.")
+                return False, {"error": "upload_failed",
+                               "message": f"Не удалось зашифровать файл ({e}). "
+                                          "Попробуйте ещё раз."}
             user.vault_files = [f for f in (getattr(user, "vault_files", []) or [])
                                 if isinstance(f, dict)]
             user.vault_files.append(new_rec)
-            if vault_pw:
-                sess = _miniapp_session_of(request)
+            if vault_pw and http_request is not None:
+                sess = _miniapp_session_of(http_request)
                 if sess is not None:
                     sess["vault_pw"] = vault_pw
             # ВОЛНА 22.38: «Скрыть» больше НЕ отправляется в канал — кнопка
@@ -19793,14 +20565,15 @@ async def miniapp_upload_complete(request):
             _MINIAPP_COMPLETED[upid] = {"ts": time.time(), "uid": uid,
                                         "resp": _resp}
             _miniapp_prune_completed()
-            return web.json_response(_resp)
+            return True, _resp
         # === режим «БЕЗ ШИФРА» (личный канал) — прежний путь, облако ===
         app = _MINIAPP_PTB_APP
         sent = None
         if size <= STORAGE_MAX_FILE_BYTES:
             if app is None:
-                return _miniapp_err(503, "no_bot",
-                                    "Бот ещё не завершил запуск — попробуйте через минуту.")
+                return False, {"error": "no_bot",
+                               "message": "Бот ещё не завершил запуск — "
+                                          "попробуйте через минуту."}
             # ВОЛНА 22.36: читаем файл с диска ПОД шлагбаумом (data_path) —
             # пачка файлов больше не держит все данные в ОЗУ одновременно.
             sent = await _storage_upload_document(
@@ -19809,18 +20582,20 @@ async def miniapp_upload_complete(request):
         else:
             client = await _mt_client()
             if client is None:
-                return _miniapp_err(
-                    503, "mt_unavailable",
-                    "Файлы больше 49 МБ требуют MTProto (Telethon) на сервере: "
-                    + (_MT_LAST_ERR or "недоступен")
-                    + ". Загрузите такой файл через чат «как файл» (до 2 ГБ).")
+                return False, {"error": "mt_unavailable",
+                               "message": "Файлы больше 49 МБ требуют MTProto "
+                                          "(Telethon) на сервере: "
+                                          + (_MT_LAST_ERR or "недоступен")
+                                          + ". Загрузите такой файл через чат "
+                                          "«как файл» (до 2 ГБ)."}
             sent = await _mt_upload_container(
                 client, s["path"], size, name[:100], filename=name, user=user)
         if not sent:
-            return _miniapp_err(
-                502, "upload_failed",
-                "Telegram не принял файл в хранилище. Проверьте канал "
-                "(бот должен быть его админом с правом публикации) и попробуйте ещё раз.")
+            return False, {"error": "upload_failed",
+                           "message": "Telegram не принял файл в хранилище. "
+                                      "Проверьте канал (бот должен быть его "
+                                      "админом с правом публикации) и попробуйте "
+                                      "ещё раз."}
         rec = {
             "id": _cloud_gen_file_id(user),
             "name": name[:120],
@@ -19854,7 +20629,7 @@ async def miniapp_upload_complete(request):
         _MINIAPP_COMPLETED[upid] = {"ts": time.time(), "uid": uid,
                                     "resp": _resp}
         _miniapp_prune_completed()
-        return web.json_response(_resp)
+        return True, _resp
     finally:
         # ВОЛНА 22.49: сессию и .part снимаем ТОЛЬКО при успехе или
         # неисправимой порче; при incomplete/safe_locked/ошибке Telegram
@@ -20015,8 +20790,15 @@ async def miniapp_storage_connect(request):
     # подключение/замена канала молча сбрасывала plain (клиент получал
     # hardcoded "plain": False) → мини-апп снова шифровал, хотя пользователь
     # выключил шифрование. Сохраняем выбор и возвращаем честное значение.
-    _prev_plain = bool((getattr(user, "vault_channel", None) or {}).get("plain")) \
-        if isinstance(getattr(user, "vault_channel", None), dict) else False
+    # ВОЛНА 22.51: НОВЫЙ канал по умолчанию — БЕЗ ШИФРОВАНИЯ («если
+    # пользователь добавляет свой канал — изначально там должно быть без
+    # шифрования»). Выбор уже подключённого канала по-прежнему переживает
+    # переподключение/замену.
+    _prev_vc = getattr(user, "vault_channel", None)
+    if isinstance(_prev_vc, dict) and int(_prev_vc.get("id") or 0):
+        _prev_plain = bool(_prev_vc.get("plain"))
+    else:
+        _prev_plain = True
     user.vault_channel = {
         "id": int(tc.id),
         "title": title,
@@ -25048,8 +25830,14 @@ async def vault_cloud_receive(update: Update, context: ContextTypes.DEFAULT_TYPE
     # («поставлено без шифрования — бот всё равно шифрует»). Теперь выбор
     # переживает переподключение: тот же канал — сохраняем всегда, новый
     # канал — тоже (это настройка пользователя, честно подтверждаем её текстом).
-    _prev_plain = bool((getattr(user, "vault_channel", None) or {}).get("plain")) \
-        if isinstance(getattr(user, "vault_channel", None), dict) else False
+    # ВОЛНА 22.51: НОВЫЙ канал по умолчанию подключается БЕЗ ШИФРОВАНИЯ
+    # (первое подключение / после отключения) — файлы изначально кладутся
+    # КАК ЕСТЬ, без шифров; включить шифрование можно одной кнопкой.
+    _prev_vc = getattr(user, "vault_channel", None)
+    if isinstance(_prev_vc, dict) and int(_prev_vc.get("id") or 0):
+        _prev_plain = bool(_prev_vc.get("plain"))
+    else:
+        _prev_plain = True
     user.vault_channel = {
         "id": int(tc.id),
         "title": title,
@@ -26709,7 +27497,17 @@ async def vault_show_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def _vault_prompt_password(msg, user, note: str = "", context=None):
     """ВОЛНА 9: единый запрос пароля Сейфа (после пачки/переноса).
     ВОЛНА 11: при ПЕРВОЙ настройке показываем таблицу стойкости пароля
-    (за сколько его разгадала бы супер-машина — дословные значения)."""
+    (за сколько его разгадала бы супер-машина — дословные значения).
+    ВОЛНА 22.51: СТРАХОВКА режима «без шифрования» — если у пользователя
+    личный канал с выключенным шифрованием и в пачке есть файлы, пароль
+    НЕ спрашиваем вовсе: пачка уходит в канал как есть (_vault_plain_upload).
+    Раньше любой непройденный шаг приводил сюда, и файлы «вдруг» шифровались."""
+    if (context is not None
+            and isinstance(context.user_data.get('vault_batch'), list)
+            and context.user_data.get('vault_batch')
+            and _user_vault_channel(user) is not None
+            and _vault_channel_plain(user)):
+        return await _vault_plain_upload(msg, context, user)
     if _vault_auth_valid(user):
         _sent = await msg.reply_text(
             f"{note}🔑 Введите ПАРОЛЬ СЕЙФА (попыток: {VAULT_ATTEMPTS_MAX}) — "
