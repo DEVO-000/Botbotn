@@ -3641,7 +3641,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.49"
+BOT_BUILD = "22.50"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -12553,7 +12553,11 @@ async function loadFiles(silent) {
       kind: String(f.kind || 'document'),
       size: +f.size || 0,
       ts: String(f.ts || ''),
-      vault: !!f.vault
+      vault: !!f.vault,
+      /* ВОЛНА 22.50: признаки Сейфа — «Достать из Сейфа» для файлов режима
+         «без шифра» (plain) идёт БЕЗ пароля (сервер 22.50 это умеет) */
+      safe: !!f.safe,
+      plain: !!f.plain
     }));
 
     CONN.bot = String(data.bot || CONN.bot || '');
@@ -12644,6 +12648,17 @@ document.addEventListener('visibilitychange', function () {
 try {
   if (tg && tg.onEvent) tg.onEvent('activated', maybeAutoResync);
 } catch (e) {}
+
+/* ВОЛНА 22.50: тихая авто-синхронизация каждые 45 секунд. Пользователь:
+   «автоматическая синхронизация мини приложения должна быть каждые сколько-то
+   секунд/минут, чтобы всё было синхронизировано, но не уведомлять об этом».
+   loadFiles(true) молчит (без тостов и спиннеров) и обновляет файлы, режим
+   шифрования и статус канала. В фоне и без входа не тикает. */
+setInterval(function () {
+  if (document.hidden) return;
+  if (!IS_TELEGRAM && !WEB_TOKEN) return;   /* не вошли — нечего синхронизировать */
+  maybeAutoResync();
+}, 45000);
 
 let FILTER = 'all';
 let SEARCH = '';
@@ -13135,8 +13150,12 @@ function onSafeAction() {
   }
 }
 
-/* ВОЛНА 22.40: перемещение в Сейф и обратно ЧЕРЕЗ окно с паролем.
-   Верный пароль → окно закрывается → справа снизу идёт загрузка
+/* ВОЛНА 22.50: перемещение в Сейф и обратно. Пароль спрашиваем ТОЛЬКО когда
+   он реально нужен: зашифрованный Сейф. Файл режима «без шифра» (f.plain)
+   достаётся БЕЗ пароля (его не существует), а «в Сейф» при выключенном
+   шифровании уходит без пароля (сервер сам решит: ввёл — зашифрует).
+   Раньше окно требовало пароль ВСЕГДА → «не достать файл из сейфа через
+   мини апп». Верный пароль → окно закрывается → справа снизу идёт загрузка
    (та же пилюля, что у скачивания), чтобы было видно, сколько ждать. */
 async function safeDoTransfer(kind) {
   const input = document.getElementById('safePassword');
@@ -13149,29 +13168,39 @@ async function safeDoTransfer(kind) {
     return;
   }
 
-  if (!pw) {
+  /* Пароль обязателен только для зашифрованных файлов/режима */
+  const pwNeeded = (kind === 'to_safe')
+    ? (STORAGE_PLAIN !== true)
+    : !f.plain;   /* from_safe: plain-файл достаётся без пароля */
+
+  if (pwNeeded && !pw) {
     showToast('Введите пароль Сейфа');
     return;
   }
 
   /* пароль проверяем сразу: неверный — окно остаётся открытым */
-  try {
-    await apiJson('/api/safe/unlock', {
-      method: 'POST',
-      headers: authHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify({ password: pw })
-    });
-  } catch (e) {
-    showToast(cloudErrText(e));
-    return;
-  }
+  if (pw) {
+    try {
+      await apiJson('/api/safe/unlock', {
+        method: 'POST',
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ password: pw })
+      });
+    } catch (e) {
+      showToast(cloudErrText(e));
+      return;
+    }
 
-  VAULT_PW = pw;
-  VAULT_SERVER_UNLOCKED = true;
+    VAULT_PW = pw;
+    VAULT_SERVER_UNLOCKED = true;
+  }
 
   if (input) input.value = '';
 
   closeSafeModal();
+
+  SAFE_MODAL_FILE_ID = null;
+  SAFE_MODAL_MODE = 'unlock';
 
   const tid = 'safe-' + Date.now().toString(36) + '-' +
     Math.floor(Math.random() * 1e6).toString(36);
@@ -13270,13 +13299,22 @@ function toSafeCurrentFile() {
 }
 
 /* ВОЛНА 22.40: «Достать из сейфа» — окно только с паролем и кнопкой
-   «Разблокировать»; верный пароль закрывает окно и запускает загрузку. */
+   «Разблокировать»; верный пароль закрывает окно и запускает загрузку.
+   ВОЛНА 22.50: файл режима «без шифра» (plain) достаётся СРАЗУ, без окна
+   пароля — пароля у такого файла нет (раньше окно блокировало выдачу). */
 function fromSafeCurrentFile() {
   const f = ALL_FILES.find((x) => x.id === activeEditingFileId);
 
   closeEditModal();
 
   if (!f) return;
+
+  if (f.plain) {
+    SAFE_MODAL_FILE_ID = f.id;
+    SAFE_MODAL_MODE = 'from_safe';
+    safeDoTransfer('from_safe');
+    return;
+  }
 
   openSafeModal('from_safe', f.id);
 }
@@ -14018,9 +14056,11 @@ function passwordRequired() {
 }
 
 async function detectStorageMode() {
-  if (STORAGE_ENCRYPTED !== null) return;
-
-  const urls = ['/api/storage/plain', '/api/storage/settings', '/api/storage'];
+  /* ВОЛНА 22.50: сверяем режим ВСЕГДА (раньше — только если ещё не знаем:
+     устаревшее значение «шифрование вкл» пережило бы переключатель и мини апп
+     шифровал файлы, хотя пользователь включил «без шифрования»). Запрос
+     дешёвый, окно загрузки при этом открывается без ожидания. */
+  const urls = ['/api/storage', '/api/storage/settings', '/api/storage/plain'];
 
   for (const u of urls) {
     try {
@@ -14032,7 +14072,11 @@ async function detectStorageMode() {
       /* 22.39: баннер-рекомендация виден, пока канал не подключён */
       if (typeof d.connected === 'boolean') updateDevRecBanner(d.connected);
 
-      if (typeof d.plain === 'boolean') { STORAGE_ENCRYPTED = !d.plain; return; }
+      if (typeof d.plain === 'boolean') {
+        STORAGE_PLAIN = d.plain;
+        STORAGE_ENCRYPTED = !d.plain;
+        return;
+      }
       if (typeof d.encrypted === 'boolean') { STORAGE_ENCRYPTED = d.encrypted; return; }
       if (typeof d.encryption === 'boolean') { STORAGE_ENCRYPTED = d.encryption; return; }
     } catch (e) {}
@@ -14689,6 +14733,16 @@ function proceedUpload(files, opts) {
   uploadAbortFlag = false;
   uploadQueue = files.slice();
 
+  /* ВОЛНА 22.50: пароль именно ЭТОЙ загрузки — на каждый файл. Раньше
+     UPLOAD_PLAIN_PW был глобальным: если пользователь один раз ввёл пароль
+     Сейфа (загрузка в Сейф при «без шифрования»), то ПЕРЕЗАПУЩЕННАЯ сессия
+     другого файла (докачка после 404 → re-init) молча подхватывала старый
+     пароль → файл шифровался БЕЗ ведома пользователя. Теперь пароль
+     фиксируется на файле в момент постановки в очередь. */
+  for (const f of uploadQueue) {
+    if (f && typeof f._uploadPw === 'undefined') f._uploadPw = UPLOAD_PLAIN_PW || '';
+  }
+
   /* 22.39: сохраняем файлы в IndexedDB для докачки после закрытия
      мини-аппа (файлы из resume-очереди уже сохранены — не дублируем). */
   const isResume = !!(opts && opts.resume);
@@ -14761,6 +14815,10 @@ function resetUploadUI(bar, checkmark, squareStop) {
 
   pendingFiles = [];
   pendingNames = {};
+
+  /* ВОЛНА 22.50: пароль «этой загрузки» не переживает партию — иначе
+     следующая партия при «без шифрования» внезапно уходила в Сейф. */
+  UPLOAD_PLAIN_PW = '';
 }
 
 function sendChunk(uploadId, index, blobPart, offset, onLoaded) {
@@ -14872,8 +14930,10 @@ async function _uploadOneSession(file, reportBytes) {
         name: upName,
         size: +file.size || 0,
         mime: file.type || '',
-        /* 22.40: пароль именно этой загрузки (для «без шифрования» → Сейф) */
-        password: UPLOAD_PLAIN_PW || ''
+        /* 22.40: пароль именно этой загрузки (для «без шифрования» → Сейф).
+           ВОЛНА 22.50: берём из file._uploadPw (зафиксирован при постановке
+           в очередь) — рестарт сессии больше не подхватывает чужой пароль. */
+        password: file._uploadPw || ''
       })
     });
 
@@ -15023,11 +15083,80 @@ async function _uploadOneSession(file, reportBytes) {
     }
   }
 
-  if (cErr) throw cErr;
+  if (cErr) {
+    /* ВОЛНА 22.50: «фантомные ошибки». Сервер после разрыва связи может
+       ДОговорить загрузку (шифрование/заливка в канал идут минуты), а
+       повторный complete ловит 409 already_processing — раньше мы честно
+       рисовали «⚠️ Не удалось», файл появлялся в канале позже, и выходило
+       «не загружается, а потом оказывается в канале». Теперь спрашиваем у
+       сервера статус сессии: completed → успех, processing → ждём, ready →
+       повторяем complete, gone → честная ошибка. */
+    done = await pollUploadStatus(uploadId, file);
+  }
 
   if (key) upqDel(key);
 
-  return done.file;
+  /* ВОЛНА 22.50: pollUploadStatus отдаёт запись файла напрямую, обычный
+     complete — объектом {file: …}; приводим к одному виду. */
+  if (done && done.file) return done.file;
+
+  return done;
+}
+
+/* ВОЛНА 22.50: опрос статуса загрузки после сбоя complete (до 8 минут). */
+async function pollUploadStatus(uploadId, file) {
+  const deadline = Date.now() + 8 * 60 * 1000;
+  let recompleted = 0;
+
+  while (Date.now() < deadline) {
+    await sleepMs(3000);
+
+    let st = null;
+
+    try {
+      st = await apiJson('/api/upload/status?uploadId=' +
+        encodeURIComponent(uploadId), { headers: authHeaders() });
+    } catch (e) {
+      /* сессия авторизации умерла — останавливаем опрос честной ошибкой
+         (после повторного входа очередь подхватится сама) */
+      if (e && (e.code === 'unauthorized' || e.code === 'not_registered')) throw e;
+
+      continue;   /* сеть дёрнулась — попробуем на следующем тике */
+    }
+
+    if (st && st.state === 'completed' && st.resp) return st.resp.file;
+
+    if (st && st.state === 'processing') continue;
+
+    if (st && st.state === 'ready' && recompleted < 3) {
+      recompleted++;
+
+      try {
+        const d2 = await apiJson('/api/upload/complete', {
+          method: 'POST',
+          headers: vaultHeaders({ 'Content-Type': 'application/json' }),
+          body: JSON.stringify({ uploadId })
+        });
+
+        return d2.file;
+      } catch (e) {
+        if (e && (e.code === 'safe_locked' || e.code === 'wrong_password')) {
+          if (file) {
+            file._resumeId = uploadId;
+            file._retryComplete = true;
+          }
+
+          throw e;
+        }
+
+        continue;
+      }
+    }
+
+    if (st && st.state === 'gone') break;
+  }
+
+  throw new Error('сервер не подтвердил загрузку — попробуйте ещё раз');
 }
 
 async function uploadOneFile(file, reportBytes) {
@@ -18543,7 +18672,60 @@ async def miniapp_files_from_safe(request):
     kind = str(rec.get("kind") or "document")
     mime = str(rec.get("mime") or "")
     try:
-        if rec.get("dvf2"):
+        if rec.get("plain"):
+            # ВОЛНА 22.50: файл режима «без шифра» — ЭТО НЕ КОНТЕЙНЕР. Раньше
+            # путь проваливался в _vault_unpack и ВСЕГДА падал с 502 («не
+            # удалось достать из Сейфа» в мини-аппе не работало именно для
+            # файлов, загруженных без шифрования). Выдаём сырой файл как есть.
+            name = str(rec.get("name") or rec.get("label") or "файл")
+            if int(rec.get("size_orig") or 0) <= VAULT_MAX_FILE_BYTES:
+                data = await _miniapp_fetch_cloud_bytes(user, rec)
+                up = await _storage_upload_document(
+                    _MiniappCtx(app.bot), data, filename=name[:120],
+                    caption=name[:100], user=user)
+                data = b""
+            else:
+                client = await _mt_client()
+                if client is None:
+                    return _miniapp_err(503, "mt_unavailable",
+                                        "Большие файлы требуют MTProto: "
+                                        + (_MT_LAST_ERR or "недоступен"))
+                if not _dvf2_disk_ok(int(rec.get("size_orig") or 0)):
+                    return _miniapp_err(507, "no_disk",
+                                        "Мало свободного места на диске сервера.")
+                job = _dvf2_make_job_dir()
+                try:
+                    tmp_raw = os.path.join(job, "plain.bin")
+                    _m, doc = await _mt_fetch_document(
+                        client, int(rec.get("channel_id") or get_storage_channel_id()),
+                        int(rec["msg_id"]))
+                    if doc is None:
+                        raise RuntimeError("в сообщении канала нет документа")
+                    with open(tmp_raw, "wb") as fh:
+                        await _mt_download_stream(
+                            client, doc,
+                            int(getattr(doc, "size", 0) or rec.get("size_orig") or 0),
+                            lambda chunk: fh.write(chunk))
+                    raw_size = os.path.getsize(tmp_raw)
+                    if raw_size <= (49 * 1024 * 1024 - 1024 * 1024):
+                        with open(tmp_raw, "rb") as fh:
+                            data = fh.read()
+                        try:
+                            up = await _storage_upload_document(
+                                _MiniappCtx(app.bot), data, filename=name[:120],
+                                caption=name[:100], user=user)
+                        finally:
+                            data = b""
+                    else:
+                        up = await _mt_upload_container(
+                            client, tmp_raw, raw_size, caption=name[:100],
+                            filename=name[:120], user=user)
+                finally:
+                    _shutil.rmtree(job, ignore_errors=True)
+            if not up:
+                return _miniapp_err(502, "upload_failed",
+                                    "Telegram не принял файл в хранилище.")
+        elif rec.get("dvf2"):
             client = await _mt_client()
             if client is None:
                 return _miniapp_err(503, "mt_unavailable",
@@ -19270,6 +19452,46 @@ async def miniapp_upload_closed(request):
     return web.json_response({"ok": True, "marked": marked})
 
 
+async def miniapp_upload_status(request):
+    """ВОЛНА 22.50: статус сессии загрузки — «фантомные ошибки» больше не пугают.
+
+    Раньше: complete шифрует/заливает большой файл МИНУТЫ, соединение рвётся
+    (или повторный complete ловит 409 already_processing) → мини-апп честно
+    рисовал «⚠️ Не удалось» — а сервер ДОговаривал до конца, и файл всплывал
+    в канале позже («файлы не загружаются, а потом оказываются в канале»).
+
+    Теперь после сбоя complete клиент опрашивает ЭТОТ эндпоинт:
+      • state=completed  → ответ complete сохранился (_MINIAPP_COMPLETED),
+        возвращаем ТОТ ЖЕ результат (файл загружен — честный успех);
+      • state=processing → сервер ещё шифрует/заливает — клиент ждёт;
+      • state=ready      → сессия жива, complete не дошёл — повторить complete;
+      • state=gone       → сессии нет и результата нет — честная ошибка."""
+    user, uid, err = await _api_get_user_any(request)
+    if err is not None:
+        return err
+    upid = str(request.query.get("uploadId") or "")
+    if not upid:
+        return _miniapp_err(400, "bad_request", "Не указан uploadId.")
+    _done = _MINIAPP_COMPLETED.get(upid)
+    if _done and _done.get("uid") == uid and \
+            time.time() - float(_done.get("ts", 0)) < 3600:
+        return web.json_response({"state": "completed", "resp": _done["resp"]})
+    s = _MINIAPP_UPLOADS.get(upid)
+    if s and s.get("uid") == uid:
+        if s.get("completing"):
+            return web.json_response({
+                "state": "processing",
+                "received": int(s.get("received") or 0),
+                "size": int(s.get("size") or 0),
+            })
+        return web.json_response({
+            "state": "ready",
+            "received": int(s.get("received") or 0),
+            "size": int(s.get("size") or 0),
+        })
+    return web.json_response({"state": "gone"})
+
+
 # uid → ts последнего отправленного сообщения «⏸ Загрузка на паузе»
 _UPLOAD_PAUSE_LAST = {}
 # не чаще одного сообщения в 2 минуты на пользователя (TTL-циклы, двойные биконы)
@@ -19375,6 +19597,78 @@ async def _upload_pause_watchdog(app):
             raise
         except Exception as e:
             logger.error(f"upload pause watchdog error: {e}")
+
+
+# ВОЛНА 22.50: напоминание «файлы ещё не догружены» при ЛЮБОМ сообщении боту.
+# Сценарий пользователя: закрыл мини апп крестиком посреди загрузки и ВЫШЕЛ
+# ИЗ TELEGRAM; вернулся позже — бот сам напоминает и даёт продолжить одной
+# кнопкой (раньше сообщения сторожа можно было просто не заметить/потерять
+# в чате). uid → ts последнего напоминания; не чаще раза в 30 минут.
+_UPLOAD_REMIND_LAST = {}
+_UPLOAD_REMIND_COOLDOWN = 1800.0
+
+
+async def _upload_resume_reminder(update, context):
+    """Группа 1: бежит ПАРАЛЛЕЛЬНО основному потоку, ничего не глушит и ни на
+    что не отвечает вместо бота. Если у написавшего в личку пользователя есть
+    НЕдогруженные сессии загрузки из мини-аппа — одно короткое сообщение со
+    списком и кнопкой «▶️ Продолжить загрузку» (web_app → мини апп, где очередь
+    из IndexedDB подхватывается сама). Антиспам: скипаем активные загрузки
+    (куски идут прямо сейчас), 1 раз на сессию (remind_done) + 30 мин на юзера."""
+    try:
+        u = getattr(update, "effective_user", None)
+        ch = getattr(update, "effective_chat", None)
+        if u is None or ch is None or str(getattr(ch, "type", "")) != "private":
+            return
+        uid = str(u.id)
+        now = time.time()
+        if now - float(_UPLOAD_REMIND_LAST.get(uid, 0)) < _UPLOAD_REMIND_COOLDOWN:
+            return
+        stale = []
+        for upid, s in list(_MINIAPP_UPLOADS.items()):
+            if str(s.get("uid") or "") != uid or s.get("remind_done"):
+                continue
+            size = int(s.get("size") or 0)
+            received = int(s.get("received") or 0)
+            if size <= 0 or received >= size:
+                continue                      # завершено/пусто — не интересует
+            if now - float(s.get("ts", 0)) < 15.0:
+                continue                      # куски идут СЕЙЧАС — загрузка жива
+            stale.append((upid, str(s.get("name") or "файл")[:60], size, received))
+        if not stale:
+            return
+        bot = getattr(context, "bot", None)
+        if bot is None:
+            return
+        _UPLOAD_REMIND_LAST[uid] = now
+        for upid, _nm, _sz, _rc in stale:
+            _s = _MINIAPP_UPLOADS.get(upid)
+            if _s is not None:
+                _s["remind_done"] = True
+        lines = ""
+        for _upid, nm, sz, rc in stale[:3]:
+            lines += f"• «{nm}» — догружено {_fmt_bytes(rc)} из {_fmt_bytes(sz)}\n"
+        extra = len(stale) - 3
+        if extra > 0:
+            lines += f"• и ещё {extra} файл(ов)\n"
+        kb = None
+        if MINIAPP_URL:
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("▶️ Продолжить загрузку",
+                                     web_app=WebAppInfo(url=MINIAPP_URL))]])
+        try:
+            await bot.send_message(
+                chat_id=int(uid),
+                text=("⏸ Файлы ещё не догружены\n\n" + lines +
+                      "\nМини апп закрыли посреди загрузки, но файлы НЕ "
+                      "потеряны. Откройте мини апп — загрузка продолжится "
+                      "сама с того же места."),
+                reply_markup=kb,
+            )
+        except Exception:
+            pass
+    except Exception:
+        pass
 
 
 async def miniapp_upload_complete(request):
@@ -19717,18 +20011,26 @@ async def miniapp_storage_connect(request):
                             "этим правом и попробуйте снова — без права "
                             "публикации файлам физически некуда лечь.")
     title = str(getattr(tc, "title", "") or raw or tc.id)[:80]
+    # ВОЛНА 22.50: режим «без шифрования» — выбор пользователя. Раньше
+    # подключение/замена канала молча сбрасывала plain (клиент получал
+    # hardcoded "plain": False) → мини-апп снова шифровал, хотя пользователь
+    # выключил шифрование. Сохраняем выбор и возвращаем честное значение.
+    _prev_plain = bool((getattr(user, "vault_channel", None) or {}).get("plain")) \
+        if isinstance(getattr(user, "vault_channel", None), dict) else False
     user.vault_channel = {
         "id": int(tc.id),
         "title": title,
         "added": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "plain": _prev_plain,
     }
     save_user(user)
     logger.info(f"miniapp storage: пользователь {uid} подключил личный канал "
-                f"{tc.id} («{title}»)")
+                f"{tc.id} («{title}»), режим шифрования: "
+                f"{'ВКЛЮЧЁН' if not _prev_plain else 'ВЫКЛЮЧЕН пользователем'}")
     return web.json_response({
         "ok": True, "connected": True, "id": int(tc.id),
         "title": title, "added": user.vault_channel["added"],
-        "plain": False,  # ВОЛНА 22.25: новый канал всегда НАЧИНАЕТ с шифрованием
+        "plain": bool(_prev_plain),  # ВОЛНА 22.50: выбор пользователя сохранён
         "has_general": bool(get_cloud_channel_ids()),
         "build": BOT_BUILD,
         "bot": _miniapp_bot_username(),
@@ -20203,6 +20505,8 @@ def mount_miniapp_routes(app):
     app.router.add_post("/api/upload/abort", miniapp_upload_abort)
     # ВОЛНА 22.48: «мини апп закрыли посреди загрузки» (fetch keepalive)
     app.router.add_post("/api/upload/closed", miniapp_upload_closed)
+    # ВОЛНА 22.50: статус сессии загрузки — честный успех вместо фантомных ошибок
+    app.router.add_get("/api/upload/status", miniapp_upload_status)
     # ВОЛНА 22.23: «Моё облако» в мини-аппе (статус/подключить/отключить канал)
     app.router.add_get("/api/storage", miniapp_storage_get)
     app.router.add_post("/api/storage/connect", miniapp_storage_connect)
@@ -24738,10 +25042,19 @@ async def vault_cloud_receive(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # 3) Сохраняем — и честно объясняем, что теперь где лежит.
     title = str(getattr(tc, "title", "") or raw_text or tc.id)[:80]
+    # ВОЛНА 22.50: режим «без шифрования» — ВЫБОР ПОЛЬЗОВАТЕЛЯ, а не свойство
+    # канала. Раньше «🔄 Заменить канал»/переподключение МОЛЧА сбрасывало
+    # plain → бот снова шифровал, хотя пользователь выключил шифрование
+    # («поставлено без шифрования — бот всё равно шифрует»). Теперь выбор
+    # переживает переподключение: тот же канал — сохраняем всегда, новый
+    # канал — тоже (это настройка пользователя, честно подтверждаем её текстом).
+    _prev_plain = bool((getattr(user, "vault_channel", None) or {}).get("plain")) \
+        if isinstance(getattr(user, "vault_channel", None), dict) else False
     user.vault_channel = {
         "id": int(tc.id),
         "title": title,
         "added": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "plain": _prev_plain,
     }
     save_user(user)
     _q_note = (
@@ -24750,12 +25063,20 @@ async def vault_cloud_receive(update: Update, context: ContextTypes.DEFAULT_TYPE
         "тогда в вашем канале будут лежать байты ровно с вашего устройства, "
         "без сжатия Telegram."
     )
+    _mode_note = (
+        "\n\n🔓 Режим «БЕЗ шифрования» Вами сохранён — новые файлы ложатся в "
+        "канал КАК ЕСТЬ, без пароля (переключатель: 🔗 Моё облако)."
+        if _prev_plain else
+        "\n\n🔒 Шифрование включено (режим по умолчанию) — файлы Сейфа уходят "
+        "в канал зашифрованными. Выключить: 🔗 Моё облако → «🔓 Хранить файлы "
+        "БЕЗ шифра»."
+    )
     await msg.reply_text(
         "✅ Готово! Ваш личный канал подключён:\n"
         f"«{title}» ({tc.id})\n\n"
         "Шифры ВАШИХ новых загрузок Сейфа теперь уходят только в него — "
         "общее хранилище бота больше не используется. Файлы, уже лежащие в "
-        "общем хранилище, открываются как раньше." + _q_note,
+        "общем хранилище, открываются как раньше." + _mode_note + _q_note,
         reply_markup=get_main_menu_keyboard(user),
     )
     return MAIN_MENU
@@ -54558,6 +54879,13 @@ def main():
     # middleware честно отвечает и глушит апдейт, не ломая FSM.
     application.add_handler(
         TypeHandler(Update, _voice_transcription_middleware), group=-1
+    )
+    # ВОЛНА 22.50: напоминание о недогруженных файлах (группа 1) — бежит
+    # параллельно основному потоку: пользователь вернулся в Telegram после
+    # закрытия мини-аппа с недокачанным файлом → бот сам подсказывает,
+    # что файлы не потеряны, и даёт кнопку «▶️ Продолжить загрузку».
+    application.add_handler(
+        TypeHandler(Update, _upload_resume_reminder), group=1
     )
     # ВОЛНА 22.4: наблюдатель групп Пульта удалён вместе с Пультом.
 
