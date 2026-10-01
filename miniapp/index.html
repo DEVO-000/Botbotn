@@ -3248,6 +3248,16 @@ let currentTheme = localStorage.getItem('devo_theme') || 'system';
 let blobsEnabled = localStorage.getItem('devo_blobs_enabled') !== 'false';
 let blobIdleSpeed = localStorage.getItem('devo_blob_speed') || '5';
 
+/* ВОЛНА 22.49: безопасная запись в localStorage. Раньше голый setItem
+   в приватном режиме/при заблокированном хранилище бросал исключение:
+   boot-вызов applyTheme падал на середине и ВСЁ, что ниже — звук, сортировка,
+   рендер списков, загрузка настроек — оставалось мёртвым (пустой экран). */
+function safeSet(key, value) {
+  try {
+    localStorage.setItem(key, value);
+  } catch (e) {}
+}
+
 /* Слабые устройства: тяжёлые эффекты выключаем по умолчанию,
    чтобы не было лагов — пользователь может включить вручную */
 let LOW_END = false;
@@ -3267,7 +3277,7 @@ if (LOW_END) {
 if (LOW_END && localStorage.getItem('devo_blobs_enabled') === null) {
   blobsEnabled = false;
 
-  try { localStorage.setItem('devo_blobs_enabled', 'false'); } catch (e) {}
+  try { safeSet('devo_blobs_enabled', 'false'); } catch (e) {}
 }
 
 function toggleSettingsPanel(e) {
@@ -3331,7 +3341,7 @@ let themeBootApplied = false;
 
 function applyTheme(theme) {
   currentTheme = theme;
-  localStorage.setItem('devo_theme', theme);
+  safeSet('devo_theme', theme);
   settingsChanged(); /* 22.39: настройки живут в базе */
 
   let isDark = false;
@@ -3411,11 +3421,11 @@ function updateCustomColors() {
   document.documentElement.style.setProperty('--custom-btn-bg', btnBg);
   document.documentElement.style.setProperty('--custom-btn-text', btnText);
 
-  localStorage.setItem('devo_custom_c1', c1);
-  localStorage.setItem('devo_custom_c2', c2);
-  localStorage.setItem('devo_custom_angle', angle);
-  localStorage.setItem('devo_custom_btn_bg', btnBg);
-  localStorage.setItem('devo_custom_btn_text', btnText);
+  safeSet('devo_custom_c1', c1);
+  safeSet('devo_custom_c2', c2);
+  safeSet('devo_custom_angle', angle);
+  safeSet('devo_custom_btn_bg', btnBg);
+  safeSet('devo_custom_btn_text', btnText);
 
   settingsChanged(); /* 22.39: настройки живут в базе */
 }
@@ -3438,7 +3448,7 @@ function initCustomColors() {
 
 function toggleBlobs() {
   blobsEnabled = !blobsEnabled;
-  localStorage.setItem('devo_blobs_enabled', blobsEnabled);
+  safeSet('devo_blobs_enabled', blobsEnabled);
   settingsChanged(); /* 22.39: настройки живут в базе */
   updateBlobsVisibility();
 }
@@ -3585,7 +3595,7 @@ window.addEventListener('resize', function () {
 
 function changeBlobSpeed(val) {
   blobIdleSpeed = val;
-  localStorage.setItem('devo_blob_speed', val);
+  safeSet('devo_blob_speed', val);
   settingsChanged(); /* 22.39: настройки живут в базе */
 
   const label = document.getElementById('speedValueLabel');
@@ -3608,7 +3618,9 @@ function getAudioContext() {
     if (AudioContextClass) audioCtx = new AudioContextClass();
   }
 
-  if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+  /* ВОЛНА 22.49: .catch — autoplay-policy отклоняет resume(): раньше это
+     сыпало необработанными rejection в консоль */
+  if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
 
   return audioCtx;
 }
@@ -3726,7 +3738,7 @@ let selectedSoundId = parseInt(localStorage.getItem('devo_sound_id') || '1');
 
 if (!SOUND_PROFILES.some((s) => s.id === selectedSoundId)) {
   selectedSoundId = 1;
-  localStorage.setItem('devo_sound_id', '1');
+  safeSet('devo_sound_id', '1');
 }
 
 function playSoundDirectly(id) {
@@ -3789,7 +3801,7 @@ function handleSoundSelect(e, id) {
   unlockAudio();
 
   selectedSoundId = Number(id);
-  localStorage.setItem('devo_sound_id', selectedSoundId);
+  safeSet('devo_sound_id', selectedSoundId);
   settingsChanged(); /* 22.39: настройки живут в базе */
 
   renderSoundMenu();
@@ -3921,7 +3933,7 @@ async function webLogin() {
 
     if (r.ok && data.token) {
       WEB_TOKEN = String(data.token);
-      localStorage.setItem('devo_web_token', WEB_TOKEN);
+      safeSet('devo_web_token', WEB_TOKEN);
 
       document.getElementById('loginPassword').value = '';
 
@@ -4474,19 +4486,23 @@ function renderFiles(files) {
   list.innerHTML = files.map((f) => {
     const sel = selectMode && selectedIds.has(f.id);
 
+    /* 22.49: id экранируется — раньше подставлялся в inline-атрибут raw:
+       id с кавычкой ломал разметку (и это XSS-sink на будущее) */
+    const fid = escapeHtml(String(f.id == null ? '' : f.id));
+
     const cardAction = selectMode
-      ? `toggleFileSelection(event,'${f.id}')`
-      : `openEditModal('${f.id}')`;
+      ? `toggleFileSelection(event,'${fid}')`
+      : `openEditModal('${fid}')`;
 
     const checkHtml = selectMode ? `
-      <div onclick="toggleFileSelection(event,'${f.id}')" style="flex-shrink:0;width:24px;height:24px;border-radius:8px;display:flex;align-items:center;justify-content:center;border:2px solid ${sel ? 'var(--btn-text)' : 'var(--border-color)'};background:${sel ? 'var(--btn-text)' : 'transparent'};transition:transform .15s var(--ease-spring)">
+      <div onclick="toggleFileSelection(event,'${fid}')" style="flex-shrink:0;width:24px;height:24px;border-radius:8px;display:flex;align-items:center;justify-content:center;border:2px solid ${sel ? 'var(--btn-text)' : 'var(--border-color)'};background:${sel ? 'var(--btn-text)' : 'transparent'};transition:transform .15s var(--ease-spring)">
         ${sel ? '<i data-lucide="check" style="width:14px;height:14px;stroke:var(--card-bg)"></i>' : ''}
       </div>
     ` : '';
 
     const actionsHtml = selectMode ? '' : `
       <div style="display:flex;gap:4px;flex-shrink:0" onclick="event.stopPropagation()">
-        <button class="action-btn" onclick="openEditModal('${f.id}')" title="Редактировать">
+        <button class="action-btn" onclick="openEditModal('${fid}')" title="Редактировать">
           <i data-lucide="more-vertical" style="width:16px;height:16px"></i>
         </button>
       </div>
@@ -5626,7 +5642,7 @@ function updateDevRecBanner(connected) {
 function dismissDevRec(e) {
   if (e) e.stopPropagation();
 
-  localStorage.setItem('devo_recbanner_hide', '1');
+  safeSet('devo_recbanner_hide', '1');
   settingsChanged(); /* 22.39: настройки живут в базе */
 
   const b = document.getElementById('devRecBanner');
@@ -5861,7 +5877,13 @@ function notifyUploadClosed() {
   if (!isUploading || !uploadQueue || !uploadQueue.length) return;
 
   try {
-    const names = uploadQueue.slice(0, 3).map(function (f) {
+    /* 22.49: считаем ТОЛЬКО ещё не догруженные (загруженные файлы остаются
+       в uploadQueue до конца пачки — раньше N было завышено) */
+    const pending = uploadQueue.filter(function (f) { return !f._doneFlag; });
+
+    if (!pending.length) return;
+
+    const names = pending.slice(0, 3).map(function (f) {
       return String(f.uploadName || f.name || 'файл').slice(0, 40);
     });
 
@@ -5869,7 +5891,7 @@ function notifyUploadClosed() {
       method: 'POST',
       keepalive: true,
       headers: vaultHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify({ n: uploadQueue.length, names: names })
+      body: JSON.stringify({ n: pending.length, names: names })
     }).catch(function () {});
   } catch (e) {}
 }
@@ -6027,7 +6049,14 @@ function addMoreUploadFiles() {
 function uploadFiles(fileList) {
   let files = Array.from(fileList);
 
-  if (!files.length || isUploading) return;
+  /* 22.49: раньше файлы, выбранные ВО ВРЕМЯ активной загрузки, молча
+     пропадали (return без тоста) — пользователь думал, что «не сработало» */
+  if (files.length && isUploading) {
+    showToast('⏳ Дождитесь окончания текущей загрузки — потом добавьте остальные');
+    return;
+  }
+
+  if (!files.length) return;
 
   /* 22.39: пустые файлы (0 Б) не грузим вообще — «такого не должно быть»
      (сервер их отвергает, клиент отсекает сразу с честным тостом) */
@@ -6339,6 +6368,11 @@ function sendChunk(uploadId, index, blobPart, offset, onLoaded) {
 
     xhr.open('POST', q);
 
+    /* ВОЛНА 22.49: таймаут 60 с — раньше зависшее TCP-соединение (сервер
+       жив, пакеты теряются) оставляло await sendChunk висеть НАВСЕГДА:
+       воркер стоял, ретраи не срабатывали, очередь молча стояла */
+    xhr.timeout = 60000;
+
     const headers = vaultHeaders();
 
     for (const k in headers) {
@@ -6383,6 +6417,12 @@ function sendChunk(uploadId, index, blobPart, offset, onLoaded) {
       reject(err);
     };
 
+    xhr.ontimeout = () => {
+      uploadXhrs.delete(xhr);
+      if (uploadXhr === xhr) uploadXhr = null;
+      reject(new Error('таймаут сети (60 с)'));
+    };
+
     xhr.onerror = () => {
       uploadXhrs.delete(xhr);
       if (uploadXhr === xhr) uploadXhr = null;
@@ -6410,7 +6450,9 @@ async function _uploadOneSession(file, reportBytes) {
   let uploadId = file._resumeId || '';
 
   if (uploadId) {
-    /* продолжаем ПОСЛЕ закрытия мини-аппа */
+    /* продолжаем ПОСЛЕ закрытия мини-аппа... или повторяем complete
+       после ввода пароля Сейфа (22.49, _retryComplete): куски уже на
+       сервере, init не нужен — сразу complete */
     file._resumeId = '';
   } else {
     const initData = await apiJson('/api/upload/init', {
@@ -6426,6 +6468,10 @@ async function _uploadOneSession(file, reportBytes) {
     });
 
     uploadId = initData.uploadId;
+
+    /* ВОЛНА 22.49: сервер не выдал сессию — честная ошибка вместо
+       «uploadId=undefined» во всех URL кусков */
+    if (!uploadId) throw new Error('сервер не выдал сессию загрузки');
   }
 
   file._lastUploadId = uploadId;
@@ -6472,6 +6518,11 @@ async function _uploadOneSession(file, reportBytes) {
       let resp = null;
 
       for (let attempt = 0; attempt < 3; attempt++) {
+        /* ВОЛНА 22.49: проверка отмены на КАЖДОЙ попытке — раньше воркер,
+           заснувший в sleepMs(1200*(attempt+1)) во время отмены, просыпался
+           и отправлял ЕЩЁ ОДИН кусок поверх отменённой загрузки */
+        if (uploadAbortFlag || file._cancelFlag) return 'abort';
+
         try {
           resp = await sendChunk(uploadId, idx, file.slice(off, end), off,
             (n) => reportChunk(idx, n));
@@ -6504,13 +6555,12 @@ async function _uploadOneSession(file, reportBytes) {
         if (nextByServer > idx + 1) nextIndex = Math.max(nextIndex, nextByServer);
       }
 
-      if (key) {
-        upqPut({
-          k: key, blob: file, name: file.name, uploadName: upName,
-          size: +file.size || 0, mime: file.type || '',
-          uploadId: uploadId, added: Date.now()
-        });
-      }
+      /* ВОЛНА 22.49: per-кусочный upqPut УДАЛЁН. Раньше после КАЖДОГО куска
+         в IndexedDB перезаписывалась ЗАПИСЬ С ЦЕЛИМ ФАЙЛОМ: 2 ГБ файл =
+         ~342 куска × 2 ГБ ≈ 680 ГБ записи — квота IDB взрывалась (и молча
+         глоталась), большие файлы тормозили. Запись с блобом уже лежит в IDB
+         (до старта, см. proceedUpload); докачка и так переотправляет куски
+         идемпотентно (?offset=, сервер дедупит по index) — позиция не нужна. */
     }
   }
 
@@ -6550,6 +6600,14 @@ async function _uploadOneSession(file, reportBytes) {
       if (e.message === 'aborted') throw e;
 
       cErr = e;
+
+      /* ВОЛНА 22.49: не хватает пароля Сейфа — сервер держит сессию и .part
+         (куски НЕ потеряны). Запоминаем uploadId: после ввода пароля
+         complete повторится БЕЗ перекачки файла заново */
+      if (e && (e.code === 'safe_locked' || e.code === 'wrong_password')) {
+        file._resumeId = uploadId;
+        file._retryComplete = true;
+      }
 
       if (!a) await sleepMs(2500);
     }
@@ -6598,8 +6656,22 @@ async function uploadEngine(bar) {
       });
 
       if (rec) added.push(rec);
+
+      /* 22.49: помечаем ДОСТИГНУТЫМ — notifyUploadClosed считает
+         только недогруженные, «⏸ пауза» больше не преувеличивает */
+      file._doneFlag = true;
     } catch (e) {
       if (e.message === 'aborted' || uploadAbortFlag) break;
+
+      /* 22.49: НЕобратимые ошибки сервера (4xx, кроме 429/423 — это
+         «слишком часто»/«нет пароля») — убираем файл из очереди докачки,
+         чтобы он не бесконечно повторял тост «⏳ Продолжаю прерванную
+         загрузку» на каждом открытии приложения */
+      const _code = String((e && e.code) || '');
+      if (/^4\d\d$/.test(_code) && _code !== '429' && _code !== '423'
+        && file._entryKey) {
+        upqDel(file._entryKey);
+      }
 
       failedFiles.push({ file: file, e: e });
     }
@@ -6784,7 +6856,7 @@ async function pullSettingsApply() {
     for (const k in map) {
       if (s[k] != null && String(s[k]) !== '' &&
           localStorage.getItem(map[k]) !== String(s[k])) {
-        localStorage.setItem(map[k], String(s[k]));
+        safeSet(map[k], String(s[k]));
         dirty = true;
       }
     }
@@ -6793,12 +6865,12 @@ async function pullSettingsApply() {
       const want = s.blobs ? 'true' : 'false';
 
       if (localStorage.getItem('devo_blobs_enabled') !== want) {
-        localStorage.setItem('devo_blobs_enabled', want);
+        safeSet('devo_blobs_enabled', want);
         dirty = true;
       }
     }
 
-    if (s.recbanner_hide === true) localStorage.setItem('devo_recbanner_hide', '1');
+    if (s.recbanner_hide === true) safeSet('devo_recbanner_hide', '1');
 
     if (dirty) {
       currentTheme = localStorage.getItem('devo_theme') || 'system';
@@ -7343,6 +7415,8 @@ function mpIsAudioFile(f) {
   return String(f.kind || '') === 'audio' || /\.(mp3|wav|ogg|oga|m4a|aac|flac)$/i.test(String(f.name || ''));
 }
 
+let mpBrokenStreak = 0;   /* ВОЛНА 22.49: подряд битых треков (анти-шторм) */
+
 function mpBuildPlaylist() {
   mpList = ALL_FILES.filter(mpIsAudioFile).map((f) => ({
     id: f.id,
@@ -7676,12 +7750,25 @@ async function mpLoad(i, autoplay) {
   if (t.localFile && url) mpObjectUrl = url;
 
   if (!url) {
+    /* ВОЛНА 22.49: счётчик ПОДРЯД битых треков. Раньше при недоступных
+       ссылках (сеть/сервер/Сейф закрыт) mpLoad → mpNextTrack → mpLoad
+       крутил плейлист БЕСКОНЕЧНО, спамя сервер запросами ссылок и
+       дёргая окно входа при каждом 401 */
+    mpBrokenStreak++;
+
     mpSyncPlayIcon();
 
-    if (autoplay) mpNextTrack();
+    if (autoplay && mpOpen && mpList.length
+      && mpBrokenStreak <= mpList.length) {
+      mpNextTrack();
+    } else if (autoplay && mpBrokenStreak > mpList.length) {
+      showToast('⚠️ Не удалось воспроизвести треки — они недоступны');
+    }
 
     return;
   }
+
+  mpBrokenStreak = 0;
 
   mpAudioEl.src = url;
 
@@ -7870,6 +7957,9 @@ function openMusicPlayer(fileId, forcedUrl) {
   document.getElementById('musicPlayer').classList.add('open');
   document.body.classList.add('mp-lock');
 
+  /* ВОЛНА 22.49: новый запуск плеера — счётчик битых сброшен */
+  mpBrokenStreak = 0;
+
   mpRenderDots();
 
   /* rAF-циклы живут только пока плеер открыт */
@@ -7892,6 +7982,31 @@ function closeMusicPlayer() {
 
   if (mpAudioEl) mpAudioEl.pause();
 
+  /* ВОЛНА 22.49: освобождаем ресурсы — раньше blob-URL и src последнего
+     трека держались в памяти до следующего открытия (утечка RAM), а
+     lock-screen-кнопки «играть/дальше» молча срабатывали в никуда */
+  if (mpObjectUrl) {
+    try { URL.revokeObjectURL(mpObjectUrl); } catch (e) {}
+
+    mpObjectUrl = null;
+  }
+
+  if (mpCoverUrl) {
+    try { URL.revokeObjectURL(mpCoverUrl); } catch (e) {}
+
+    mpCoverUrl = null;
+  }
+
+  if (mpAudioEl) {
+    try {
+      mpAudioEl.removeAttribute('src');
+      mpAudioEl.load();
+    } catch (e) {}
+  }
+
+  if (mpBeatRaf) { cancelAnimationFrame(mpBeatRaf); mpBeatRaf = 0; }
+  if (mpTickRaf) { cancelAnimationFrame(mpTickRaf); mpTickRaf = 0; }
+
   setTimeout(() => {
     if (!mpOpen) document.body.classList.remove('mp-lock');
   }, 450);
@@ -7910,6 +8025,7 @@ let vpControlsTimeout = null;
 let vpLastTapTime = 0;
 let vpLastTapSide = null;
 let vpAudioCtx = null;
+let vpOsc = null;   /* ВОЛНА 22.49: ссылка на осциллятор фонового тишины */
 let vpSavedRate = 1.0;
 let vpPressTimer = null;
 let vpLongPressing = false;
@@ -8147,14 +8263,16 @@ function vpInitBackgroundAudio() {
 
       vpAudioCtx = new AC();
 
-      const osc = vpAudioCtx.createOscillator();
+      vpOsc = vpAudioCtx.createOscillator();
       const dst = vpAudioCtx.createMediaStreamDestination();
 
-      osc.connect(dst);
-      osc.start();
+      vpOsc.connect(dst);
+      vpOsc.start();
     }
 
-    if (vpAudioCtx.state === 'suspended') vpAudioCtx.resume();
+    if (vpAudioCtx.state === 'suspended') {
+      vpAudioCtx.resume().catch(() => {});
+    }
   } catch (e) {}
 }
 
@@ -8195,8 +8313,11 @@ function vpPlayVideo(v) {
 
       navigator.mediaSession.setActionHandler('play', () => vpPlayerEl.play());
       navigator.mediaSession.setActionHandler('pause', () => vpPlayerEl.pause());
-      navigator.mediaSession.setActionHandler('seekbackward', (e) => vpRewindSec(-10, e));
-      navigator.mediaSession.setActionHandler('seekforward', (e) => vpRewindSec(10, e));
+      /* ВОЛНА 22.49: БЕЗ аргумента — MediaSession кладёт в колбэк свой
+         ActionDetails, а vpRewindSec звал на нём stopPropagation() →
+         TypeError с каждого seek с экрана блокировки */
+      navigator.mediaSession.setActionHandler('seekbackward', () => vpRewindSec(-10));
+      navigator.mediaSession.setActionHandler('seekforward', () => vpRewindSec(10));
     } catch (e) {}
   }
 
@@ -8415,7 +8536,9 @@ function vpOnSeekInput() {
 }
 
 function vpOnSeekChange() {
-  if (vpPlayerEl.duration) {
+  /* ВОЛНА 22.49: isFinite-гард — duration===Infinity (webm/MediaRecorder
+     до метаданных) давал currentTime = x*Infinity */
+  if (vpPlayerEl.duration && isFinite(vpPlayerEl.duration)) {
     vpPlayerEl.currentTime = (vpSeekEl.value / 100) * vpPlayerEl.duration;
   }
 
@@ -8455,7 +8578,7 @@ function vpTogglePlay(e) {
 }
 
 function vpRewindSec(seconds, e) {
-  if (e) {
+  if (e && typeof e.stopPropagation === 'function') {
     e.stopPropagation();
     if (e.cancelable) e.preventDefault();
   }
@@ -8469,7 +8592,28 @@ function vpCloseModal(e) {
   if (e) e.stopPropagation();
 
   vpPlayerEl.pause();
-  vpPlayerEl.src = '';
+
+  /* ВОЛНА 22.49: removeAttribute вместо src='' — пустой src резолвится в
+     URL страницы и рождает внутреннюю media-ошибку элемента */
+  try {
+    vpPlayerEl.removeAttribute('src');
+    vpPlayerEl.load();
+  } catch (e2) {}
+
+  /* ВОЛНА 22.49: гасим бесконечный фоновый осциллятор — раньше он рендерил
+     440 Гц ДО КОНЦА СЕССИИ после закрытия плеера (CPU/батарея в WebView) */
+  if (vpOsc) {
+    try { vpOsc.stop(); } catch (e3) {}
+
+    vpOsc = null;
+  }
+
+  if (vpAudioCtx) {
+    try { vpAudioCtx.suspend().catch(() => {}); } catch (e4) {}
+  }
+
+  if (vpSeekSafetyTimer) { clearTimeout(vpSeekSafetyTimer); vpSeekSafetyTimer = null; }
+  if (vpControlsTimeout) { clearTimeout(vpControlsTimeout); vpControlsTimeout = null; }
 
   vpZoomScale = 1.0;
   vpPlayerEl.style.transform = 'scale(1)';
