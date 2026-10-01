@@ -1583,10 +1583,14 @@ def save_data(filename, data):
         return True
     # 3) Локальный файл — последний шанс. На Render Free данные пропадут
     # после рестарта, но это лучше, чем потерять прямо сейчас.
+    # ВОЛНА 22.49: атомарная запись (tmp + os.replace) — раньше крэш/kill
+    # посреди json.dump портил файл НАМЕРТВО (это была единственная копия).
     try:
         _ensure_parent_dir(filename)
-        with open(filename, 'w', encoding='utf-8') as f:
+        _tmpf = filename + ".tmp"
+        with open(_tmpf, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(_tmpf, filename)
         _cdb_mark_dirty(filename)
         return True
     except Exception as e:
@@ -1597,29 +1601,12 @@ def save_data(filename, data):
 async def _async_save_data(filename, data):
     """Асинхронная обёртка save_data (с ленивой инициализацией Supabase).
 
-    ВОЛНА 22.18: данные запечатываются DVF3-шифром до любого бэкенда."""
-    data = _db_seal(data)
-    # 1) Supabase
-    if _supabase_ready:
-        if _supabase_save(filename, data):
-            _cdb_mark_dirty(filename)
-            return
-    elif SUPABASE_URL and SUPABASE_KEY:
-        if _supabase_try_late_init() and _supabase_save(filename, data):
-            _cdb_mark_dirty(filename)
-            return
-    # 2) Mongo
-    if _mongo_kv is not None and _mongo_save(filename, data):
-        _cdb_mark_dirty(filename)
-        return
-    # 3) Файл
-    try:
-        _ensure_parent_dir(filename)
-        with open(filename, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        _cdb_mark_dirty(filename)
-    except Exception as e:
-        logger.error(f"Ошибка при асинхронном сохранении {filename}: {e}")
+    ВОЛНА 22.18: данные запечатываются DVF3-шифром до любого бэкенда.
+    ВОЛНА 22.49: РЕАЛЬНО асинхронная — вся работа (сеть Supabase/Mongo,
+    шифрование DVF3, файл) уходит в worker-поток. Раньше функция была
+    «фейково-асинхронной»: те же блокирующие вызовы, но прямо на event loop,
+    и каждый вызов фризил бота до ~16 с при медленном Supabase."""
+    return await asyncio.to_thread(save_data, filename, data)
 
 
 # ==================================
@@ -3126,10 +3113,31 @@ def save_global_buttons(buttons):
     data = {button_id: button.to_dict() for button_id, button in buttons.items()}
     return save_data(GLOBAL_BUTTONS_FILE, data)
 
+# ВОЛНА 22.49: TTL-кэш списка заблокированных (60 с, как load_users).
+# Раньше get_user() → is_user_blocked() → load_blocked_users() ХОДИЛ В СЕТЬ
+# (Supabase GET) при каждом вызове: единый тик по N пользователям делал
+# ~N сетевых запросов каждые 30 с — блокируя event loop на секунды.
+_blocked_users_cache = None
+_blocked_users_cache_ts = 0.0
+
+
 def load_blocked_users():
-    return load_data(BLOCKED_USERS_FILE, {})
+    global _blocked_users_cache, _blocked_users_cache_ts
+    now = time.time()
+    if _blocked_users_cache is not None and now - _blocked_users_cache_ts < CACHE_TTL:
+        return _blocked_users_cache
+    data = load_data(BLOCKED_USERS_FILE, {})
+    if not isinstance(data, dict):
+        data = {}
+    _blocked_users_cache = data
+    _blocked_users_cache_ts = now
+    return data
+
 
 def save_blocked_users(blocked_users):
+    global _blocked_users_cache, _blocked_users_cache_ts
+    _blocked_users_cache = blocked_users
+    _blocked_users_cache_ts = time.time()
     return save_data(BLOCKED_USERS_FILE, blocked_users)
 
 def load_class_blocked_users():
@@ -3633,7 +3641,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.47"
+BOT_BUILD = "22.49"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -6423,6 +6431,13 @@ async def _storage_upload_document(context, data: bytes, filename: str, caption:
                 return _fh.read()
         return data
 
+    async def _payload_bytes_async():
+        """ВОЛНА 22.49: чтение до ~49 МиБ с диска — в worker-потоке
+        (раньше read() целиком блокировал event loop на десятки мс..сек)."""
+        if data_path:
+            return await asyncio.to_thread(_payload_bytes)
+        return data
+
     if channel_id:
         targets = [int(channel_id)]
     else:
@@ -6444,14 +6459,16 @@ async def _storage_upload_document(context, data: bytes, filename: str, caption:
         try:
             # ВОЛНА 22.35: публикация через «шлагбаум» — очередь на канал;
             # ВОЛНА 22.36: чтение данных происходит ВНУТРИ гейта (по очереди)
-            sent, queue_pos = await _pub_send(
-                ch,
-                lambda ch=ch: context.bot.send_document(
+            # ВОЛНА 22.49: coro_factory — теперь async def (чтение файла с
+            # диска ушло в worker-поток; лямбда не может содержать await).
+            async def _send_doc(ch=ch):
+                return await context.bot.send_document(
                     chat_id=ch,
-                    document=InputFile(_payload_bytes(), filename=filename or "file.bin"),
+                    document=InputFile(await _payload_bytes_async(), filename=filename or "file.bin"),
                     caption=(caption or "")[:1024] or None,
-                ),
-            )
+                )
+
+            sent, queue_pos = await _pub_send(ch, _send_doc)
             doc = getattr(sent, "document", None)
             # Продвигаем указатель круговой загрузки (только общий путь).
             # Считаем от позиции канала в ИСХОДНОМ списке, а не в повёрнутом.
@@ -6635,7 +6652,8 @@ async def _storage_do_backup(context):
     if not db_ids:
         return False, ("❌ Хранилище не настроено. Подключите приватный канал: "
                        "🛠️ Панель разработчика → ☁️ Хранилище → 🔗 Каналы.")
-    payload, meta, files_n = _storage_pack_payload()
+    # ВОЛНА 22.49: сборка zip+LZMA всей базы — в worker-потоке.
+    payload, meta, files_n = await asyncio.to_thread(_storage_pack_payload)
     if not payload:
         return False, "❌ Нет данных для бэкапа."
     users_n = meta.get("users", 0)
@@ -6863,7 +6881,9 @@ async def _cdb_flush(context, force: bool = False, reason: str = ""):
         # Повторная проверка после ожидания лока: другой тик уже слил.
         if not _CDB_DIRTY and not force:
             return True, "Изменений нет — сливать нечего (после лока)."
-        payload, meta, files_n = _storage_pack_payload()
+        # ВОЛНА 22.49: сборка снапшота (zip+LZMA+AES целой базы) — в
+        # worker-потоке; вызывается из тика — раньше фризил loop на секунды.
+        payload, meta, files_n = await asyncio.to_thread(_storage_pack_payload)
         if not payload:
             return False, "Нет данных для снапшота."
         now = _utcnow()
@@ -8005,8 +8025,21 @@ async def cloud_del_yes_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 _MINIAPP_PTB_APP = None        # ссылка на Application (ставится в _post_init)
 _MINIAPP_UPLOADS = {}          # uploadId → {path, name, mime, size, uid, received, ts}
 _MINIAPP_UPLOADS_TTL = 6 * 3600
+# ВОЛНА 22.49: успешно завершённые загрузки (uploadId → ответ complete) —
+# идемпотентность: повторный complete после потери ответа отдаёт ТОТ ЖЕ
+# результат, вместо дубля файла в Сейфе.
+_MINIAPP_COMPLETED = {}
+_MINIAPP_COMPLETED_TTL = 3600
 _MINIAPP_AUTH_TTL = 86400      # 24 часа — как рекомендует Telegram
 _MINIAPP_CHUNK = 4 * 1024 * 1024  # клиент шлёт кусками по 4 МБ (документация)
+
+
+def _miniapp_prune_completed():
+    """ВОЛНА 22.49: чистка просроченных результатов complete."""
+    now = time.time()
+    for k in [k for k, v in _MINIAPP_COMPLETED.items()
+              if now - float(v.get("ts", 0)) > _MINIAPP_COMPLETED_TTL]:
+        _MINIAPP_COMPLETED.pop(k, None)
 
 # ВОЛНА 22.30: ОДНОРАЗОВЫЕ ССЫЛКИ СКАЧИВАНИЯ. Заголовки авторизации в ссылке
 # не передашь, а blob-загрузки в WebView Telegram часто блокированы — поэтому
@@ -8344,6 +8377,33 @@ def _miniapp_cleanup_uploads():
                 except Exception:
                     pass
             _MINIAPP_UPLOADS.pop(k, None)
+    # ВОЛНА 22.49: сиротские .part после рестарта + просроченные ответы
+    # complete — всё чистим в одном месте (вызывается на каждый init).
+    _miniapp_sweep_orphan_parts()
+    _miniapp_prune_completed()
+
+
+def _miniapp_sweep_orphan_parts():
+    """ВОЛНА 22.49: чистка СИРОТСКИХ .part-файлов. Сессии живут в RAM —
+    после рестарта сервера все недокачанные .part (до ~2 ГБ каждый) навсегда
+    теряли «хозяина» и лежали на диске, пока не закончится место. Удаляем
+    .part старше часа, на которые не ссылается живая сессия."""
+    try:
+        d = _miniapp_tmpdir()
+        live = {os.path.basename(str(s.get("path") or ""))
+                for s in _MINIAPP_UPLOADS.values()}
+        now = time.time()
+        for fn in os.listdir(d):
+            if not fn.endswith(".part") or fn in live:
+                continue
+            p = os.path.join(d, fn)
+            try:
+                if now - os.path.getmtime(p) > 3600:
+                    os.remove(p)
+            except OSError:
+                pass
+    except Exception:
+        pass
 
 
 # --- MINIAPP_EMBED_BEGIN (ВОЛНА 22.25: сюда сборщик scripts/embed_miniapp.py
@@ -11598,6 +11658,16 @@ let currentTheme = localStorage.getItem('devo_theme') || 'system';
 let blobsEnabled = localStorage.getItem('devo_blobs_enabled') !== 'false';
 let blobIdleSpeed = localStorage.getItem('devo_blob_speed') || '5';
 
+/* ВОЛНА 22.49: безопасная запись в localStorage. Раньше голый setItem
+   в приватном режиме/при заблокированном хранилище бросал исключение:
+   boot-вызов applyTheme падал на середине и ВСЁ, что ниже — звук, сортировка,
+   рендер списков, загрузка настроек — оставалось мёртвым (пустой экран). */
+function safeSet(key, value) {
+  try {
+    localStorage.setItem(key, value);
+  } catch (e) {}
+}
+
 /* Слабые устройства: тяжёлые эффекты выключаем по умолчанию,
    чтобы не было лагов — пользователь может включить вручную */
 let LOW_END = false;
@@ -11617,7 +11687,7 @@ if (LOW_END) {
 if (LOW_END && localStorage.getItem('devo_blobs_enabled') === null) {
   blobsEnabled = false;
 
-  try { localStorage.setItem('devo_blobs_enabled', 'false'); } catch (e) {}
+  try { safeSet('devo_blobs_enabled', 'false'); } catch (e) {}
 }
 
 function toggleSettingsPanel(e) {
@@ -11681,7 +11751,7 @@ let themeBootApplied = false;
 
 function applyTheme(theme) {
   currentTheme = theme;
-  localStorage.setItem('devo_theme', theme);
+  safeSet('devo_theme', theme);
   settingsChanged(); /* 22.39: настройки живут в базе */
 
   let isDark = false;
@@ -11761,11 +11831,11 @@ function updateCustomColors() {
   document.documentElement.style.setProperty('--custom-btn-bg', btnBg);
   document.documentElement.style.setProperty('--custom-btn-text', btnText);
 
-  localStorage.setItem('devo_custom_c1', c1);
-  localStorage.setItem('devo_custom_c2', c2);
-  localStorage.setItem('devo_custom_angle', angle);
-  localStorage.setItem('devo_custom_btn_bg', btnBg);
-  localStorage.setItem('devo_custom_btn_text', btnText);
+  safeSet('devo_custom_c1', c1);
+  safeSet('devo_custom_c2', c2);
+  safeSet('devo_custom_angle', angle);
+  safeSet('devo_custom_btn_bg', btnBg);
+  safeSet('devo_custom_btn_text', btnText);
 
   settingsChanged(); /* 22.39: настройки живут в базе */
 }
@@ -11788,7 +11858,7 @@ function initCustomColors() {
 
 function toggleBlobs() {
   blobsEnabled = !blobsEnabled;
-  localStorage.setItem('devo_blobs_enabled', blobsEnabled);
+  safeSet('devo_blobs_enabled', blobsEnabled);
   settingsChanged(); /* 22.39: настройки живут в базе */
   updateBlobsVisibility();
 }
@@ -11935,7 +12005,7 @@ window.addEventListener('resize', function () {
 
 function changeBlobSpeed(val) {
   blobIdleSpeed = val;
-  localStorage.setItem('devo_blob_speed', val);
+  safeSet('devo_blob_speed', val);
   settingsChanged(); /* 22.39: настройки живут в базе */
 
   const label = document.getElementById('speedValueLabel');
@@ -11958,7 +12028,9 @@ function getAudioContext() {
     if (AudioContextClass) audioCtx = new AudioContextClass();
   }
 
-  if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+  /* ВОЛНА 22.49: .catch — autoplay-policy отклоняет resume(): раньше это
+     сыпало необработанными rejection в консоль */
+  if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
 
   return audioCtx;
 }
@@ -12076,7 +12148,7 @@ let selectedSoundId = parseInt(localStorage.getItem('devo_sound_id') || '1');
 
 if (!SOUND_PROFILES.some((s) => s.id === selectedSoundId)) {
   selectedSoundId = 1;
-  localStorage.setItem('devo_sound_id', '1');
+  safeSet('devo_sound_id', '1');
 }
 
 function playSoundDirectly(id) {
@@ -12139,7 +12211,7 @@ function handleSoundSelect(e, id) {
   unlockAudio();
 
   selectedSoundId = Number(id);
-  localStorage.setItem('devo_sound_id', selectedSoundId);
+  safeSet('devo_sound_id', selectedSoundId);
   settingsChanged(); /* 22.39: настройки живут в базе */
 
   renderSoundMenu();
@@ -12271,7 +12343,7 @@ async function webLogin() {
 
     if (r.ok && data.token) {
       WEB_TOKEN = String(data.token);
-      localStorage.setItem('devo_web_token', WEB_TOKEN);
+      safeSet('devo_web_token', WEB_TOKEN);
 
       document.getElementById('loginPassword').value = '';
 
@@ -12824,19 +12896,23 @@ function renderFiles(files) {
   list.innerHTML = files.map((f) => {
     const sel = selectMode && selectedIds.has(f.id);
 
+    /* 22.49: id экранируется — раньше подставлялся в inline-атрибут raw:
+       id с кавычкой ломал разметку (и это XSS-sink на будущее) */
+    const fid = escapeHtml(String(f.id == null ? '' : f.id));
+
     const cardAction = selectMode
-      ? `toggleFileSelection(event,'${f.id}')`
-      : `openEditModal('${f.id}')`;
+      ? `toggleFileSelection(event,'${fid}')`
+      : `openEditModal('${fid}')`;
 
     const checkHtml = selectMode ? `
-      <div onclick="toggleFileSelection(event,'${f.id}')" style="flex-shrink:0;width:24px;height:24px;border-radius:8px;display:flex;align-items:center;justify-content:center;border:2px solid ${sel ? 'var(--btn-text)' : 'var(--border-color)'};background:${sel ? 'var(--btn-text)' : 'transparent'};transition:transform .15s var(--ease-spring)">
+      <div onclick="toggleFileSelection(event,'${fid}')" style="flex-shrink:0;width:24px;height:24px;border-radius:8px;display:flex;align-items:center;justify-content:center;border:2px solid ${sel ? 'var(--btn-text)' : 'var(--border-color)'};background:${sel ? 'var(--btn-text)' : 'transparent'};transition:transform .15s var(--ease-spring)">
         ${sel ? '<i data-lucide="check" style="width:14px;height:14px;stroke:var(--card-bg)"></i>' : ''}
       </div>
     ` : '';
 
     const actionsHtml = selectMode ? '' : `
       <div style="display:flex;gap:4px;flex-shrink:0" onclick="event.stopPropagation()">
-        <button class="action-btn" onclick="openEditModal('${f.id}')" title="Редактировать">
+        <button class="action-btn" onclick="openEditModal('${fid}')" title="Редактировать">
           <i data-lucide="more-vertical" style="width:16px;height:16px"></i>
         </button>
       </div>
@@ -13976,7 +14052,7 @@ function updateDevRecBanner(connected) {
 function dismissDevRec(e) {
   if (e) e.stopPropagation();
 
-  localStorage.setItem('devo_recbanner_hide', '1');
+  safeSet('devo_recbanner_hide', '1');
   settingsChanged(); /* 22.39: настройки живут в базе */
 
   const b = document.getElementById('devRecBanner');
@@ -14199,6 +14275,43 @@ window.addEventListener('pageshow', () => {
   setTimeout(resumePendingUploads, 600); /* 22.47: и после возврата из кэша истории */
 });
 
+/* ВОЛНА 22.48: ЗАКРЫЛИ МИНИ АПП ПОСРЕДИ ЗАГРУЗКИ. Последним дыханием
+   (fetch keepalive — доходит даже при выгрузке страницы) сообщаем серверу,
+   что пользователь ушёл, пока файлы не догрузились. Бот пришлёт в чат
+   «⏸ Загрузка на паузе» с кнопкой «▶️ Продолжить загрузку» — НО только
+   если куски и правда перестали идти (если мини апп просто свернули и
+   загрузка продолжает идти в фоне, сервер метку снимет — ложных
+   сообщений нет). Файлы не теряются в любом случае: при переоткрытии
+   очередь подхватывается из IndexedDB (22.39/22.47) и догружается сама. */
+function notifyUploadClosed() {
+  if (!isUploading || !uploadQueue || !uploadQueue.length) return;
+
+  try {
+    /* 22.49: считаем ТОЛЬКО ещё не догруженные (загруженные файлы остаются
+       в uploadQueue до конца пачки — раньше N было завышено) */
+    const pending = uploadQueue.filter(function (f) { return !f._doneFlag; });
+
+    if (!pending.length) return;
+
+    const names = pending.slice(0, 3).map(function (f) {
+      return String(f.uploadName || f.name || 'файл').slice(0, 40);
+    });
+
+    fetch('/api/upload/closed', {
+      method: 'POST',
+      keepalive: true,
+      headers: vaultHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ n: pending.length, names: names })
+    }).catch(function () {});
+  } catch (e) {}
+}
+
+document.addEventListener('visibilitychange', function () {
+  if (document.hidden) notifyUploadClosed();
+});
+
+window.addEventListener('pagehide', notifyUploadClosed);
+
 setInterval(ensureScrollUnlocked, 4000);
 
 function refreshUploadModal() {
@@ -14346,7 +14459,14 @@ function addMoreUploadFiles() {
 function uploadFiles(fileList) {
   let files = Array.from(fileList);
 
-  if (!files.length || isUploading) return;
+  /* 22.49: раньше файлы, выбранные ВО ВРЕМЯ активной загрузки, молча
+     пропадали (return без тоста) — пользователь думал, что «не сработало» */
+  if (files.length && isUploading) {
+    showToast('⏳ Дождитесь окончания текущей загрузки — потом добавьте остальные');
+    return;
+  }
+
+  if (!files.length) return;
 
   /* 22.39: пустые файлы (0 Б) не грузим вообще — «такого не должно быть»
      (сервер их отвергает, клиент отсекает сразу с честным тостом) */
@@ -14658,6 +14778,11 @@ function sendChunk(uploadId, index, blobPart, offset, onLoaded) {
 
     xhr.open('POST', q);
 
+    /* ВОЛНА 22.49: таймаут 60 с — раньше зависшее TCP-соединение (сервер
+       жив, пакеты теряются) оставляло await sendChunk висеть НАВСЕГДА:
+       воркер стоял, ретраи не срабатывали, очередь молча стояла */
+    xhr.timeout = 60000;
+
     const headers = vaultHeaders();
 
     for (const k in headers) {
@@ -14702,6 +14827,12 @@ function sendChunk(uploadId, index, blobPart, offset, onLoaded) {
       reject(err);
     };
 
+    xhr.ontimeout = () => {
+      uploadXhrs.delete(xhr);
+      if (uploadXhr === xhr) uploadXhr = null;
+      reject(new Error('таймаут сети (60 с)'));
+    };
+
     xhr.onerror = () => {
       uploadXhrs.delete(xhr);
       if (uploadXhr === xhr) uploadXhr = null;
@@ -14729,7 +14860,9 @@ async function _uploadOneSession(file, reportBytes) {
   let uploadId = file._resumeId || '';
 
   if (uploadId) {
-    /* продолжаем ПОСЛЕ закрытия мини-аппа */
+    /* продолжаем ПОСЛЕ закрытия мини-аппа... или повторяем complete
+       после ввода пароля Сейфа (22.49, _retryComplete): куски уже на
+       сервере, init не нужен — сразу complete */
     file._resumeId = '';
   } else {
     const initData = await apiJson('/api/upload/init', {
@@ -14745,6 +14878,10 @@ async function _uploadOneSession(file, reportBytes) {
     });
 
     uploadId = initData.uploadId;
+
+    /* ВОЛНА 22.49: сервер не выдал сессию — честная ошибка вместо
+       «uploadId=undefined» во всех URL кусков */
+    if (!uploadId) throw new Error('сервер не выдал сессию загрузки');
   }
 
   file._lastUploadId = uploadId;
@@ -14791,6 +14928,11 @@ async function _uploadOneSession(file, reportBytes) {
       let resp = null;
 
       for (let attempt = 0; attempt < 3; attempt++) {
+        /* ВОЛНА 22.49: проверка отмены на КАЖДОЙ попытке — раньше воркер,
+           заснувший в sleepMs(1200*(attempt+1)) во время отмены, просыпался
+           и отправлял ЕЩЁ ОДИН кусок поверх отменённой загрузки */
+        if (uploadAbortFlag || file._cancelFlag) return 'abort';
+
         try {
           resp = await sendChunk(uploadId, idx, file.slice(off, end), off,
             (n) => reportChunk(idx, n));
@@ -14823,13 +14965,12 @@ async function _uploadOneSession(file, reportBytes) {
         if (nextByServer > idx + 1) nextIndex = Math.max(nextIndex, nextByServer);
       }
 
-      if (key) {
-        upqPut({
-          k: key, blob: file, name: file.name, uploadName: upName,
-          size: +file.size || 0, mime: file.type || '',
-          uploadId: uploadId, added: Date.now()
-        });
-      }
+      /* ВОЛНА 22.49: per-кусочный upqPut УДАЛЁН. Раньше после КАЖДОГО куска
+         в IndexedDB перезаписывалась ЗАПИСЬ С ЦЕЛИМ ФАЙЛОМ: 2 ГБ файл =
+         ~342 куска × 2 ГБ ≈ 680 ГБ записи — квота IDB взрывалась (и молча
+         глоталась), большие файлы тормозили. Запись с блобом уже лежит в IDB
+         (до старта, см. proceedUpload); докачка и так переотправляет куски
+         идемпотентно (?offset=, сервер дедупит по index) — позиция не нужна. */
     }
   }
 
@@ -14869,6 +15010,14 @@ async function _uploadOneSession(file, reportBytes) {
       if (e.message === 'aborted') throw e;
 
       cErr = e;
+
+      /* ВОЛНА 22.49: не хватает пароля Сейфа — сервер держит сессию и .part
+         (куски НЕ потеряны). Запоминаем uploadId: после ввода пароля
+         complete повторится БЕЗ перекачки файла заново */
+      if (e && (e.code === 'safe_locked' || e.code === 'wrong_password')) {
+        file._resumeId = uploadId;
+        file._retryComplete = true;
+      }
 
       if (!a) await sleepMs(2500);
     }
@@ -14917,8 +15066,22 @@ async function uploadEngine(bar) {
       });
 
       if (rec) added.push(rec);
+
+      /* 22.49: помечаем ДОСТИГНУТЫМ — notifyUploadClosed считает
+         только недогруженные, «⏸ пауза» больше не преувеличивает */
+      file._doneFlag = true;
     } catch (e) {
       if (e.message === 'aborted' || uploadAbortFlag) break;
+
+      /* 22.49: НЕобратимые ошибки сервера (4xx, кроме 429/423 — это
+         «слишком часто»/«нет пароля») — убираем файл из очереди докачки,
+         чтобы он не бесконечно повторял тост «⏳ Продолжаю прерванную
+         загрузку» на каждом открытии приложения */
+      const _code = String((e && e.code) || '');
+      if (/^4\d\d$/.test(_code) && _code !== '429' && _code !== '423'
+        && file._entryKey) {
+        upqDel(file._entryKey);
+      }
 
       failedFiles.push({ file: file, e: e });
     }
@@ -15103,7 +15266,7 @@ async function pullSettingsApply() {
     for (const k in map) {
       if (s[k] != null && String(s[k]) !== '' &&
           localStorage.getItem(map[k]) !== String(s[k])) {
-        localStorage.setItem(map[k], String(s[k]));
+        safeSet(map[k], String(s[k]));
         dirty = true;
       }
     }
@@ -15112,12 +15275,12 @@ async function pullSettingsApply() {
       const want = s.blobs ? 'true' : 'false';
 
       if (localStorage.getItem('devo_blobs_enabled') !== want) {
-        localStorage.setItem('devo_blobs_enabled', want);
+        safeSet('devo_blobs_enabled', want);
         dirty = true;
       }
     }
 
-    if (s.recbanner_hide === true) localStorage.setItem('devo_recbanner_hide', '1');
+    if (s.recbanner_hide === true) safeSet('devo_recbanner_hide', '1');
 
     if (dirty) {
       currentTheme = localStorage.getItem('devo_theme') || 'system';
@@ -15662,6 +15825,8 @@ function mpIsAudioFile(f) {
   return String(f.kind || '') === 'audio' || /\.(mp3|wav|ogg|oga|m4a|aac|flac)$/i.test(String(f.name || ''));
 }
 
+let mpBrokenStreak = 0;   /* ВОЛНА 22.49: подряд битых треков (анти-шторм) */
+
 function mpBuildPlaylist() {
   mpList = ALL_FILES.filter(mpIsAudioFile).map((f) => ({
     id: f.id,
@@ -15995,12 +16160,25 @@ async function mpLoad(i, autoplay) {
   if (t.localFile && url) mpObjectUrl = url;
 
   if (!url) {
+    /* ВОЛНА 22.49: счётчик ПОДРЯД битых треков. Раньше при недоступных
+       ссылках (сеть/сервер/Сейф закрыт) mpLoad → mpNextTrack → mpLoad
+       крутил плейлист БЕСКОНЕЧНО, спамя сервер запросами ссылок и
+       дёргая окно входа при каждом 401 */
+    mpBrokenStreak++;
+
     mpSyncPlayIcon();
 
-    if (autoplay) mpNextTrack();
+    if (autoplay && mpOpen && mpList.length
+      && mpBrokenStreak <= mpList.length) {
+      mpNextTrack();
+    } else if (autoplay && mpBrokenStreak > mpList.length) {
+      showToast('⚠️ Не удалось воспроизвести треки — они недоступны');
+    }
 
     return;
   }
+
+  mpBrokenStreak = 0;
 
   mpAudioEl.src = url;
 
@@ -16189,6 +16367,9 @@ function openMusicPlayer(fileId, forcedUrl) {
   document.getElementById('musicPlayer').classList.add('open');
   document.body.classList.add('mp-lock');
 
+  /* ВОЛНА 22.49: новый запуск плеера — счётчик битых сброшен */
+  mpBrokenStreak = 0;
+
   mpRenderDots();
 
   /* rAF-циклы живут только пока плеер открыт */
@@ -16211,6 +16392,31 @@ function closeMusicPlayer() {
 
   if (mpAudioEl) mpAudioEl.pause();
 
+  /* ВОЛНА 22.49: освобождаем ресурсы — раньше blob-URL и src последнего
+     трека держались в памяти до следующего открытия (утечка RAM), а
+     lock-screen-кнопки «играть/дальше» молча срабатывали в никуда */
+  if (mpObjectUrl) {
+    try { URL.revokeObjectURL(mpObjectUrl); } catch (e) {}
+
+    mpObjectUrl = null;
+  }
+
+  if (mpCoverUrl) {
+    try { URL.revokeObjectURL(mpCoverUrl); } catch (e) {}
+
+    mpCoverUrl = null;
+  }
+
+  if (mpAudioEl) {
+    try {
+      mpAudioEl.removeAttribute('src');
+      mpAudioEl.load();
+    } catch (e) {}
+  }
+
+  if (mpBeatRaf) { cancelAnimationFrame(mpBeatRaf); mpBeatRaf = 0; }
+  if (mpTickRaf) { cancelAnimationFrame(mpTickRaf); mpTickRaf = 0; }
+
   setTimeout(() => {
     if (!mpOpen) document.body.classList.remove('mp-lock');
   }, 450);
@@ -16229,6 +16435,7 @@ let vpControlsTimeout = null;
 let vpLastTapTime = 0;
 let vpLastTapSide = null;
 let vpAudioCtx = null;
+let vpOsc = null;   /* ВОЛНА 22.49: ссылка на осциллятор фонового тишины */
 let vpSavedRate = 1.0;
 let vpPressTimer = null;
 let vpLongPressing = false;
@@ -16466,14 +16673,16 @@ function vpInitBackgroundAudio() {
 
       vpAudioCtx = new AC();
 
-      const osc = vpAudioCtx.createOscillator();
+      vpOsc = vpAudioCtx.createOscillator();
       const dst = vpAudioCtx.createMediaStreamDestination();
 
-      osc.connect(dst);
-      osc.start();
+      vpOsc.connect(dst);
+      vpOsc.start();
     }
 
-    if (vpAudioCtx.state === 'suspended') vpAudioCtx.resume();
+    if (vpAudioCtx.state === 'suspended') {
+      vpAudioCtx.resume().catch(() => {});
+    }
   } catch (e) {}
 }
 
@@ -16514,8 +16723,11 @@ function vpPlayVideo(v) {
 
       navigator.mediaSession.setActionHandler('play', () => vpPlayerEl.play());
       navigator.mediaSession.setActionHandler('pause', () => vpPlayerEl.pause());
-      navigator.mediaSession.setActionHandler('seekbackward', (e) => vpRewindSec(-10, e));
-      navigator.mediaSession.setActionHandler('seekforward', (e) => vpRewindSec(10, e));
+      /* ВОЛНА 22.49: БЕЗ аргумента — MediaSession кладёт в колбэк свой
+         ActionDetails, а vpRewindSec звал на нём stopPropagation() →
+         TypeError с каждого seek с экрана блокировки */
+      navigator.mediaSession.setActionHandler('seekbackward', () => vpRewindSec(-10));
+      navigator.mediaSession.setActionHandler('seekforward', () => vpRewindSec(10));
     } catch (e) {}
   }
 
@@ -16734,7 +16946,9 @@ function vpOnSeekInput() {
 }
 
 function vpOnSeekChange() {
-  if (vpPlayerEl.duration) {
+  /* ВОЛНА 22.49: isFinite-гард — duration===Infinity (webm/MediaRecorder
+     до метаданных) давал currentTime = x*Infinity */
+  if (vpPlayerEl.duration && isFinite(vpPlayerEl.duration)) {
     vpPlayerEl.currentTime = (vpSeekEl.value / 100) * vpPlayerEl.duration;
   }
 
@@ -16774,7 +16988,7 @@ function vpTogglePlay(e) {
 }
 
 function vpRewindSec(seconds, e) {
-  if (e) {
+  if (e && typeof e.stopPropagation === 'function') {
     e.stopPropagation();
     if (e.cancelable) e.preventDefault();
   }
@@ -16788,7 +17002,28 @@ function vpCloseModal(e) {
   if (e) e.stopPropagation();
 
   vpPlayerEl.pause();
-  vpPlayerEl.src = '';
+
+  /* ВОЛНА 22.49: removeAttribute вместо src='' — пустой src резолвится в
+     URL страницы и рождает внутреннюю media-ошибку элемента */
+  try {
+    vpPlayerEl.removeAttribute('src');
+    vpPlayerEl.load();
+  } catch (e2) {}
+
+  /* ВОЛНА 22.49: гасим бесконечный фоновый осциллятор — раньше он рендерил
+     440 Гц ДО КОНЦА СЕССИИ после закрытия плеера (CPU/батарея в WebView) */
+  if (vpOsc) {
+    try { vpOsc.stop(); } catch (e3) {}
+
+    vpOsc = null;
+  }
+
+  if (vpAudioCtx) {
+    try { vpAudioCtx.suspend().catch(() => {}); } catch (e4) {}
+  }
+
+  if (vpSeekSafetyTimer) { clearTimeout(vpSeekSafetyTimer); vpSeekSafetyTimer = null; }
+  if (vpControlsTimeout) { clearTimeout(vpControlsTimeout); vpControlsTimeout = null; }
 
   vpZoomScale = 1.0;
   vpPlayerEl.style.transform = 'scale(1)';
@@ -17364,6 +17599,16 @@ async def miniapp_files_patch(request):
         # совместимость со старым клиентом: флаг больше ни на что не влияет
         rec["va"] = bool(body.get("vault"))
     save_user(user)
+    # ВОЛНА 22.48: переименование переезжает и В КАНАЛ ПОЛЬЗОВАТЕЛЯ —
+    # подпись сообщения-хранилища обновляется на новое имя (best-effort).
+    try:
+        _app = _MINIAPP_PTB_APP
+        if _app is not None:
+            await _storage_rename_caption(_app.bot, rec,
+                                          rec.get("label") if where == "safe"
+                                          else rec.get("name"))
+    except Exception:
+        pass
     if where == "safe":
         idx = next((i for i, f in enumerate(user.vault_files or [], 1)
                     if isinstance(f, dict) and f.get("id") == rec.get("id")), 1)
@@ -17997,6 +18242,44 @@ async def _miniapp_delete_channel_message(rec):
             pass
 
 
+async def _storage_rename_caption(bot, rec, new_name):
+    """ВОЛНА 22.48: переименование файла меняет подпись СООБЩЕНИЯ-ХРАНИЛИЩА
+    в канале пользователя (файл «переименовывается» и в канале тоже).
+
+    Правила подписи — как при загрузке:
+      • облако            → подпись = новое имя;
+      • Сейф «без шифра»  → «🔐 Сейф (без шифра): имя» (имя не секрет);
+      • зашифрованный Сейф → НЕ трогаем: имя файла не должно светиться
+        в канале (контейнер подписан нейтрально по дизайну 22.30).
+
+    Best-effort: нет бота/канала/сообщения, Telegram отказал — молча False,
+    локальная запись уже переименована и это главное."""
+    try:
+        if bot is None or not isinstance(rec, dict):
+            return False
+        mid = int(rec.get("msg_id") or 0)
+        if not mid:
+            return False
+        ch = int(rec.get("channel_id") or 0) or get_storage_channel_id()
+        if not ch:
+            return False
+        nm = str(new_name or "").strip()
+        if not nm:
+            return False
+        if rec.get("plain"):
+            # «без шифрования» (личный канал) — имя в канале уже лежит открыто
+            cap = "🔐 Сейф (без шифра): " + nm[:80]
+        elif "label" in rec and "name" not in rec:
+            # зашифрованный контейнер Сейфа — имя в канале не светим
+            return False
+        else:
+            cap = nm[:100]
+        await bot.edit_message_caption(chat_id=int(ch), message_id=mid, caption=cap)
+        return True
+    except Exception:
+        return False
+
+
 async def miniapp_files_to_safe(request):
     """ВОЛНА 22.30: «🔐 В Сейф» из веба — НАСТОЯЩИЙ перенос файла облака
     в зашифрованный Сейф (как кнопка 🔐 в чате): скачиваем исходник, шифруем
@@ -18087,8 +18370,10 @@ async def miniapp_files_to_safe(request):
             }
         elif size <= VAULT_MAX_FILE_BYTES:
             payload = await _miniapp_fetch_cloud_bytes(user, rec)
-            container = await asyncio.to_thread(
-                _vault_pack, password, payload, {
+            # ВОЛНА 22.49: _vault_pack2 — одна деривация вместо двух,
+            # целиком в worker-потоке.
+            container, verifier_hex = await asyncio.to_thread(
+                _vault_pack2, password, payload, {
                     "n": name, "k": kind, "m": mime,
                     "t": datetime.now().strftime("%Y-%m-%d %H:%M"),
                 })
@@ -18096,8 +18381,6 @@ async def miniapp_files_to_safe(request):
             salt_hex = container[9:25].hex()
             nonce_hex = container[25:37].hex()
             iters = int.from_bytes(container[5:9], "big")
-            key = _vault_derive_key(password, bytes.fromhex(salt_hex), iters)
-            verifier_hex = _vault_verifier(key).hex()
             _vfn = f"vault_{datetime.now().strftime('%Y%m%d_%H%M%S')}_w.bin"
             up = await _storage_upload_document(
                 _MiniappCtx(app.bot), container, filename=_vfn,
@@ -18148,19 +18431,27 @@ async def miniapp_files_to_safe(request):
                     int(rec["msg_id"]))
                 if doc is None:
                     raise RuntimeError("в сообщении канала нет документа")
-                enc = _Dvf2Encryptor(password, {
-                    "n": name, "k": kind, "m": mime,
-                    "t": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                    "sz": size,
-                }, os.path.join(job, "container.bin"))
+                # ВОЛНА 22.49: шифратор создаём в worker-потоке (внутри —
+                # PBKDF2 600k, который раньше фризил loop), и каждый кусок
+                # шифруем тоже в потоке (async-sink в _mt_download_stream).
+                enc = await asyncio.to_thread(
+                    _Dvf2Encryptor, password, {
+                        "n": name, "k": kind, "m": mime,
+                        "t": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                        "sz": size,
+                    }, os.path.join(job, "container.bin"))
                 enc_total = 0
                 try:
                     with open(tmp_src, "wb") as fh:
+                        async def _seal_sink(_chunk):
+                            await asyncio.to_thread(
+                                _seal_sink_step, fh, enc, _chunk)
+
                         await _mt_download_stream(
                             client, doc, int(getattr(doc, "size", 0) or size),
-                            lambda chunk: (fh.write(chunk), enc.push(chunk)))
-                    enc_total = enc.finish()
-                except Exception:
+                            _seal_sink)
+                    enc_total = await asyncio.to_thread(enc.finish)
+                except BaseException:
                     enc.abort()
                     raise
                 tmp_enc = os.path.join(job, "container.bin")
@@ -18491,13 +18782,15 @@ async def _miniapp_encrypt_local_to_safe(user, src_path, size, name, kind,
         # DVF1: контейнер целиком в ОЗУ
         with open(src_path, "rb") as fh:
             payload = fh.read()
-        container = await asyncio.to_thread(_vault_pack, password, payload, meta)
+        # ВОЛНА 22.49: _vault_pack2 — контейнер + верификатор за ОДНУ
+        # деривацию ключа, целиком в worker-потоке (PBKDF2 600k и AES
+        # больше не выполняются на event loop).
+        container, verifier_hex = await asyncio.to_thread(
+            _vault_pack2, password, payload, meta)
         payload = b""
         salt_hex = container[9:25].hex()
         nonce_hex = container[25:37].hex()
         iters = int.from_bytes(container[5:9], "big")
-        key = _vault_derive_key(password, bytes.fromhex(salt_hex), iters)
-        verifier_hex = _vault_verifier(key).hex()
         _vfn = f"vault_{datetime.now().strftime('%Y%m%d_%H%M%S')}_w.bin"
         up = await _storage_upload_document(
             _MiniappCtx(app.bot), container, filename=_vfn,
@@ -18537,19 +18830,30 @@ async def _miniapp_encrypt_local_to_safe(user, src_path, size, name, kind,
     job = _dvf2_make_job_dir()
     try:
         tmp_enc = os.path.join(job, "container.bin")
-        enc = _Dvf2Encryptor(password, meta, tmp_enc)
-        enc_total = 0
-        try:
-            with open(src_path, "rb") as fh:
-                while True:
-                    chunk = fh.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    enc.push(chunk)
-            enc_total = enc.finish()
-        except Exception:
-            enc.abort()
-            raise
+
+        # ВОЛНА 22.49: всё шифрование — В WORKER-ПОТОК. Раньше цикл
+        # «читай 1 МиБ → AES-256-GCM → пиши» гонялся прямо на event loop:
+        # на каждый МиБ — блокирующее чтение/запись диска + шифрование,
+        # и на 1 ГБ файл бот ФРИЗИЛСЯ секунд на 10-15 (висели ВСЕ:
+        # и HTTP-запросы мини-аппа, и сообщения Telegram всем пользователям).
+        def _encrypt_to_file():
+            enc = _Dvf2Encryptor(password, meta, tmp_enc)
+            try:
+                with open(src_path, "rb") as fh:
+                    while True:
+                        chunk = fh.read(4 * 1024 * 1024)
+                        if not chunk:
+                            break
+                        enc.push(chunk)
+                return (enc.finish(), enc.salt_hex(), enc.verifier_hex(),
+                        enc.np_hex(), enc.iters)
+            except BaseException:
+                enc.abort()
+                raise
+
+        (enc_total, _salt_hex, _verifier_hex, _np_hex,
+         _iters) = await asyncio.to_thread(_encrypt_to_file)
+
         _vfn = f"vault_{datetime.now().strftime('%Y%m%d_%H%M%S')}_w.bin"
         if enc_total <= (49 * 1024 * 1024 - 1024 * 1024):
             with open(tmp_enc, "rb") as fh:
@@ -18583,8 +18887,8 @@ async def _miniapp_encrypt_local_to_safe(user, src_path, size, name, kind,
             "id": _vault_gen_id(user), "kind": kind, "mime": mime,
             "ts": _file_ts_now(), "tss": datetime.now().strftime("%Y-%m-%d %H:%M"),
             "size_orig": size, "size_enc": enc_total,
-            "salt": enc.salt_hex(), "verifier": enc.verifier_hex(),
-            "iters": enc.iters, "nonce": enc.np_hex(),
+            "salt": _salt_hex, "verifier": _verifier_hex,
+            "iters": _iters, "nonce": _np_hex,
             "msg_id": int(up.get("message_id", 0)),
             "file_id": up.get("file_id"), "channel_id": up.get("channel_id"),
             "dvf2": True, "label": name[:120],
@@ -18737,7 +19041,11 @@ async def miniapp_upload_init(request):
         body = await request.json()
     except Exception:
         return _miniapp_err(400, "bad_json", "Ожидался JSON.")
-    name = (str(body.get("name") or "").strip() or "file.bin")[:120]
+    # ВОЛНА 22.49: _dvf2_safe_name — имя БЕЗ разделителей пути и управляющих
+    # символов. Раньше name="/../../users.json" с клиента просачивался в
+    # переименование временного файла (os.replace/os.remove) — произвольная
+    # перезапись/удаление файлов на сервере.
+    name = _dvf2_safe_name(str(body.get("name") or "").strip() or "file.bin")
     mime = str(body.get("mime") or "")[:120]
     try:
         size = int(body.get("size") or 0)
@@ -18764,9 +19072,12 @@ async def miniapp_upload_init(request):
         vault_pw_raw = _miniapp_vault_pw_from(request, body)
         # ВОЛНА 22.35: не-Latin1 пароль из заголовка URL-кодирован клиентом —
         # выбираем рабочий вариант (как есть / URL-декод) по верификаторам.
-        vault_pw = _miniapp_vault_pw_pick(user, _vault_pw_candidates(vault_pw_raw)) \
+        # ВОЛНА 22.49: pick/guard — PBKDF2 по 600 000 раундов на каждый
+        # файл-верификатор — считаем в worker-потоке (loop свободен).
+        vault_pw = await asyncio.to_thread(
+            _miniapp_vault_pw_pick, user, _vault_pw_candidates(vault_pw_raw)) \
             if vault_pw_raw else None
-        guard = _miniapp_vault_pw_guard(user, vault_pw)
+        guard = await asyncio.to_thread(_miniapp_vault_pw_guard, user, vault_pw)
         if guard is None:
             return _miniapp_err(
                 423, "safe_locked",
@@ -18784,10 +19095,11 @@ async def miniapp_upload_init(request):
         # пароль НЕ переключает режим (иначе «обычная загрузка» внезапно
         # шифровалась без ведома пользователя).
         pw_raw = str((body or {}).get("password") or "")
-        cand = _miniapp_vault_pw_pick(user, _vault_pw_candidates(pw_raw)) \
+        cand = await asyncio.to_thread(
+            _miniapp_vault_pw_pick, user, _vault_pw_candidates(pw_raw)) \
             if pw_raw else None
         if cand:
-            if _miniapp_vault_pw_verify(user, cand) is False:
+            if await asyncio.to_thread(_miniapp_vault_pw_verify, user, cand) is False:
                 return _miniapp_err(403, "wrong_password",
                                     "Пароль Сейфа не подходит.")
             plain_mode = False
@@ -18804,6 +19116,15 @@ async def miniapp_upload_init(request):
             f"Лимит облака ({limit} файлов) достигнут — удалите что-нибудь "
             "(в вебе или в чате: 🗑 у файла).")
     _miniapp_cleanup_uploads()
+    # ВОЛНА 22.49: капа одновременных сессий на пользователя — иначе спам
+    # init создаёт неограниченное число пустых .part-файлов на диске.
+    _my_sessions = sum(
+        1 for _s in _MINIAPP_UPLOADS.values()
+        if str(_s.get("uid") or "") == str(uid))
+    if _my_sessions >= 5:
+        return _miniapp_err(
+            429, "too_many_uploads",
+            "У вас уже 5 активных загрузок — дождитесь их завершения.")
     upload_id = ''.join(random.choices(string.ascii_lowercase + string.digits, k=16))
     path = os.path.join(_miniapp_tmpdir(), upload_id + ".part")
     open(path, "wb").close()
@@ -18814,6 +19135,9 @@ async def miniapp_upload_init(request):
         # загрузки (до complete), в базу не пишем никогда.
         "vault_pw": vault_pw or "",
         "plain": plain_mode,
+        # ВОЛНА 22.49: согласованный размер куска — фолбэк index→offset
+        # работает даже если клиент шлёт куски нестандартного размера.
+        "chunk": _MINIAPP_CHUNK,
     }
     # пароль пригодится и следующим операциям веб-сессии (RAM)
     if vault_pw:
@@ -18854,7 +19178,16 @@ async def miniapp_upload_chunk(request):
     except (TypeError, ValueError):
         _off = None
     if _off is None and _idx >= 0:
-        _off = _idx * _MINIAPP_CHUNK
+        # ВОЛНА 22.49: фолбэк по согласованной с сессией величине куска
+        # (клиент мог шлить нестандартный размер — иначе куски ложатся мимо).
+        _off = _idx * int(s.get("chunk") or _MINIAPP_CHUNK)
+    # ВОЛНА 22.49: offset обязан лежать внутри файла — раньше ?offset=10^15
+    # создавал гигантский разреженный файл на диске (заполнение диска).
+    if _off is not None and data:
+        if _off >= s["size"] or _off + len(data) > s["size"]:
+            return _miniapp_err(
+                400, "offset_out_of_range",
+                "Кусок вне границ файла — начните загрузку заново.")
     parts = s.setdefault("parts", set())
     if _idx >= 0 and s["size"] > 0 and _idx in parts:
         s["ts"] = time.time()
@@ -18867,12 +19200,18 @@ async def miniapp_upload_chunk(request):
         f = open(s["path"], "r+b")
     except FileNotFoundError:
         f = open(s["path"], "wb")
-    with f:
-        if _off is not None:
-            f.seek(_off)
-        else:
-            f.seek(0, os.SEEK_END)
-        f.write(data)
+
+    def _write_chunk(fobj, off, payload):
+        with fobj:
+            if off is not None:
+                fobj.seek(off)
+            else:
+                fobj.seek(0, os.SEEK_END)
+            fobj.write(payload)
+
+    # ВОЛНА 22.49: запись 6 МиБ на диск — в worker-потоке (раньше каждый
+    # кусок блокировал event loop на время записи).
+    await asyncio.to_thread(_write_chunk, f, _off, data)
     s["received"] += len(data)
     if _idx >= 0:
         parts.add(_idx)
@@ -18881,7 +19220,9 @@ async def miniapp_upload_chunk(request):
 
 
 async def miniapp_upload_abort(request):
-    """Отмена загрузки: сессия и временный файл стираются (идемпотентно)."""
+    """Отмена загрузки: сессия и временный файл стираются (идемпотентно).
+    ВОЛНА 22.49: владение проверяем ДО pop — чужой uploadId больше не
+    снимает чужую сессию (раньше это обрывало загрузку другому человеку)."""
     user, uid, err = await _api_get_user_any(request)
     if err is not None:
         return err
@@ -18889,13 +19230,151 @@ async def miniapp_upload_abort(request):
         body = await request.json()
     except Exception:
         body = {}
-    s = _MINIAPP_UPLOADS.pop(str(body.get("uploadId") or ""), None)
-    if s and s.get("uid") == uid:
+    upid = str(body.get("uploadId") or "")
+    s = _MINIAPP_UPLOADS.get(upid)
+    if not s or s.get("uid") != uid:
+        return web.json_response({"ok": True})
+    _MINIAPP_UPLOADS.pop(upid, None)
+    try:
+        os.remove(s["path"])
+    except Exception:
+        pass
+    return web.json_response({"ok": True})
+
+
+async def miniapp_upload_closed(request):
+    """ВОЛНА 22.48: «мини апп закрыли посреди загрузки».
+
+    Клиент последним дыханием (fetch keepalive — доходит даже при выгрузке
+    страницы) сообщает, что пользователь ушёл, пока файлы НЕ догрузились.
+    Мы помечаем незавершённые сессии closed_hint: сторож (_upload_pause_
+    check_once) через ~6 секунд пришлёт в чат «⏸ Загрузка на паузе» с
+    кнопкой «▶️ Продолжить загрузку» — но ТОЛЬКО если куски и правда
+    перестали приходить (мини апп могли просто свернуть, а загрузка
+    продолжает идти в фоне — тогда метка снимается, ложных сообщений нет).
+    Файлы при этом не теряются: при переоткрытии мини-аппа очередь
+    подхватывается из IndexedDB и грузится дальше."""
+    user, uid, err = await _api_get_user_any(request)
+    if err is not None:
+        return err
+    now = time.time()
+    marked = 0
+    for s in _MINIAPP_UPLOADS.values():
+        if s.get("uid") != uid:
+            continue
+        size = int(s.get("size") or 0)
+        received = int(s.get("received") or 0)
+        if size > 0 and received < size:
+            s["closed_hint"] = now
+            marked += 1
+    return web.json_response({"ok": True, "marked": marked})
+
+
+# uid → ts последнего отправленного сообщения «⏸ Загрузка на паузе»
+_UPLOAD_PAUSE_LAST = {}
+# не чаще одного сообщения в 2 минуты на пользователя (TTL-циклы, двойные биконы)
+_UPLOAD_PAUSE_COOLDOWN = 120.0
+# сколько секунд тишины (без закрытия) считаем «загрузка умерла молча»
+_UPLOAD_PAUSE_SILENCE = 30.0
+
+
+async def _upload_pause_check_once(app, now=None):
+    """Один проход сторожа паузы загрузок (22.48).
+
+    Находит НЕЗАВЕРШЁННЫЕ сессии загрузки, по которым перестали приходить
+    куски, и отправляет каждому затронутому пользователю ОДНО сообщение со
+    списком файлов и кнопкой «▶️ Продолжить загрузку» (Mini App).
+
+    Триггеры тишины:
+      • closed_hint (клиент сам сообщил о закрытии) — ждём ~6 с: если куски
+        снова пошли (ts > hint) — ложная тревога, метка снимается;
+      • без hint — сессия молчит > 30 с (крестик без событий, обрыв сети).
+
+    Один раз на сессию (pause_notified) + кулдаун 2 мин на пользователя.
+    Возвращает, скольким пользователям отправили сообщение."""
+    now = time.time() if now is None else float(now)
+    bot = getattr(app, "bot", None)
+
+    # 1) снимаем метки у живых загрузок и собираем затухшие по пользователям
+    stale = {}                     # uid → [(uploadId, имя, размер, догружено)]
+    for upid, s in list(_MINIAPP_UPLOADS.items()):
+        size = int(s.get("size") or 0)
+        received = int(s.get("received") or 0)
+        if size <= 0 or received >= size:
+            continue               # завершено/пусто — пауза не интересна
+        hint = s.get("closed_hint")
+        if hint:
+            if float(s.get("ts", 0)) > float(hint):
+                s.pop("closed_hint", None)   # куски пошли — загрузка жива
+                continue
+            if now - float(hint) < 6.0:
+                continue                     # ещё ждём «последний вдох»
+        elif now - float(s.get("ts", now)) <= _UPLOAD_PAUSE_SILENCE:
+            continue                         # молчит недолго — может, оживёт
+        if s.get("pause_notified"):
+            continue                         # по этой сессии уже сообщали
+        uid = str(s.get("uid") or "")
+        if not uid:
+            continue
+        stale.setdefault(uid, []).append(
+            (upid, str(s.get("name") or "файл")[:60], size, received))
+
+    if not stale:
+        return 0
+
+    sent = 0
+    for uid, items in list(stale.items()):
+        # недавно уже писали об остановке? — сессии НЕ помечаем: если
+        # тишина продолжится, сообщение уйдёт после кулдауна (а не «никогда»)
+        last = _UPLOAD_PAUSE_LAST.get(uid, 0)
+        if now - last < _UPLOAD_PAUSE_COOLDOWN:
+            continue
+        if bot is None:
+            continue
+        # помечаем ДО отправки (отправка может упасть — спамить не нужно)
+        for upid, _nm, _sz, _rc in items:
+            _s = _MINIAPP_UPLOADS.get(upid)
+            if _s is not None:
+                _s["pause_notified"] = True
+                _s.pop("closed_hint", None)
+        _UPLOAD_PAUSE_LAST[uid] = now
+        lines = ""
+        for _upid, nm, sz, rc in items[:3]:
+            lines += f"• «{nm}» — догружено {_fmt_bytes(rc)} из {_fmt_bytes(sz)}\n"
+        extra = len(items) - 3
+        if extra > 0:
+            lines += f"• и ещё {extra} файл(ов)\n"
+        kb = None
+        if MINIAPP_URL:
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("▶️ Продолжить загрузку",
+                                     web_app=WebAppInfo(url=MINIAPP_URL))]])
         try:
-            os.remove(s["path"])
+            await bot.send_message(
+                chat_id=int(uid),
+                text=("⏸ Загрузка на паузе\n\n" + lines +
+                      "\nМини апп закрыли посреди загрузки, и файлы "
+                      "перестали лететь на сервер.\n\n"
+                      "Файлы НЕ потеряны: откройте мини апп — загрузка "
+                      "продолжится сама с того же места."),
+                reply_markup=kb,
+            )
+            sent += 1
         except Exception:
             pass
-    return web.json_response({"ok": True})
+    return sent
+
+
+async def _upload_pause_watchdog(app):
+    """Фоновый тикер сторожа паузы загрузок (раз в 10 секунд, 22.48)."""
+    while True:
+        try:
+            await asyncio.sleep(10)
+            await _upload_pause_check_once(app)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"upload pause watchdog error: {e}")
 
 
 async def miniapp_upload_complete(request):
@@ -18914,16 +19393,38 @@ async def miniapp_upload_complete(request):
         body = await request.json()
     except Exception:
         body = {}
-    s = _MINIAPP_UPLOADS.pop(str(body.get("uploadId") or ""), None)
+    upid = str(body.get("uploadId") or "")
+
+    # ВОЛНА 22.49: идемпотентный complete — если первый запрос УСПЕШНО создал
+    # файл, но ответ потерялся (обрыв сети/таймаут прокси), повторный запрос
+    # возвращает ТОТ ЖЕ результат вместо дубля записи в Сейфе.
+    _done = _MINIAPP_COMPLETED.get(upid)
+    if _done and _done.get("uid") == uid and \
+            time.time() - float(_done.get("ts", 0)) < 3600:
+        return web.json_response(_done["resp"])
+
+    # ВОЛНА 22.49: сессию НЕ снимаем до успешной валидации — раньше ЛЮБАЯ
+    # ошибка (не досланы куски, пароль не введён, Telegram отказал) уничтожала
+    # сессию и .part: почти загруженный файл приходилось качать ЗАНОВО.
+    # Теперь: incomplete/safe_locked — сессия ЖИВА (дослали куски / ввели
+    # пароль → complete просто повторяется); снимаем только при успехе или
+    # при неисправимой порче (empty/incomplete_disk).
+    s = _MINIAPP_UPLOADS.get(upid)
     if not s or s.get("uid") != uid:
         return _miniapp_err(404, "session_not_found",
                             "Загрузка не найдена или устарела — начните заново.")
+    if s.get("completing"):
+        return _miniapp_err(409, "already_processing",
+                            "Загрузка уже обрабатывается — подождите.")
+    s["completing"] = True
     # ВАЖНО: _mt_upload_container может ПЕРЕИМЕНОВАТЬ временный файл — чистим оба пути.
     mt_renamed = os.path.join(os.path.dirname(s["path"]), s["name"] or "file.bin")
+    _finished = False   # сессия закрыта (успех или неисправимая порча)
     try:
         if s["size"] <= 0:
             # ВОЛНА 22.38: 0-байтовые файлы невозможны (init их отвергает;
             # здесь страховка от повреждённой сессии).
+            _finished = True
             return _miniapp_err(
                 400, "empty_file",
                 "Файл пустой (0 Б) — запись не создана. Попробуйте загрузить "
@@ -18935,12 +19436,16 @@ async def miniapp_upload_complete(request):
             _disk_size = 0
         if _disk_size != s["size"]:
             # ВОЛНА 22.38: не создаём запись, если на диске не все байты —
-            # иначе получаются «файлы 0б / повреждённые».
+            # иначе получаются «файлы 0б / повреждённые». ВОЛНА 22.49:
+            # порча диска неисправима (куски уже лежат криво) — сессию закрываем.
+            _finished = True
             return _miniapp_err(
                 400, "incomplete_disk",
                 f"Файл получен не полностью (на диске {_disk_size} из "
                 f"{s['size']} байт) — начните загрузку заново.")
         if s["received"] != s["size"]:
+            # ВОЛНА 22.49: сессию НЕ снимаем — клиент досылает недостающие
+            # куски в ЭТУ ЖЕ сессию (без перекачки всего файла).
             return _miniapp_err(
                 400, "incomplete",
                 f"Получено {s['received']} из {s['size']} байт — загрузка не завершена.")
@@ -18950,10 +19455,11 @@ async def miniapp_upload_complete(request):
         if not s.get("plain"):
             vault_pw_raw = _miniapp_vault_pw_from(request, body, upload_sess=s)
             # ВОЛНА 22.35: резолвим URL-кодированный не-Latin1 пароль из заголовка
-            vault_pw = _miniapp_vault_pw_pick(
-                user, _vault_pw_candidates(vault_pw_raw)) \
+            # ВОЛНА 22.49: pick/guard — в worker-потоке (PBKDF2 600k).
+            vault_pw = await asyncio.to_thread(
+                _miniapp_vault_pw_pick, user, _vault_pw_candidates(vault_pw_raw)) \
                 if vault_pw_raw else None
-            guard = _miniapp_vault_pw_guard(user, vault_pw)
+            guard = await asyncio.to_thread(_miniapp_vault_pw_guard, user, vault_pw)
             if guard is None:
                 return _miniapp_err(
                     423, "safe_locked",
@@ -18985,10 +19491,15 @@ async def miniapp_upload_complete(request):
             save_user(user)
             logger.info(f"miniapp upload: файл пользователя {uid} "
                         "зашифрован и сохранён в Сейф")
-            return web.json_response({
+            _finished = True
+            _resp = {
                 "file": _miniapp_safe_rec_out(len(user.vault_files), new_rec),
                 "safe": True,
-            })
+            }
+            _MINIAPP_COMPLETED[upid] = {"ts": time.time(), "uid": uid,
+                                        "resp": _resp}
+            _miniapp_prune_completed()
+            return web.json_response(_resp)
         # === режим «БЕЗ ШИФРА» (личный канал) — прежний путь, облако ===
         app = _MINIAPP_PTB_APP
         sent = None
@@ -19044,13 +19555,26 @@ async def miniapp_upload_complete(request):
             out["queue_pos"] = int(sent.get("queue_pos") or 1)
         except Exception:
             out["queue_pos"] = 1
-        return web.json_response({"file": out})
+        _finished = True
+        _resp = {"file": out}
+        _MINIAPP_COMPLETED[upid] = {"ts": time.time(), "uid": uid,
+                                    "resp": _resp}
+        _miniapp_prune_completed()
+        return web.json_response(_resp)
     finally:
-        for p in (s["path"], mt_renamed):
-            try:
-                os.remove(p)
-            except Exception:
-                pass
+        # ВОЛНА 22.49: сессию и .part снимаем ТОЛЬКО при успехе или
+        # неисправимой порче; при incomplete/safe_locked/ошибке Telegram
+        # сессия остаётся — досыл кусков / повтор complete продолжит БЕЗ
+        # перекачки файла заново.
+        if _finished:
+            _MINIAPP_UPLOADS.pop(upid, None)
+            for p in (s["path"], mt_renamed):
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
+        else:
+            s["completing"] = False
 
 
 # --- ВОЛНА 22.23: «МОЁ ОБЛАКО» В МИНИ-АППЕ (хранилище пользователя) ---
@@ -19236,6 +19760,31 @@ async def miniapp_storage_disconnect(request):
 _WEB_LOGIN_MAX_ATTEMPTS = 5
 _WEB_LOGIN_LOCK_MINUTES = 10
 
+# ВОЛНА 22.49: ГЛОБАЛЬНЫЙ лимитер по IP. Раньше лимит был только на юзера:
+# атакующий перебирал user_id'ы (каждый промах — PBKDF2 200 000 раундов
+# прямо на event loop = CPU-DoS всего бота).
+_WEB_LOGIN_GLOBAL_MAX = 30       # попыток с одного IP
+_WEB_LOGIN_GLOBAL_WINDOW = 600   # за 10 минут
+_WEB_LOGIN_GLOBAL = {}           # ip → [timestamp попыток]
+
+
+def _web_login_global_allowed(ip: str) -> bool:
+    """Разрешена ли попытка входа с этого IP (скользящее окно)."""
+    now = time.time()
+    lst = [t for t in _WEB_LOGIN_GLOBAL.get(ip, [])
+           if now - t < _WEB_LOGIN_GLOBAL_WINDOW]
+    if len(lst) >= _WEB_LOGIN_GLOBAL_MAX:
+        _WEB_LOGIN_GLOBAL[ip] = lst
+        return False
+    lst.append(now)
+    _WEB_LOGIN_GLOBAL[ip] = lst
+    # анти-рост словаря: чистим IP, молчащие дольше окна
+    if len(_WEB_LOGIN_GLOBAL) > 4096:
+        for k in [k for k, v in _WEB_LOGIN_GLOBAL.items()
+                  if not v or now - v[-1] > _WEB_LOGIN_GLOBAL_WINDOW]:
+            _WEB_LOGIN_GLOBAL.pop(k, None)
+    return True
+
 
 def _web_lock_remaining_minutes(user) -> int:
     """Сколько минут ещё действует блокировка веб-входа (0 — не заблокирован)."""
@@ -19267,6 +19816,14 @@ async def miniapp_web_login(request):
     password = str(body.get("password") or "")
     if not user_id or not password:
         return _miniapp_err(400, "bad_request", "Укажите ID и пароль.")
+    # ВОЛНА 22.49: глобальный лимит попыток с одного IP (анти-перебор).
+    _ip = (request.headers.get("X-Forwarded-For") or "").split(",")[0].strip() \
+        or request.remote or "?"
+    if not _web_login_global_allowed(_ip):
+        return _miniapp_err(
+            429, "locked",
+            f"Слишком много попыток входа. Подождите "
+            f"{_WEB_LOGIN_GLOBAL_WINDOW // 60} мин.")
     user = get_user(user_id)
     # ЧЕСТНАЯ БЕЗОПАСНОСТЬ: «нет пользователя» и «нет пароля» неразличимы.
     if not user or not isinstance(getattr(user, "web_password_hash", None), dict):
@@ -19276,7 +19833,8 @@ async def miniapp_web_login(request):
         return _miniapp_err(
             429, "locked",
             f"Слишком много попыток. Подождите {mins_left} мин.")
-    if not _web_check_password(user, password):
+    # ВОЛНА 22.49: PBKDF2 (200 000 раундов) — в worker-потоке.
+    if not await asyncio.to_thread(_web_check_password, user, password):
         user.web_login_attempts = int(getattr(user, "web_login_attempts", 0) or 0) + 1
         if user.web_login_attempts >= _WEB_LOGIN_MAX_ATTEMPTS:
             user.web_login_locked_until = (
@@ -19643,6 +20201,8 @@ def mount_miniapp_routes(app):
     app.router.add_post("/api/upload/chunk", miniapp_upload_chunk)
     app.router.add_post("/api/upload/complete", miniapp_upload_complete)
     app.router.add_post("/api/upload/abort", miniapp_upload_abort)
+    # ВОЛНА 22.48: «мини апп закрыли посреди загрузки» (fetch keepalive)
+    app.router.add_post("/api/upload/closed", miniapp_upload_closed)
     # ВОЛНА 22.23: «Моё облако» в мини-аппе (статус/подключить/отключить канал)
     app.router.add_get("/api/storage", miniapp_storage_get)
     app.router.add_post("/api/storage/connect", miniapp_storage_connect)
@@ -19924,6 +20484,12 @@ async def cloud_rename_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
     old = rec.get("name", "?")
     rec["name"] = text[:120]
     save_user(user)
+    # ВОЛНА 22.48: файл переименовывается и В КАНАЛЕ ПОЛЬЗОВАТЕЛЯ —
+    # подпись сообщения-хранилища догоняет новое имя (best-effort).
+    try:
+        await _storage_rename_caption(context.bot, rec, rec["name"])
+    except Exception:
+        pass
     await msg.reply_text(
         f"✏️ Готово: «{old}» → «{rec['name']}».",
         reply_markup=get_main_menu_keyboard(user),
@@ -20680,7 +21246,9 @@ async def dev_cdb_export_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
         return
-    payload, meta, files_n = _storage_pack_payload()
+    # ВОЛНА 22.49: сборка снапшота (zip+LZMA+шифрование целой базы) —
+    # тяжёлая CPU/IO работа — в worker-потоке, не фризим loop.
+    payload, meta, files_n = await asyncio.to_thread(_storage_pack_payload)
     if not payload:
         try:
             await query.answer("Нет данных для снапшота.", show_alert=True)
@@ -20800,6 +21368,28 @@ def _vault_derive_key(password: str, salt: bytes, iters: int) -> bytes:
     )
 
 
+# ВОЛНА 22.49: кэш выведенных ключей. Одна проверка пароля Сейфа = PBKDF2
+# (600 000 раундов, ~0.3-0.6 с CPU). За одну загрузку пароль проверяется
+# до 4 раз (pick в init → guard в init → pick в complete → guard в complete)
+# по одному и тому же файлу-верификатору — кэш убирает повторные прогоны.
+# Ключи и так живут в RAM во время шифрования — хранить тут их не опаснее.
+_KDF_CACHE = {}
+_KDF_CACHE_MAX = 128
+
+
+def _vault_derive_key_cached(password: str, salt_hex: str, iters: int) -> bytes:
+    """_vault_derive_key с кэшем по (пароль, соль-hex, итерации)."""
+    ck = (str(password), str(salt_hex), int(iters))
+    hit = _KDF_CACHE.get(ck)
+    if hit is not None:
+        return hit
+    key = _vault_derive_key(password, bytes.fromhex(salt_hex), iters)
+    if len(_KDF_CACHE) >= _KDF_CACHE_MAX:
+        _KDF_CACHE.clear()
+    _KDF_CACHE[ck] = key
+    return key
+
+
 def _vault_verifier(key: bytes) -> bytes:
     """«Отпечаток» ключа: позволяет проверить пароль БЕЗ скачивания файла.
 
@@ -20808,21 +21398,32 @@ def _vault_verifier(key: bytes) -> bytes:
     return hmac.new(b"DEVORKS-VAULT-VERIFY", key, hashlib.sha256).digest()[:16]
 
 
+def _vault_pack2(password: str, payload: bytes, meta: dict):
+    """ВОЛНА 22.49: контейнер DVF1 + верификатор за ОДНУ деривацию ключа.
+    Возвращает (container, verifier_hex). Раньше _vault_pack выводил ключ
+    (PBKDF2, 600 000 раундов), а верификатор считали ВТОРЫМ прогоном
+    PBKDF2 по той же соли — минус ~0.3-0.6 с задержки на каждый файл ≤20 МБ."""
+    salt = os.urandom(16)
+    nonce = os.urandom(12)
+    key = _vault_derive_key(password, salt, VAULT_KDF_ITERS)
+    verifier_hex = _vault_verifier(key).hex()
+    header = json.dumps(meta, ensure_ascii=False).encode("utf-8")
+    plaintext = header + b"\x00" + (payload or b"")
+    ct = AESGCM(key).encrypt(nonce, plaintext, VAULT_MAGIC + bytes([VAULT_VERSION]))
+    container = (
+        VAULT_MAGIC + bytes([VAULT_VERSION])
+        + VAULT_KDF_ITERS.to_bytes(4, "big") + salt + nonce + ct
+    )
+    return container, verifier_hex
+
+
 def _vault_pack(password: str, payload: bytes, meta: dict) -> bytes:
     """Шифрует payload + метаданные паролем. Возвращает контейнер DVF1.
 
     meta — dict (имя файла, mime, тип, дата). Сериализуется внутрь
     контейнера и шифруется ВМЕСТЕ с файлом: без пароля не видно даже имени."""
-    salt = os.urandom(16)
-    nonce = os.urandom(12)
-    key = _vault_derive_key(password, salt, VAULT_KDF_ITERS)
-    header = json.dumps(meta, ensure_ascii=False).encode("utf-8")
-    plaintext = header + b"\x00" + (payload or b"")
-    ct = AESGCM(key).encrypt(nonce, plaintext, VAULT_MAGIC + bytes([VAULT_VERSION]))
-    return (
-        VAULT_MAGIC + bytes([VAULT_VERSION])
-        + VAULT_KDF_ITERS.to_bytes(4, "big") + salt + nonce + ct
-    )
+    container, _verifier_hex = _vault_pack2(password, payload, meta)
+    return container
 
 
 def _vault_unpack(password: str, container: bytes):
@@ -20859,11 +21460,13 @@ def _vault_unpack(password: str, container: bytes):
 
 
 def _vault_check_password(user, rec, password: str) -> bool:
-    """Быстрая проверка пароля по верификатору (файл даже не скачивается)."""
+    """Быстрая проверка пароля по верификатору (файл даже не скачивается).
+    ВОЛНА 22.49: ключ через кэш — повторные проверки одного (пароль, файл)
+    мгновенны."""
     try:
-        salt = bytes.fromhex(rec.get("salt", ""))
+        salt_hex = str(rec.get("salt", ""))
         iters = int(rec.get("iters") or VAULT_KDF_ITERS)
-        key = _vault_derive_key(password, salt, iters)
+        key = _vault_derive_key_cached(password, salt_hex, iters)
         return hmac.compare_digest(_vault_verifier(key), bytes.fromhex(rec.get("verifier", "")))
     except Exception:
         return False
@@ -20909,6 +21512,8 @@ def _web_set_password(user, password: str) -> None:
     # Новый пароль — старые блокировки и счётчики попыток не имеют смысла.
     user.web_login_attempts = 0
     user.web_login_locked_until = None
+    # ВОЛНА 22.49: все прежние сессии этого пользователя — недействительны.
+    _web_invalidate_sessions(getattr(user, "user_id", ""))
     save_user(user)
 
 
@@ -20934,9 +21539,21 @@ _WEB_SESSIONS = {}
 WEB_SESSION_TTL = 30 * 24 * 3600   # 30 дней, сек
 WEB_SESSIONS_MAX = 10000           # капа словаря (при превышении чистим просрочку)
 
+# ВОЛНА 22.49: epoch на пользователя — смена/удаление веб-пароля мгновенно
+# инвалидирует ВСЕ его сессии (раньше украденный Bearer-токен оставался жив
+# до 30 дней ПОСЛЕ смены пароля).
+_WEB_SESSIONS_EPOCH = {}
+
+
+def _web_invalidate_sessions(user_id) -> None:
+    """Убивает все веб-сессии пользователя (смена/удаление пароля)."""
+    uid = str(user_id)
+    _WEB_SESSIONS_EPOCH[uid] = int(_WEB_SESSIONS_EPOCH.get(uid, 0)) + 1
+
 
 def _web_create_session(user_id) -> str:
-    """Создаёт веб-сессию: secrets.token_urlsafe(32) → {user_id, expires, created}."""
+    """Создаёт веб-сессию: secrets.token_urlsafe(32) → {user_id, expires, created}.
+    ВОЛНА 22.49: сессия запоминает epoch владельца."""
     # Капа: если записей стало слишком много — сначала чистим просроченные.
     if len(_WEB_SESSIONS) >= WEB_SESSIONS_MAX:
         _now = time.time()
@@ -20953,12 +21570,14 @@ def _web_create_session(user_id) -> str:
         "user_id": str(user_id),
         "expires": _now + WEB_SESSION_TTL,
         "created": _now,
+        "epoch": int(_WEB_SESSIONS_EPOCH.get(str(user_id), 0)),
     }
     return token
 
 
 def _web_check_session(token) -> "str | None":
-    """Возвращает user_id живой сессии; просроченную удаляет; None — нет/битая."""
+    """Возвращает user_id живой сессии; просроченную удаляет; None — нет/битая.
+    ВОЛНА 22.49: сессии с устаревшим epoch (пароль сменили) — недействительны."""
     if not token:
         return None
     rec = _WEB_SESSIONS.get(token)
@@ -20968,7 +21587,12 @@ def _web_check_session(token) -> "str | None":
         _WEB_SESSIONS.pop(token, None)
         return None
     uid = str(rec.get("user_id") or "")
-    return uid or None
+    if not uid:
+        return None
+    if int(rec.get("epoch", 0)) != int(_WEB_SESSIONS_EPOCH.get(uid, 0)):
+        _WEB_SESSIONS.pop(token, None)
+        return None
+    return uid
 
 
 # ВОЛНА 17: ТЕКСТЫ секретных вопросов шифруются в файле базы ключом бота
@@ -21163,12 +21787,12 @@ def _vault_restore_warning(users: dict) -> str:
 
 
 def _vault_check_safe_password(user, password: str) -> bool:
-    """Проверка ЕДИНОГО пароля Сейфа по верификатору (без скачивания файлов)."""
+    """Проверка ЕДИНОГО пароля Сейфа по верификатору (без скачивания файлов).
+    ВОЛНА 22.49: ключ через кэш (повторные проверки мгновенны)."""
     auth = getattr(user, "vault_auth", None) or {}
     try:
-        salt = bytes.fromhex(auth.get("salt", ""))
         iters = int(auth.get("iters") or VAULT_KDF_ITERS)
-        key = _vault_derive_key(password, salt, iters)
+        key = _vault_derive_key_cached(password, auth.get("salt", ""), iters)
         return hmac.compare_digest(_vault_verifier(key), bytes.fromhex(auth.get("verifier", "")))
     except Exception:
         return False
@@ -21787,6 +22411,14 @@ def _dvf2_safe_name(name):
     return name[:120]
 
 
+def _seal_sink_step(fh, enc, chunk):
+    """ВОЛНА 22.49: один шаг sink'а «скачал кусок → записал исходник →
+    зашифровал» — выполняется ЦЕЛИКОМ в worker-потоке (asyncio.to_thread
+    из async-sink), чтобы диск и AES не останавливали event loop."""
+    fh.write(chunk)
+    enc.push(chunk)
+
+
 class _ProgressEdit:
     """Редкие правки сообщения-прогресса (не чаще раза в 3.5 с — лимиты
     editMessageText), чтобы потоковые операции 2 ГБ не упирались во флуд.
@@ -22185,7 +22817,11 @@ async def _mt_download_stream(client, doc, doc_size, sink, progress=None, title=
                         continue
                     chunk = chunk[skip:]
                     skip = 0
-                sink(chunk)
+                # ВОЛНА 22.49: sink может быть async-функцией — вызываем
+                # с await (шифратор уходит в worker-поток, не фризя loop).
+                _sink_res = sink(chunk)
+                if asyncio.iscoroutine(_sink_res):
+                    await _sink_res
                 got += len(chunk)
                 if progress is not None and doc_size:
                     pct = min(99, got * 100 // int(doc_size))
@@ -22231,6 +22867,9 @@ async def _mt_upload_container(client, path, size, caption, filename=None,
     upload_path = path
     if filename:
         try:
+            # ВОЛНА 22.49: санитизация имени — filename приходит от клиента
+            # (../обход пути = произвольная перезапись файла на диске).
+            filename = _dvf2_safe_name(filename)
             fixed = os.path.join(os.path.dirname(path), filename)
             if fixed != path and os.path.exists(path):
                 os.replace(path, fixed)
@@ -22572,7 +23211,8 @@ async def _vault_seal_item_mtproto_once(msg, context, user, item, password,
     if _op_here is not None:
         _op_here["temp"].append(job)
     tmp_enc = os.path.join(job, "container.bin")
-    enc = _Dvf2Encryptor(password, {
+    # ВОЛНА 22.49: шифратор — в worker-потоке (внутри PBKDF2 600k).
+    enc = await asyncio.to_thread(_Dvf2Encryptor, password, {
         "n": name, "k": kind, "m": mime,
         "t": datetime.now().strftime("%Y-%m-%d %H:%M"),
         "sz": size or doc_size,
@@ -22587,26 +23227,27 @@ async def _vault_seal_item_mtproto_once(msg, context, user, item, password,
         if _op_here is not None:
             _op_here["phase"] = f"Файл {idx}/{total}: «{name}»"
 
-        def _push_checked(chunk):
+        async def _push_checked(chunk):
             # ВОЛНА 22.3: кусок-за-куском — кооперативная отмена «❌ Отмена».
+            # ВОЛНА 22.49: шифрование куска — в worker-потоке (loop свободен).
             if _op_here is not None and _op_here["event"].is_set():
                 raise _VaultCancelled()
-            enc.push(chunk)
+            await asyncio.to_thread(enc.push, chunk)
 
         try:
             if botapi_payload is not None:
                 # ВОЛНА 18: оригинал уже в памяти (Bot API) — шифруем сразу.
                 if _op_here is not None and _op_here["event"].is_set():
                     raise _VaultCancelled()
-                enc.push(botapi_payload)
-                enc_total = enc.finish()
+                await asyncio.to_thread(enc.push, botapi_payload)
+                enc_total = await asyncio.to_thread(enc.finish)
                 botapi_payload = b""
             else:
                 await _mt_download_stream(
                     client, doc, doc_size, _push_checked, prog,
                     f"📦 [{idx}/{total}] «{name}»: качаю и шифрую")
-                enc_total = enc.finish()
-        except Exception:
+                enc_total = await asyncio.to_thread(enc.finish)
+        except BaseException:
             enc.abort()
             raise
         if _op_here is not None and _op_here["event"].is_set():
@@ -23492,6 +24133,8 @@ async def web_pw_delete_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user.web_password_set_at = None
     user.web_login_attempts = 0
     user.web_login_locked_until = None
+    # ВОЛНА 22.49: веб-пароль удалён — все веб-сессии недействительны.
+    _web_invalidate_sessions(getattr(user, "user_id", ""))
     save_user(user)
     logger.info(f"web_password: пользователь {user.user_id} удалил веб-пароль")
     try:
@@ -26137,8 +26780,9 @@ async def _vault_encrypt_batch(msg, context, user, password):
                 item["done"] = True  # ВОЛНА 11: шифр в канале — оригинал из чата сотрём
                 continue
             try:
-                container = await asyncio.to_thread(
-                    _vault_pack, password, item.get("payload") or b"", {
+                # ВОЛНА 22.49: _vault_pack2 — одна деривация вместо двух.
+                container, verifier_hex = await asyncio.to_thread(
+                    _vault_pack2, password, item.get("payload") or b"", {
                         "n": item.get("name", "файл"), "k": item.get("kind", "document"),
                         "m": item.get("mime", ""), "t": datetime.now().strftime("%Y-%m-%d %H:%M"),
                     },
@@ -26156,8 +26800,6 @@ async def _vault_encrypt_batch(msg, context, user, password):
             salt_hex = container[9:25].hex()
             nonce_hex = container[25:37].hex()
             iters = int.from_bytes(container[5:9], "big")
-            key = _vault_derive_key(password, bytes.fromhex(salt_hex), iters)
-            verifier_hex = _vault_verifier(key).hex()
             # Грузим ШИФР в канал по кругу (cloud-каналы).
             _vfn = f"vault_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{i}.bin"
             _vcap = "🔐 Сейф: зашифрованный файл (открыть без пароля невозможно)."
@@ -27270,6 +27912,12 @@ async def vault_ren_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     save_user(user)
     context.user_data.pop('vault_ren_id', None)
+    # ВОЛНА 22.48: в режиме «без шифрования» подпись в канале тоже догоняет
+    # новое имя (у зашифрованного Сейфа имя в канале не светится — не трогаем).
+    try:
+        await _storage_rename_caption(context.bot, rec, rec["label"])
+    except Exception:
+        pass
     await msg.reply_text(
         f"✏️ Подпись сохранена: «{rec['label']}». Теперь в списке Сейфа видно, "
         "где что лежит.",
@@ -27544,7 +28192,8 @@ async def vault_rec_newpass(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if up is None:
             fail += 1
             continue
-        new_key = _vault_derive_key(password, bytes.fromhex(salt_hex), VAULT_KDF_ITERS)
+        new_key = await asyncio.to_thread(
+            _vault_derive_key, password, bytes.fromhex(salt_hex), VAULT_KDF_ITERS)
         old_msg_id = int(rec.get("msg_id") or 0)
         old_channel = channel_id
         rec.update({
@@ -27569,7 +28218,9 @@ async def vault_rec_newpass(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ответами (вопросы не менялись — менять их вправе сам пользователь отдельно).
     auth["salt"] = os.urandom(16).hex()
     auth["iters"] = VAULT_KDF_ITERS
-    key = _vault_derive_key(password, bytes.fromhex(auth["salt"]), auth["iters"])
+    # ВОЛНА 22.49: PBKDF2 (600k) — в worker-потоке, не фризим loop.
+    key = await asyncio.to_thread(
+        _vault_derive_key, password, bytes.fromhex(auth["salt"]), auth["iters"])
     auth["verifier"] = _vault_verifier(key).hex()
     auth["rec"] = _vault_seal_password(password, answers)
     # ВОЛНА 17: свежая метка времени (для merge при восстановлении) + шифруем
@@ -27934,7 +28585,9 @@ async def vault_chpass_new_password(update: Update, context: ContextTypes.DEFAUL
     salt_hex = new_container[9:25].hex()
     nonce_hex = new_container[25:37].hex()  # ВОЛНА 9: честный nonce новой записи
     new_container = b""
-    new_key = _vault_derive_key(password, bytes.fromhex(salt_hex), VAULT_KDF_ITERS)
+    # ВОЛНА 22.49: PBKDF2 (600k) — в worker-потоке, не фризим loop.
+    new_key = await asyncio.to_thread(
+        _vault_derive_key, password, bytes.fromhex(salt_hex), VAULT_KDF_ITERS)
     old_msg_id = int(rec.get("msg_id") or 0)
     old_channel_id = channel_id
     rec.update({
@@ -38454,6 +39107,11 @@ async def dev_broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 @timeout(CONVERSATION_TIMEOUT)
 async def dev_broadcast_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # ВОЛНА 22.49: защита в глубину (гейт есть и в handle_callback) —
+    # рассылка ВСЕМ пользователям должна быть доступна только разработчику.
+    if str(update.effective_user.id) != str(DEVELOPER_ID):
+        await update.message.reply_text("🚫 Только для разработчика.")
+        return MAIN_MENU
     message_text = update.message.text
     users = load_users()
 
@@ -38467,8 +39125,25 @@ async def dev_broadcast_handler(update: Update, context: ContextTypes.DEFAULT_TY
                     parse_mode=ParseMode.MARKDOWN
                 )
                 sent_count += 1
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
-                logger.error(f"Ошибка рассылки {user_id}: {e}")
+                # ВОЛНА 22.49: RetryAfter (флуд-лимит) — ждём и ДОСЫЛАЕМ
+                # этому пользователю (раньше сообщение молча терялось).
+                _ra = getattr(e, "retry_after", None)
+                if _ra:
+                    await asyncio.sleep(min(float(_ra) + 0.5, 60))
+                    try:
+                        await context.bot.send_message(
+                            chat_id=user_id,
+                            text=f"📢 **Сообщение от разработчика:**\n\n{message_text}",
+                            parse_mode=ParseMode.MARKDOWN
+                        )
+                        sent_count += 1
+                    except Exception as e2:
+                        logger.error(f"Ошибка рассылки {user_id}: {e2}")
+                else:
+                    logger.error(f"Ошибка рассылки {user_id}: {e}")
             # ЗАЩИТА (22.13): пауза между отправками — не попадать под
             # флуд-лимиты Telegram и не рисковать баном бота.
             await asyncio.sleep(0.05)
@@ -38557,6 +39232,11 @@ async def dev_delete_class_handler(update: Update, context: ContextTypes.DEFAULT
     query = update.callback_query
     await query.answer()
 
+    # ВОЛНА 22.49: защита в глубину — удаление класса только разработчику.
+    if str(query.from_user.id) != str(DEVELOPER_ID):
+        await query.answer("🚫 Только для разработчика.", show_alert=True)
+        return MAIN_MENU
+
     class_code = query.data.split("_")[3]
     class_obj = get_class_by_code(class_code)
 
@@ -38565,8 +39245,12 @@ async def dev_delete_class_handler(update: Update, context: ContextTypes.DEFAULT
         return DEV_PANEL
 
     classes = load_classes()
-    classes[class_code].is_active = False
-    save_classes(classes)
+    # ВОЛНА 22.49: .get() вместо [class_code] — класс могли удалить
+    # параллельно (KeyError между проверкой и перезагрузкой).
+    _cls = classes.get(class_code)
+    if _cls is not None:
+        _cls.is_active = False
+        save_classes(classes)
 
     for member_id in class_obj.students:
         try:
@@ -38601,6 +39285,12 @@ async def dev_block_user_start(update: Update, context: ContextTypes.DEFAULT_TYP
 async def dev_block_user_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+
+    # ВОЛНА 22.49: защита в глубину — блокировка пользователей только
+    # разработчику (callback_data подделывается).
+    if str(query.from_user.id) != str(DEVELOPER_ID):
+        await query.answer("🚫 Только для разработчика.", show_alert=True)
+        return MAIN_MENU
 
     user_id = query.data.split("_")[2]
     context.user_data['blocking_user_id'] = user_id
@@ -46052,6 +46742,21 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _send_age_block(update, context)
             return AGE_BLOCKED
 
+    # ВОЛНА 22.49: жёсткий гейт разработчика на ВСЕ dev_*/qprice_* колбэки.
+    # callback_data подделывается ЛЮБЫМ клиентом (бот не может проверить,
+    # кому именно была показана клавиатура) — раньше часть dev-действий
+    # (рассылка всем, удаление класса, блокировка пользователей, цены)
+    # не имела проверки ID и была доступна обычному пользователю.
+    if _cb_uid != str(DEVELOPER_ID) and (
+            data.startswith("dev") or data.startswith("qprice_")):
+        try:
+            await query.answer(
+                "🚫 Панель разработчика доступна только разработчику.",
+                show_alert=True)
+        except Exception:
+            pass
+        return MAIN_MENU
+
     # ВОЛНА 22.4: маршрутизатор pult_* удалён вместе с Пультом.
 
     if data.startswith("view_anon_msg_"):
@@ -47839,15 +48544,32 @@ DEFAULT_HOLIDAYS = {
 }
 
 
+# ВОЛНА 22.49: TTL-кэш праздников (300 с) — единый тик читал их из базы
+# на КАЖДОГО отправляющего пользователя (блокирующий сетевой запрос).
+_holidays_cache = None
+_holidays_cache_ts = 0.0
+
+
 def load_holidays():
     """Загружает праздники из файла. При первом запуске создаёт файл с
     дефолтным набором праздников (DEFAULT_HOLIDAYS)."""
+    global _holidays_cache, _holidays_cache_ts
+    now = time.time()
+    if _holidays_cache is not None and now - _holidays_cache_ts < 300:
+        return {k: list(v) for k, v in _holidays_cache.items()}
     data = load_data(HOLIDAYS_FILE, None)
     if data is None or not isinstance(data, dict):
         # Первый запуск — кладём дефолты в файл, чтобы их сразу можно было
         # править/удалять через панель разработчика.
         save_data(HOLIDAYS_FILE, DEFAULT_HOLIDAYS)
         # Возвращаем КОПИЮ, чтобы внешний код мог её править без побочных эффектов.
+        return {k: list(v) for k, v in DEFAULT_HOLIDAYS.items()}
+    # ВОЛНА 22.49: load_data для отсутствующего файла возвращает {} (не None),
+    # поэтому ветка «первого запуска» выше не срабатывала НИКОГДА и файл
+    # дефолтов не создавался. Создаём его, если файла по-настоящему нет
+    # (намеренно ОПУСТОШЁННЫЙ администратором файл не трогаем).
+    if not data and not os.path.exists(HOLIDAYS_FILE):
+        save_data(HOLIDAYS_FILE, DEFAULT_HOLIDAYS)
         return {k: list(v) for k, v in DEFAULT_HOLIDAYS.items()}
     # На случай, если кто-то сохранил значение строкой вместо списка —
     # приводим к списку для единообразия.
@@ -47859,11 +48581,16 @@ def load_holidays():
             fixed[k] = [v]
         else:
             fixed[k] = []
-    return fixed
+    _holidays_cache = fixed
+    _holidays_cache_ts = now
+    return {k: list(v) for k, v in fixed.items()}
 
 
 def save_holidays(holidays):
     """Сохраняет праздники в файл."""
+    global _holidays_cache, _holidays_cache_ts
+    _holidays_cache = None
+    _holidays_cache_ts = 0.0
     save_data(HOLIDAYS_FILE, holidays)
 
 
@@ -51577,9 +52304,24 @@ async def _tick_send_timers(bot):
                     chat_id=int(user_id),
                     text=msg,
                 )
+                # ВОЛНА 22.49: успех — сбрасываем счётчик неудачных отправок.
+                timer_data.pop("send_fails", None)
                 logger.info(f"tick/timers: timer {timer_id} -> {user_id} sent.")
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 logger.error(f"tick/timers: send failed {timer_id}->{user_id}: {e}")
+                # ВОЛНА 22.49: отправка не удалась (сеть/Telegram) — возвращаем
+                # ОДНОРАЗОВЫЙ таймер в активные, чтобы тик ДОСЛАЛ напоминание
+                # (раньше таймер молча помечался неактивным и напоминание
+                # терялось навсегда). Не более 10 попыток — чтобы не спамить
+                # вечно заблокировавшего бота пользователя.
+                if not _timer_advance_repeat(timer_data):
+                    _fails = int(timer_data.get("send_fails", 0) or 0) + 1
+                    timer_data["send_fails"] = _fails
+                    timer_data["is_active"] = _fails <= 10
+                timers[timer_id] = timer_data
+                changed = True
         except Exception as e:
             logger.error(f"tick/timers: error on timer {timer_id}: {e}")
     if changed:
@@ -51936,7 +52678,18 @@ async def _unified_notification_tick_locked(context):
     if not users:
         logger.info("unified_tick: пользователей нет (users.json пустой?)")
         return
-    logger.info(f"unified_tick: проверяю {len(users)} пользователей")
+    # ВОЛНА 22.49: logger.info на КАЖДЫЙ тик = 2880 строк в сутки — в DEBUG.
+    logger.debug(f"unified_tick: проверяю {len(users)} пользователей")
+    # ВОЛНА 22.49: чистка завершённых фоновых задач — без неё bot_data
+    # ["_bg_tasks"] рос бесконечно (медленная утечка памяти на живом процессе).
+    try:
+        _bg = getattr(context.application, "bot_data", None)
+        if isinstance(_bg, dict):
+            _bgl = _bg.get("_bg_tasks")
+            if isinstance(_bgl, list) and len(_bgl) > 64:
+                _bg["_bg_tasks"] = [t for t in _bgl if not t.done()]
+    except Exception:
+        pass
     log = _load_notification_log()
     log_changed = False
 
@@ -51972,7 +52725,9 @@ async def _unified_notification_tick_locked(context):
                 due, too_late, morn_occ = _is_daily_time_due(
                     local_now, morning_t, max_late_minutes=14 * 60
                 )
-                logger.info(
+                # ВОЛНА 22.49: per-user логи в DEBUG (2 строки × N юзеров
+                # × 2880 тиков/сутки забивали журнал и тормозили тик).
+                logger.debug(
                     f"unified_tick: morning check uid={uid} t={morning_t} "
                     f"local_now={local_now:%H:%M} due={due} too_late={too_late} occ={morn_occ} "
                     f"sent_occ={(not morn_occ) or _notification_already_sent(log, uid, 'morning', morn_occ)} "
@@ -52011,7 +52766,8 @@ async def _unified_notification_tick_locked(context):
                 due, too_late, eve_occ = _is_daily_time_due(
                     local_now, evening_t, max_late_minutes=12 * 60
                 )
-                logger.info(
+                # ВОЛНА 22.49: per-user логи в DEBUG.
+                logger.debug(
                     f"unified_tick: evening check uid={uid} t={evening_t} "
                     f"local_now={local_now:%H:%M} due={due} too_late={too_late} occ={eve_occ} "
                     f"sent_occ={(not eve_occ) or _notification_already_sent(log, uid, 'evening', eve_occ)} "
@@ -52370,6 +53126,21 @@ async def _post_init(application):
         logger.info("Time-sync loop запущен (каждые 5 минут).")
     except Exception as e2:
         logger.error(f"Не удалось запустить time-sync loop: {e2}")
+
+    # === ВОЛНА 22.48: сторож паузы загрузок. ===
+    # Мини апп закрыли посреди загрузки → в чат уходит «⏸ Загрузка на паузе»
+    # с кнопкой «▶️ Продолжить загрузку» (открывает мини апп — очередь
+    # докачивается сама). Раз в 10 секунд, без спама (1 раз на сессию,
+    # кулдаун 2 мин на пользователя).
+    try:
+        _upw_task = asyncio.create_task(_upload_pause_watchdog(application))
+        try:
+            application.bot_data.setdefault("_bg_tasks", []).append(_upw_task)
+        except Exception:
+            pass
+        logger.info("Сторож паузы загрузок запущен (каждые 10 секунд).")
+    except Exception as e2:
+        logger.error(f"Не удалось запустить сторожа паузы загрузок: {e2}")
 
     # === ШАГ 4: диагностика уведомлений по каждому пользователю. ===
     try:
