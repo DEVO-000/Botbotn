@@ -3641,7 +3641,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.52"
+BOT_BUILD = "22.53"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -15309,6 +15309,16 @@ async function _uploadOneSession(file, reportBytes) {
     /* ВОЛНА 22.49: сервер не выдал сессию — честная ошибка вместо
        «uploadId=undefined» во всех URL кусков */
     if (!uploadId) throw new Error('сервер не выдал сессию загрузки');
+
+    /* ВОЛНА 22.53: сервер УЗНАЛ прерванную сессию этого же файла (выход из
+       веб-облака посреди загрузки, локальная очередь потерялась — квота,
+       другой браузер/устройство). Продолжаем ТОТ ЖЕ uploadId: куски, которые
+       сервер уже имеет, не перекачиваем — только недостающие. Прогресс
+       докачки предзаполнится ниже через serverParts. */
+    if (initData.resumed && Array.isArray(initData.parts) &&
+        initData.parts.length) {
+      serverParts = new Set(initData.parts);
+    }
   }
 
   file._lastUploadId = uploadId;
@@ -20322,6 +20332,67 @@ async def miniapp_upload_init(request):
             f"Лимит облака ({limit} файлов) достигнут — удалите что-нибудь "
             "(в вебе или в чате: 🗑 у файла).")
     _miniapp_cleanup_uploads()
+    # ВОЛНА 22.53: ПОВТОРНЫЙ ВЫБОР ТОГО ЖЕ ФАЙЛА = ПРОДОЛЖЕНИЕ ПРЕРВАННОЙ
+    # СЕССИИ. Пользователь вышел из веб-облака посреди загрузки; при
+    # возвращении очередь из IndexedDB подхватывает докачку сама
+    # (22.39/22.51), но если очередь потерялась (квота, другой браузер/
+    # устройство) — пользователь выбирает файл заново, и раньше сервер
+    # начинал С НУЛЯ, а старый .part становился мусором. Теперь init
+    # узнаёт «свою» незавершённую сессию по отпечатку (uid + имя + размер +
+    # режим хранения) и продолжает её: тот же uploadId, клиент получает
+    # parts и перешлёт ТОЛЬКО недостающие куски — загрузка продолжается
+    # с того же места даже после полного выхода из веб-облака.
+    _reuse = None
+    for _upid, _s in list(_MINIAPP_UPLOADS.items()):
+        if str(_s.get("uid") or "") != str(uid):
+            continue
+        if _s.get("completing") or _s.get("auto_done"):
+            continue
+        if str(_s.get("name") or "") != name or \
+                int(_s.get("size") or 0) != size:
+            continue
+        if bool(_s.get("plain")) != bool(plain_mode):
+            continue              # режим хранения изменился — новая сессия
+        _rc = int(_s.get("received") or 0)
+        if _rc <= 0 or _rc > size:
+            continue              # нечего продолжать / повреждена
+        try:
+            if not os.path.exists(_s.get("path") or ""):
+                continue
+        except Exception:
+            continue
+        _reuse = (_upid, _s)
+        break
+    if _reuse is not None:
+        _upid, _s = _reuse
+        _s["ts"] = time.time()
+        # пароль из ЭТОГО init (уже проверен гардом выше): сессия после
+        # рестарта бота ждала пароль — теперь он есть и в RAM, значит
+        # авто-догрузка сможет закончить файл даже без клиента
+        if not plain_mode and vault_pw and not _s.get("vault_pw"):
+            _s["vault_pw"] = vault_pw
+            sess = _miniapp_session_of(request)
+            if sess is not None:
+                sess["vault_pw"] = vault_pw
+        _upload_session_persist(_s)
+        # все байты уже были, клиента может снова не стать — страховка:
+        # отложенная серверная финализация (клиент обычно успеет сам)
+        if _rc >= size and not _s.get("auto_scheduled"):
+            _s["auto_scheduled"] = True
+            try:
+                asyncio.create_task(
+                    _upload_auto_complete_delayed(_upid, 2.5))
+            except Exception:
+                _s["auto_scheduled"] = False
+        _parts_out = sorted(int(i) for i in (_s.get("parts") or ()))
+        return web.json_response({
+            "uploadId": _upid,
+            "chunkSize": int(_s.get("chunk") or _MINIAPP_CHUNK),
+            "encrypt": not bool(_s.get("plain")),
+            "resumed": True,
+            "received": _rc,
+            "parts": _parts_out,
+        })
     # ВОЛНА 22.49: капа одновременных сессий на пользователя — иначе спам
     # init создаёт неограниченное число пустых .part-файлов на диске.
     _my_sessions = sum(
@@ -20721,6 +20792,15 @@ async def _upload_auto_complete_task(app, upid):
         s = _MINIAPP_UPLOADS.get(upid)
         if s is not None:
             s["auto_giveup"] = True
+        # ВОЛНА 22.53: «safe_locked» = все байты на сервере, но пароля Сейфа
+        # нет (рестарт бота). Молча сдаваться больше нельзя — просим пароль
+        # в чате: следующий текст пользователя догрузит файл ЧЕРЕЗ БОТА.
+        if code == "safe_locked":
+            try:
+                await _upload_ask_vault_pw(getattr(app, "bot", None),
+                                           uid, upid)
+            except Exception:
+                pass
 
 
 def _notify_auto_complete(uid, s, payload, ok=True):
@@ -20888,6 +20968,162 @@ def _miniapp_restore_upload_sessions():
     return restored, auto_upids
 
 
+# === ВОЛНА 22.53: ПАРОЛЬ СЕЙФА ЧЕРЕЗ ЧАТ — ДОГРУЗКА «ЧЕРЕЗ САМОГО БОТА» ===
+# Пользователь: «если вышел из веб-облака, но загружается файл — файл должен
+# загружаться через бота, чтоб даже при выходе шла загрузка». Все байты уже
+# на сервере, но сессия ЗАШИФРОВАННАЯ, а пароль Сейфа жил только в RAM
+# (рестарт бота / потеря сессии) — раньше бот молча сдавался (safe_locked),
+# и файл висел, пока пользователь сам не открывал мини апп. Теперь бот САМ
+# пишет в чат: «пришлите пароль Сейфа — я догружу», и следующий текст
+# пользователя становится паролем (RAM-only: ни в логи, ни в базу, на диск
+# не пишем — политика zero-knowledge сохранена).
+_UPLOAD_PW_WAIT = {}           # uid → {"upid":…, "ts":…, "tries":…}
+_UPLOAD_PW_LAST = {}           # uid → ts последнего запроса пароля (антиспам)
+_UPLOAD_PW_COOLDOWN = 600.0    # проактивный запрос — не чаще раза в 10 минут
+_UPLOAD_PW_SESSION_CD = 1800.0 # и не чаще раза в 30 минут на одну сессию
+_UPLOAD_PW_TRIES_MAX = 3       # три неверных ввода — запрос пароля снимается
+_UPLOAD_PW_TTL = 3600.0        # ожидание пароля живёт час
+
+
+def _upload_pw_wait_expired(w, now=None):
+    now = time.time() if now is None else float(now)
+    return (not w) or now - float(w.get("ts", 0)) > _UPLOAD_PW_TTL
+
+
+def _upload_pw_register(uid, upid):
+    """Ставим ожидание пароля: следующий текст пользователя = пароль."""
+    now = time.time()
+    s = _MINIAPP_UPLOADS.get(upid)
+    if s is None:
+        return False
+    s["pw_asked_ts"] = now
+    _UPLOAD_PW_WAIT[uid] = {"upid": upid, "ts": now, "tries": 0}
+    return True
+
+
+def _upload_pw_wait_expired_session(s):
+    """Сессию уже спрашивали про пароль недавно?"""
+    _la = float(s.get("pw_asked_ts") or 0)
+    return bool(_la) and time.time() - _la < _UPLOAD_PW_SESSION_CD
+
+
+async def _upload_ask_vault_pw(bot, uid, upid):
+    """Один проактивный запрос «пришлите пароль Сейфа — догружу сам».
+    Кулдауны: 10 минут на пользователя, 30 минут на сессию."""
+    s = _MINIAPP_UPLOADS.get(upid)
+    if s is None or s.get("plain") is not False or s.get("vault_pw"):
+        return False
+    now = time.time()
+    if now - float(_UPLOAD_PW_LAST.get(uid, 0)) < _UPLOAD_PW_COOLDOWN:
+        return False
+    if _upload_pw_wait_expired_session(s):
+        return False
+    if bot is None:
+        return False
+    _UPLOAD_PW_LAST[uid] = now
+    if not _upload_pw_register(uid, upid):
+        return False
+    nm = str(s.get("name") or "файл")[:60]
+    try:
+        await bot.send_message(
+            chat_id=int(uid),
+            text=("🔐 Файл «" + nm + "» уже полностью на сервере, но он "
+                  "зашифрован паролем Сейфа.\n\n"
+                  "Пришлите пароль Сейфа следующим сообщением — я расшифрую "
+                  "и загружу файл в хранилище прямо здесь, мини апп "
+                  "открывать не нужно.\n"
+                  "(Не хотите присылать пароль в чат — просто откройте мини "
+                  "апп: загрузка продолжится там.)"))
+        return True
+    except Exception:
+        return False
+
+
+async def _upload_pw_attempt(bot, uid, text):
+    """Пользователь прислал ТЕКСТ, пока бот ждёт пароль Сейфа для его файла.
+    Возвращает True, если текст обработан как пароль (напоминание не шлём).
+    Пароль в логи/базу/диск не попадает НИКОГДА."""
+    w = _UPLOAD_PW_WAIT.get(uid)
+    if w is None:
+        return False
+    if _upload_pw_wait_expired(w):
+        _UPLOAD_PW_WAIT.pop(uid, None)
+        return False
+    upid = str(w.get("upid") or "")
+    s = _MINIAPP_UPLOADS.get(upid)
+    if s is None:
+        _UPLOAD_PW_WAIT.pop(uid, None)
+        return False
+    user = get_user(uid)
+    if user is None:
+        _UPLOAD_PW_WAIT.pop(uid, None)
+        return False
+    ok, payload = await _miniapp_upload_finalize(
+        user, uid, upid, s, pw_raw=str(text or ""), http_request=None)
+    if ok:
+        _UPLOAD_PW_WAIT.pop(uid, None)
+        f = (payload or {}).get("file") or {}
+        nm = str(f.get("name") or f.get("label") or
+                 s.get("name") or "Файл")[:60]
+        where = "Сейф" if (payload or {}).get("safe") else "хранилище"
+        try:
+            await bot.send_message(
+                chat_id=int(uid),
+                text=("✅ Догрузил: «" + nm + "» — файл уже в " + where +
+                      ".\nЗагрузка закончена через бота, мини апп не "
+                      "понадобился."))
+        except Exception:
+            pass
+        return True
+    code = str((payload or {}).get("error") or "")
+    if code == "wrong_password":
+        w["tries"] = int(w.get("tries") or 0) + 1
+        if w["tries"] >= _UPLOAD_PW_TRIES_MAX:
+            _UPLOAD_PW_WAIT.pop(uid, None)
+            try:
+                await bot.send_message(
+                    chat_id=int(uid),
+                    text=("❌ Пароль не подошёл 3 раза — запрос пароля снят. "
+                          "Откройте мини апп: там загрузка продолжится без "
+                          "перекачки файла."))
+            except Exception:
+                pass
+        else:
+            try:
+                await bot.send_message(
+                    chat_id=int(uid),
+                    text=("❌ Пароль Сейфа не подошёл. Пришлите правильный "
+                          "пароль следующим сообщением (попытка "
+                          f"{w['tries']} из {_UPLOAD_PW_TRIES_MAX})."))
+            except Exception:
+                pass
+        return True
+    if code == "safe_locked":
+        # у пользователя вообще нет пароля Сейфа — шифровать нечем
+        _UPLOAD_PW_WAIT.pop(uid, None)
+        try:
+            await bot.send_message(
+                chat_id=int(uid),
+                text=("Для этого файла пароль Сейфа не установлен — откройте "
+                      "мини апп, загрузка продолжится там."))
+        except Exception:
+            pass
+        return True
+    # прочие ошибки (Telegram не принял и т.п.) — ожидание снимаем,
+    # сторож/напоминание предложат продолжить позже
+    _UPLOAD_PW_WAIT.pop(uid, None)
+    try:
+        await bot.send_message(
+            chat_id=int(uid),
+            text=("⚠️ Не удалось догрузить файл: " +
+                  str((payload or {}).get("message") or "ошибка сервера") +
+                  "\nОткройте мини апп — загрузка продолжится с того же "
+                  "места."))
+    except Exception:
+        pass
+    return True
+
+
 # ВОЛНА 22.50: напоминание «файлы ещё не догружены» при ЛЮБОМ сообщении боту.
 # Сценарий пользователя: закрыл мини апп крестиком посреди загрузки и ВЫШЕЛ
 # ИЗ TELEGRAM; вернулся позже — бот сам напоминает и даёт продолжить одной
@@ -20903,7 +21139,10 @@ async def _upload_resume_reminder(update, context):
     НЕдогруженные сессии загрузки из мини-аппа — одно короткое сообщение со
     списком и кнопкой «▶️ Продолжить загрузку» (web_app → мини апп, где очередь
     из IndexedDB подхватывается сама). Антиспам: скипаем активные загрузки
-    (куски идут прямо сейчас), 1 раз на сессию (remind_done) + 30 мин на юзера."""
+    (куски идут прямо сейчас), 1 раз на сессию (remind_done) + 30 мин на юзера.
+    ВОЛНА 22.53: (а) если бот ждёт пароль Сейфа для догрузки через чат —
+    текст пользователя ЭТО ПАРОЛЬ; (б) в напоминание добавляется строка
+    про зашифрованные файлы, у которых все байты на сервере, но нет пароля."""
     try:
         u = getattr(update, "effective_user", None)
         ch = getattr(update, "effective_chat", None)
@@ -20911,6 +21150,20 @@ async def _upload_resume_reminder(update, context):
             return
         uid = str(u.id)
         now = time.time()
+        # ВОЛНА 22.53 (а): пользователь отвечает текстом на запрос пароля —
+        # этот текст и есть пароль (просроченное ожидание снимаем). ДО
+        # кулдауна напоминания: попытки пароля не должны глотаться им.
+        _w = _UPLOAD_PW_WAIT.get(uid)
+        if _w is not None and _upload_pw_wait_expired(_w, now):
+            _UPLOAD_PW_WAIT.pop(uid, None)
+            _w = None
+        _msg = getattr(update, "effective_message", None)
+        _txt = str(getattr(_msg, "text", "") or "").strip() \
+            if _msg is not None else ""
+        if _w is not None and _txt and not _txt.startswith("/"):
+            if await _upload_pw_attempt(getattr(context, "bot", None),
+                                        uid, _txt):
+                return
         if now - float(_UPLOAD_REMIND_LAST.get(uid, 0)) < _UPLOAD_REMIND_COOLDOWN:
             return
         stale = []
@@ -20924,10 +21177,32 @@ async def _upload_resume_reminder(update, context):
             if now - float(s.get("ts", 0)) < 15.0:
                 continue                      # куски идут СЕЙЧАС — загрузка жива
             stale.append((upid, str(s.get("name") or "файл")[:60], size, received))
-        if not stale:
+        # ВОЛНА 22.53 (б): зашифрованные сессии, где ВСЕ байты на сервере,
+        # а пароля нет (рестарт бота) — предложим догрузить прямо в чате.
+        pw_need = []
+        for upid2, s2 in list(_MINIAPP_UPLOADS.items()):
+            if str(s2.get("uid") or "") != uid:
+                continue
+            if s2.get("plain") is not False or s2.get("vault_pw") \
+                    or s2.get("completing") or s2.get("auto_done"):
+                continue
+            _sz2 = int(s2.get("size") or 0)
+            _rc2 = int(s2.get("received") or 0)
+            if _sz2 <= 0 or _rc2 < _sz2:
+                continue                      # байтов не хватает — это не про пароль
+            if now - float(s2.get("ts", 0)) < 15.0:
+                continue                      # куски идут сейчас — загрузка жива
+            if _upload_pw_wait_expired_session(s2):
+                continue                      # недавно уже спрашивали
+            pw_need.append((upid2, str(s2.get("name") or "файл")[:60]))
+        if not stale and not pw_need:
             return
         bot = getattr(context, "bot", None)
         if bot is None:
+            return
+        if not stale:
+            # только «парольные» сессии — отдельный запрос пароля
+            await _upload_ask_vault_pw(bot, uid, pw_need[0][0])
             return
         _UPLOAD_REMIND_LAST[uid] = now
         for upid, _nm, _sz, _rc in stale:
@@ -20940,6 +21215,13 @@ async def _upload_resume_reminder(update, context):
         extra = len(stale) - 3
         if extra > 0:
             lines += f"• и ещё {extra} файл(ов)\n"
+        if pw_need:
+            # регистрируем ожидание пароля — следующий текст пользователя
+            # будет принят как пароль Сейфа (догрузка прямо в чате)
+            if _upload_pw_register(uid, pw_need[0][0]):
+                lines += ("• 🔐 «" + pw_need[0][1] + "» — файл уже на сервере, "
+                          "но зашифрован: пришлите пароль Сейфа следующим "
+                          "сообщением, и я загружу его прямо в чат\n")
         kb = None
         if MINIAPP_URL:
             kb = InlineKeyboardMarkup([[
