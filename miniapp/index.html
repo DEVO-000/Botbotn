@@ -415,6 +415,56 @@ html.low-end .file-card {
   contain-intrinsic-size: auto;
 }
 
+/* ═══ ВОЛНА 22.56: ПЛАВНОЕ ПОЯВЛЕНИЕ / ИСЧЕЗНОВЕНИЕ КАРТОЧЕК ═══
+   Раньше список перерисовывался «скачком» (innerHTML без анимации) —
+   смена фильтра, сортировки, загрузка и удаление выглядели резко.
+   Теперь карточки въезжают лёгкой волной (только transform+opacity —
+   композитор, без reflow), а удаляемые — мягко сжимаются и тают.
+   Стаггер ограничен (--i ≤ 12), на слабых телефонах и при системном
+   «меньше движений» анимация отключается — там важнее отсутствие лагов. */
+@keyframes cardIn {
+  from { opacity: 0; transform: translateY(14px) scale(0.985); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+@keyframes cardOut {
+  to { opacity: 0; transform: scale(0.94); }
+}
+
+@keyframes softFadeIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.file-card.card-enter {
+  animation: cardIn 0.38s var(--ease-smooth) both;
+  /* --i приходит из JS и уже ограничен 12 — старые WebView не знают CSS min() */
+  animation-delay: calc(var(--i, 0) * 24ms);
+}
+
+.file-card.card-out {
+  animation: cardOut 0.2s var(--ease-smooth) both;
+  pointer-events: none;
+}
+
+.fade-soft-in {
+  animation: softFadeIn 0.45s var(--ease-smooth) both;
+}
+
+html.low-end .file-card.card-enter,
+html.low-end .file-card.card-out,
+html.low-end .fade-soft-in {
+  animation: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .file-card.card-enter,
+  .file-card.card-out,
+  .fade-soft-in {
+    animation: none;
+  }
+}
+
 .icon-wrap {
   width: 46px;
   height: 46px;
@@ -455,7 +505,11 @@ html.low-end .file-card {
   font-size: 14px;
   border: 1px solid var(--border-color);
   cursor: pointer;
-  transition: transform 0.15s var(--ease-spring);
+  /* 22.56: + плавная смена цветов активного чипа (paint-only, дёшево) */
+  transition: transform 0.15s var(--ease-spring),
+    background 0.25s var(--ease-smooth),
+    color 0.25s var(--ease-smooth),
+    border-color 0.25s var(--ease-smooth);
   white-space: nowrap;
   display: inline-flex;
   align-items: center;
@@ -562,13 +616,15 @@ html.low-end .file-card {
   align-items: center;
   justify-content: center;
   gap: 8px;
-  opacity: 0;
-  transition: opacity 0.5s var(--ease-smooth);
 }
 
+/* ВОЛНА 22.56: раньше тут был transition: opacity — он НЕ проигрывался:
+   display:none → flex в одном кадре даёт «выскакивание» без плавности.
+   Keyframes-анимация стартует сразу при первом рендере элемента —
+   кольцо прогресса мягко проявляется. */
 .download-progress-wrap.active {
   display: flex;
-  opacity: 1;
+  animation: softFadeIn 0.5s var(--ease-smooth) both;
 }
 
 .drop-loader {
@@ -1043,7 +1099,9 @@ html.low-end .file-card {
   max-height: 0;
   opacity: 0;
   transition: max-height 0.4s var(--ease-ultra), opacity 0.35s var(--ease-smooth);
-  will-change: max-height, opacity;
+  /* ВОЛНА 22.55 (плавность): will-change на max-height (layout-свойство)
+     не помогает и лишь держит слой в памяти — убрано; opacity оставлена */
+  will-change: opacity;
 }
 
 .settings-submenu.open {
@@ -1885,6 +1943,49 @@ html.low-end #musicPlayer .art-container.mp-switch {
   transform: translateY(-50%) scale(1);
 }
 
+/* ═══ ВОЛНА 22.52: СПИННЕР ЗАГРУЗКИ НА КНОПКЕ PLAY ═══
+   «Плееры должны сразу открываться и уже там загружаться — загрузка на
+   кнопке»: модалка открывается мгновенно, медиа докачивается в плеере,
+   а прогресс виден на большой кнопке (кольцо-спиннер). */
+.pld-spin {
+  display: inline-block;
+  width: 22px;
+  height: 22px;
+  border: 3px solid rgba(0, 0, 0, 0.18);
+  border-top-color: #000;
+  border-radius: 50%;
+  animation: pldSpin 0.8s linear infinite;
+  will-change: transform;
+  flex-shrink: 0;
+}
+
+/* светлый вариант — на тёмном фоне (фотопросмотрщик) */
+.pld-spin.pld-spin-light {
+  border-color: rgba(255, 255, 255, 0.25);
+  border-top-color: #fff;
+}
+
+@keyframes pldSpin {
+  to { transform: rotate(360deg); }
+}
+
+#vpPlayBtn.loading,
+#mpPlayBtn.loading {
+  opacity: 0.92;
+}
+
+/* ВОЛНА 22.52: уважаем системную настройку «меньше движений» —
+   декоративные бесконечные анимации отключаем (плавность без лагов) */
+@media (prefers-reduced-motion: reduce) {
+  #musicPlayer .art-container.playing .art-fallback {
+    animation: none;
+  }
+
+  .pld-spin {
+    animation-duration: 1.6s;
+  }
+}
+
 #musicPlayer .time-row {
   display: flex;
   justify-content: space-between;
@@ -1979,7 +2080,11 @@ html.low-end #musicPlayer .art-container.mp-switch {
   height: 8px;
   border-radius: 9999px;
   background: rgba(255, 255, 255, 0.25);
-  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  /* ВОЛНА 22.55 (плавность): «transition: all» заставлял движок проверять
+     ВСЕ свойства на каждый кадр — на слабых телефонах точки плеера
+     подрагивали. Перечисляем только реально анимируемые свойства. */
+  transition: background 0.3s cubic-bezier(0.4, 0, 0.2, 1),
+              width 0.3s cubic-bezier(0.4, 0, 0.2, 1);
   cursor: pointer;
   flex-shrink: 0;
 }
@@ -2526,6 +2631,8 @@ body.vp-lock {
   </div>
   <div id="photoStage">
     <img id="photoImg" alt="">
+    <!-- ВОЛНА 22.52: спиннер загрузки фото (пока качается из сети) -->
+    <span id="pmSpin" class="pld-spin pld-spin-light" style="position:absolute;top:50%;left:50%;margin:-13px 0 0 -13px;opacity:0;pointer-events:none;transition:opacity .2s;z-index:5;"></span>
   </div>
   <div class="pm-footer">
     <button class="pm-btn" onclick="pmNav(-1,event)" title="Предыдущее">
@@ -3270,6 +3377,15 @@ try {
   LOW_END = (mem > 0 && mem <= 2) || (cores > 0 && cores <= 3);
 } catch (e) {}
 
+/* ВОЛНА 22.52: «все анимации плавные без лагов на любом устройстве» —
+   уважаем системный «минимум движений»: декоративный фон-анимация выключается */
+let REDUCED_MOTION = false;
+
+try {
+  REDUCED_MOTION = !!(window.matchMedia &&
+    window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+} catch (e) {}
+
 if (LOW_END) {
   try { document.documentElement.classList.add('low-end'); } catch (e) {}
 }
@@ -3583,7 +3699,7 @@ function blobLoop(ts) {
 function startBlobAnimation() {
   stopBlobAnimation();
 
-  if (!blobsEnabled || document.hidden) return;
+  if (!blobsEnabled || REDUCED_MOTION || document.hidden) return;
 
   updateBlobViewport();
   blobRafId = requestAnimationFrame(blobLoop);
@@ -4035,7 +4151,7 @@ async function zipSelected() {
         vault: !!data.file.vault
       });
 
-      renderAll();
+      renderAll({ animate: true });
 
       showToast('📦 Архив готов, скачиваю…');
       downloadFileById(data.file.id, data.file.name, +data.file.size || 0);
@@ -4079,7 +4195,7 @@ async function unzipSelected() {
       });
     });
 
-    renderAll();
+    renderAll({ animate: true });
 
     showToast(
       '✅ Файлов получено: ' + (data.files || []).length +
@@ -4088,6 +4204,25 @@ async function unzipSelected() {
   } catch (e) {
     showToast(cloudErrText(e));
   }
+}
+
+/* ВОЛНА 22.56: мягкое исчезновение карточек перед удалением — файлы
+   больше не «вырываются» из списка рывком, а плавно сжимаются и тают.
+   Возвращает true, если анимация реально запущена (иначе ждать нечего). */
+function animateCardsOut(ids) {
+  if (LOW_END || REDUCED_MOTION) return false;
+
+  const set = new Set(ids);
+  let found = false;
+
+  document.querySelectorAll('#filesList .file-card').forEach((c) => {
+    if (set.has(c.dataset.id)) {
+      c.classList.add('card-out');
+      found = true;
+    }
+  });
+
+  return found;
 }
 
 async function deleteSelected() {
@@ -4099,6 +4234,11 @@ async function deleteSelected() {
   const ids = [...selectedIds];
 
   showToast('🗑 Удаляю ' + ids.length + '…');
+
+  /* 22.56: карточки выбранных файлов мягко «улетают» ДО перерисовки */
+  const animated = animateCardsOut(ids);
+
+  if (animated) await new Promise((r) => setTimeout(r, 210));
 
   let ok = 0;
 
@@ -4143,19 +4283,27 @@ async function loadFiles(silent) {
       kind: String(f.kind || 'document'),
       size: +f.size || 0,
       ts: String(f.ts || ''),
-      vault: !!f.vault
+      vault: !!f.vault,
+      /* ВОЛНА 22.50: признаки Сейфа — «Достать из Сейфа» для файлов режима
+         «без шифра» (plain) идёт БЕЗ пароля (сервер 22.50 это умеет) */
+      safe: !!f.safe,
+      plain: !!f.plain
     }));
 
     CONN.bot = String(data.bot || CONN.bot || '');
     CONN.build = String(data.build || CONN.build || '');
 
     if (typeof data.plain === 'boolean') STORAGE_ENCRYPTED = !data.plain;
-    else if (ALL_FILES.some((f) => f.vault)) STORAGE_ENCRYPTED = true;
+    /* ВОЛНА 22.52: зашифрованными считаем только НЕ-plain файлы Сейфа.
+       Раньше existence ЛЮБОГО vault-файла (включая «без шифра») включало
+       «шифрование» для всего интерфейса — пароль спрашивался даже там,
+       где файл лежит в канале открыто. */
+    else if (ALL_FILES.some((f) => f.vault && !f.plain)) STORAGE_ENCRYPTED = true;
 
     LAST_ERR = null;
     LAST_SYNC = Date.now();
 
-    renderAll();
+    renderAll({ animate: true });
 
     return true;
   } catch (e) {
@@ -4234,6 +4382,17 @@ document.addEventListener('visibilitychange', function () {
 try {
   if (tg && tg.onEvent) tg.onEvent('activated', maybeAutoResync);
 } catch (e) {}
+
+/* ВОЛНА 22.50: тихая авто-синхронизация каждые 45 секунд. Пользователь:
+   «автоматическая синхронизация мини приложения должна быть каждые сколько-то
+   секунд/минут, чтобы всё было синхронизировано, но не уведомлять об этом».
+   loadFiles(true) молчит (без тостов и спиннеров) и обновляет файлы, режим
+   шифрования и статус канала. В фоне и без входа не тикает. */
+setInterval(function () {
+  if (document.hidden) return;
+  if (!IS_TELEGRAM && !WEB_TOKEN) return;   /* не вошли — нечего синхронизировать */
+  maybeAutoResync();
+}, 45000);
 
 let FILTER = 'all';
 let SEARCH = '';
@@ -4449,11 +4608,11 @@ function applyFilters() {
   return list;
 }
 
-function renderAll() {
+function renderAll(opts) {
   /* Один проход фильтрации на рендер вместо двух */
   const list = applyFilters();
 
-  renderFiles(list);
+  renderFiles(list, opts);
   renderStats(list);
 }
 
@@ -4471,19 +4630,35 @@ function renderStats(list) {
       : `${shown} из ${ALL_FILES.length}`;
 }
 
-function renderFiles(files) {
+function renderFiles(files, opts) {
   const list = document.getElementById('filesList');
   const empty = document.getElementById('emptyState');
 
+  /* ВОЛНА 22.56: анимация появления — только по явному запросу (загрузка
+     списка, смена фильтра/сортировки, новые файлы). Поиск и выделение
+     перерисовываются мгновенно — анимация на каждый символ/тап мешает.
+     На слабых устройствах и при «меньше движений» — выключена (плавность
+     важнее декораций, там каждый кадр на счету). */
+  const animate = !!(opts && opts.animate) && !LOW_END && !REDUCED_MOTION;
+
   if (!files.length) {
     list.innerHTML = '';
+
+    /* ВОЛНА 22.56: пустое состояние больше не «выскакивает» — мягко проявляется */
     empty.style.display = 'block';
+
+    if (animate) {
+      empty.classList.remove('fade-soft-in');
+      void empty.offsetWidth;
+      empty.classList.add('fade-soft-in');
+    }
+
     return;
   }
 
   empty.style.display = 'none';
 
-  list.innerHTML = files.map((f) => {
+  list.innerHTML = files.map((f, idx) => {
     const sel = selectMode && selectedIds.has(f.id);
 
     /* 22.49: id экранируется — раньше подставлялся в inline-атрибут raw:
@@ -4493,6 +4668,11 @@ function renderFiles(files) {
     const cardAction = selectMode
       ? `toggleFileSelection(event,'${fid}')`
       : `openEditModal('${fid}')`;
+
+    /* ВОЛНА 22.56: индекс стаггера (кап 12) для волны появления карточек */
+    const enterAttrs = animate
+      ? ` card-enter" data-id="${fid}" style="--i:${Math.min(idx, 12)};`
+      : `" data-id="${fid}" style="`;
 
     const checkHtml = selectMode ? `
       <div onclick="toggleFileSelection(event,'${fid}')" style="flex-shrink:0;width:24px;height:24px;border-radius:8px;display:flex;align-items:center;justify-content:center;border:2px solid ${sel ? 'var(--btn-text)' : 'var(--border-color)'};background:${sel ? 'var(--btn-text)' : 'transparent'};transition:transform .15s var(--ease-spring)">
@@ -4509,11 +4689,11 @@ function renderFiles(files) {
     `;
 
     return `
-      <article class="file-card" style="display:flex;align-items:center;gap:12px;${sel ? 'outline:2px solid var(--btn-text);outline-offset:-2px' : ''}" onclick="${cardAction}">
+      <article class="file-card${enterAttrs}display:flex;align-items:center;gap:12px;${sel ? 'outline:2px solid var(--btn-text);outline-offset:-2px' : ''}" onclick="${cardAction}">
         ${checkHtml}
 
         <div class="icon-wrap" style="flex-shrink:0">
-          <i data-lucide="${f.vault ? 'lock' : iconFor(f.kind)}" style="width:20px;height:20px"></i>
+          <i data-lucide="${(f.vault && !f.plain) ? 'lock' : iconFor(f.kind)}" style="width:20px;height:20px"></i>
         </div>
 
         <div style="flex:1;min-width:0">
@@ -4725,8 +4905,12 @@ function onSafeAction() {
   }
 }
 
-/* ВОЛНА 22.40: перемещение в Сейф и обратно ЧЕРЕЗ окно с паролем.
-   Верный пароль → окно закрывается → справа снизу идёт загрузка
+/* ВОЛНА 22.50: перемещение в Сейф и обратно. Пароль спрашиваем ТОЛЬКО когда
+   он реально нужен: зашифрованный Сейф. Файл режима «без шифра» (f.plain)
+   достаётся БЕЗ пароля (его не существует), а «в Сейф» при выключенном
+   шифровании уходит без пароля (сервер сам решит: ввёл — зашифрует).
+   Раньше окно требовало пароль ВСЕГДА → «не достать файл из сейфа через
+   мини апп». Верный пароль → окно закрывается → справа снизу идёт загрузка
    (та же пилюля, что у скачивания), чтобы было видно, сколько ждать. */
 async function safeDoTransfer(kind) {
   const input = document.getElementById('safePassword');
@@ -4739,29 +4923,39 @@ async function safeDoTransfer(kind) {
     return;
   }
 
-  if (!pw) {
+  /* Пароль обязателен только для зашифрованных файлов/режима */
+  const pwNeeded = (kind === 'to_safe')
+    ? (STORAGE_PLAIN !== true)
+    : !f.plain;   /* from_safe: plain-файл достаётся без пароля */
+
+  if (pwNeeded && !pw) {
     showToast('Введите пароль Сейфа');
     return;
   }
 
   /* пароль проверяем сразу: неверный — окно остаётся открытым */
-  try {
-    await apiJson('/api/safe/unlock', {
-      method: 'POST',
-      headers: authHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify({ password: pw })
-    });
-  } catch (e) {
-    showToast(cloudErrText(e));
-    return;
-  }
+  if (pw) {
+    try {
+      await apiJson('/api/safe/unlock', {
+        method: 'POST',
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ password: pw })
+      });
+    } catch (e) {
+      showToast(cloudErrText(e));
+      return;
+    }
 
-  VAULT_PW = pw;
-  VAULT_SERVER_UNLOCKED = true;
+    VAULT_PW = pw;
+    VAULT_SERVER_UNLOCKED = true;
+  }
 
   if (input) input.value = '';
 
   closeSafeModal();
+
+  SAFE_MODAL_FILE_ID = null;
+  SAFE_MODAL_MODE = 'unlock';
 
   const tid = 'safe-' + Date.now().toString(36) + '-' +
     Math.floor(Math.random() * 1e6).toString(36);
@@ -4832,6 +5026,11 @@ async function unlockSafe() {
       const df = ALL_FILES.find((x) => x.id === pending.id);
 
       if (df) setTimeout(() => downloadFileById(df.id, df.name, df.size), 350);
+    } else if (pending && pending.type === 'dlq') {
+      /* ВОЛНА 22.55: продолжаем постановку очереди «через бота» —
+         пароль теперь известен, сервер примет файлы Сейфа */
+      showToast('📨 Ставлю файлы в очередь бота…');
+      setTimeout(() => enqueueBotDownload(pending.ids || []), 350);
     }
   } catch (e) {
     showToast(cloudErrText(e));
@@ -4860,13 +5059,22 @@ function toSafeCurrentFile() {
 }
 
 /* ВОЛНА 22.40: «Достать из сейфа» — окно только с паролем и кнопкой
-   «Разблокировать»; верный пароль закрывает окно и запускает загрузку. */
+   «Разблокировать»; верный пароль закрывает окно и запускает загрузку.
+   ВОЛНА 22.50: файл режима «без шифра» (plain) достаётся СРАЗУ, без окна
+   пароля — пароля у такого файла нет (раньше окно блокировало выдачу). */
 function fromSafeCurrentFile() {
   const f = ALL_FILES.find((x) => x.id === activeEditingFileId);
 
   closeEditModal();
 
   if (!f) return;
+
+  if (f.plain) {
+    SAFE_MODAL_FILE_ID = f.id;
+    SAFE_MODAL_MODE = 'from_safe';
+    safeDoTransfer('from_safe');
+    return;
+  }
 
   openSafeModal('from_safe', f.id);
 }
@@ -4900,9 +5108,16 @@ function openExternalLink(abs) {
   else window.open(abs, '_blank', 'noopener');
 }
 
-async function fetchFileBlob(absUrl, name) {
+async function fetchFileBlob(absUrl, name, onProgress) {
   const ctrl = ('AbortController' in window) ? new AbortController() : null;
   const tid = 'dl-' + Date.now().toString(36) + '-' + Math.floor(Math.random() * 1e6).toString(36);
+
+  /* ВОЛНА 22.52: onProgress(got, total) — прогресс загрузки НА КНОПКЕ плеера */
+  const _prog = (typeof onProgress === 'function')
+    ? (got, total) => {
+        try { onProgress(total ? (got / total) * 100 : 0, got, total); } catch (eP) {}
+      }
+    : null;
 
   let r;
 
@@ -4945,6 +5160,8 @@ async function fetchFileBlob(absUrl, name) {
       got += part.value.length;
 
       transferProgress(tid, got);
+
+      if (_prog) _prog(got, total);
     }
   } catch (e) {
     transferFinish(tid, false, 'Отменено');
@@ -4954,6 +5171,216 @@ async function fetchFileBlob(absUrl, name) {
   transferFinish(tid, true);
 
   return new Blob(chunks, { type: type });
+}
+
+/* ═══ ВОЛНА 22.51: КЭШ МЕДИА — «посмотреть фото/музыку и потом ЕЩЁ РАЗ
+   БЕЗ ЗАДЕРЖЕК» ═══
+   Открытые фото, треки и видео сохраняются в Cache API (диск телефона) и
+   дублируются в памяти. Повторное открытие включается МГНОВЕННО — без
+   повторного скачивания из Telegram. Плюс блоб-воспроизведение: у blob-
+   URL перемотка работает идеально (ползунок не срывает playback). */
+const MEDIA_CACHE_NAME = 'devo-media-v1';
+const MEDIA_BLOB_LIMIT = 80 * 1024 * 1024;        /* музыка/фото: до 80 МБ в блоб */
+const MEDIA_VIDEO_BLOB_LIMIT = 200 * 1024 * 1024; /* видео: до 200 МБ в блоб */
+const MEDIA_CACHE_MAX_BYTES = 350 * 1024 * 1024;  /* потолок дискового кэша */
+const MEDIA_CACHE_IDX = 'devo-media-idx';
+const mediaMem = new Map();          /* key -> Blob (быстрая память сессии) */
+const mediaMemOrder = [];            /* LRU-порядок использования */
+let mediaCacheDb = null;             /* caches.open() — лениво */
+let mediaIdxDirty = false;
+
+function mediaCacheOn() {
+  return typeof caches !== 'undefined' && !!caches.open;
+}
+
+function mediaCacheKey(f) {
+  /* ключ = id файла + размер: переименованный файл остаётся в кэше,
+     а перезалитый (новый id) — честно качается заново */
+  return 'm_' + String((f && f.id) || 'x') + '_' + (+((f && f.size) || 0));
+}
+
+function mediaIdxLoad() {
+  try {
+    const raw = localStorage.getItem(MEDIA_CACHE_IDX);
+
+    return raw ? (JSON.parse(raw) || {}) : {};
+  } catch (e) {
+    return {};
+  }
+}
+
+function mediaIdxSave(idx) {
+  if (mediaIdxDirty) return;
+
+  mediaIdxDirty = true;
+
+  setTimeout(() => {
+    mediaIdxDirty = false;
+
+    safeSet(MEDIA_CACHE_IDX, JSON.stringify(idx));
+  }, 700);
+}
+
+function mediaMemTouch(key, blob) {
+  if (mediaMem.has(key)) {
+    const i = mediaMemOrder.indexOf(key);
+
+    if (i >= 0) mediaMemOrder.splice(i, 1);
+  } else {
+    mediaMemOrder.push(key);
+  }
+
+  mediaMem.set(key, blob);
+
+  /* память сессии: держим не больше ~12 последних (диск — отдельный лимит) */
+  while (mediaMemOrder.length > 12) {
+    const old = mediaMemOrder.shift();
+
+    mediaMem.delete(old);
+  }
+}
+
+async function mediaCacheOpen() {
+  if (!mediaCacheOn()) return null;
+
+  if (!mediaCacheDb) {
+    try {
+      mediaCacheDb = await caches.open(MEDIA_CACHE_NAME);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  return mediaCacheDb;
+}
+
+function mediaReq(key) {
+  return new Request('/__devo-media__/' + key, { method: 'GET' });
+}
+
+async function mediaCacheGet(key) {
+  const mem = mediaMem.get(key);
+
+  if (mem) return mem;
+
+  const cache = await mediaCacheOpen();
+
+  if (!cache) return null;
+
+  try {
+    const hit = await cache.match(mediaReq(key));
+
+    if (hit) {
+      const blob = await hit.blob();
+
+      mediaMemTouch(key, blob);
+
+      /* отметка использования (для LRU-вытеснения) */
+      const idx = mediaIdxLoad();
+
+      if (idx[key]) {
+        idx[key].ts = Date.now();
+
+        mediaIdxSave(idx);
+      }
+
+      return blob;
+    }
+  } catch (e) {}
+
+  return null;
+}
+
+async function mediaCachePut(key, blob) {
+  mediaMemTouch(key, blob);
+
+  const cache = await mediaCacheOpen();
+
+  const idx = mediaIdxLoad();
+
+  if (!cache) return;
+
+  try {
+    await cache.put(mediaReq(key), new Response(blob, {
+      headers: { 'Content-Type': blob.type || 'application/octet-stream' }
+    }));
+
+    idx[key] = { ts: Date.now(), size: +blob.size || 0 };
+
+    mediaIdxSave(idx);
+    mediaCacheTrim();
+  } catch (e) {
+    /* квота/приватный режим — живём только памятью сессии */
+  }
+}
+
+async function mediaCacheTrim() {
+  const cache = await mediaCacheOpen();
+
+  if (!cache) return;
+
+  const idx = mediaIdxLoad();
+  const keys = Object.keys(idx);
+  const entries = keys.map((k) => ({ k: k, ts: +idx[k].ts || 0, sz: +idx[k].size || 0 }));
+  const total = entries.reduce((s, e) => s + e.sz, 0);
+
+  if (total <= MEDIA_CACHE_MAX_BYTES && entries.length <= 90) return;
+
+  entries.sort((a, b) => a.ts - b.ts);  /* старые — первыми */
+
+  let need = Math.max(total - MEDIA_CACHE_MAX_BYTES, 0);
+  let removed = 0;
+
+  for (const e of entries) {
+    if (need <= 0 && removed >= 10) break;
+
+    try { await cache.delete(mediaReq(e.k)); } catch (err) {}
+
+    delete idx[e.k];
+    mediaMem.delete(e.k);
+
+    const oi = mediaMemOrder.indexOf(e.k);
+
+    if (oi >= 0) mediaMemOrder.splice(oi, 1);
+
+    need -= e.sz;
+    removed++;
+  }
+
+  mediaIdxSave(idx);
+}
+
+/* Главная точка входа: блоб файла — из кэша (мгновенно) или скачиванием
+   (с честной панелью прогресса, см. fetchFileBlob) с последующим кэшем. */
+async function mediaBlobFor(f, name, resolveAbsUrl, onProgress) {
+  const key = mediaCacheKey(f);
+
+  const cached = await mediaCacheGet(key);
+
+  if (cached) {
+    if (typeof onProgress === 'function') {
+      try { onProgress(100); } catch (eP) {}
+    }
+
+    return cached;
+  }
+
+  const abs = (typeof resolveAbsUrl === 'function')
+    ? await resolveAbsUrl()
+    : resolveAbsUrl;
+
+  if (!abs) throw new Error('нет ссылки на файл');
+
+  const blob = await fetchFileBlob(abs, name, onProgress);
+
+  mediaCachePut(key, blob);
+
+  return blob;
+}
+
+function mediaCachedHint(f) {
+  /* есть ли файл в кэше (для мгновенных решений UI) */
+  return mediaMem.has(mediaCacheKey(f));
 }
 
 async function saveBlobToPhone(blob, name) {
@@ -5037,6 +5464,24 @@ async function downloadFileById(id, name, size) {
       }
     }
 
+    /* ВОЛНА 22.55: прямой путь сорвался (WebView-ограничения, обрыв сети,
+         выход из Telegram) — НЕ теряем файл: ставим его в серверную очередь
+     «через бота», он приедет в чат и сохранится оттуда. Файл зашифрован
+     Сейфом и пароля нет — тогда честно про пароль, без тихих провалов. */
+    try {
+      const fInfo = ALL_FILES.find((x) => x.id === id);
+      const isEncSafe = fInfo && fInfo.vault && !fInfo.plain;
+
+      if (!isEncSafe || VAULT_PW || VAULT_SERVER_UNLOCKED) {
+        const okBot = await enqueueBotDownload([id]);
+
+        if (okBot) {
+          showToast('📨 Отправлю файл в чат бота — сохраните его из чата (можно закрывать мини-апп)');
+          return;
+        }
+      }
+    } catch (e2) {}
+
     openExternalLink(abs);
     showToast('Открыл ссылку в браузере — если файл не скачался, нажмите на неё там');
   } catch (e) {
@@ -5057,7 +5502,9 @@ async function downloadCurrentFile() {
 
   if (!f) return;
 
-  if (f.vault && !VAULT_PW && !VAULT_SERVER_UNLOCKED) {
+  /* ВОЛНА 22.52: plain-файл Сейфа («без шифра») открывается БЕЗ пароля —
+   «шифр не должен оставаться нигде, если отмечено без шифрования» */
+  if (f.vault && !f.plain && !VAULT_PW && !VAULT_SERVER_UNLOCKED) {
     PENDING_FILE_ACTION = { type: 'download', id: f.id };
 
     ensureSafeUnlocked();
@@ -5077,7 +5524,8 @@ async function sendCurrentFileToChat() {
 
   if (!f) return;
 
-  if (f.vault && !VAULT_PW && !VAULT_SERVER_UNLOCKED) {
+  /* ВОЛНА 22.52: plain-файл Сейфа — без пароля */
+  if (f.vault && !f.plain && !VAULT_PW && !VAULT_SERVER_UNLOCKED) {
     PENDING_FILE_ACTION = { type: 'download', id: f.id };
 
     ensureSafeUnlocked();
@@ -5109,6 +5557,165 @@ async function sendCurrentFileToChat() {
   }
 }
 
+/* ═══ ВОЛНА 22.55: ОЧЕРЕДЬ СКАЧИВАНИЯ «ЧЕРЕЗ БОТА» ═══
+   Пользователь выбрал несколько файлов и жмёт «Скачать» — файлы НЕ качаются
+   клиентом (WebView умирает при выходе из Telegram и всё «исчезало»), а
+   ставятся в очередь НА СЕРВЕРЕ: бот сам, один за другим, отправляет их в
+   личный чат. Мини-апп можно закрывать, Telegram — сворачивать: файлы
+   приедут в чат, а из чата Telegram надёжно сохраняет в галерею.
+   Прогресс — в угловой панели передач; после переоткрытия мини-аппа
+   очередь «находится» опросом статуса. */
+let botQueueTimer = null;
+let botQueueActive = false;
+let botQueueFinalNotified = false;
+
+function botQueueEnsureTransfer(total) {
+  if (!TRANSFERS.has('botqueue')) {
+    transferStart({
+      id: 'botqueue',
+      type: 'botqueue',
+      name: 'Файлы в чат (через бота)',
+      total: Math.max(1, total),
+      cancel: () => {
+        fetch('/api/download/queue/cancel', {
+          method: 'POST',
+          keepalive: true,
+          headers: vaultHeaders({ 'Content-Type': 'application/json' }),
+          body: '{}'
+        }).catch(function () {});
+      }
+    });
+  } else {
+    const t = TRANSFERS.get('botqueue');
+
+    if (!t.done && total) t.total = total;
+  }
+}
+
+function botQueueApplyState(data) {
+  if (!data) return;
+
+  const active = !!(data.running) || (+data.pending || 0) > 0;
+  const total = +data.total || 0;
+  const sent = +data.sent || 0;
+  const failed = +data.failed || 0;
+
+  if (total && (active || TRANSFERS.has('botqueue'))) {
+    botQueueEnsureTransfer(total);
+
+    const t = TRANSFERS.get('botqueue');
+
+    if (t && !t.done) {
+      /* прогресс считаем по ЗАКРЫТЫМ пунктам: sent + failed */
+      t.loaded = Math.min(total, sent + failed);
+      t.note = failed
+        ? 'Отправлено ' + sent + ' из ' + total + ' · не вышло: ' + failed
+        : 'Отправлено ' + sent + ' из ' + total;
+      ctSync();
+    }
+  }
+
+  if (!active && botQueueTimer) {
+    clearTimeout(botQueueTimer);
+    botQueueTimer = null;
+  }
+
+  botQueueActive = active;
+
+  /* очередь ещё работает — продолжаем опрос (сам таймер сбрасывается
+     в начале botQueuePoll, так что здесь просто перевзводим при пустоте) */
+  if (active && !botQueueTimer) {
+    botQueueTimer = setTimeout(botQueuePoll, 2500);
+  }
+
+  /* финал: панель закрываем, тост-итог */
+  if (!active && total) {
+    if (TRANSFERS.has('botqueue')) {
+      const t = TRANSFERS.get('botqueue');
+
+      if (t && !t.done) {
+        transferFinish('botqueue', true,
+          failed ? 'Готово · отправлено ' + sent + ' из ' + total
+                 : 'Готово · ' + total + ' файлов в чате');
+        showToast(failed
+          ? '📨 Готово: ' + sent + ' из ' + total + ' в чате бота (детали в панели)'
+          : '📨 Все ' + total + ' файлов приехали в чат бота — сохраните их из чата');
+        botQueueFinalNotified = true;
+      }
+    } else if (!botQueueFinalNotified && (sent || failed)) {
+      /* ВОЛНА 22.55: переоткрыли мини-апп уже ПОСЛЕ того, как бот всё
+         отправил (пока мы были вне Telegram) — короткий тост-итог,
+         чтобы пользователь знал: файлы в чате, ничего не потерялось */
+      botQueueFinalNotified = true;
+
+      showToast(failed
+        ? '📨 Пока вас не было: ' + sent + ' из ' + total + ' файлов в чате бота'
+        : '📨 Пока вас не было: все ' + total + ' файлов приехали в чат бота');
+    }
+  }
+
+  /* новая пачка поехала — итоговое уведомление сбрасываем */
+  if (active) botQueueFinalNotified = false;
+}
+
+async function botQueuePoll() {
+  /* таймер сработал — обнуляем, чтобы botQueueApplyState мог перевзвести */
+  botQueueTimer = null;
+
+  try {
+    const data = await apiJson('/api/download/queue', {
+      headers: vaultHeaders()
+    });
+
+    botQueueApplyState(data);
+  } catch (e) {
+    /* сеть моргнула — попробуем позже, пока очередь активна */
+    if (botQueueActive && !botQueueTimer) {
+      botQueueTimer = setTimeout(botQueuePoll, 4000);
+    }
+  }
+}
+
+function botQueueTrack() {
+  /* стартуем цикл опроса сразу; статус применится первым же ответом */
+  botQueueFinalNotified = false;
+
+  if (botQueueTimer) clearTimeout(botQueueTimer);
+  botQueueTimer = setTimeout(botQueuePoll, 300);
+}
+
+async function enqueueBotDownload(ids) {
+  /* ВОЛНА 22.55: ставим файлы в серверную очередь «через бота».
+  Возвращает true при успехе; при safe_locked открывает окно пароля
+  и повторит постановку после разблокировки. */
+  try {
+    const data = await apiJson('/api/download/queue', {
+      method: 'POST',
+      headers: vaultHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ ids: ids })
+    });
+
+    botQueueTrack();
+
+    return true;
+  } catch (e) {
+    if (e.code === 'safe_locked') {
+      VAULT_PW = '';
+      VAULT_SERVER_UNLOCKED = false;
+      PENDING_FILE_ACTION = { type: 'dlq', ids: ids.slice() };
+
+      showToast('🔒 Введите пароль Сейфа — среди файлов есть зашифрованные');
+      openSafeModal();
+
+      return false;
+    }
+
+    showToast('Не получилось: ' + cloudErrText(e));
+
+    return false;
+  }
+}
+
 async function downloadSelected() {
   if (!selectedIds.size) {
     showToast('Сначала выберите файлы');
@@ -5120,7 +5727,8 @@ async function downloadSelected() {
 
     if (!f) return;
 
-    if (f.vault && !VAULT_PW && !VAULT_SERVER_UNLOCKED) {
+    /* ВОЛНА 22.52: plain-файл Сейфа — без пароля */
+    if (f.vault && !f.plain && !VAULT_PW && !VAULT_SERVER_UNLOCKED) {
       PENDING_FILE_ACTION = { type: 'download', id: f.id };
 
       ensureSafeUnlocked();
@@ -5133,32 +5741,35 @@ async function downloadSelected() {
     return;
   }
 
-  showToast('📦 Собираю архив…');
+  /* ВОЛНА 22.55: НЕСКОЛЬКО файлов — очередь «через бота». Раньше собирался
+     ZIP и качался клиентом: выход из Telegram убивал WebView — скачивание
+     пропадало. Теперь сервер сам отправляет каждый файл в чат бота: можно
+     закрывать мини-апп и выходить из Telegram — ничего не исчезнет.
+     Нужен именно архив одним файлом — рядом есть кнопка «В ZIP». */
+  const ids = [...selectedIds];
 
-  try {
-    const data = await apiJson('/api/files/zip_selected', {
-      method: 'POST',
-      headers: authHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify({ ids: [...selectedIds] })
-    });
+  const hasEncrypted = ids.some((id) => {
+    const f = ALL_FILES.find((x) => x.id === id);
+    return f && f.vault && !f.plain;
+  });
 
-    if (data.file) {
-      ALL_FILES.unshift({
-        id: data.file.id,
-        name: data.file.name,
-        kind: data.file.kind,
-        size: +data.file.size || 0,
-        ts: data.file.ts || '',
-        vault: !!data.file.vault
-      });
+  if (hasEncrypted && !VAULT_PW && !VAULT_SERVER_UNLOCKED) {
+    PENDING_FILE_ACTION = { type: 'dlq', ids: ids };
 
-      renderAll();
+    showToast('🔒 Введите пароль Сейфа — среди файлов есть зашифрованные');
+    openSafeModal();
 
-      showToast('📦 Архив готов: ' + data.file.name);
-      downloadFileById(data.file.id, data.file.name, +data.file.size || 0);
-    }
-  } catch (e) {
-    showToast(cloudErrText(e));
+    return;
+  }
+
+  showToast('📨 Ставлю ' + ids.length + ' файлов в очередь бота…');
+
+  const ok = await enqueueBotDownload(ids);
+
+  if (ok) {
+    toggleSelectMode();
+
+    showToast('📨 ' + ids.length + ' файлов полетят в чат бота — можно закрывать мини-апп, ничего не пропадёт');
   }
 }
 
@@ -5167,7 +5778,10 @@ function viewCurrentFile() {
 
   if (!f) return;
 
-  const needPw = f.vault || STORAGE_ENCRYPTED === true;
+  /* ВОЛНА 22.52: пароль нужен ТОЛЬКО на настоящий шифр (vault без plain).
+   Раньше STORAGE_ENCRYPTED включал пароль даже на обычные файлы облака —
+   «в мини апп шифр остаётся, хотя отмечено без шифрования» */
+  const needPw = (f.vault && !f.plain);
 
   closeEditModal();
 
@@ -5201,6 +5815,42 @@ async function openFileViewer(id) {
 
   showToast('📂 Открываю файл…');
 
+  /* ВОЛНА 22.52: видео ≤200 МБ — плеер открывается ЕЩЁ ДО запроса ссылки:
+     тап → модалка + спиннер на кнопке, затем ссылка → блоб качается прямо
+     в плеере (прогресс на кнопке). Никакого «нажимаю — и ничего». */
+  if (isVideo && (+f.size || 0) > 0 && (+f.size || 0) <= MEDIA_VIDEO_BLOB_LIMIT) {
+    openVideoPlayer(f.id, '', { deferred: true });
+
+    try {
+      const vdata = await apiJson('/api/files/' + encodeURIComponent(id) + '/link?disp=inline', {
+        headers: vaultHeaders()
+      });
+
+      const vabs = new URL(vdata.url, location.origin).href;
+
+      await vpFeedDeferred(f, vabs);
+    } catch (eV52) {
+      const modal = document.getElementById('videoPlayerModal');
+
+      if (eV52 && eV52.code === 'safe_locked') {
+        VAULT_PW = '';
+        VAULT_SERVER_UNLOCKED = false;
+
+        PENDING_FILE_ACTION = { type: 'view', id: id };
+
+        openSafeModal();
+      } else if (eV52 && (eV52.name === 'AbortError' || /abort/i.test(String(eV52.message || '')))) {
+        showToast('⏹ Скачивание отменено');
+      } else if (modal && modal.classList.contains('open')) {
+        showToast('Не удалось открыть: ' + cloudErrText(eV52));
+      }
+
+      vpCloseModal();
+    }
+
+    return;
+  }
+
   try {
     /* ВОЛНА 22.40: disp=inline для просмотра (аудио/видео плееры, PDF) */
     const data = await apiJson('/api/files/' + encodeURIComponent(id) + '/link?disp=inline', {
@@ -5209,9 +5859,17 @@ async function openFileViewer(id) {
 
     const abs = new URL(data.url, location.origin).href;
 
-    /* Аудио и видео открываем во встроенных плеерах */
+    /* Аудио и видео открываем во встроенных плеерах.
+       ВОЛНА 22.51: видео ≤200 МБ играет из блоба (скачанного в кэш) —
+       мгновенный старт и честная перемотка; большее — потоком с сервера
+       (сервер теперь отвечает 206 на Range — перемотка без рестарта). */
     if (isAudio) { openMusicPlayer(f.id, abs); return; }
-    if (isVideo) { openVideoPlayer(f.id, abs); return; }
+
+    if (isVideo) {
+      openVideoPlayer(f.id, abs);
+
+      return;
+    }
 
     if (IS_TELEGRAM && tg && tg.openLink) {
       tg.openLink(abs);
@@ -5236,6 +5894,14 @@ async function deleteCurrentFile() {
   if (!activeEditingFileId) return;
 
   const id = activeEditingFileId;
+
+  /* 22.56: карточка мягко «улетает» до перерисовки списка */
+  const animated = animateCardsOut([id]);
+
+  if (animated) {
+    closeEditModal();
+    await new Promise((r) => setTimeout(r, 210));
+  }
 
   try {
     await apiJson('/api/files/' + encodeURIComponent(id), { method: 'DELETE' });
@@ -5271,7 +5937,7 @@ function clearSearch() {
 
   document.getElementById('clearSearch').style.display = 'none';
 
-  renderAll();
+  renderAll({ animate: true });
 }
 
 function setFilter(f) {
@@ -5281,7 +5947,8 @@ function setFilter(f) {
     b.classList.toggle('active', b.dataset.filter === f);
   });
 
-  renderAll();
+  /* 22.56: смена фильтра — как смена экрана: список мягко «подъезжает» */
+  renderAll({ animate: true });
 }
 
 function toggleSortMenu(e) {
@@ -5309,7 +5976,8 @@ function setSort(s) {
   document.getElementById('sortLabel').textContent = labels[s] || 'По дате';
   document.getElementById('sortMenu').classList.remove('open');
 
-  renderAll();
+  /* 22.56: пересортировка — карточки мягко перестраиваются волной */
+  renderAll({ animate: true });
 }
 
 document.addEventListener('pointerdown', (e) => {
@@ -5598,19 +6266,28 @@ function closeNameModal(e) {
 function startActualUpload() {
   if (!pendingFiles.length) return;
 
+  /* ВОЛНА 22.54: файлы уже летят в бота (предохранка стартовала в момент
+     подтверждения окна загрузки). Введённые имена «догоняют» загрузку:
+     живая сессия — сервер переименует до финализации, готовый файл —
+     переименуется запись и подпись в канале. */
+  prestreamApplyNames(pendingFiles);
+
   proceedUpload(pendingFiles);
 }
 
 let STORAGE_ENCRYPTED = null;
 
 function passwordRequired() {
-  return STORAGE_ENCRYPTED === true || ALL_FILES.some((f) => f.vault);
+  /* ВОЛНА 22.52: plain-файлы Сейфа не включают обязательный пароль */
+  return STORAGE_ENCRYPTED === true || ALL_FILES.some((f) => f.vault && !f.plain);
 }
 
 async function detectStorageMode() {
-  if (STORAGE_ENCRYPTED !== null) return;
-
-  const urls = ['/api/storage/plain', '/api/storage/settings', '/api/storage'];
+  /* ВОЛНА 22.50: сверяем режим ВСЕГДА (раньше — только если ещё не знаем:
+     устаревшее значение «шифрование вкл» пережило бы переключатель и мини апп
+     шифровал файлы, хотя пользователь включил «без шифрования»). Запрос
+     дешёвый, окно загрузки при этом открывается без ожидания. */
+  const urls = ['/api/storage', '/api/storage/settings', '/api/storage/plain'];
 
   for (const u of urls) {
     try {
@@ -5622,7 +6299,11 @@ async function detectStorageMode() {
       /* 22.39: баннер-рекомендация виден, пока канал не подключён */
       if (typeof d.connected === 'boolean') updateDevRecBanner(d.connected);
 
-      if (typeof d.plain === 'boolean') { STORAGE_ENCRYPTED = !d.plain; return; }
+      if (typeof d.plain === 'boolean') {
+        STORAGE_PLAIN = d.plain;
+        STORAGE_ENCRYPTED = !d.plain;
+        return;
+      }
       if (typeof d.encrypted === 'boolean') { STORAGE_ENCRYPTED = d.encrypted; return; }
       if (typeof d.encryption === 'boolean') { STORAGE_ENCRYPTED = d.encryption; return; }
     } catch (e) {}
@@ -5874,12 +6555,21 @@ window.addEventListener('pageshow', () => {
    сообщений нет). Файлы не теряются в любом случае: при переоткрытии
    очередь подхватывается из IndexedDB (22.39/22.47) и догружается сама. */
 function notifyUploadClosed() {
-  if (!isUploading || !uploadQueue || !uploadQueue.length) return;
-
   try {
     /* 22.49: считаем ТОЛЬКО ещё не догруженные (загруженные файлы остаются
        в uploadQueue до конца пачки — раньше N было завышено) */
-    const pending = uploadQueue.filter(function (f) { return !f._doneFlag; });
+    let pending = (isUploading && uploadQueue && uploadQueue.length)
+      ? uploadQueue.filter(function (f) { return !f._doneFlag; })
+      : [];
+
+    /* ВОЛНА 22.54: плюс файлы ПРЕДОХРАНКИ — они летят в бота параллельно
+       с окнами имени (движок ещё не запущен). closed_hint придёт сразу:
+       сторож сообщит о паузе через ~6 с тишины, а не через 30. */
+    const preRun = (pendingFiles || []).filter(function (f) {
+      return f && f._preId && f._preState === 'run' && !f._preStop;
+    });
+
+    pending = pending.concat(preRun);
 
     if (!pending.length) return;
 
@@ -5986,6 +6676,14 @@ function openUploadModal() {
 function closeUploadModal(e) {
   if (e) e.stopPropagation();
 
+  /* ВОЛНА 22.54: крестик ДО подтверждения — как раньше, «отмена»: файлы,
+     которые ещё не начали лететь в бота (нет сессии), убираем из очереди
+     докачки, чтобы при следующем открытии не всплывала фантомная докачка.
+     Файлы предохранки (сессия уже создана) НЕ трогаем — они уже у бота. */
+  for (const f of pendingFiles) {
+    if (f && f._entryKey && !f._preId) upqDel(f._entryKey);
+  }
+
   pendingFiles = [];
   pickerAppend = false;
 
@@ -6023,6 +6721,16 @@ function confirmUploadFiles() {
   if (passInput) passInput.value = '';
 
   closeModalEl('uploadModal');
+
+  /* ВОЛНА 22.54: ПРЕДОХРАНКА — байты каждого файла летят в бота СРАЗУ,
+     пока пользователь отвечает на окна имени. Пароль уже решён (выше):
+     шифрованный режим — VAULT_PW уйдёт заголовком, «без шифрования» —
+     пароль Сейфа (если ввёл) телом init. Закрытие мини аппа посреди
+     окна имени больше НЕ теряет файлы: байты у бота, бот договорит сам. */
+  for (const f of pendingFiles) {
+    if (f && typeof f._uploadPw === 'undefined') f._uploadPw = UPLOAD_PLAIN_PW || '';
+  }
+  prestreamStart(pendingFiles.slice());
 
   /* ВОЛНА 22.43: окно имени открывается для ЛЮБОГО количества файлов —
      один файл можно назвать или пропустить, пачка — как раньше
@@ -6073,6 +6781,29 @@ function uploadFiles(fileList) {
 
   const modalOpen = !!(document.getElementById('uploadModal') || {}).classList &&
     document.getElementById('uploadModal').classList.contains('open');
+
+  /* ВОЛНА 22.54: файлы сохраняются в очередь докачки (IndexedDB) ПРЯМО В
+     МОМЕНТ ВЫБОРА — раньше запись происходила только после всех окон
+     (пароль + имя), и закрытие мини аппа до старта загрузки теряло файлы
+     целиком. Теперь даже внезапное закрытие на любом шаге оставляет файл
+     в очереди: при следующем открытии мини апп сам предложит докачку. */
+  for (const f of files) {
+    if (f._entryKey) continue;
+
+    if ((+f.size || 0) > UPQ_MAX_PERSIST) {
+      f._entryKey = '';
+      continue;
+    }
+
+    const k = 'up_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+
+    f._entryKey = k;
+
+    upqPut({
+      k: k, blob: f, name: f.name, uploadName: f.uploadName || f.name,
+      size: +f.size || 0, mime: f.type || '', uploadId: '', added: Date.now()
+    });
+  }
 
   if (pickerAppend && modalOpen) {
     pendingFiles = pendingFiles.concat(files);
@@ -6279,6 +7010,21 @@ function proceedUpload(files, opts) {
   uploadAbortFlag = false;
   uploadQueue = files.slice();
 
+  /* ВОЛНА 22.54: движок вступает — очередь предохранки гасим (файлы из неё
+     движок загрузит сам, двойной отправки не будет). Уже ЛЕТЯЩИЕ предохранки
+     не трогаем: uploadOneFile мягко перехватит их сессии. */
+  try { PRE_QUEUE.length = 0; } catch (e) {}
+
+  /* ВОЛНА 22.50: пароль именно ЭТОЙ загрузки — на каждый файл. Раньше
+     UPLOAD_PLAIN_PW был глобальным: если пользователь один раз ввёл пароль
+     Сейфа (загрузка в Сейф при «без шифрования»), то ПЕРЕЗАПУЩЕННАЯ сессия
+     другого файла (докачка после 404 → re-init) молча подхватывала старый
+     пароль → файл шифровался БЕЗ ведома пользователя. Теперь пароль
+     фиксируется на файле в момент постановки в очередь. */
+  for (const f of uploadQueue) {
+    if (f && typeof f._uploadPw === 'undefined') f._uploadPw = UPLOAD_PLAIN_PW || '';
+  }
+
   /* 22.39: сохраняем файлы в IndexedDB для докачки после закрытия
      мини-аппа (файлы из resume-очереди уже сохранены — не дублируем). */
   const isResume = !!(opts && opts.resume);
@@ -6331,6 +7077,14 @@ function resetUploadUI(bar, checkmark, squareStop) {
   filenameEl.style.display = 'none';
   initial.style.display = 'flex';
 
+  /* ВОЛНА 22.56: зона загрузки мягко возвращается после завершения пачки —
+     раньше «выскакивала» рывком */
+  if (!LOW_END && !REDUCED_MOTION) {
+    initial.classList.remove('fade-soft-in');
+    void initial.offsetWidth;
+    initial.classList.add('fade-soft-in');
+  }
+
   if (bar) {
     bar.classList.remove('success');
     bar.style.strokeDashoffset = `${circumference}`;
@@ -6351,6 +7105,10 @@ function resetUploadUI(bar, checkmark, squareStop) {
 
   pendingFiles = [];
   pendingNames = {};
+
+  /* ВОЛНА 22.50: пароль «этой загрузки» не переживает партию — иначе
+     следующая партия при «без шифрования» внезапно уходила в Сейф. */
+  UPLOAD_PLAIN_PW = '';
 }
 
 function sendChunk(uploadId, index, blobPart, offset, onLoaded) {
@@ -6439,6 +7197,205 @@ function sendChunk(uploadId, index, blobPart, offset, onLoaded) {
   });
 }
 
+/* ═══ ВОЛНА 22.54: ПРЕДОХРАНКА — ФАЙЛЫ ИДУТ В БОТА СРАЗУ ═══
+   После подтверждения окна загрузки (пароль решён) байты КАЖДОГО файла
+   начинают уходить на сервер НЕМЕДЛЕННО — параллельно с окнами «Назовите
+   файл». Что это даёт:
+   • закрыл мини апп / Telegram посреди окна имени — байты уже у бота:
+     бот сам финализирует сессию (авто-догрузка 22.51/22.52), файл НЕ
+     теряется и появляется в облаке/Сейфе;
+   • предохранка сама зовёт complete, когда все байты на сервере — файл
+     уходит в канал ещё до конца Naming-окон;
+   • имя из окна имени применяется задним числом: живая сессия — через
+     /api/upload/rename (бот зальёт уже с новым именем), готовый файл —
+     тот же эндпоинт переименует запись и подпись в канале;
+   • движок загрузки после Naming-окон подхватывает ТУ ЖЕ сессию
+     (uploadId): перекачки байтов нет, кольцо прогресса просто честно
+     добегает до конца.
+   Дизайн и порядок окон НЕ изменились. */
+
+/* ВОЛНА 22.56: 3 файла одновременно (было 2) — пока пользователь отвечает
+   на окна имени/пароля, в полёте больше файлов: закрыл мини апп в этот
+   момент — у большего числа файлов байты уже на сервере */
+let PRE_CONCURRENCY = 3;        /* сколько файлов грузим «впрок» одновременно */
+let PRE_RUNNING = 0;
+const PRE_QUEUE = [];
+
+function prestreamKick() {
+  while (PRE_RUNNING < PRE_CONCURRENCY && PRE_QUEUE.length) {
+    const f = PRE_QUEUE.shift();
+
+    if (!f || f._preStop || f._preId || f._preState === 'done') continue;
+
+    PRE_RUNNING++;
+
+    _preStreamFile(f).catch(() => {}).finally(() => {
+      PRE_RUNNING--;
+      prestreamKick();
+    });
+  }
+}
+
+function prestreamStart(files) {
+  /* без входа предохранка бессмысленна (init ответит 401) — движок сам
+     покажет окно входа, как раньше */
+  if (!IS_TELEGRAM && !WEB_TOKEN) return;
+
+  for (const f of files) {
+    if (f && !f._preId && f._preState !== 'done' && !f._preStop && +f.size > 0) {
+      PRE_QUEUE.push(f);
+    }
+  }
+
+  prestreamKick();
+}
+
+/* Ожидание окончания предохранки файла (ограниченно по времени). */
+async function _preSettle(file, timeoutSec) {
+  if (!file || file._preState !== 'run') return;
+
+  const t0 = Date.now();
+  const lim = Math.max(5, +timeoutSec || 120) * 1000;
+
+  while (file._preState === 'run' && Date.now() - t0 < lim) {
+    if (file._prePromise) { await file._prePromise; break; }
+    await sleepMs(120);
+  }
+}
+
+async function _preStreamFile(file) {
+  const upName = String(file.uploadName || file.name || 'file.bin').slice(0, 120);
+  let uploadId = '';
+  let serverParts = null;
+
+  file._preState = 'run';
+
+  try {
+    const initData = await apiJson('/api/upload/init', {
+      method: 'POST',
+      headers: vaultHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({
+        name: upName,
+        size: +file.size || 0,
+        mime: file.type || '',
+        password: file._uploadPw || ''
+      })
+    });
+
+    uploadId = initData.uploadId;
+
+    if (!uploadId) throw new Error('сервер не выдал сессию');
+
+    if (initData.resumed && Array.isArray(initData.parts) &&
+        initData.parts.length) {
+      serverParts = new Set(initData.parts);
+    }
+  } catch (e) {
+    /* предохранка не удалась (лимит/сеть/пароль) — НЕ страшно: движок после
+       окон имени сделает всё как раньше, с честной ошибкой при необходимости */
+    file._preState = 'fail';
+    return;
+  }
+
+  file._preId = uploadId;
+
+  /* uploadId — в очередь докачки сразу: закрыл мини апп на окне имени —
+     при следующем открытии докачка подхватит ИМЕННО эту сессию */
+  if (file._entryKey) {
+    upqPut({
+      k: file._entryKey, blob: file, name: file.name, uploadName: upName,
+      size: +file.size || 0, mime: file.type || '',
+      uploadId: uploadId, added: Date.now()
+    });
+  }
+
+  file._prePromise = new Promise((resolvePre) => {
+    const totalChunks = Math.ceil((+file.size || 0) / CHUNK_SIZE);
+    let nextIndex = 0;
+    let alive = true;
+
+    const worker = async () => {
+      while (alive) {
+        /* preStop — движок перехватил файл; uploadAbortFlag — пользователь
+           нажал «отмену» в кольце прогресса: гасим предохранку, как раньше */
+        if (file._preStop || uploadAbortFlag) return;
+
+        const idx = nextIndex;
+
+        if (idx >= totalChunks) return;
+
+        nextIndex++;
+
+        /* сервер уже принял этот кусок (докачка/повторный выбор) — скип */
+        if (serverParts && serverParts.has(idx)) continue;
+
+        const off = idx * CHUNK_SIZE;
+        const end = Math.min(off + CHUNK_SIZE, file.size);
+
+        for (let attempt = 0; attempt < 3; attempt++) {
+          if (!alive || file._preStop || uploadAbortFlag) return;
+
+          try {
+            await sendChunk(uploadId, idx, file.slice(off, end), off);
+            break;
+          } catch (e) {
+            if (e && e.message === 'aborted') return;
+            if (e && e.code === 'session_not_found') { alive = false; return; }
+            if (attempt < 2) await sleepMs(1200 * (attempt + 1));
+            else { alive = false; return; }
+          }
+        }
+      }
+    };
+
+    Promise.all(
+      Array.from({ length: Math.max(1, Math.min(UPLOAD_PARALLEL, 6)) }, worker))
+      .then(() => { file._preState = alive ? 'done' : 'fail'; })
+      .catch(() => { file._preState = 'fail'; })
+      .finally(resolvePre);
+  });
+
+  await file._prePromise;
+
+  /* Все байты у бота — зовём complete ПРЯМО ИЗ ПРЕДОХРАНКИ: файл уходит в
+     канал/Сейф сразу (2.5-секундная авто-финализация сервера сделала бы то
+     же самое). Неудача не фатальна: движок после окон имени добьёт через
+     status/complete. Пароль у complete — как у движка (заголовок/сессия). */
+  if (file._preState === 'done' && !file._preStop && !uploadAbortFlag) {
+    try {
+      await apiJson('/api/upload/complete', {
+        method: 'POST',
+        headers: vaultHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ uploadId })
+      });
+    } catch (e) { /* бот догрузит сам / добьёт движок */ }
+  }
+}
+
+/* Имя из окна имени — догоняет уже летящую/готовую загрузку. */
+function prestreamApplyNames(files) {
+  for (const f of files || []) {
+    if (!f || !f._preId || !f.uploadName) continue;
+
+    const nm = String(f.uploadName).slice(0, 120);
+
+    f._preRename = apiJson('/api/upload/rename', {
+      method: 'POST',
+      headers: vaultHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ uploadId: f._preId, name: nm })
+    }).catch(() => {});
+
+    /* имя и в очереди докачки — резюм покажет правильное */
+    if (f._entryKey) {
+      upqPut({
+        k: f._entryKey, blob: f, name: f.name, uploadName: nm,
+        size: +f.size || 0, mime: f.type || '',
+        uploadId: f._preId, added: Date.now()
+      });
+    }
+  }
+}
+
 /* ═══ 22.39: ПАРАЛЛЕЛЬНАЯ ЗАГРУЗКА ═══
    Файл режется на куски по 6 МиБ, куски летят на сервер тремя параллельными
    потоками (сервер пишет их по offset — порядок прилёта не важен).
@@ -6448,13 +7405,47 @@ async function _uploadOneSession(file, reportBytes) {
   const key = file._entryKey || null;
 
   let uploadId = file._resumeId || '';
+  let serverParts = null;   /* ВОЛНА 22.51: куски, которые сервер УЖЕ имеет */
 
   if (uploadId) {
     /* продолжаем ПОСЛЕ закрытия мини-аппа... или повторяем complete
        после ввода пароля Сейфа (22.49, _retryComplete): куски уже на
        сервере, init не нужен — сразу complete */
     file._resumeId = '';
-  } else {
+
+    /* ВОЛНА 22.51: узнаём у сервера, что он уже имеет:
+       • completed — бот ДОГРУЗИЛ САМ (авто-догрузка) — честный успех БЕЗ
+         перекачки, файл уже в облаке/Сейфе;
+       • ready + parts — пересылаем ТОЛЬКО недостающие куски (трафик);
+       • gone — сессия умерла, открываем новую (init ниже). */
+    try {
+      const st0 = await apiJson('/api/upload/status?uploadId=' +
+        encodeURIComponent(uploadId), { headers: authHeaders() });
+
+      if (st0 && st0.state === 'completed' && st0.resp) {
+        if (key) upqDel(key);
+
+        return (st0.resp && st0.resp.file) || st0.resp;
+      }
+
+      if (st0 && st0.state === 'processing' &&
+          Array.isArray(st0.parts) && st0.parts.length) {
+        /* ВОЛНА 22.54: предохранка уложила все байты, бот ещё финализирует —
+           куски уже у сервера, перекачивать нечего; complete мягко поймает
+           already_processing и дождётся результата через статус */
+        serverParts = new Set(st0.parts);
+      }
+
+      if (st0 && st0.state === 'ready' &&
+          Array.isArray(st0.parts) && st0.parts.length) {
+        serverParts = new Set(st0.parts);
+      }
+
+      if (st0 && st0.state === 'gone') uploadId = '';
+    } catch (e0) { /* статус не узнали — докачиваем как раньше */ }
+  }
+
+  if (!uploadId) {
     const initData = await apiJson('/api/upload/init', {
       method: 'POST',
       headers: vaultHeaders({ 'Content-Type': 'application/json' }),
@@ -6462,8 +7453,10 @@ async function _uploadOneSession(file, reportBytes) {
         name: upName,
         size: +file.size || 0,
         mime: file.type || '',
-        /* 22.40: пароль именно этой загрузки (для «без шифрования» → Сейф) */
-        password: UPLOAD_PLAIN_PW || ''
+        /* 22.40: пароль именно этой загрузки (для «без шифрования» → Сейф).
+           ВОЛНА 22.50: берём из file._uploadPw (зафиксирован при постановке
+           в очередь) — рестарт сессии больше не подхватывает чужой пароль. */
+        password: file._uploadPw || ''
       })
     });
 
@@ -6472,6 +7465,16 @@ async function _uploadOneSession(file, reportBytes) {
     /* ВОЛНА 22.49: сервер не выдал сессию — честная ошибка вместо
        «uploadId=undefined» во всех URL кусков */
     if (!uploadId) throw new Error('сервер не выдал сессию загрузки');
+
+    /* ВОЛНА 22.53: сервер УЗНАЛ прерванную сессию этого же файла (выход из
+       веб-облака посреди загрузки, локальная очередь потерялась — квота,
+       другой браузер/устройство). Продолжаем ТОТ ЖЕ uploadId: куски, которые
+       сервер уже имеет, не перекачиваем — только недостающие. Прогресс
+       докачки предзаполнится ниже через serverParts. */
+    if (initData.resumed && Array.isArray(initData.parts) &&
+        initData.parts.length) {
+      serverParts = new Set(initData.parts);
+    }
   }
 
   file._lastUploadId = uploadId;
@@ -6488,6 +7491,20 @@ async function _uploadOneSession(file, reportBytes) {
 
   let nextIndex = 0;                  /* следующий кусок для отправки */
   const chunkGot = new Map();         /* idx -> принятых байт куска (прогресс) */
+
+  /* ВОЛНА 22.51: куски, уже принятые сервером, — в прогресс докачки */
+  if (serverParts) {
+    let preBytes = 0;
+
+    for (const pi of serverParts) {
+      const po = pi * CHUNK_SIZE;
+      const pe = Math.min(po + CHUNK_SIZE, +file.size || 0);
+
+      if (po < pe) { chunkGot.set(pi, pe - po); preBytes += pe - po; }
+    }
+
+    if (preBytes) reportBytes(preBytes);
+  }
 
   const reportChunk = (idx, n) => {
     chunkGot.set(idx, n);
@@ -6510,6 +7527,10 @@ async function _uploadOneSession(file, reportBytes) {
       if (idx >= totalChunks) return null;
 
       nextIndex++;
+
+      /* ВОЛНА 22.51: этот кусок сервер уже принял в прошлой сессии —
+         не перекачиваем (экономия трафика телефона) */
+      if (serverParts && serverParts.has(idx)) continue;
 
       const off = idx * CHUNK_SIZE;
       const end = Math.min(off + CHUNK_SIZE, file.size);
@@ -6613,14 +7634,102 @@ async function _uploadOneSession(file, reportBytes) {
     }
   }
 
-  if (cErr) throw cErr;
+  if (cErr) {
+    /* ВОЛНА 22.50: «фантомные ошибки». Сервер после разрыва связи может
+       ДОговорить загрузку (шифрование/заливка в канал идут минуты), а
+       повторный complete ловит 409 already_processing — раньше мы честно
+       рисовали «⚠️ Не удалось», файл появлялся в канале позже, и выходило
+       «не загружается, а потом оказывается в канале». Теперь спрашиваем у
+       сервера статус сессии: completed → успех, processing → ждём, ready →
+       повторяем complete, gone → честная ошибка. */
+    done = await pollUploadStatus(uploadId, file);
+  }
 
   if (key) upqDel(key);
 
-  return done.file;
+  /* ВОЛНА 22.50: pollUploadStatus отдаёт запись файла напрямую, обычный
+     complete — объектом {file: …}; приводим к одному виду. */
+  if (done && done.file) return done.file;
+
+  return done;
+}
+
+/* ВОЛНА 22.50: опрос статуса загрузки после сбоя complete (до 8 минут). */
+async function pollUploadStatus(uploadId, file) {
+  const deadline = Date.now() + 8 * 60 * 1000;
+  let recompleted = 0;
+
+  while (Date.now() < deadline) {
+    await sleepMs(3000);
+
+    let st = null;
+
+    try {
+      st = await apiJson('/api/upload/status?uploadId=' +
+        encodeURIComponent(uploadId), { headers: authHeaders() });
+    } catch (e) {
+      /* сессия авторизации умерла — останавливаем опрос честной ошибкой
+         (после повторного входа очередь подхватится сама) */
+      if (e && (e.code === 'unauthorized' || e.code === 'not_registered')) throw e;
+
+      continue;   /* сеть дёрнулась — попробуем на следующем тике */
+    }
+
+    if (st && st.state === 'completed' && st.resp) return st.resp.file;
+
+    if (st && st.state === 'processing') continue;
+
+    if (st && st.state === 'ready' && recompleted < 3) {
+      recompleted++;
+
+      try {
+        const d2 = await apiJson('/api/upload/complete', {
+          method: 'POST',
+          headers: vaultHeaders({ 'Content-Type': 'application/json' }),
+          body: JSON.stringify({ uploadId })
+        });
+
+        return d2.file;
+      } catch (e) {
+        if (e && (e.code === 'safe_locked' || e.code === 'wrong_password')) {
+          if (file) {
+            file._resumeId = uploadId;
+            file._retryComplete = true;
+          }
+
+          throw e;
+        }
+
+        continue;
+      }
+    }
+
+    if (st && st.state === 'gone') break;
+  }
+
+  throw new Error('сервер не подтвердил загрузку — попробуйте ещё раз');
 }
 
 async function uploadOneFile(file, reportBytes) {
+  /* ВОЛНА 22.54: файл мог УЖЕ улететь в бота (предохранка стартует с момента
+     подтверждения окна загрузки). Гасим её воркеры, дожидаемся тишины и
+     продолжаем ТУ ЖЕ сессию: /api/upload/status скажет completed (файл готов —
+     честный успех без перекачки) или ready+parts (дошлём только остаток). */
+  file._preStop = true;
+
+  try { await _preSettle(file, 120); } catch (e) {}
+
+  /* имя из окна имени должно успеть «догнать» сессию до complete */
+  if (file._preRename) {
+    try { await Promise.race([file._preRename, sleepMs(10000)]); } catch (e) {}
+  }
+
+  if (file._preId && file._preState !== 'fail') {
+    file._resumeId = file._resumeId || file._preId;
+  }
+  /* _preState === 'fail' → init на сервере узнает сессию по отпечатку (22.53)
+     и продолжит с принятых кусков; совсем без сессии — обычная загрузка */
+
   for (let session = 0; session < 3; session++) {
     const r = await _uploadOneSession(file, reportBytes);
 
@@ -6632,54 +7741,123 @@ async function uploadOneFile(file, reportBytes) {
   throw new Error('Загрузка не удалась — попробуйте ещё раз');
 }
 
+/* ═══ ВОЛНА 22.56: ПАРАЛЛЕЛЬНАЯ ЗАГРУЗКА ВСЕХ ФАЙЛОВ ПАЧКИ ═══
+   Раньше файлы грузились СТРОГО ПО ОДНОМУ: пока летел первый, остальные
+   просто ЖДАЛИ в очереди — и если пользователь закрывал мини апп (или
+   вообще выходил из Telegram), до поздних файлов не успевал доехать НИ
+   ОДИН байт: они целиком оставались на телефоне. Теперь ВСЕ файлы пачки
+   летят ОДНОВРЕМЕННО (пул из UPLOAD_FILES_PARALLEL задач, каждая со
+   своими кусочными воркерами): пока мини апп жив, КАЖДЫЙ файл очереди
+   непрерывно грузится, а не только «текущий». Закрыли апп — байты,
+   которые успели доехать, уже на сервере (переживают даже рестарт
+   бота), и при возвращении докачка продолжится С ТОГО ЖЕ места для
+   КАЖДОГО файла. Ошибки и повторы — как раньше (22.39): сбой одного
+   файла не роняет остальных, итог честно показываем в конце. */
+const UPLOAD_FILES_PARALLEL = 2;
+
 async function uploadEngine(bar) {
   const checkmark = document.getElementById('checkmark');
   const squareStop = document.getElementById('squareStop');
   const dlText = document.getElementById('downloadText');
 
-  const totalBytes = uploadQueue.reduce((s, f) => s + (+f.size || 0), 0) || 1;
+  const queue = uploadQueue.slice();
+  const totalBytes = queue.reduce((s, f) => s + (+f.size || 0), 0) || 1;
 
-  let doneBytes = 0;
   const added = [];
   const failedFiles = [];
 
-  /* 22.39: ошибка ОДНОГО файла больше не роняет всю пачку — грузим дальше,
-     итог честно показываем в конце */
-  for (const file of uploadQueue.slice()) {
-    if (uploadAbortFlag) break;
+  /* Прогресс считается по КАЖДОМУ файлу отдельно и суммируется живьём —
+     файлы грузятся параллельно, поэтому «doneBytes» одного файла из
+     старого движка больше не подходит */
+  const fileBytes = new Map();
+  let reportedTotal = 0;
 
-    file._cancelFlag = false;
+  const reportTotal = () => {
+    setUploadPct((reportedTotal / totalBytes) * 100, bar);
+  };
 
-    try {
-      const rec = await uploadOneFile(file, (cur) => {
-        setUploadPct(((doneBytes + cur) / totalBytes) * 100, bar);
-      });
+  const topUpFile = (file) => {
+    /* файл прошёл через движок (успех или ошибка) — добираем его полные
+       байты в общий прогресс, чтобы кольцо не «зависало» на 97% */
+    const prev = fileBytes.get(file) || 0;
+    const full = +file.size || 0;
 
-      if (rec) added.push(rec);
+    if (full > prev) {
+      reportedTotal += full - prev;
+      fileBytes.set(file, full);
+      reportTotal();
+    }
+  };
 
-      /* 22.49: помечаем ДОСТИГНУТЫМ — notifyUploadClosed считает
-         только недогруженные, «⏸ пауза» больше не преувеличивает */
-      file._doneFlag = true;
-    } catch (e) {
-      if (e.message === 'aborted' || uploadAbortFlag) break;
+  let nextFileIdx = 0;
 
-      /* 22.49: НЕобратимые ошибки сервера (4xx, кроме 429/423 — это
-         «слишком часто»/«нет пароля») — убираем файл из очереди докачки,
-         чтобы он не бесконечно повторял тост «⏳ Продолжаю прерванную
-         загрузку» на каждом открытии приложения */
-      const _code = String((e && e.code) || '');
-      if (/^4\d\d$/.test(_code) && _code !== '429' && _code !== '423'
-        && file._entryKey) {
-        upqDel(file._entryKey);
+  const engineWorker = async () => {
+    for (;;) {
+      if (uploadAbortFlag) return;
+
+      const file = queue[nextFileIdx++];
+
+      if (!file) return;
+
+      file._cancelFlag = false;
+      fileBytes.set(file, 0);
+
+      try {
+        const rec = await uploadOneFile(file, (cur) => {
+          const prev = fileBytes.get(file) || 0;
+
+          if (cur > prev) {
+            reportedTotal += cur - prev;
+            fileBytes.set(file, cur);
+            reportTotal();
+          }
+        });
+
+        if (rec) added.push(rec);
+
+        /* ВОЛНА 22.54: страховка имени. Файл уходил в бота под оригинальным
+           именем (предохранка), пользователь назвал его в окне имени — если
+           сервер всё же записал старое имя (финализация обогнала ренейм),
+           тихо переименовываем запись и подпись в канале (как ✏️). */
+        if (rec && rec.id && file.uploadName && rec.name &&
+            String(rec.name) !== String(file.uploadName)) {
+          apiJson('/api/files/' + encodeURIComponent(rec.id), {
+            method: 'PATCH',
+            headers: authHeaders({ 'Content-Type': 'application/json' }),
+            body: JSON.stringify({ name: file.uploadName })
+          }).catch(() => {});
+        }
+
+        /* 22.49: помечаем ДОСТИГНУТЫМ — notifyUploadClosed считает
+           только недогруженные, «⏸ пауза» больше не преувеличивает */
+        file._doneFlag = true;
+      } catch (e) {
+        if (e.message === 'aborted' || uploadAbortFlag) {
+          topUpFile(file);
+          return;
+        }
+
+        /* 22.49: НЕобратимые ошибки сервера (4xx, кроме 429/423 — это
+           «слишком часто»/«нет пароля») — убираем файл из очереди докачки,
+           чтобы он не бесконечно повторял тост «⏳ Продолжаю прерванную
+           загрузку» на каждом открытии приложения */
+        const _code = String((e && e.code) || '');
+        if (/^4\d\d$/.test(_code) && _code !== '429' && _code !== '423'
+          && file._entryKey) {
+          upqDel(file._entryKey);
+        }
+
+        failedFiles.push({ file: file, e: e });
       }
 
-      failedFiles.push({ file: file, e: e });
+      topUpFile(file);
     }
+  };
 
-    doneBytes += (+file.size || 0);
-
-    setUploadPct((doneBytes / totalBytes) * 100, bar);
-  }
+  /* Пул: не больше задач, чем файлов; минимум одна (пустых пачек не бывает) */
+  await Promise.all(Array.from(
+    { length: Math.max(1, Math.min(UPLOAD_FILES_PARALLEL, queue.length)) },
+    engineWorker));
 
   if (uploadAbortFlag) {
     /* отмена — стираем очередь докачки (пользователь сам отменил) */
@@ -6753,7 +7931,7 @@ async function uploadEngine(bar) {
     });
   });
 
-  renderAll();
+  renderAll({ animate: true });
 
   setTimeout(() => {
     resetUploadUI(bar, checkmark, squareStop);
@@ -6793,7 +7971,7 @@ startBlobAnimation();
 renderSoundMenu();
 updateSoundLabel();
 setSort('date-desc');
-renderAll();
+renderAll({ animate: true });
 detectStorageMode();
 updateDevRecBanner(false);
 pullSettingsApply(); /* 22.39: подтянуть настройки из базы */
@@ -7032,6 +8210,14 @@ function ctSubText(t) {
 
   if (t.type === 'safe_out') return 'Расшифровываю и возвращаю…';
 
+  /* ВОЛНА 22.55: очередь «через бота» — прогресс в файлах, не в байтах.
+     Текст готовит botQueueApplyState (note), здесь только отрисовка */
+  if (t.type === 'botqueue') {
+    if (t.done) return t.note || 'Готово';
+
+    return t.note || 'Бот отправляет в чат — можно закрывать мини-апп';
+  }
+
   const sec = (Date.now() - t.t0) / 1000;
   const speed = (sec > 0.8 && t.loaded) ? fmtSize(t.loaded / sec) + '/с · ' : '';
 
@@ -7057,7 +8243,9 @@ function ctRow(t) {
         ? '<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/>'
         : t.type === 'safe_out'
           ? '<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 7.5-2"/><path d="m3 3 18 18"/>'
-          : '<path d="M12 5v14"/><path d="m19 12-7 7-7-7"/>')
+          : t.type === 'botqueue'
+            ? '<path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/>'
+            : '<path d="M12 5v14"/><path d="m19 12-7 7-7-7"/>')
     + '</svg>';
 
   const main = document.createElement('div');
@@ -7228,10 +8416,19 @@ let mpScrubbing = false;
 let mpSeekPending = null;
 let mpSeekPendingTimer = null;
 let mpScrubLastPct = 0;
+/* ВОЛНА 22.52: «плеер должен открываться сразу, а загрузка — на кнопке».
+   mpLoading — трек ещё доставается (спиннер на большой кнопке);
+   mpDeferredAutoplay — тап по кнопке ВО время загрузки = «после готовности
+   НЕ включать» (пауза). */
+let mpLoading = false;
+let mpDeferredAutoplay = true;
 const mpEl = {};
 
 function mpSetSeekPending(sec) {
   mpSeekPending = sec;
+
+  /* ВОЛНА 22.52: после ручной перемотки тикер обязан перерисовать позицию */
+  mpTickLoop._lastPct = undefined;
 
   if (mpSeekPendingTimer) clearTimeout(mpSeekPendingTimer);
 
@@ -7713,6 +8910,10 @@ async function mpLoad(i, autoplay) {
   const t = mpList[idx];
   const token = ++mpLoadToken;
 
+  /* ВОЛНА 22.52: плеер уже открыт, трек доставается — СПИННЕР НА КНОПКЕ */
+  mpDeferredAutoplay = !!autoplay;
+  mpSetLoading(true);
+
   mpAnimateSwitch();
 
   mpEl.mpTitle.textContent = t.title;
@@ -7723,6 +8924,11 @@ async function mpLoad(i, autoplay) {
   mpEl.mpProgressFill.style.width = '0%';
   mpEl.mpCurrent.textContent = '0:00';
   mpEl.mpDuration.textContent = '0:00';
+
+  /* ВОЛНА 22.52: сброс кэша экономного тикера — следующий кадр перерисует */
+  mpTickLoop._lastPct = 0;
+  mpTickLoop._lastCur = '';
+  mpTickLoop._lastDur = '';
 
   mpSyncDots();
 
@@ -7756,6 +8962,7 @@ async function mpLoad(i, autoplay) {
        дёргая окно входа при каждом 401 */
     mpBrokenStreak++;
 
+    mpSetLoading(false);
     mpSyncPlayIcon();
 
     if (autoplay && mpOpen && mpList.length
@@ -7770,12 +8977,44 @@ async function mpLoad(i, autoplay) {
 
   mpBrokenStreak = 0;
 
-  mpAudioEl.src = url;
+  /* ВОЛНА 22.51: трек качается ЦЕЛИКОМ в кэш (первый раз) и играет из блоба:
+     перемотка мгновенная и БЕЗ «запуска песни заново» (серверные Range 206
+     поддерживаем тоже, но блоб — самый надёжный путь в WebView). Кэш →
+     повторное прослушивание без единого байта из сети. */
+  let playUrl = url;
+
+  if (!t.localFile && (+((t.file && t.file.size) || 0)) > 0
+      && (+((t.file && t.file.size) || 0)) <= MEDIA_BLOB_LIMIT) {
+    try {
+      const tblob = await mediaBlobFor(t.file, t.title || t.file.name, url);
+
+      if (token !== mpLoadToken || !mpOpen) return;
+
+      if (tblob) {
+        if (mpObjectUrl) {
+          try { URL.revokeObjectURL(mpObjectUrl); } catch (e1) {}
+
+          mpObjectUrl = null;
+        }
+
+        playUrl = URL.createObjectURL(tblob);
+        mpObjectUrl = playUrl;
+      }
+    } catch (eCache) {
+      /* не скачался блоб (сеть/отмена) — играем потоком (сервер уже с Range) */
+    }
+  }
+
+  /* ВОЛНА 22.52: загрузка завершена (или играем потоком) — спиннер с кнопки */
+  mpSetLoading(false);
+
+  mpAudioEl.src = playUrl;
 
   /* теги/обложка читаем параллельно — не ждём начала воспроизведения */
   mpReadTags(t, token);
 
-  if (autoplay) {
+  /* mpDeferredAutoplay: тапнули по кнопке во время загрузки — без автоплея */
+  if (autoplay && mpDeferredAutoplay) {
     mpPlay();
   } else {
     mpSyncPlayIcon();
@@ -7862,15 +9101,65 @@ function mpTickLoop() {
       !mpScrubbing && mpSeekPending == null) {
     const pct = (mpAudioEl.currentTime / mpAudioEl.duration) * 100;
 
-    mpEl.mpProgressFill.style.width = pct + '%';
-    mpEl.mpCurrent.textContent = mpFmtTime(mpAudioEl.currentTime);
-    mpEl.mpDuration.textContent = mpFmtTime(mpAudioEl.duration);
+    /* ВОЛНА 22.52: плавность на ЛЮБОМ устройстве — layout полоски трогаем
+       только при реальном изменении позиции (>0.15%), текст времени — при
+       смене отображаемой секунды. Раньше: 60–120 layout/сек даже на
+       стоячем треке — на слабых WebView это и были «лаги анимаций». */
+    if (mpTickLoop._lastPct === undefined ||
+        Math.abs(pct - mpTickLoop._lastPct) > 0.15) {
+      mpTickLoop._lastPct = pct;
+
+      mpEl.mpProgressFill.style.width = pct + '%';
+    }
+
+    const cur = mpFmtTime(mpAudioEl.currentTime);
+
+    if (cur !== mpTickLoop._lastCur) {
+      mpTickLoop._lastCur = cur;
+
+      mpEl.mpCurrent.textContent = cur;
+    }
+
+    const dur = mpFmtTime(mpAudioEl.duration);
+
+    if (dur !== mpTickLoop._lastDur) {
+      mpTickLoop._lastDur = dur;
+
+      mpEl.mpDuration.textContent = dur;
+    }
   }
 
   mpTickRaf = requestAnimationFrame(mpTickLoop);
 }
 
+function mpSetLoading(on) {
+  mpLoading = !!on;
+
+  if (mpEl.mpPlayBtn) {
+    mpEl.mpPlayBtn.classList.toggle('loading', mpLoading);
+
+    let sp = mpEl.mpPlayBtn.querySelector('.pld-spin');
+
+    if (mpLoading && !sp) {
+      sp = document.createElement('span');
+
+      sp.className = 'pld-spin';
+
+      mpEl.mpPlayBtn.appendChild(sp);
+    } else if (!mpLoading && sp) {
+      sp.remove();
+    }
+  }
+
+  if (mpEl.mpPlayIcon) {
+    mpEl.mpPlayIcon.style.display = mpLoading ? 'none' : '';
+  }
+}
+
 function mpSyncPlayIcon() {
+  /* ВОЛНА 22.52: пока идёт загрузка, на кнопке спиннер — иконку не трогаем */
+  if (mpLoading) return;
+
   const playing = mpPlaying();
 
   mpEl.mpPlayIcon.innerHTML = playing ? MP_ICONS.pause : MP_ICONS.play;
@@ -7899,6 +9188,16 @@ function mpPlay() {
 
 function mpTogglePlay() {
   if (!mpAudioEl) return;
+
+  /* ВОЛНА 22.52: тап во время загрузки = «пауза после готовности» —
+   кнопка живая даже пока трек качается */
+  if (mpLoading) {
+    mpDeferredAutoplay = false;
+
+    showToast('⏳ Трек ещё загружается — после готовности будет пауза');
+
+    return;
+  }
 
   if (mpAudioEl.paused) {
     if (!mpAudioEl.src) mpLoad(mpIndex, true);
@@ -7957,6 +9256,10 @@ function openMusicPlayer(fileId, forcedUrl) {
   document.getElementById('musicPlayer').classList.add('open');
   document.body.classList.add('mp-lock');
 
+  /* ВОЛНА 22.52: фоновые blobs за полноэкранным плеером не видны, а rAF-цикл
+     жжёт GPU/батарею — на время плеера ставим их на паузу */
+  stopBlobAnimation();
+
   /* ВОЛНА 22.49: новый запуск плеера — счётчик битых сброшен */
   mpBrokenStreak = 0;
 
@@ -8007,8 +9310,15 @@ function closeMusicPlayer() {
   if (mpBeatRaf) { cancelAnimationFrame(mpBeatRaf); mpBeatRaf = 0; }
   if (mpTickRaf) { cancelAnimationFrame(mpTickRaf); mpTickRaf = 0; }
 
+  /* ВОЛНА 22.52: спиннер загрузки с кнопки + возврат фоновых blobs
+     (за полноэкранным плеером они всё равно не видны — берегём батарею) */
+  mpSetLoading(false);
+  mpLoadToken++;
+
   setTimeout(() => {
     if (!mpOpen) document.body.classList.remove('mp-lock');
+
+    startBlobAnimation();
   }, 450);
 }
 
@@ -8026,6 +9336,14 @@ let vpLastTapTime = 0;
 let vpLastTapSide = null;
 let vpAudioCtx = null;
 let vpOsc = null;   /* ВОЛНА 22.49: ссылка на осциллятор фонового тишины */
+let vpObjectUrl = null;   /* ВОЛНА 22.51: blob-URL видео из кэша */
+/* ВОЛНА 22.52: «плеер открывается сразу, видео грузится в нём, прогресс на
+   кнопке». vpLoadToken отменяет отложенную загрузку при закрытии плеера;
+   vpDeferredAutoplay — тап по кнопке ВО время загрузки = пауза после
+   готовности. */
+let vpLoadToken = 0;
+let vpLoading = false;
+let vpDeferredAutoplay = true;
 let vpSavedRate = 1.0;
 let vpPressTimer = null;
 let vpLongPressing = false;
@@ -8061,8 +9379,8 @@ function vpCache() {
   vpWrapperEl.addEventListener('mouseup', vpEndPress);
   vpWrapperEl.addEventListener('mouseleave', vpEndPress);
   vpWrapperEl.addEventListener('touchstart', vpStartPress, { passive: true });
-  vpWrapperEl.addEventListener('touchend', vpEndPress);
-  vpWrapperEl.addEventListener('touchcancel', vpEndPress);
+  vpWrapperEl.addEventListener('touchend', vpEndPress, { passive: true });
+  vpWrapperEl.addEventListener('touchcancel', vpEndPress, { passive: true });
 
   vpWrapperEl.addEventListener('touchstart', (e) => {
     if (e.touches.length === 2) {
@@ -8141,7 +9459,7 @@ function vpCache() {
         if (!vpForcedLandscape) vpPlayerEl.style.objectFit = 'contain';
       }
     }, 300);
-  });
+  }, { passive: true });
 
   vpPlayerEl.ontimeupdate = vpOnTimeUpdate;
 
@@ -8227,14 +9545,19 @@ function vpFormatTime(sec) {
   return (m < 10 ? '0' : '') + m + ':' + (s < 10 ? '0' : '') + s;
 }
 
-function openVideoPlayer(fileId, forcedUrl) {
+function openVideoPlayer(fileId, forcedUrl, opts) {
   const f = ALL_FILES.find((x) => x.id === fileId);
 
   if (!f) return;
 
+  /* ВОЛНА 22.52: deferred-режим — модалка открывается СРАЗУ (пустое видео +
+     спиннер на кнопке), а блоб докачивается прямо в плеере. Раньше
+     openFileViewer ждал скачивания ДОЛЬШЕ МИНУТЫ, и только потом открывал
+     плеер — «при нажатии ничего не происходит». */
+  const deferred = !!(opts && opts.deferred);
   const url = forcedUrl || '';
 
-  if (!url) {
+  if (!url && !deferred) {
     showToast('Не удалось открыть видео');
     return;
   }
@@ -8252,8 +9575,140 @@ function openVideoPlayer(fileId, forcedUrl) {
   document.getElementById('videoPlayerModal').classList.add('open');
   document.body.classList.add('vp-lock');
 
+  /* ВОЛНА 22.52: фоновые blobs за полноэкранным плеером — на паузу */
+  stopBlobAnimation();
+
   safeIcons();
+
+  if (deferred) {
+    /* ВОЛНА 22.52: интерфейс «загрузки на кнопке» мгновенно; если ссылка
+       уже есть (opts.abs) — качаем сразу, иначе openFileViewer пришлёт её
+       следом через vpFeedDeferred (плеер уже открыт) */
+    vpSetLoading(true, 0);
+
+    if (vpSeekEl) vpSeekEl.value = 0;
+    if (vpSeekEl) vpUpdateSeekFill();
+
+    if (opts && opts.abs) vpFeedDeferred(f, opts.abs);
+    return;
+  }
+
+  vpSetLoading(false);
   vpPlayVideo(vpVideos[0]);
+}
+
+/* ─── ВОЛНА 22.52: ЗАГРУЗКА НА КНОПКЕ ─────────────────────────────
+   vpSetLoading(true, pct): спиннер вместо иконки play на большой белой
+   кнопке + подпись «⬇ N%» над контролами. Тап по кнопке в этот момент —
+   «после готовности НЕ включать» (пауза). vpFeedDeferred качает блог
+   через кэш (mediaBlobFor) и по готовности запускает vpPlayVideo; при
+   сбое — честный поток с сервера (сервер 22.51 умеет Range/206). */
+function vpSetLoading(on, pct) {
+  vpLoading = !!on;
+
+  const wrap = document.getElementById('vpPlayIconWrap');
+  const btn = document.getElementById('vpPlayBtn');
+
+  if (btn) btn.classList.toggle('loading', vpLoading);
+
+  if (wrap) {
+    if (vpLoading) {
+      wrap.innerHTML = '<span class="pld-spin"></span>';
+    } else {
+      wrap.innerHTML = '<i data-lucide="' +
+        (vpPlayerEl && vpPlayerEl.paused ? 'play' : 'pause') +
+        '" style="width:24px;height:24px;fill:#000;margin-left:2px;"></i>';
+
+      safeIcons();
+    }
+  }
+
+  let lbl = document.getElementById('vpLoadLabel');
+
+  if (!lbl) {
+    lbl = document.createElement('div');
+
+    lbl.id = 'vpLoadLabel';
+    lbl.style.cssText = 'position:absolute;left:50%;transform:translateX(-50%);bottom:150px;z-index:31;background:rgba(0,0,0,0.7);color:#fff;padding:6px 14px;border-radius:9999px;font-weight:800;font-size:12px;letter-spacing:.3px;pointer-events:none;opacity:0;transition:opacity .2s;font-family:"Nunito",sans-serif;';
+
+    const wr = document.getElementById('vpWrapper');
+
+    if (wr) wr.appendChild(lbl);
+  }
+
+  lbl.textContent = vpLoading ? ('⬇ ' + Math.round(pct || 0) + '%') : '';
+  lbl.style.opacity = vpLoading ? '1' : '0';
+}
+
+function vpStartDeferredLoad(f, abs) {
+  /* ВОЛНА 22.52: точка входа «ссылка уже есть» — сам плеер уже открыт. */
+  const token = ++vpLoadToken;
+
+  vpDeferredAutoplay = true;
+
+  vpSetLoading(true, 0);
+
+  if (vpSeekEl) vpSeekEl.value = 0;
+  if (vpSeekEl) vpUpdateSeekFill();
+
+  return vpFeedDeferred(f, abs, token);
+}
+
+/* Качает блоб в УЖЕ ОТКРЫТЫЙ плеер (кнопка показывает прогресс).
+   token — защита от отмены (закрытие плеера / новое видео). */
+async function vpFeedDeferred(f, abs, tokenIn) {
+  const token = tokenIn || ++vpLoadToken;
+
+  try {
+    const vblob = await mediaBlobFor(f, f.name || 'видео', abs,
+      (p) => {
+        if (token === vpLoadToken) vpSetLoading(true, p);
+      });
+
+    if (token !== vpLoadToken) return;
+
+    if (vpObjectUrl) {
+      try { URL.revokeObjectURL(vpObjectUrl); } catch (eV) {}
+    }
+
+    vpObjectUrl = URL.createObjectURL(vblob);
+
+    vpSetLoading(false);
+
+    const modal = document.getElementById('videoPlayerModal');
+
+    if (!modal || !modal.classList.contains('open')) return;
+
+    vpPlayVideo({
+      id: f.id,
+      title: String(f.name || 'Видео').replace(/\.[^/.]+$/, ''),
+      filename: f.name || '',
+      url: vpObjectUrl,
+      size: +f.size || 0
+    });
+
+    /* тапнули по кнопке во время загрузки — после готовности на паузе */
+    if (!vpDeferredAutoplay) {
+      try { vpPlayerEl.pause(); } catch (eP) {}
+    }
+  } catch (eDef) {
+    if (token !== vpLoadToken) return;
+
+    /* блоб не скачался (сеть/отмена) — честный поток, сервер с Range 206 */
+    vpSetLoading(false);
+
+    const modal = document.getElementById('videoPlayerModal');
+
+    if (!modal || !modal.classList.contains('open')) return;
+
+    vpPlayVideo({
+      id: f.id,
+      title: String(f.name || 'Видео').replace(/\.[^/.]+$/, ''),
+      filename: f.name || '',
+      url: abs,
+      size: +f.size || 0
+    });
+  }
 }
 
 function vpInitBackgroundAudio() {
@@ -8530,12 +9985,16 @@ function vpShowControls() {
 }
 
 function vpOnSeekInput() {
+  if (vpLoading) return;   /* ВОЛНА 22.52: ползунок живёт после готовности */
+
   vpIsSeeking = true;
   vpUpdateSeekFill();
   vpShowControls();
 }
 
 function vpOnSeekChange() {
+  if (vpLoading) return;   /* ВОЛНА 22.52: ползунок живёт после готовности */
+
   /* ВОЛНА 22.49: isFinite-гард — duration===Infinity (webm/MediaRecorder
      до метаданных) давал currentTime = x*Infinity */
   if (vpPlayerEl.duration && isFinite(vpPlayerEl.duration)) {
@@ -8557,6 +10016,9 @@ function vpOnSeekChange() {
 }
 
 function vpUpdatePlayIcon() {
+  /* ВОЛНА 22.52: пока грузится — на кнопке спиннер, иконку не трогаем */
+  if (vpLoading) return;
+
   const container = document.getElementById('vpPlayIconWrap');
 
   if (!container) return;
@@ -8571,6 +10033,16 @@ function vpUpdatePlayIcon() {
 function vpTogglePlay(e) {
   if (e) e.stopPropagation();
 
+  /* ВОЛНА 22.52: тап во время загрузки = «после готовности — пауза».
+   Кнопка не мёртвая, пока видео качается */
+  if (vpLoading) {
+    vpDeferredAutoplay = false;
+
+    showToast('⏳ Видео ещё загружается — после готовности будет пауза');
+
+    return;
+  }
+
   if (vpPlayerEl.paused) vpPlayerEl.play();
   else vpPlayerEl.pause();
 
@@ -8583,6 +10055,9 @@ function vpRewindSec(seconds, e) {
     if (e.cancelable) e.preventDefault();
   }
 
+  /* ВОЛНА 22.52: во время загрузки мотать нечего — видео ещё не на кнопке */
+  if (vpLoading) return;
+
   vpPlayerEl.currentTime += seconds;
   vpRewindFeedback(seconds > 0 ? '+10 сек' : '-10 сек');
   vpShowControls();
@@ -8590,6 +10065,11 @@ function vpRewindSec(seconds, e) {
 
 function vpCloseModal(e) {
   if (e) e.stopPropagation();
+
+  /* ВОЛНА 22.52: отменяем отложенную загрузку (закрыли плеер — качать некуда
+     визуально, докачанный блок останется в кэше) + снимаем спиннер */
+  vpLoadToken++;
+  vpSetLoading(false);
 
   vpPlayerEl.pause();
 
@@ -8599,6 +10079,14 @@ function vpCloseModal(e) {
     vpPlayerEl.removeAttribute('src');
     vpPlayerEl.load();
   } catch (e2) {}
+
+  /* ВОЛНА 22.51: освобождаем blob-URL видео из кэша (сам блоб остаётся
+     в кэше — повторное открытие будет мгновенным) */
+  if (vpObjectUrl) {
+    try { URL.revokeObjectURL(vpObjectUrl); } catch (e5) {}
+
+    vpObjectUrl = null;
+  }
 
   /* ВОЛНА 22.49: гасим бесконечный фоновый осциллятор — раньше он рендерил
      440 Гц ДО КОНЦА СЕССИИ после закрытия плеера (CPU/батарея в WebView) */
@@ -8627,6 +10115,9 @@ function vpCloseModal(e) {
 
   if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
   vpForceLandscape(false);
+
+  /* ВОЛНА 22.52: возвращаем фоновые blobs после закрытия плеера */
+  startBlobAnimation();
 }
 
 /* ═══ КОНЕЦ ВИДЕОПЛЕЕРА ═══ */
@@ -8675,6 +10166,9 @@ async function pmOpen(f) {
   document.getElementById('photoModal').classList.add('open');
   document.getElementById('pmTitle').textContent = f.name || 'Фото';
 
+  /* ВОЛНА 22.52: фоновые blobs за полноэкранным просмотрщиком — на паузу */
+  stopBlobAnimation();
+
   safeIcons();
   pmApplyZoom(1.0, false);
   await pmShowCurrent();
@@ -8701,6 +10195,11 @@ async function pmShowCurrent() {
 
   img.style.opacity = '0.35';
 
+  /* ВОЛНА 22.52: спиннер на время загрузки фото (из кэша — мигнёт) */
+  const _spin = document.getElementById('pmSpin');
+
+  if (_spin) _spin.style.opacity = '1';
+
   try {
     const data = await apiJson('/api/files/' + encodeURIComponent(f.id) + '/link?disp=inline', {
       headers: vaultHeaders()
@@ -8715,14 +10214,20 @@ async function pmShowCurrent() {
       return;
     }
 
-    const blob = await fetchFileBlob(abs, f.name || 'фото');
+    /* ВОЛНА 22.51: фото из кэша открывается мгновенно; при первом просмотре
+       качается (с панелью прогресса) и сохраняется в кэш телефона */
+    const blob = await mediaBlobFor(f, f.name || 'фото', abs);
 
     pmCurBlob = blob;
     pmCurUrl = URL.createObjectURL(blob);
     img.src = pmCurUrl;
     img.style.opacity = '1';
+
+    if (_spin) _spin.style.opacity = '0';
   } catch (e) {
     img.style.opacity = '1';
+
+    if (_spin) _spin.style.opacity = '0';
 
     if (e && (e.name === 'AbortError' || /abort/i.test(String(e.message || '')))) {
       showToast('⏹ Скачивание отменено');
@@ -8760,6 +10265,13 @@ function pmClose(e) {
   pmRevoke();
   pmLoading = false;
   pmApplyZoom(1.0, false);
+
+  const _spin = document.getElementById('pmSpin');
+
+  if (_spin) _spin.style.opacity = '0';
+
+  /* ВОЛНА 22.52: возвращаем фоновые blobs после закрытия */
+  startBlobAnimation();
 }
 
 async function pmDownload(e) {
@@ -8875,6 +10387,7 @@ if (!IS_TELEGRAM) {
         if (r.ok) {
           loadFiles();
           resumePendingUploads(); /* 22.39: докачка после закрытия мини-аппа */
+          setTimeout(botQueuePoll, 1200); /* 22.55: живая очередь «через бота» */
         } else {
           localStorage.removeItem('devo_web_token');
           WEB_TOKEN = '';
@@ -8895,6 +10408,11 @@ if (!IS_TELEGRAM) {
       setTimeout(function () {
         loadFiles(true);
       }, 4000);
+    } else {
+      /* ВОЛНА 22.55: переоткрыли мини-апп, а очередь «через бота» ещё
+         работает (или доделала работу, пока мы были вне Telegram) —
+         находим её и показываем прогресс в панели передач */
+      setTimeout(botQueuePoll, 1200);
     }
 
     /* 22.39: докачка прерванных загрузок после открытия мини-аппа */
