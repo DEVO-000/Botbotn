@@ -2746,6 +2746,14 @@ body.vp-lock {
     </p>
 
     <div style="display:flex;flex-direction:column;gap:8px">
+      <button class="sound-item-btn" id="uploadViaBotBtn" onclick="uploadViaBot()" style="background:#2481cc;color:#ffffff;border-color:#2481cc">
+        <div style="text-align:left">
+          <div style="font-weight:800">📤 Загрузить через Telegram</div>
+          <div style="font-size:11px;opacity:.85;margin-top:2px">Грузится в фоне — можно закрыть приложение</div>
+        </div>
+        <i data-lucide="send" style="width:18px;height:18px"></i>
+      </button>
+
       <button class="sound-item-btn" id="uploadAddBtn" onclick="pickUploadFiles()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
         <span>Добавить файл</span>
         <i data-lucide="plus" style="width:18px;height:18px"></i>
@@ -4287,11 +4295,43 @@ async function loadFiles(silent) {
       /* ВОЛНА 22.50: признаки Сейфа — «Достать из Сейфа» для файлов режима
          «без шифра» (plain) идёт БЕЗ пароля (сервер 22.50 это умеет) */
       safe: !!f.safe,
-      plain: !!f.plain
+      plain: !!f.plain,
+      /* ВОЛНА 22.57: откуда файл — «через бота» (из чата) или из веба;
+         нужно для тоста «Пока вас не было» после фоновых загрузок */
+      src: String(f.src || '')
     }));
 
     CONN.bot = String(data.bot || CONN.bot || '');
     CONN.build = String(data.build || CONN.build || '');
+
+    /* ВОЛНА 22.57: файлы, приехавшие «ЧЕРЕЗ БОТА» (из чата), пока мини-апп
+       был закрыт — короткий тост, чтобы пользователь точно знал: ничего
+       не потерялось. База — самый свежий ts из ПРОШЛОЙ синхронизации
+       (localStorage); при первом запуске базы нет — тоста нет, только
+       запоминаем. Старые записи со строковым ts (до 22.36) не считаются. */
+    try {
+      var _bgPrev = localStorage.getItem('dv_cloud_last_ts');
+      var _bgMax = 0;
+
+      for (var _i = 0; _i < ALL_FILES.length; _i++) {
+        var _t = +ALL_FILES[_i].ts;
+        if (_t > _bgMax) _bgMax = _t;
+      }
+
+      if (_bgPrev !== null && _bgMax) {
+        var _bgPrevNum = +_bgPrev || 0;
+        var _bgFresh = ALL_FILES.filter(function (f) {
+          return f.src === 'chat' && +f.ts > _bgPrevNum;
+        });
+
+        if (_bgFresh.length) {
+          showToast('📨 Через бота загрузилось: ' + _bgFresh.length +
+            ' файл(ов) — уже в облаке');
+        }
+      }
+
+      if (_bgMax) localStorage.setItem('dv_cloud_last_ts', String(_bgMax));
+    } catch (e) {}
 
     if (typeof data.plain === 'boolean') STORAGE_ENCRYPTED = !data.plain;
     /* ВОЛНА 22.52: зашифрованными считаем только НЕ-plain файлы Сейфа.
@@ -6608,7 +6648,9 @@ function refreshUploadModal() {
 
   if (info) {
     info.textContent = !has
-      ? 'Файлы ещё не выбраны — нажмите «Добавить файл» или перетащите их в облако'
+      /* ВОЛНА 22.57: подсказка о двух путях — «через бота» (в фоне,
+         главное) и «здесь» (быстро, пока приложение открыто) */
+      ? 'Через Telegram — грузится в фоне (можно закрыть приложение). «Добавить файл» — быстро здесь и сейчас.'
       : pendingFiles.length === 1
         ? (pendingFiles[0].name || 'файл')
         : 'Выбрано файлов: ' + pendingFiles.length;
@@ -6752,6 +6794,42 @@ function pickUploadFiles() {
 function addMoreUploadFiles() {
   pickerAppend = true;
   document.getElementById('fileInput').click();
+}
+
+/* ═══ ВОЛНА 22.57: ГЛАВНЫЙ ПУТЬ ЗАГРУЗКИ — «ЧЕРЕЗ БОТА» (в фоне) ═══
+   Физика WebView: когда мини-апп закрывают, его JS умирает, и байты
+   файлов перестают идти С ТЕЛЕФОНА навсегда — сколько движок ни улучшай.
+   Единственная по-настоящему фоновая загрузка — НАТИВНАЯ загрузка
+   Telegram: пользователь прикладывает файлы в ЧАТ бота, Telegram сам
+   доносит их (даже с закрытым мини-аппом; на Android — даже со
+   свёрнутым Telegram; очередь не теряется никогда), а бот сохраняет
+   всё в облако НА СЕРВЕРЕ. Кнопка открывает чат бота — дальше
+   пользователь просто прикрепляет файлы. */
+function uploadViaBot() {
+  const uname = String(CONN.bot || '').replace(/^@/, '').trim();
+
+  if (!uname) {
+    showToast('Не нашёл адрес бота — нажмите «🔄» в шапке и попробуйте ещё раз');
+    return;
+  }
+
+  const url = 'https://t.me/' + encodeURIComponent(uname);
+
+  try {
+    if (tg && tg.openTelegramLink) {
+      tg.openTelegramLink(url);
+      return;
+    }
+  } catch (e) {}
+
+  try {
+    if (tg && tg.openLink) {
+      tg.openLink(url);
+      return;
+    }
+  } catch (e) {}
+
+  window.open(url, '_blank');
 }
 
 function uploadFiles(fileList) {
