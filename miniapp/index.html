@@ -2749,7 +2749,7 @@ body.vp-lock {
       <button class="sound-item-btn" id="uploadViaBotBtn" onclick="uploadViaBot()" style="background:#2481cc;color:#ffffff;border-color:#2481cc">
         <div style="text-align:left">
           <div style="font-weight:800">📤 Загрузить через Telegram</div>
-          <div style="font-size:11px;opacity:.85;margin-top:2px">Грузится в фоне — можно закрыть приложение</div>
+          <div style="font-size:11px;opacity:.85;margin-top:2px">Грузится в фоне на 100% — прогресс появится здесь</div>
         </div>
         <i data-lucide="send" style="width:18px;height:18px"></i>
       </button>
@@ -4276,8 +4276,12 @@ const CONN = {
 let LAST_ERR = null;
 const NETERR_RE = /failed to fetch|networkerror|load failed|timed? ?out/i;
 let LAST_SYNC = 0;
+/* ВОЛНА 22.58: сигнатура списка файлов — если данные не изменились,
+   опрос (каждые 2.5с живой карточки) не перерисовывает и не мигает
+   карточками списка: DOM не трогаем вообще */
+let LAST_FILES_SIG = '';
 
-async function loadFiles(silent) {
+async function loadFiles(silent, quiet) {
   if (listLoading) return false;
 
   listLoading = true;
@@ -4324,7 +4328,7 @@ async function loadFiles(silent) {
           return f.src === 'chat' && +f.ts > _bgPrevNum;
         });
 
-        if (_bgFresh.length) {
+        if (_bgFresh.length && !bgUploadTracking()) {
           showToast('📨 Через бота загрузилось: ' + _bgFresh.length +
             ' файл(ов) — уже в облаке');
         }
@@ -4335,7 +4339,7 @@ async function loadFiles(silent) {
 
     if (typeof data.plain === 'boolean') STORAGE_ENCRYPTED = !data.plain;
     /* ВОЛНА 22.52: зашифрованными считаем только НЕ-plain файлы Сейфа.
-       Раньше existence ЛЮБОГО vault-файла (включая «без шифра») включало
+       Раньше существование ЛЮБОГО vault-файла (включая «без шифра») включало
        «шифрование» для всего интерфейса — пароль спрашивался даже там,
        где файл лежит в канале открыто. */
     else if (ALL_FILES.some((f) => f.vault && !f.plain)) STORAGE_ENCRYPTED = true;
@@ -4343,7 +4347,23 @@ async function loadFiles(silent) {
     LAST_ERR = null;
     LAST_SYNC = Date.now();
 
-    renderAll({ animate: true });
+    /* ВОЛНА 22.58: список не изменился — не перерисовываем его вовсе
+       (живой опрос каждые 2.5с не должен дёргать DOM и мигать карточками).
+       Тихий опрос (quiet) рендерит без волны появления — новые файлы
+       просто появляются на местах, плавно и без рывков */
+    const _sig = ALL_FILES.length + '|'
+      + ALL_FILES.map(function (f) {
+          return f.id + ':' + f.ts + ':' + f.name + ':' + f.size;
+        }).join('|');
+
+    if (_sig !== LAST_FILES_SIG) {
+      LAST_FILES_SIG = _sig;
+      renderAll({ animate: !quiet });
+    }
+
+    /* ВОЛНА 22.58: живая карточка «Загрузка через Telegram» — считаем
+       приехавшие из чата файлы и серверные статусы bg_live */
+    bgUploadApply(data.bg_live);
 
     return true;
   } catch (e) {
@@ -5724,6 +5744,197 @@ function botQueueTrack() {
   botQueueTimer = setTimeout(botQueuePoll, 300);
 }
 
+/* ═══ ВОЛНА 22.58: ЖИВАЯ КАРТОЧКА «ЗАГРУЗКА ЧЕРЕЗ БОТА» ═══
+   Физика WebView: мини-апп не может сам «отдать» выбранные файлы в чат
+   бота — байты уходят только пока он жив. Поэтому главный путь (22.57) —
+   файлы прикладываются В ЧАТЕ бота, Telegram доносит их сам (настоящий
+   фон, 100%), а бот сохраняет всё в облако на сервере. Здесь этот путь
+   становится ПРОЗРАЧНЫМ: карточка в панели передач включается в момент
+   нажатия кнопки «📤 Загрузить через Telegram» и живёт, пока файлы
+   едут: считает приехавшие из чата файлы (src='chat' свежее пометки
+   dv_bg_wait_ts) и показывает серверные статусы bg_live — в том числе
+   живые проценты больших файлов («Качаю с Telegram: 45%»). */
+let bgUploadTimer = null;
+let bgUploadLastGrow = 0;
+let bgUploadCount = 0;
+
+function bgUploadMarker() {
+  try {
+    return +localStorage.getItem('dv_bg_wait_ts') || 0;
+  } catch (e) {
+    return 0;
+  }
+}
+
+function bgUploadTracking() {
+  /* Активно ли живое отслеживание прямо сейчас (пометка свежая,
+     не старше 30 минут): свежие бот-загрузки показываются карточкой,
+     а не дублирующим тостом «Пока вас не было» */
+  const m = bgUploadMarker();
+
+  return !!(m && Date.now() / 1000 - m < 1800);
+}
+
+function bgUploadClearMarker() {
+  try { localStorage.removeItem('dv_bg_wait_ts'); } catch (e) {}
+}
+
+function bgUploadEnsureCard() {
+  if (!TRANSFERS.has('bgupload')) {
+    transferStart({
+      id: 'bgupload',
+      type: 'bgupload',
+      name: 'Загрузка через Telegram',
+      total: 1,
+      cancel: () => {
+        /* ручное снятие карточки — загрузкам в чате это не мешает,
+           просто перестаём подсвечивать прогресс */
+        bgUploadFinish(true, 0, 'Отслеживание остановлено');
+      }
+    });
+    bgUploadCount = 0;
+    bgUploadLastGrow = Date.now();
+  }
+}
+
+function bgUploadCard() {
+  return TRANSFERS.get('bgupload') || null;
+}
+
+function bgUploadSchedule(ms) {
+  if (bgUploadTimer) clearTimeout(bgUploadTimer);
+  bgUploadTimer = setTimeout(bgUploadTick, ms || 2500);
+}
+
+async function bgUploadTick() {
+  bgUploadTimer = null;
+
+  const t = bgUploadCard();
+
+  /* карточки нет (сняли/финишировали) и пометки нет — цикл не нужен */
+  if (!t) return;
+  if (t.done) return;
+
+  /* мини-апп скрыт (пользователь в чате бота) — сеть в WebView обычно
+     заморожена; при возврате всё подхватит visibilitychange + этот цикл */
+  if (document.hidden) {
+    bgUploadSchedule(5000);
+    return;
+  }
+
+  await loadFiles(true, true);
+
+  /* карточку могли финишировать прямо в loadFiles → bgUploadApply */
+  if (bgUploadCard() && !bgUploadCard().done) bgUploadSchedule(2500);
+}
+
+function bgUploadApply(live) {
+  /* Вызывается из loadFiles ПОСЛЕ обновления ALL_FILES: обновляет живую
+     карточку «через бота» (счётчик приехавших + серверные статусы) */
+  const markerRaw = bgUploadMarker();
+
+  /* пометка старше 30 минут — считаем отслеживание завершённым: такие
+     arrivals покажет обычный тост «Пока вас не было», а не карточка */
+  const marker = (markerRaw && Date.now() / 1000 - markerRaw < 1800)
+    ? markerRaw : 0;
+
+  if (markerRaw && !marker) bgUploadClearMarker();
+
+  let t = bgUploadCard();
+
+  if (!t && !marker) return;
+  if (t && t.done) return;
+
+  const liveArr = (live || []).filter(function (x) { return x && x.name; });
+  const fresh = marker
+    ? ALL_FILES.filter(function (f) { return f.src === 'chat' && +f.ts > marker; })
+    : [];
+
+  if (!t && marker && (fresh.length || liveArr.length)) {
+    bgUploadEnsureCard();
+    t = bgUploadCard();
+  }
+
+  if (!t) return;
+
+  if (fresh.length > bgUploadCount) {
+    /* первый приехавший — короткое подтверждение, что всё работает */
+    if (!bgUploadCount) showToast('📨 Файлы поехали — сохраняю в облако, можете вернуться в чат');
+    bgUploadCount = fresh.length;
+    bgUploadLastGrow = Date.now();
+  }
+
+  if (liveArr.length) bgUploadLastGrow = Date.now();
+
+  t.total = Math.max(1, fresh.length + liveArr.length);
+  t.loaded = fresh.length;
+
+  if (liveArr.length) {
+    const top = liveArr[0];
+    const stageText = top.stage === 'mt_dl'
+      ? 'Качаю с Telegram: ' + (+top.pct || 0) + '%'
+      : top.stage === 'mt_up'
+        ? 'Загружаю в облако: ' + (+top.pct || 0) + '%'
+        : 'Сохраняю в облако…';
+    t.note = '«' + top.name + '» — ' + stageText
+      + (liveArr.length > 1 ? ' · ещё ' + (liveArr.length - 1) : '')
+      + (fresh.length ? ' · готово: ' + fresh.length : '');
+  } else if (fresh.length) {
+    t.note = 'Сохранено в облако: ' + fresh.length + ' файл(ов)';
+  } else {
+    t.note = 'Ждём файлы из чата бота — отправьте их в чате (скрепка)';
+  }
+
+  ctSync();
+
+  /* финал: всё приехало и сохранилось, 6с тишины после последнего события */
+  if (!liveArr.length && fresh.length && Date.now() - bgUploadLastGrow > 6000) {
+    bgUploadFinish(true, fresh.length);
+    return;
+  }
+
+  /* таймаут ожидания: 12 минут карточка живёт без единого события —
+     снимаем её честным текстом (загрузкам в чате это не мешает) */
+  if (!liveArr.length && !fresh.length && Date.now() - t.t0 > 720000) {
+    bgUploadFinish(false, 0, 'Файлы не пришли — можно отправить их в чат бота позже');
+  }
+}
+
+function bgUploadFinish(ok, count, noteOverride) {
+  const t = bgUploadCard();
+
+  bgUploadClearMarker();
+  bgUploadCount = 0;
+
+  if (bgUploadTimer) {
+    clearTimeout(bgUploadTimer);
+    bgUploadTimer = null;
+  }
+
+  if (t && !t.done) {
+    transferFinish('bgupload', ok, noteOverride
+      || (ok && count ? 'Готово · ' + count + ' файл(ов) в облаке' : 'Завершено'));
+
+    if (ok && count) showToast('📨 Через бота: ' + count + ' файл(ов) — уже в облаке');
+  }
+}
+
+function bgUploadRestore() {
+  /* Переоткрытие мини-аппа: если недавно уходили «через бота» (WebView
+     мог быть убит, пока пользователь был в чате) — оживляем карточку
+     и цикл опроса: приехавшие файлы посчитаются и покажут итог */
+  const marker = bgUploadMarker();
+
+  if (!marker) return;
+  if (Date.now() / 1000 - marker > 1800) {
+    bgUploadClearMarker();
+    return;
+  }
+
+  bgUploadEnsureCard();
+  bgUploadSchedule(800);
+}
+
 async function enqueueBotDownload(ids) {
   /* ВОЛНА 22.55: ставим файлы в серверную очередь «через бота».
   Возвращает true при успехе; при safe_locked открывает окно пароля
@@ -6812,6 +7023,18 @@ function uploadViaBot() {
     showToast('Не нашёл адрес бота — нажмите «🔄» в шапке и попробуйте ещё раз');
     return;
   }
+
+  /* ВОЛНА 22.58: включаем живое отслеживание. Пометка dv_bg_wait_ts —
+     момент ухода в чат бота: всё, что приедет из чата ПОСЛЕ неё (src='chat'),
+     карточка в панели передач посчитает своим. Карточка живёт, пока
+     пользователь прикладывает файлы в чате: показывает серверные статусы
+     (bg_live: «Качаю с Telegram: 45%») и счётчик «Сохранено: N». */
+  try {
+    localStorage.setItem('dv_bg_wait_ts', String(Math.floor(Date.now() / 1000)));
+  } catch (e) {}
+  bgUploadEnsureCard();
+  bgUploadSchedule(1500);
+  showToast('Прикрепите файлы скрепкой в чате бота — Telegram доносит их в фоне, здесь появится прогресс');
 
   const url = 'https://t.me/' + encodeURIComponent(uname);
 
@@ -8296,6 +8519,15 @@ function ctSubText(t) {
     return t.note || 'Бот отправляет в чат — можно закрывать мини-апп';
   }
 
+  /* ВОЛНА 22.58: загрузка «через бота» — статус текстом (готовит
+     bgUploadApply: счётчик «Сохранено: N» и проценты больших файлов);
+     байты не считаются — файлов может быть сколько угодно */
+  if (t.type === 'bgupload') {
+    if (t.done) return t.note || 'Готово';
+
+    return t.note || 'Ждём файлы из чата бота…';
+  }
+
   const sec = (Date.now() - t.t0) / 1000;
   const speed = (sec > 0.8 && t.loaded) ? fmtSize(t.loaded / sec) + '/с · ' : '';
 
@@ -8323,7 +8555,9 @@ function ctRow(t) {
           ? '<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 7.5-2"/><path d="m3 3 18 18"/>'
           : t.type === 'botqueue'
             ? '<path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/>'
-            : '<path d="M12 5v14"/><path d="m19 12-7 7-7-7"/>')
+            : t.type === 'bgupload'
+              ? '<path d="M4 14.899A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.5 8.242"/><path d="M12 12v9"/><path d="m8 17 4-4 4 4"/>'
+              : '<path d="M12 5v14"/><path d="m19 12-7 7-7-7"/>')
     + '</svg>';
 
   const main = document.createElement('div');
@@ -8363,7 +8597,10 @@ function ctRow(t) {
       ? '<svg viewBox="0 0 24 24" stroke="#34c759"><path d="M20 6 9 17l-5-5"/></svg>'
       : '<svg viewBox="0 0 24 24" stroke="#ef4444"><path d="M18 6 6 18M6 6l12 12"/></svg>';
     row.appendChild(doneEl);
-  } else {
+  } else if (t.cancel) {
+    /* ВОЛНА 22.58: кнопка отмены — только у передач, которые реально
+       отменяются; карточка bgupload лишь наблюдает за бот-загрузками
+       (крестик снимает отслеживание, не трогая сами загрузки) */
     const btn = document.createElement('button');
     btn.className = 'ct-item-cancel';
     btn.setAttribute('aria-label', 'Отменить');
@@ -10466,6 +10703,7 @@ if (!IS_TELEGRAM) {
           loadFiles();
           resumePendingUploads(); /* 22.39: докачка после закрытия мини-аппа */
           setTimeout(botQueuePoll, 1200); /* 22.55: живая очередь «через бота» */
+          setTimeout(bgUploadRestore, 900); /* 22.58: живая карточка бот-загрузок */
         } else {
           localStorage.removeItem('devo_web_token');
           WEB_TOKEN = '';
@@ -10492,6 +10730,11 @@ if (!IS_TELEGRAM) {
          находим её и показываем прогресс в панели передач */
       setTimeout(botQueuePoll, 1200);
     }
+
+    /* ВОЛНА 22.58: карточка «через бота» — оживляем в любом случае
+       (даже если первый синк не удался): без пометки функция тихо
+       выйдет, со свежей — сразу покажет прогресс бот-загрузок */
+    setTimeout(bgUploadRestore, 900);
 
     /* 22.39: докачка прерванных загрузок после открытия мини-аппа */
     setTimeout(resumePendingUploads, 800);
