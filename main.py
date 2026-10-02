@@ -3641,7 +3641,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.54"
+BOT_BUILD = "22.55"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -9243,8 +9243,6 @@ html.low-end .file-card {
   overscroll-behavior: contain;
   touch-action: none;
   transition:
-    backdrop-filter 0.4s var(--ease-smooth),
-    -webkit-backdrop-filter 0.4s var(--ease-smooth),
     background-color 0.35s var(--ease-smooth),
     visibility 0s linear 0.45s;
 }
@@ -9255,9 +9253,12 @@ html.low-end .file-card {
   background: var(--overlay-bg, rgba(0, 0, 0, 0.5));
   backdrop-filter: blur(14px) saturate(160%);
   -webkit-backdrop-filter: blur(14px) saturate(160%);
+  /* ВОЛНА 22.55: САМОГО дорогого в открытии окон больше нет — анимации
+     самого backdrop-filter (0 -> 14px = пересчёт размытия КАЖДЫЙ кадр на
+     слабых GPU = «дёрганое открытие»). Теперь blur применяется мгновенно
+     в первом кадре, а мягкость даёт fade подложки + поезд карточки.
+     Статичный blur дёшев: композитор кэширует его, пока фон не меняется */
   transition:
-    backdrop-filter 0.4s var(--ease-smooth),
-    -webkit-backdrop-filter 0.4s var(--ease-smooth),
     background-color 0.35s var(--ease-smooth),
     visibility 0s;
 }
@@ -9465,7 +9466,12 @@ html.low-end .file-card {
   max-height: 0;
   opacity: 0;
   transition: max-height 0.4s var(--ease-ultra), opacity 0.35s var(--ease-smooth);
-  will-change: max-height, opacity;
+}
+
+/* ВОЛНА 22.55: слабым устройствам — мгновенный раскрытие подменю
+   (анимация max-height = layout КАЖДЫЙ кадр; opacity оставлен) */
+html.low-end .settings-submenu {
+  transition: opacity 0.2s var(--ease-smooth);
 }
 
 .settings-submenu.open {
@@ -9752,6 +9758,9 @@ html.low-end .file-card {
   visibility: hidden;
   transform: translateY(18px) scale(0.82);
   transform-origin: 100% 100%;
+  /* ВОЛНА 22.55: слой подсказан заранее — первый кадр открытия панели
+     без лага на аллокацию */
+  will-change: transform;
   transition:
     transform 0.42s var(--ease-snap),
     opacity 0.28s var(--ease-smooth),
@@ -9901,8 +9910,12 @@ html.low-end #cornerTransfers.panel-open .ct-panel {
   height: 100%;
   border-radius: 9999px;
   background: var(--loader-bar);
-  width: 0%;
-  transition: width 0.2s linear;
+  /* ВОЛНА 22.55: заливка через transform: scaleX вместо width — прогресс
+     передач больше НЕ двигает layout N-полосок каждый тик (композитор) */
+  width: 100%;
+  transform-origin: 0 50%;
+  transform: scaleX(0);
+  transition: transform 0.2s linear;
 }
 
 .ct-item-bar-fill.done {
@@ -9988,7 +10001,6 @@ html.low-end #cornerTransfers.panel-open .ct-panel {
   transition:
     transform 0.44s cubic-bezier(0.55, 0.06, 0.68, 0.19),
     opacity 0.3s cubic-bezier(0.45, 0, 0.7, 0.4),
-    background 1s ease,
     visibility 0s linear 0.46s;
 }
 
@@ -9997,21 +10009,23 @@ html.low-end #cornerTransfers.panel-open .ct-panel {
   pointer-events: auto;
   opacity: 1;
   transform: translate3d(0, 0, 0) scale(1);
+  /* ВОЛНА 22.55: background убран из transition — раньше смена палитры
+     трека перекрашивала fullscreen-слой 60 кадров подряд ( repaint 80vmax
+     слоёв = джанк на слабых GPU). Смена мгновенна, слои статичны */
   transition:
     transform 0.5s var(--ease-snap),
     opacity 0.35s var(--ease-smooth),
-    background 1s ease,
     visibility 0s;
 }
 
 /* Слабые устройства: чуть короче — композиция кадров легче.
-   ВАЖНО: порядок = transform, opacity, background, visibility */
+   ВАЖНО: порядок = transform, opacity, visibility */
 html.low-end #musicPlayer {
-  transition-duration: 0.34s, 0.26s, 1s, 0s;
+  transition-duration: 0.34s, 0.26s, 0s;
 }
 
 html.low-end #musicPlayer.open {
-  transition-duration: 0.3s, 0.25s, 1s, 0s;
+  transition-duration: 0.3s, 0.25s, 0s;
 }
 
 body.mp-lock {
@@ -10037,7 +10051,6 @@ body.mp-lock {
   mask-image: radial-gradient(circle closest-side, #000 0%, rgba(0, 0, 0, 0.85) 45%, rgba(0, 0, 0, 0.35) 72%, transparent 100%);
   opacity: 0.5;
   will-change: transform;
-  transition: background 0.8s ease;
   transform: translate3d(0, 0, 0);
 }
 
@@ -10058,7 +10071,6 @@ body.mp-lock {
   mask-image: radial-gradient(circle closest-side, #000 0%, rgba(0, 0, 0, 0.9) 55%, rgba(0, 0, 0, 0.3) 80%, transparent 100%);
   opacity: 0.8;
   will-change: transform;
-  transition: background 0.8s ease;
   transform: translate3d(0, 0, 0);
 }
 
@@ -10142,7 +10154,10 @@ html.low-end #musicPlayer .mp-circle {
   overflow: hidden;
   position: relative;
   box-shadow: 0 20px 40px rgba(0, 0, 0, 0.5);
-  transition: transform 0.5s cubic-bezier(0.175, 0.885, 0.32, 1.275), box-shadow 0.5s ease;
+  /* ВОЛНА 22.55: box-shadow убран из transition — смена тени play/pause
+     repaint-ила 320px-слой с blur-тенью каждый кадр 0.5 с. Смена мгновенна
+     (тени различаются едва), плавный scale остался */
+  transition: transform 0.5s cubic-bezier(0.175, 0.885, 0.32, 1.275);
 }
 
 #musicPlayer .art-container.playing {
@@ -10284,9 +10299,14 @@ html.low-end #musicPlayer .art-container.mp-switch {
   height: 100%;
   background: #fff;
   border-radius: 9999px;
-  width: 0%;
+  /* ВОЛНА 22.55: заливка через transform: scaleX вместо width — позиция
+     трека больше НЕ двигает layout полоски десятки раз в секунду
+     (композитор; --mp-inv держит ручку круглой при контр-масштабе) */
+  width: 100%;
+  transform-origin: 0 50%;
+  transform: scaleX(var(--mp-sx, 0));
   position: relative;
-  transition: width 0.1s linear;
+  transition: transform 0.1s linear;
 }
 
 #musicPlayer .progress-fill::after {
@@ -10304,7 +10324,9 @@ html.low-end #musicPlayer .art-container.mp-switch {
 }
 
 #musicPlayer .progress-fill.active::after {
-  transform: translateY(-50%) scale(1);
+  /* ВОЛНА 22.55: контр-масштаб ручки (1 / --mp-sx) — круглая при любом
+     положении заливки; значение пишет JS вместе с --mp-sx */
+  transform: translateY(-50%) scale(var(--mp-inv, 1));
 }
 
 /* ═══ ВОЛНА 22.52: СПИННЕР ЗАГРУЗКИ НА КНОПКЕ PLAY ═══
@@ -10444,7 +10466,11 @@ html.low-end #musicPlayer .art-container.mp-switch {
   height: 8px;
   border-radius: 9999px;
   background: rgba(255, 255, 255, 0.25);
-  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  /* ВОЛНА 22.55: универсальный переход заменён на точечный — он инвалидовал
+     layout точки по ЛЮБОМУ свойству; расширяются только width/цвет */
+  transition:
+    width 0.3s cubic-bezier(0.4, 0, 0.2, 1),
+    background-color 0.3s cubic-bezier(0.4, 0, 0.2, 1);
   cursor: pointer;
   flex-shrink: 0;
 }
@@ -10479,12 +10505,15 @@ html.low-end #musicPlayer .art-container.mp-switch {
    Плавность: transform + width/height транзишеном 0.55s; зум (scale на самом
    видео) живёт отдельно и compose'ится без конфликтов */
 #videoPlayerModal {
+  /* ВОЛНА 22.55: width/height убраны из transition — раньше переворот
+     анимировал РАЗМЕРЫ fullscreen-элемента = layout КАЖДЫЙ кадр 0.55 с
+     (самая тяжёлая анимация приложения, слайд-шоу на слабых девайсах).
+     Теперь размеры ставятся мгновенно (под чёрной подложкой их не видно),
+     а плавным остаётся сам ПОВОРОТ (transform — композитор). */
   transition:
     opacity 0.35s var(--ease-smooth),
     visibility 0s linear 0.35s,
-    transform 0.55s var(--ease-snap),
-    width 0.55s var(--ease-snap),
-    height 0.55s var(--ease-snap);
+    transform 0.55s var(--ease-snap);
 }
 
 #vpRot {
@@ -10498,22 +10527,31 @@ html.low-end #musicPlayer .art-container.mp-switch {
   align-items: center;
   justify-content: center;
   transition:
-    transform 0.55s var(--ease-snap),
-    width 0.55s var(--ease-snap),
-    height 0.55s var(--ease-snap);
+    transform 0.55s var(--ease-snap);
   will-change: transform;
+}
+
+/* Слабые устройства: поворот короче — меньше кадров тяжёлой перерисовки.
+   Порядок длительностей = opacity, visibility, transform */
+html.low-end #videoPlayerModal {
+  transition-duration: 0.25s, 0s, 0.3s;
+}
+
+html.low-end #vpRot {
+  transition-duration: 0.3s;
 }
 
 #videoPlayerModal.open {
   visibility: visible;
   pointer-events: auto;
   opacity: 1;
+  /* ВОЛНА 22.55: и в ОТКРЫТОМ состоянии поворот анимирует только transform —
+     width/height ставятся мгновенно (layout-анимация fullscreen каждый кадр
+     была самым тяжёлым местом приложения) */
   transition:
     opacity 0.35s var(--ease-smooth),
     visibility 0s,
-    transform 0.55s var(--ease-snap),
-    width 0.55s var(--ease-snap),
-    height 0.55s var(--ease-snap);
+    transform 0.55s var(--ease-snap);
 }
 
 body.vp-lock {
@@ -10555,9 +10593,26 @@ body.vp-lock {
   100% { opacity: 0; transform: translateY(15px) scale(0.95); }
 }
 
-@keyframes vpFadeIn {
-  from { opacity: 0; transform: translateY(10px); }
-  to { opacity: 1; transform: translateY(0); }
+/* ВОЛНА 22.55: слабым устройствам — blur-стёкла кнопок/тостов плееров
+   заменены на плотные подложки (backdrop-filter поверх играющего видео
+   пересчитывается каждый кадр зума/кнопок — главная причина лагов плееров
+   на слабых GPU; вид тот же, читаемость даже выше) */
+html.low-end #vpSpeed,
+html.low-end #vpRewind,
+html.low-end #vpHeader button,
+html.low-end #videoPlayerModal .vp-toast {
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+
+html.low-end #vpHeader button {
+  background: rgba(40, 40, 40, 0.78) !important;
+}
+
+html.low-end #photoModal .pm-btn {
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  background: rgba(40, 40, 40, 0.78) !important;
 }
 
 #videoPlayerModal input[type=range] {
@@ -10709,17 +10764,29 @@ body.vp-lock {
   touch-action: manipulation;
 }
 
-/* ═══ 22.39: ФОТОПРОСМОТРЩИК (полный экран, стиль плееров) ═══ */
+/* ═══ 22.39: ФОТОПРОСМОТРЩИК (полный экран, стиль плееров) ═══
+   ВОЛНА 22.55: плавное открытие/закрытие — раньше display:none делал
+   появление/исчезание МГНОВЕННЫМ (резко на фоне остальных окон). Заменено
+   на visibility+opacity (как у видеоплеера): тот же дизайн, но fade 0.25 с */
 #photoModal {
   position: fixed;
   inset: 0;
   background: #000;
   z-index: 230;
-  display: none;
+  display: flex;
   flex-direction: column;
+  visibility: hidden;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.25s var(--ease-smooth), visibility 0s linear 0.25s;
 }
 
-#photoModal.open { display: flex; }
+#photoModal.open {
+  visibility: visible;
+  pointer-events: auto;
+  opacity: 1;
+  transition: opacity 0.25s var(--ease-smooth), visibility 0s;
+}
 
 #photoModal .pm-header {
   padding: calc(env(safe-area-inset-top, 0px) + 14px) 16px 12px;
@@ -13042,12 +13109,18 @@ function escapeHtml(s) {
 let touchStartY = 0;
 let touchCurrentY = 0;
 let isDraggingModal = false;
+/* ВОЛНА 22.55: прокручиваемость карточки — кэш на один жест (см. touchstart) */
+let modalDragScrollable = false;
 
 const modalCard = document.getElementById('modalCard');
 
 modalCard.addEventListener('touchstart', (e) => {
   touchStartY = e.touches[0].clientY;
   isDraggingModal = true;
+  /* ВОЛНА 22.55: прокручиваемость карточки кэшируется ОДИН раз на жест —
+     раньше scrollHeight/clientHeight читались на КАЖДОМ touchmove
+     (forced layout во время жеста = дёрганый drag на слабых девайсах) */
+  modalDragScrollable = modalCard.scrollHeight > modalCard.clientHeight + 4;
   modalCard.style.transition = 'none';
 }, { passive: true });
 
@@ -13057,7 +13130,7 @@ modalCard.addEventListener('touchmove', (e) => {
   /* 22.39: если карточка переполнена и прокручивается — НЕ перехватываем
      вертикальный жест: отдаём его внутренней прокрутке (иначе жест тащил
      карточку вниз, а контент не листался) */
-  if (modalCard.scrollHeight > modalCard.clientHeight + 4) {
+  if (modalDragScrollable) {
     isDraggingModal = false;
     modalCard.style.transition = '';
     modalCard.style.transform = '';
@@ -14166,6 +14239,11 @@ function cancelUpload() {
 
   uploadAbortFlag = true;
 
+  /* ВОЛНА 22.55: отменяем и сессии предохранки (файлы летели в бота
+     параллельно окнам) — без этого по отменённым файлам бот присылал
+     «⏸ Загрузка на паузе», а сессии висели до TTL */
+  abortPrestreamSessions();
+
   uploadXhrs.forEach((x) => {
     try { x.abort(); } catch (e) {}
   });
@@ -14581,20 +14659,11 @@ function openModalEl(id) {
   clearTimeout(m._blurT1);
   clearTimeout(m._blurT2);
 
-  /* Цвет и blur разгоняются ОДНОВРЕМЕННО: .blur-off держит blur(0) ровно 2 кадра
-     (double rAF — движок должен закоммитить стартовое значение, иначе transition
-     пойдёт none -> blur «рывком»), дальше CSS 0.4s ведёт blur 0 -> 14px вместе
-     с подложкой. Раньше blur стартовал только через 460 мс — получалось
-     «сначала цвет, потом размытие». Повторное открытие открытого окна — без
-     повторного «провала» blur в ноль */
-  if (!m.classList.contains('open')) {
-    m.classList.add('blur-off');
-
-    requestAnimationFrame(() => requestAnimationFrame(() => {
-      if (m.classList.contains('open')) m.classList.remove('blur-off');
-    }));
-  }
-
+  /* ВОЛНА 22.55: blur больше НЕ анимируется (см. .modal-overlay.open) —
+     применяется мгновенно в первом кадре, мягкость даёт fade подложки.
+     Прежний «разгон» blur-off/double-rAF при открытии убран: он держал
+     blur на нуле 2 кадра и давал видимый скачок. Закрытие (ниже) по-прежнему
+     снимает blur сразу — резкой смены нет, т.к. подложка гаснет 0.35 с */
   m.classList.add('open');
   document.body.classList.add('modal-open');
 
@@ -15330,6 +15399,64 @@ let PRE_CONCURRENCY = 2;        /* сколько файлов грузим «в
 let PRE_RUNNING = 0;
 const PRE_QUEUE = [];
 
+/* ВОЛНА 22.55: серверная отмена сессии (fire-and-forget, идемпотентна) —
+   ручная отмена больше не оставляет фантомные partial-сессии, по которым
+   бот через 30 секунд присылал ложное «⏸ Загрузка на паузе» */
+function abortServerSession(uploadId) {
+  if (!uploadId) return;
+
+  try {
+    fetch('/api/upload/abort', {
+      method: 'POST',
+      keepalive: true,
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ uploadId: uploadId })
+    }).catch(function () {});
+  } catch (e) {}
+}
+
+/* отменить ВСЕ сессии предохранки (пачка «отменена пользователем») */
+function abortPrestreamSessions() {
+  try {
+    const seen = {};
+    const fs = [].concat(pendingFiles || [], PRE_QUEUE || [], uploadQueue || []);
+
+    for (const f of fs) {
+      if (!f || !f._preId || seen[f._preId]) continue;
+
+      seen[f._preId] = true;
+      f._preStop = true;
+      abortServerSession(f._preId);
+    }
+  } catch (e) {}
+}
+
+/* ВОЛНА 22.55: отпечаток первого куска (sha256 hex) — сервер сверяет его
+   при init-reuse, чтобы ДРУГОЙ файл с тем же именем/размером не приклеился
+   к чужой недогруженной сессии и не уехал в канал под видом догрузки */
+async function sig0For(file) {
+  try {
+    if (!(window.crypto && crypto.subtle && crypto.subtle.digest)) return '';
+
+    const n = Math.min(CHUNK_SIZE, +file.size || 0);
+
+    if (n <= 0) return '';
+
+    const buf = await file.slice(0, n).arrayBuffer();
+    const h = await crypto.subtle.digest('SHA-256', buf);
+
+    let out = '';
+
+    new Uint8Array(h).forEach((b) => {
+      out += b.toString(16).padStart(2, '0');
+    });
+
+    return out;
+  } catch (e) {
+    return '';
+  }
+}
+
 function prestreamKick() {
   while (PRE_RUNNING < PRE_CONCURRENCY && PRE_QUEUE.length) {
     const f = PRE_QUEUE.shift();
@@ -15380,6 +15507,8 @@ async function _preStreamFile(file) {
   file._preState = 'run';
 
   try {
+    if (!file._sig0) file._sig0 = await sig0For(file);
+
     const initData = await apiJson('/api/upload/init', {
       method: 'POST',
       headers: vaultHeaders({ 'Content-Type': 'application/json' }),
@@ -15387,7 +15516,8 @@ async function _preStreamFile(file) {
         name: upName,
         size: +file.size || 0,
         mime: file.type || '',
-        password: file._uploadPw || ''
+        password: file._uploadPw || '',
+        sig0: file._sig0 || ''
       })
     });
 
@@ -15555,6 +15685,8 @@ async function _uploadOneSession(file, reportBytes) {
   }
 
   if (!uploadId) {
+    if (!file._sig0) file._sig0 = await sig0For(file);
+
     const initData = await apiJson('/api/upload/init', {
       method: 'POST',
       headers: vaultHeaders({ 'Content-Type': 'application/json' }),
@@ -15565,7 +15697,8 @@ async function _uploadOneSession(file, reportBytes) {
         /* 22.40: пароль именно этой загрузки (для «без шифрования» → Сейф).
            ВОЛНА 22.50: берём из file._uploadPw (зафиксирован при постановке
            в очередь) — рестарт сессии больше не подхватывает чужой пароль. */
-        password: file._uploadPw || ''
+        password: file._uploadPw || '',
+        sig0: file._sig0 || ''
       })
     });
 
@@ -15917,6 +16050,10 @@ async function uploadEngine(bar) {
     for (const f of uploadQueue) {
       if (f._entryKey) upqDel(f._entryKey);
     }
+
+    /* ВОЛНА 22.55: и гасим сессии предохранки — фантомных partial-сессий
+       и ложных «⏸ на паузе» по отменённым файлам больше нет */
+    abortPrestreamSessions();
 
     resetUploadUI(bar, checkmark, squareStop);
     return;
@@ -16312,7 +16449,8 @@ function ctRow(t) {
     ? 100
     : (t.total ? Math.min(100, (t.loaded / t.total) * 100) : 0);
 
-  barFill.style.width = startPct + '%';
+  /* ВОЛНА 22.55: заливка через scaleX (композитор), не width (layout) */
+  barFill.style.transform = 'scaleX(' + (startPct / 100).toFixed(4) + ')';
 
   barWrap.appendChild(barFill);
   main.appendChild(nameEl);
@@ -16417,7 +16555,10 @@ function ctSyncNow() {
       if (fill) {
         const pct = t.total ? Math.min(100, (t.loaded / t.total) * 100) : 0;
 
-        fill.style.width = (t.done && t.ok ? 100 : pct) + '%';
+        /* ВОЛНА 22.55: scaleX вместо width — прогресс передач не двигает
+           layout полосок каждый тик */
+        fill.style.transform =
+          'scaleX(' + ((t.done && t.ok ? 100 : pct) / 100).toFixed(4) + ')';
 
         if (t.done && t.ok) fill.classList.add('done');
       }
@@ -16459,6 +16600,19 @@ let mpScrubbing = false;
 let mpSeekPending = null;
 let mpSeekPendingTimer = null;
 let mpScrubLastPct = 0;
+/* ВОЛНА 22.55: кэш rect полоски на время скраба + единая запись заливки
+   (scaleX + контр-масштаб ручки) — видны и скрабу, и тикеру */
+let mpScrubRect = null;
+
+function mpMpSetFill(pct100) {
+  if (!mpEl.mpProgressFill) return;
+
+  const sx = Math.max(0, Math.min(1, pct100 / 100));
+
+  mpEl.mpProgressFill.style.transform = 'scaleX(' + sx.toFixed(4) + ')';
+  mpEl.mpProgressFill.style.setProperty('--mp-inv',
+    sx > 0.02 ? (1 / sx).toFixed(4) : '1');
+}
 /* ВОЛНА 22.52: «плеер должен открываться сразу, а загрузка — на кнопке».
    mpLoading — трек ещё доставается (спиннер на большой кнопке);
    mpDeferredAutoplay — тап по кнопке ВО время загрузки = «после готовности
@@ -16486,6 +16640,9 @@ let mpDataArray = null;
 let mpAudioInit = false;
 let mpSmoothBass = 0;
 let mpSmoothMid = 0;
+/* ВОЛНА 22.55: круги «дышали» (дрейф) только пока играет музыка;
+   флаг «была анимация» — чтобы на паузе докатиться к норме и замереть */
+let mpBeatMoved = false;
 
 function mpCache() {
   if (mpAudioEl) return;
@@ -16516,11 +16673,18 @@ function mpCache() {
   const mpSeekFromEvent = (e) => {
     if (!mpAudioEl || !mpAudioEl.duration || !isFinite(mpAudioEl.duration)) return undefined;
 
-    const rect = mpEl.mpProgressBg.getBoundingClientRect();
+    /* ВОЛНА 22.55: rect кэшируется на pointerdown — раньше getBoundingClientRect
+       вызывался на КАЖДЫЙ pointermove (forced layout на каждое событие
+       перетаскивания = дёрганый скраб на слабых WebView) */
+    if (!mpScrubRect) {
+      mpScrubRect = mpEl.mpProgressBg.getBoundingClientRect();
+    }
+
+    const rect = mpScrubRect;
     const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
 
     mpScrubLastPct = pct;
-    mpEl.mpProgressFill.style.width = (pct * 100) + '%';
+    mpMpSetFill(pct * 100);
     mpEl.mpCurrent.textContent = mpFmtTime(pct * mpAudioEl.duration);
 
     return pct;
@@ -16533,6 +16697,9 @@ function mpCache() {
       mpScrubbing = true;
 
       try { mpEl.mpProgressBg.setPointerCapture(e.pointerId); } catch (err) {}
+
+      /* ВОЛНА 22.55: rect полоски кэшируется ОДИН раз на жест */
+      mpScrubRect = mpEl.mpProgressBg.getBoundingClientRect();
 
       const pct = mpSeekFromEvent(e);
 
@@ -16556,6 +16723,7 @@ function mpCache() {
       if (!mpScrubbing) return;
 
       mpScrubbing = false;
+      mpScrubRect = null;
 
       const pct = mpSeekFromEvent(e);
 
@@ -16573,6 +16741,7 @@ function mpCache() {
       if (!mpScrubbing) return;
 
       mpScrubbing = false;
+      mpScrubRect = null;
 
       /* палец сорвался системой — фиксируем последнюю предпросмотренную
          позицию, а не старую (куда поставил — там и остаётся) */
@@ -16964,7 +17133,8 @@ async function mpLoad(i, autoplay) {
 
   mpResetCover();
 
-  mpEl.mpProgressFill.style.width = '0%';
+  mpEl.mpProgressFill.style.transform = 'scaleX(0)';
+  mpEl.mpProgressFill.style.setProperty('--mp-inv', '1');
   mpEl.mpCurrent.textContent = '0:00';
   mpEl.mpDuration.textContent = '0:00';
 
@@ -17098,7 +17268,9 @@ function mpInitWebAudio() {
 function mpRenderBeat() {
   if (!mpAudioInit) return;
 
-  if (!mpPlaying()) {
+  const playing = mpPlaying();
+
+  if (!playing) {
     mpSmoothBass += (0 - mpSmoothBass) * 0.05;
     mpSmoothMid += (0 - mpSmoothMid) * 0.05;
   } else {
@@ -17114,17 +17286,39 @@ function mpRenderBeat() {
     mpSmoothMid += (midSignal - mpSmoothMid) * (midSignal > mpSmoothMid ? 0.10 : 0.05);
   }
 
+  /* ВОЛНА 22.55: на паузе круги замирают (раньше дрейф t продолжал гонять
+     ТРИ огромных слоя 80vmax/45vmax даже на стоящем треке = постоянная
+     GPU-нагрузка всё время открытого плеера). Пишем стиль только пока
+     масштаб реально меняется — релакс к 1 заканчивается тихим простоем */
+  const settled = !playing && Math.abs(mpSmoothBass) < 0.004 &&
+    Math.abs(mpSmoothMid) < 0.004 && !mpBeatMoved;
+
+  if (settled) return;
+
   const t = performance.now() * 0.0004;
 
   const scale1 = 1 + mpSmoothBass * 0.22;
   const scale2 = 1 + mpSmoothMid * 0.18;
   const glowScale = 1 + mpSmoothBass * 0.12;
 
-  mpEl.mpGlow.style.transform = 'translate3d(0,0,0) scale(' + glowScale + ')';
+  if (playing) mpBeatMoved = true;
+
+  mpEl.mpGlow.style.transform = 'translate3d(0,0,0) scale(' + glowScale.toFixed(4) + ')';
   mpEl.mpCircle1.style.transform =
-    'translate3d(' + (Math.sin(t * 1.2) * 110).toFixed(1) + 'px,' + (Math.cos(t * 0.8) * 90).toFixed(1) + 'px,0) scale(' + scale1.toFixed(3) + ')';
+    'translate3d(' + (playing ? (Math.sin(t * 1.2) * 110).toFixed(1) : '0') + 'px,' +
+    (playing ? (Math.cos(t * 0.8) * 90).toFixed(1) : '0') + 'px,0) scale(' + scale1.toFixed(3) + ')';
   mpEl.mpCircle2.style.transform =
-    'translate3d(' + (Math.cos(t * 1.1) * 120).toFixed(1) + 'px,' + (Math.sin(t * 0.9) * 100).toFixed(1) + 'px,0) scale(' + scale2.toFixed(3) + ')';
+    'translate3d(' + (playing ? (Math.cos(t * 1.1) * 120).toFixed(1) : '0') + 'px,' +
+    (playing ? (Math.sin(t * 0.9) * 100).toFixed(1) : '0') + 'px,0) scale(' + scale2.toFixed(3) + ')';
+
+  if (!playing && Math.abs(mpSmoothBass) < 0.004 &&
+      Math.abs(mpSmoothMid) < 0.004) {
+    /* докатиться к точной норме и замереть */
+    mpEl.mpGlow.style.transform = 'translate3d(0,0,0) scale(1)';
+    mpEl.mpCircle1.style.transform = 'translate3d(0,0,0) scale(1)';
+    mpEl.mpCircle2.style.transform = 'translate3d(0,0,0) scale(1)';
+    mpBeatMoved = false;
+  }
 }
 
 function mpBeatLoop() {
@@ -17152,7 +17346,9 @@ function mpTickLoop() {
         Math.abs(pct - mpTickLoop._lastPct) > 0.15) {
       mpTickLoop._lastPct = pct;
 
-      mpEl.mpProgressFill.style.width = pct + '%';
+      /* ВОЛНА 22.55: заливка — transform: scaleX (композитор) вместо width
+         (layout); --mp-inv держит ручку круглой при контр-масштабе */
+      mpMpSetFill(pct);
     }
 
     const cur = mpFmtTime(mpAudioEl.currentTime);
@@ -17308,8 +17504,13 @@ function openMusicPlayer(fileId, forcedUrl) {
 
   mpRenderDots();
 
-  /* rAF-циклы живут только пока плеер открыт */
-  if (!mpBeatRaf) mpBeatRaf = requestAnimationFrame(mpBeatLoop);
+  /* rAF-циклы живут только пока плеер открыт.
+     ВОЛНА 22.55: beat-цикл (3 огромных слоя каждый кадр) на слабых
+     устройствах и при reduced-motion не запускается вовсе — там круги
+     статичны (дизайн приглушён сознательно, как и был на low-end) */
+  if (!LOW_END && !REDUCED_MOTION && !mpBeatRaf) {
+    mpBeatRaf = requestAnimationFrame(mpBeatLoop);
+  }
   if (!mpTickRaf) mpTickRaf = requestAnimationFrame(mpTickLoop);
 
   mpLoad(start, true);
@@ -18159,8 +18360,13 @@ function vpCloseModal(e) {
   if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
   vpForceLandscape(false);
 
-  /* ВОЛНА 22.52: возвращаем фоновые blobs после закрытия плеера */
-  startBlobAnimation();
+  /* ВОЛНА 22.52: возвращаем фоновые blobs после закрытия плеера.
+     ВОЛНА 22.55: с задержкой ПОСЛЕ fade-out (0.35 с) — раньше rAF блобов
+     стартовал мгновенно и конкурировал за кадры с уходом модалки
+     (как у музыкального плеера) */
+  setTimeout(() => {
+    if (!vpForcedLandscape) startBlobAnimation();
+  }, 380);
 }
 
 /* ═══ КОНЕЦ ВИДЕОПЛЕЕРА ═══ */
@@ -18300,14 +18506,21 @@ function pmClose(e) {
 
   document.getElementById('photoModal').classList.remove('open');
 
-  const img = document.getElementById('photoImg');
+  /* ВОЛНА 22.55: очистка ПОСЛЕ fade-out (0.25 с) — раньше src снимался
+     мгновенно и фото «прыгало» в чёрное посреди анимации закрытия */
+  setTimeout(() => {
+    const img = document.getElementById('photoImg');
 
-  img.removeAttribute('src');
-  img.style.opacity = '1';
+    if (img) {
+      img.removeAttribute('src');
+      img.style.opacity = '1';
+    }
 
-  pmRevoke();
+    pmRevoke();
+    pmApplyZoom(1.0, false);
+  }, 260);
+
   pmLoading = false;
-  pmApplyZoom(1.0, false);
 
   const _spin = document.getElementById('pmSpin');
 
@@ -20564,6 +20777,9 @@ async def miniapp_upload_init(request):
         size = int(body.get("size") or 0)
     except (TypeError, ValueError):
         size = 0
+    # ВОЛНА 22.55: отпечаток первого куска от клиента (sha256 hex, ≤64 симв.) —
+    # для анти-подмены init-reuse (см. ниже).
+    _req_sig0 = str(body.get("sig0") or "")[:128]
     # ВОЛНА 22.38: файлы 0 Б запрещены — «получается 0б такого не должно
     # быть вообще». Пустой файл — ошибка ДО создания сессии.
     if size <= 0:
@@ -20650,6 +20866,12 @@ async def miniapp_upload_init(request):
             continue
         if bool(_s.get("plain")) != bool(plain_mode):
             continue              # режим хранения изменился — новая сессия
+        # ВОЛНА 22.55: анти-подмена — если у сессии есть отпечаток первого
+        # куска и клиент прислал свой, а они НЕ совпали — это ДРУГОЙ файл
+        # с тем же именем/размером (два разных «photo.jpg»): новая сессия,
+        # чужой контент не уйдёт в канал под видом догрузки.
+        if _req_sig0 and _s.get("sig0") and _req_sig0 != _s["sig0"]:
+            continue
         _rc = int(_s.get("received") or 0)
         if _rc <= 0 or _rc > size:
             continue              # нечего продолжать / повреждена
@@ -20695,6 +20917,28 @@ async def miniapp_upload_init(request):
     _my_sessions = sum(
         1 for _s in _MINIAPP_UPLOADS.values()
         if str(_s.get("uid") or "") == str(uid))
+    if _my_sessions >= 5:
+        # ВОЛНА 22.55: перед отказом — честная уборка: просроченные сессии,
+        # затем «пустые» (ни одного куска) старше 5 минут. Раньше 5 зависших
+        # сессий блокировали НОВЫЕ загрузки до 6 часов (до ленивой TTL-чистки).
+        _miniapp_cleanup_uploads()
+        _now5 = time.time()
+        for _mid in [_m for _m, _ms in _MINIAPP_UPLOADS.items()
+                     if str(_ms.get("uid") or "") == str(uid)
+                     and int(_ms.get("received") or 0) <= 0
+                     and _now5 - float(_ms.get("ts") or 0) > 300]:
+            _ms = _MINIAPP_UPLOADS.get(_mid)
+            if _ms is None:
+                continue
+            _upload_session_unpersist(_ms)
+            _MINIAPP_UPLOADS.pop(_mid, None)
+            try:
+                os.remove(_ms["path"])
+            except Exception:
+                pass
+        _my_sessions = sum(
+            1 for _s in _MINIAPP_UPLOADS.values()
+            if str(_s.get("uid") or "") == str(uid))
     if _my_sessions >= 5:
         return _miniapp_err(
             429, "too_many_uploads",
@@ -20771,6 +21015,16 @@ async def miniapp_upload_chunk(request):
     parts = s.setdefault("parts", set())
     if _idx >= 0 and s["size"] > 0 and _idx in parts:
         s["ts"] = time.time()
+        # ВОЛНА 22.55: повтор куска при полных байтах — шанс перезапустить
+        # «застрявшую» авто-финализацию (задача могла не создаться из-за сбоя,
+        # флаг auto_scheduled остался висеть при старом коде)
+        if s["received"] >= s["size"] and not s.get("completing") \
+                and not s.get("auto_scheduled"):
+            s["auto_scheduled"] = True
+            try:
+                asyncio.create_task(_upload_auto_complete_delayed(upid, 2.5))
+            except Exception:
+                s["auto_scheduled"] = False
         return web.json_response({"received": s["received"], "size": s["size"],
                                   "duplicate": True})
     if s["received"] + len(data) > s["size"]:
@@ -20796,6 +21050,11 @@ async def miniapp_upload_chunk(request):
     if _idx >= 0:
         parts.add(_idx)
     s["ts"] = time.time()
+    # ВОЛНА 22.55: отпечаток первого куска (sha256) — защита init-reuse от
+    # подмены: ДРУГОЙ файл с тем же именем/размером больше не приклеится к
+    # чужой сессии и не уйдёт в канал под видом догрузки.
+    if (_off or 0) == 0 and data and not s.get("sig0"):
+        s["sig0"] = hashlib.sha256(data).hexdigest()
     # ВОЛНА 22.52: метаданные сессии — на диск (загрузка переживает рестарт
     # бота и «продолжается через самого бота»)
     _upload_session_persist(s)
@@ -20806,7 +21065,11 @@ async def miniapp_upload_chunk(request):
     if s["received"] >= s["size"] and not s.get("completing") \
             and not s.get("auto_scheduled"):
         s["auto_scheduled"] = True
-        asyncio.create_task(_upload_auto_complete_delayed(upid, 2.5))
+        try:
+            asyncio.create_task(_upload_auto_complete_delayed(upid, 2.5))
+        except Exception:
+            # create_task вне event loop / shutdown — сторож подхватит сам
+            s["auto_scheduled"] = False
     return web.json_response({"received": s["received"], "size": s["size"]})
 
 
@@ -20998,6 +21261,10 @@ async def miniapp_upload_rename(request):
 _UPLOAD_PAUSE_LAST = {}
 # не чаще одного сообщения в 2 минуты на пользователя (TTL-циклы, двойные биконы)
 _UPLOAD_PAUSE_COOLDOWN = 120.0
+# ВОЛНА 22.55: повтор «⏸ пауза» по ОДНОЙ сессии — не чаще раза в 30 минут
+# (раньше флаг pause_notified ставился навсегда: пропустивший сообщение
+# пользователь больше НИКОГДА не получал сигнал по этому файлу)
+_UPLOAD_PAUSE_REPEAT = 1800.0
 # сколько секунд тишины (без закрытия) считаем «загрузка умерла молча»
 _UPLOAD_PAUSE_SILENCE = 30.0
 
@@ -21035,8 +21302,9 @@ async def _upload_pause_check_once(app, now=None):
                 continue                     # ещё ждём «последний вдох»
         elif now - float(s.get("ts", now)) <= _UPLOAD_PAUSE_SILENCE:
             continue                         # молчит недолго — может, оживёт
-        if s.get("pause_notified"):
-            continue                         # по этой сессии уже сообщали
+        if s.get("pause_notified_ts") and \
+                now - float(s.get("pause_notified_ts") or 0) < _UPLOAD_PAUSE_REPEAT:
+            continue                         # по этой сессии недавно сообщали
         uid = str(s.get("uid") or "")
         if not uid:
             continue
@@ -21059,7 +21327,7 @@ async def _upload_pause_check_once(app, now=None):
         for upid, _nm, _sz, _rc in items:
             _s = _MINIAPP_UPLOADS.get(upid)
             if _s is not None:
-                _s["pause_notified"] = True
+                _s["pause_notified_ts"] = now
                 _s.pop("closed_hint", None)
         _UPLOAD_PAUSE_LAST[uid] = now
         lines = ""
@@ -21114,6 +21382,7 @@ async def _upload_pause_watchdog(app):
 # напоминание 22.48/22.50 и докачка с того же места при возвращении.
 _UPLOAD_AUTO_LAST = {}          # uid → ts последнего «сам догрузил»
 _UPLOAD_AUTO_COOLDOWN = 90.0    # не спамим: не чаще раза в 1.5 минуты
+_UPLOAD_RETRY_BACKOFF = 900.0   # ВОЛНА 22.55: отбойник повтора после неудач
 
 
 def _upload_autocomplete_candidates(now: float):
@@ -21124,11 +21393,17 @@ def _upload_autocomplete_candidates(now: float):
         received = int(s.get("received") or 0)
         if size <= 0 or received < size:
             continue                      # байтов не хватает — ждать клиента
-        if s.get("completing") or s.get("auto_done") or s.get("auto_giveup") \
-                or s.get("auto_scheduled"):
-            continue              # уже в работе / отложено / закрыта / клиент решает
-        if int(s.get("auto_fail_n") or 0) >= 3:
-            continue                      # три неудачи — не долбим
+        if s.get("completing") or s.get("auto_done") or s.get("auto_scheduled"):
+            continue              # уже в работе / отложено / закрыта
+        # ВОЛНА 22.55: отказ (auto_giveup) и «три неудачи» больше НЕ НАВСЕГДА.
+        # Раньше бот замолкал навсегда: 3 неудачи (≈30 с деградации Telegram /
+        # рестарта) — и файл висел до TTL-чистки (6 ч) и стирался. Теперь
+        # это отбойник: 15 минут тишины — и сторож пробует снова. Файл не
+        # бросается никогда, пока жива сессия; долбить сервер не даём.
+        if s.get("auto_giveup") or int(s.get("auto_fail_n") or 0) >= 3:
+            _aft = float(s.get("auto_fail_ts") or 0)
+            if _aft and now - _aft < _UPLOAD_RETRY_BACKOFF:
+                continue
         if now - float(s.get("ts", now)) < 20.0:
             continue                      # клиент ещё может прислать complete сам
         out.append((upid, s))
@@ -21136,18 +21411,38 @@ def _upload_autocomplete_candidates(now: float):
 
 
 async def _upload_auto_complete_task(app, upid):
-    """Фоновая финализация одной сессии без клиента (авто-догрузка ботом)."""
-    s = _MINIAPP_UPLOADS.get(upid)
-    if s is None or s.get("completing"):
+    """Фоновая финализация одной сессии без клиента (авто-догрузка ботом).
+    ВОЛНА 22.55: исключение финализации (переполнение диска при save_user,
+    сбой worker-потока и т.п.) больше не «ступорит» сессию навсегда — раньше
+    auto_scheduled оставался True, сторож пропускал файл вечно, и он умирал
+    на TTL-чистке. Теперь задача защищена: при любом исключении флаг
+    снимается, ставится авто_fail_ts — сторож повторит через отбойник."""
+    try:
+        s = _MINIAPP_UPLOADS.get(upid)
+        if s is None or s.get("completing"):
+            return
+        uid = str(s.get("uid") or "")
+        user = get_user(uid)
+        if not user:
+            return
+        ok, payload = await _miniapp_upload_finalize(
+            user, uid, upid, s,
+            pw_raw=str(s.get("vault_pw") or ""),
+            http_request=None)
+    except asyncio.CancelledError:
+        _s = _MINIAPP_UPLOADS.get(upid)
+        if _s is not None:
+            _s["auto_scheduled"] = False
+            _s["auto_fail_ts"] = time.time()
+        raise
+    except Exception as e:
+        logger.error(f"upload auto-complete {upid}: {e}")
+        _s = _MINIAPP_UPLOADS.get(upid)
+        if _s is not None:
+            _s["auto_scheduled"] = False
+            _s["auto_fail_ts"] = time.time()
+            _s["auto_fail_n"] = int(_s.get("auto_fail_n") or 0) + 1
         return
-    uid = str(s.get("uid") or "")
-    user = get_user(uid)
-    if not user:
-        return
-    ok, payload = await _miniapp_upload_finalize(
-        user, uid, upid, s,
-        pw_raw=str(s.get("vault_pw") or ""),
-        http_request=None)
     s = _MINIAPP_UPLOADS.get(upid)
     if ok:
         logger.info(f"upload auto-complete: {upid} догружен сервером для {uid}")
@@ -21167,6 +21462,8 @@ async def _upload_auto_complete_task(app, upid):
         # ВОЛНА 22.52: сбрасываем флаг отложенного запуска — сторож сможет
         # повторить попытку позже (если это не клиентский код-отказ)
         s["auto_scheduled"] = False
+        # ВОЛНА 22.55: отметка времени неудачи — отбойник авто-повтора
+        s["auto_fail_ts"] = time.time()
     code = str((payload or {}).get("error") or "")
     if code in ("empty_file", "incomplete_disk", "already_processing",
                 "incomplete", "safe_locked", "wrong_password"):
@@ -21174,15 +21471,34 @@ async def _upload_auto_complete_task(app, upid):
         s = _MINIAPP_UPLOADS.get(upid)
         if s is not None:
             s["auto_giveup"] = True
-        # ВОЛНА 22.53: «safe_locked» = все байты на сервере, но пароля Сейфа
-        # нет (рестарт бота). Молча сдаваться больше нельзя — просим пароль
-        # в чате: следующий текст пользователя догрузит файл ЧЕРЕЗ БОТА.
-        if code == "safe_locked":
+    elif s is not None and int(s.get("auto_fail_n") or 0) == 3 \
+            and not s.get("auto_fail_notified"):
+        # ВОЛНА 22.55: исчерпали быстрые попытки (≈30 с деградации Telegram)
+        # — РАНЬШЕ бот замолкал НАВСЕГДА и пользователь никогда не узнавал.
+        # Одно честное сообщение с причиной; дальше — тихие повторы раз в 15 мин
+        s["auto_fail_notified"] = True
+        _bot = getattr(_MINIAPP_PTB_APP, "bot", None) \
+            if _MINIAPP_PTB_APP is not None else None
+        if _bot is not None:
+            _nm = str(s.get("name") or "файл")[:60]
+            _why = str((payload or {}).get("message") or code)[:120]
             try:
-                await _upload_ask_vault_pw(getattr(app, "bot", None),
-                                           uid, upid)
+                asyncio.ensure_future(_bot.send_message(
+                    chat_id=int(str(s.get("uid") or "0")),
+                    text=("⚠️ Не смог догрузить «" + _nm + "» автоматически ("+
+                          _why + ").\nФайл НЕ потерян — буду повторять каждые "
+                          "15 минут. Откроете мини апп — докачка пойдёт сразу.")))
             except Exception:
                 pass
+    # ВОЛНА 22.53: «safe_locked» = все байты на сервере, но пароля Сейфа
+    # нет (рестарт бота). Молча сдаваться больше нельзя — просим пароль
+    # в чате: следующий текст пользователя догрузит файл ЧЕРЕЗ БОТА.
+    if code == "safe_locked":
+        try:
+            await _upload_ask_vault_pw(getattr(app, "bot", None),
+                                       uid, upid)
+        except Exception:
+            pass
 
 
 def _notify_auto_complete(uid, s, payload, ok=True):
@@ -21263,6 +21579,7 @@ def _upload_session_persist(s):
             "chunk": int(s.get("chunk") or _MINIAPP_CHUNK),
             "plain": bool(s.get("plain")),
             "parts": sorted(int(i) for i in (s.get("parts") or ())),
+            "sig0": str(s.get("sig0") or ""),
             "ts": float(s.get("ts") or time.time()),
         }
         _parts = s.get("parts")
@@ -21330,10 +21647,21 @@ def _miniapp_restore_upload_sessions():
                     "chunk": int(meta.get("chunk") or _MINIAPP_CHUNK),
                     "parts": set(int(i) for i in (_parts or [])
                                  if isinstance(i, (int, float))),
+                    "sig0": str(meta.get("sig0") or ""),
                     "restored": True,
                 }
                 if s["size"] <= 0 or s["received"] <= 0:
-                    # пустая сессия без байтов — мусор после рестарта
+                    # пустая сессия без байтов — мусор после рестарта: стираем
+                    # файлы сразу, иначе копятся до 24 ч и занимают капу
+                    # сессий пользователя (ВОЛНА 22.55)
+                    try:
+                        os.remove(pp)
+                    except Exception:
+                        pass
+                    try:
+                        os.remove(jp)
+                    except Exception:
+                        pass
                     continue
                 _MINIAPP_UPLOADS[upid] = s
                 restored += 1
@@ -21403,8 +21731,6 @@ async def _upload_ask_vault_pw(bot, uid, upid):
     if bot is None:
         return False
     _UPLOAD_PW_LAST[uid] = now
-    if not _upload_pw_register(uid, upid):
-        return False
     nm = str(s.get("name") or "файл")[:60]
     try:
         await bot.send_message(
@@ -21416,9 +21742,13 @@ async def _upload_ask_vault_pw(bot, uid, upid):
                   "открывать не нужно.\n"
                   "(Не хотите присылать пароль в чат — просто откройте мини "
                   "апп: загрузка продолжится там.)"))
-        return True
     except Exception:
         return False
+    # ВОЛНА 22.55: ожидание пароля регистрируется ТОЛЬКО после доставленного
+    # сообщения — раньше register был ДО send: если отправка падала (бот
+    # заблокирован), ожидание оставалось активным и ЛЮБОЙ следующий текст
+    # пользователя съедался как «пароль», сжигая попытки.
+    return _upload_pw_register(uid, upid)
 
 
 async def _upload_pw_attempt(bot, uid, text):
@@ -21513,6 +21843,9 @@ async def _upload_pw_attempt(bot, uid, text):
 # в чате). uid → ts последнего напоминания; не чаще раза в 30 минут.
 _UPLOAD_REMIND_LAST = {}
 _UPLOAD_REMIND_COOLDOWN = 1800.0
+# ВОЛНА 22.55: повтор напоминания по ОДНОМУ файлу — не чаще раза в 2 часа
+# (раньше remind_done ставился навсегда: файл молчал до TTL-чистки)
+_UPLOAD_REMIND_REPEAT = 7200.0
 
 
 async def _upload_resume_reminder(update, context):
@@ -21550,8 +21883,11 @@ async def _upload_resume_reminder(update, context):
             return
         stale = []
         for upid, s in list(_MINIAPP_UPLOADS.items()):
-            if str(s.get("uid") or "") != uid or s.get("remind_done"):
+            if str(s.get("uid") or "") != uid:
                 continue
+            if s.get("remind_ts") and \
+                    now - float(s.get("remind_ts") or 0) < _UPLOAD_REMIND_REPEAT:
+                continue                  # по этому файлу недавно напоминали
             size = int(s.get("size") or 0)
             received = int(s.get("received") or 0)
             if size <= 0 or received >= size:
@@ -21590,20 +21926,21 @@ async def _upload_resume_reminder(update, context):
         for upid, _nm, _sz, _rc in stale:
             _s = _MINIAPP_UPLOADS.get(upid)
             if _s is not None:
-                _s["remind_done"] = True
+                # ВОЛНА 22.55: метка времени вместо вечного флага — файл
+                # напоминает о себе, пока не догружен
+                _s["remind_ts"] = now
         lines = ""
         for _upid, nm, sz, rc in stale[:3]:
             lines += f"• «{nm}» — догружено {_fmt_bytes(rc)} из {_fmt_bytes(sz)}\n"
         extra = len(stale) - 3
         if extra > 0:
             lines += f"• и ещё {extra} файл(ов)\n"
+        _pw_line = ""
         if pw_need:
-            # регистрируем ожидание пароля — следующий текст пользователя
-            # будет принят как пароль Сейфа (догрузка прямо в чате)
-            if _upload_pw_register(uid, pw_need[0][0]):
-                lines += ("• 🔐 «" + pw_need[0][1] + "» — файл уже на сервере, "
-                          "но зашифрован: пришлите пароль Сейфа следующим "
-                          "сообщением, и я загружу его прямо в чат\n")
+            _pw_line = ("• 🔐 «" + pw_need[0][1] + "» — файл уже на сервере, "
+                        "но зашифрован: пришлите пароль Сейфа следующим "
+                        "сообщением, и я загружу его прямо в чат\n")
+        lines += _pw_line
         kb = None
         if MINIAPP_URL:
             kb = InlineKeyboardMarkup([[
@@ -21620,6 +21957,12 @@ async def _upload_resume_reminder(update, context):
             )
         except Exception:
             pass
+        else:
+            # ВОЛНА 22.55: ожидание пароля регистрируем только ПОСЛЕ
+            # доставленного сообщения — падение отправки больше не делает
+            # следующий текст пользователя «паролем».
+            if pw_need:
+                _upload_pw_register(uid, pw_need[0][0])
     except Exception:
         pass
 
@@ -21711,15 +22054,43 @@ async def _miniapp_upload_finalize(user, uid, upid, s, pw_raw="",
             _disk_size = os.path.getsize(s["path"])
         except OSError:
             _disk_size = 0
-        if _disk_size != s["size"]:
+        if _disk_size > s["size"]:
+            # ВОЛНА 22.55: на диске БОЛЬШЕ, чем заявлено (лишний хвост после
+            # сбоя питания) — обрезаем ровно до size: байты все, файл спасён
+            # (раньше любая порча уничтожала сессию вместе с принятыми байтами).
+            try:
+                with open(s["path"], "r+b") as _tf:
+                    _tf.truncate(s["size"])
+                _disk_size = s["size"]
+            except Exception:
+                pass
+        if _disk_size == s["size"]:
+            # ВОЛНА 22.55: диск — источник истины: все байты на месте, счётчик
+            # выравнивается (хвостовой кусок мог не успеть обновить received
+            # перед сбоем) — финализация продолжается, файл НЕ выбрасывается.
+            if s["received"] != s["size"]:
+                s["received"] = s["size"]
+        elif _disk_size <= 0:
             # ВОЛНА 22.38: не создаём запись, если на диске не все байты —
-            # иначе получаются «файлы 0б / повреждённые». ВОЛНА 22.49:
-            # порча диска неисправима (куски уже лежат криво) — сессию закрываем.
+            # иначе получаются «файлы 0б / повреждённые». Пустой .part —
+            # мусор: сессию закрываем (восстанавливать нечего).
             _finished = True
             return False, {"error": "incomplete_disk",
                            "message": f"Файл получен не полностью (на диске "
                                       f"{_disk_size} из {s['size']} байт) — "
                                       "начните загрузку заново."}
+        else:
+            # ВОЛНА 22.55: на диске ЧАСТЬ байтов (0 < disk < size) — раньше
+            # сессия и .part удалялись НАВСЕГДА (перекачка с нуля или потеря
+            # файла, если очередь докачки тоже пуста). Теперь сессию сохраняем:
+            # счётчик и куски обнуляются, клиент перекачает куски поверх тех
+            # же смещений (байты те же) — теряется только трафик, не файл.
+            s["received"] = 0
+            s["parts"] = set()
+            _upload_session_persist(s)
+            return False, {"error": "incomplete",
+                           "message": f"На диске {_disk_size} из {s['size']} "
+                                      "байт — докачиваем недостающее."}
         if s["received"] != s["size"]:
             # ВОЛНА 22.49: сессию НЕ снимаем — клиент досылает недостающие
             # куски в ЭТУ ЖЕ сессию (без перекачки всего файла).
