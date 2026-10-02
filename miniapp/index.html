@@ -436,6 +436,29 @@ html.low-end .file-card {
   to   { opacity: 1; transform: translateY(0); }
 }
 
+/* ВОЛНА 22.59: мягкое появление блоков — список в окне загрузки,
+   кнопки статуса хранилища, точки плеера (только transform+opacity).
+   Раньше эти элементы «выскакивали» рывком из display:none */
+@keyframes softReveal {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.soft-reveal {
+  animation: softReveal 0.32s var(--ease-smooth) both;
+}
+
+/* Слабые устройства / «меньше движений» — без анимации */
+html.low-end .soft-reveal {
+  animation: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .soft-reveal {
+    animation: none;
+  }
+}
+
 .file-card.card-enter {
   animation: cardIn 0.38s var(--ease-smooth) both;
   /* --i приходит из JS и уже ограничен 12 — старые WebView не знают CSS min() */
@@ -491,9 +514,31 @@ html.low-end .fade-soft-in {
   touch-action: manipulation;
 }
 
+/* ВОЛНА 22.59: крестик поиска — плавное появление/исчезание
+   (раньше display:none↔flex давал резкий «скачок») */
+#clearSearch {
+  transform: translateY(-50%) scale(0.55);
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    opacity 0.22s var(--ease-smooth),
+    transform 0.28s var(--ease-snap);
+}
+
+#clearSearch.shown {
+  transform: translateY(-50%) scale(1);
+  opacity: 1;
+  pointer-events: auto;
+}
+
 .action-btn:active {
   transform: scale(0.88);
   opacity: 0.85;
+}
+
+/* 22.59: у крестика поиска :active сохраняет вертикальное центрирование */
+#clearSearch:active {
+  transform: translateY(-50%) scale(0.88);
 }
 
 .chip {
@@ -1817,12 +1862,15 @@ html.low-end #musicPlayer .mp-circle {
   height: 100%;
   object-fit: cover;
   z-index: 1;
-  animation: mpFadeCover 0.5s ease;
+  /* ВОЛНА 22.59: обложка проявляется ПОСЛЕ загрузки картинки (класс .shown
+     вешается из onload). Раньше анимация стартовала на display:block —
+     пустой квадрат «выскакивал» сразу, а сама карточка догружалась позже */
+  opacity: 0;
+  transition: opacity 0.45s var(--ease-smooth);
 }
 
-@keyframes mpFadeCover {
-  from { opacity: 0; }
-  to { opacity: 1; }
+#musicPlayer .art-cover.shown {
+  opacity: 1;
 }
 
 #musicPlayer .art-container.playing .art-fallback {
@@ -3201,7 +3249,7 @@ body.vp-lock {
   <div class="search-box" style="margin-bottom:12px">
     <i data-lucide="search" style="position:absolute;left:14px;top:50%;transform:translateY(-50%);width:18px;height:18px;color:var(--text-color);opacity:.5"></i>
     <input type="text" id="searchInput" placeholder="Поиск файлов..." oninput="onSearch()">
-    <button id="clearSearch" class="action-btn" style="position:absolute;right:6px;top:50%;transform:translateY(-50%);width:26px;height:26px;display:none" onclick="clearSearch()">
+    <button id="clearSearch" class="action-btn" style="position:absolute;right:6px;top:50%;width:26px;height:26px" onclick="clearSearch()">
       <i data-lucide="x" style="width:14px;height:14px"></i>
     </button>
   </div>
@@ -4537,6 +4585,20 @@ function flashScreen() {
   flash.classList.remove('active');
   void flash.offsetWidth;
   flash.classList.add('active');
+}
+
+/* ВОЛНА 22.59: универсальное МЯГКОЕ появление блока (только transform+opacity
+   — композитор, без reflow). Раньше список файлов в окне загрузки, кнопки
+   статуса хранилища, обложка плеера и крестик поиска «выскакивали» рывком.
+   На слабых устройствах и при «меньше движений» — без анимации. */
+function softReveal(el) {
+  if (!el || LOW_END || REDUCED_MOTION) return;
+
+  try {
+    el.classList.remove('soft-reveal');
+    void el.offsetWidth;
+    el.classList.add('soft-reveal');
+  } catch (e) {}
 }
 
 function fmtSize(n) {
@@ -6171,7 +6233,7 @@ async function deleteCurrentFile() {
 function onSearch() {
   SEARCH = document.getElementById('searchInput').value;
 
-  document.getElementById('clearSearch').style.display = SEARCH ? 'flex' : 'none';
+  document.getElementById('clearSearch').classList.toggle('shown', !!SEARCH);
 
   /* Перерисовка не чаще одного раза на кадр — плавный ввод даже на 120 Гц */
   if (onSearch._raf) return;
@@ -6186,7 +6248,7 @@ function clearSearch() {
   document.getElementById('searchInput').value = '';
   SEARCH = '';
 
-  document.getElementById('clearSearch').style.display = 'none';
+  document.getElementById('clearSearch').classList.remove('shown');
 
   renderAll({ animate: true });
 }
@@ -6604,7 +6666,13 @@ async function loadStorageStatus() {
         : 'Канал не подключён — файлы хранятся в облаке бота';
     }
 
-    if (offBtn) offBtn.style.display = connected ? '' : 'none';
+    if (offBtn) {
+      offBtn.style.display = connected ? '' : 'none';
+
+      /* 22.59: кнопка появляется мягко (статус хранилища грузится позже
+         открытия окна — раньше «выскакивала» поверх готовой модалки) */
+      if (connected) softReveal(offBtn);
+    }
     if (input && channel && !input.value) input.value = channel;
 
     if (typeof d.plain === 'boolean') {
@@ -6617,6 +6685,7 @@ async function loadStorageStatus() {
 
     if (plainBtn && STORAGE_PLAIN !== null) {
       plainBtn.style.display = '';
+      softReveal(plainBtn);   /* 22.59: мягкое появление */
 
       if (plainLabel) {
         plainLabel.textContent = STORAGE_PLAIN
@@ -6805,26 +6874,43 @@ window.addEventListener('pageshow', () => {
    загрузка продолжает идти в фоне, сервер метку снимет — ложных
    сообщений нет). Файлы не теряются в любом случае: при переоткрытии
    очередь подхватывается из IndexedDB (22.39/22.47) и догружается сама. */
-function notifyUploadClosed() {
+function notifyUploadClosed(release) {
   try {
     /* 22.49: считаем ТОЛЬКО ещё не догруженные (загруженные файлы остаются
        в uploadQueue до конца пачки — раньше N было завышено) */
-    let pending = (isUploading && uploadQueue && uploadQueue.length)
-      ? uploadQueue.filter(function (f) { return !f._doneFlag; })
-      : [];
+    const seen = new Set();
+    const list = [];
+
+    const addF = function (f) {
+      if (f && !seen.has(f) && !f._doneFlag) {
+        seen.add(f);
+        list.push(f);
+      }
+    };
+
+    if (isUploading && uploadQueue && uploadQueue.length) {
+      uploadQueue.forEach(addF);
+    }
 
     /* ВОЛНА 22.54: плюс файлы ПРЕДОХРАНКИ — они летят в бота параллельно
        с окнами имени (движок ещё не запущен). closed_hint придёт сразу:
-       сторож сообщит о паузе через ~6 с тишины, а не через 30. */
-    const preRun = (pendingFiles || []).filter(function (f) {
-      return f && f._preId && f._preState === 'run' && !f._preStop;
+       сторож сообщит о паузе через ~6 с тишины, а не через 30.
+       ВОЛНА 22.59: окно загрузки могли уже ЗАКРЫТЬ (файлы продолжают
+       лететь сами) — их тоже честно учитываем через PRE_ACTIVE. */
+    (pendingFiles || []).forEach(function (f) {
+      if (f && f._preId && f._preState === 'run' && !f._preStop) addF(f);
     });
 
-    pending = pending.concat(preRun);
+    PRE_ACTIVE.forEach(addF);
 
-    if (!pending.length) return;
+    /* 22.59: приложение реально закрывается (pagehide) и есть
+       «недорешённые» сессии — пароль больше не введут, разрешаем
+       серверу закончить файлы самому (в облако, без шифра) */
+    const rel = !!release && PRE_HELD.size > 0;
 
-    const names = pending.slice(0, 3).map(function (f) {
+    if (!list.length && !rel) return;
+
+    const names = list.slice(0, 3).map(function (f) {
       return String(f.uploadName || f.name || 'файл').slice(0, 40);
     });
 
@@ -6832,16 +6918,22 @@ function notifyUploadClosed() {
       method: 'POST',
       keepalive: true,
       headers: vaultHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify({ n: pending.length, names: names })
+      body: JSON.stringify({
+        n: list.length,
+        names: names,
+        release: rel
+      })
     }).catch(function () {});
   } catch (e) {}
 }
 
 document.addEventListener('visibilitychange', function () {
-  if (document.hidden) notifyUploadClosed();
+  if (document.hidden) notifyUploadClosed(false);
 });
 
-window.addEventListener('pagehide', notifyUploadClosed);
+window.addEventListener('pagehide', function () {
+  notifyUploadClosed(true);
+});
 
 setInterval(ensureScrollUnlocked, 4000);
 
@@ -6859,12 +6951,12 @@ function refreshUploadModal() {
 
   if (info) {
     info.textContent = !has
-      /* ВОЛНА 22.57: подсказка о двух путях — «через бота» (в фоне,
-         главное) и «здесь» (быстро, пока приложение открыто) */
-      ? 'Через Telegram — грузится в фоне (можно закрыть приложение). «Добавить файл» — быстро здесь и сейчас.'
+      /* ВОЛНА 22.59: файлы летят боту С МОМЕНТА ВЫБОРА — окно теперь
+         настройки (пароль/имена), а не «шлюз». Подсказка про оба пути. */
+      ? 'Файлы, выбранные ниже, сразу летят боту и грузятся в фоне — приложение можно закрыть. Или отправьте их в чат бота: Telegram доносит сам.'
       : pendingFiles.length === 1
-        ? (pendingFiles[0].name || 'файл')
-        : 'Выбрано файлов: ' + pendingFiles.length;
+        ? (pendingFiles[0].name || 'файл') + ' — уже грузится боту. Пароль (в Сейф) и имя — по кнопке «Отправить», можно и просто закрыть окно.'
+        : 'Выбрано файлов: ' + pendingFiles.length + ' — уже грузятся боту в фоне. Пароль (в Сейф) и имена — по кнопке «Отправить», окно можно закрыть.';
   }
 
   if (list) {
@@ -6884,6 +6976,9 @@ function refreshUploadModal() {
 
       list.innerHTML = rows + more;
       list.style.display = 'block';
+
+      /* ВОЛНА 22.59: список появляется мягко — без «выскакивания» */
+      softReveal(list);
     }
   }
 
@@ -6929,12 +7024,25 @@ function openUploadModal() {
 function closeUploadModal(e) {
   if (e) e.stopPropagation();
 
-  /* ВОЛНА 22.54: крестик ДО подтверждения — как раньше, «отмена»: файлы,
-     которые ещё не начали лететь в бота (нет сессии), убираем из очереди
-     докачки, чтобы при следующем открытии не всплывала фантомная докачка.
-     Файлы предохранки (сессия уже создана) НЕ трогаем — они уже у бота. */
+  /* ВОЛНА 22.59: закрытие окна БОЛЬШЕ НЕ отменяет загрузку — файлы уже
+     летят боту с момента выбора («сразу в бота», как при отправке в чат).
+     Отменить осознанно можно крестиком строки в панели передач (справа
+     внизу). Из очереди докачки убираем только файлы, которые ещё НЕ
+     летят (нет сессии — например, ждут пароль), — как раньше. */
+  let flying = 0;
+
   for (const f of pendingFiles) {
+    if (f && !f._doneFlag &&
+        (f._preId || (f._preQueued && f._preState !== 'fail'))) {
+      flying++;
+      continue;
+    }
+
     if (f && f._entryKey && !f._preId) upqDel(f._entryKey);
+  }
+
+  if (flying) {
+    showToast('📨 Файлы продолжают грузиться боту — прогресс в панели справа внизу');
   }
 
   pendingFiles = [];
@@ -6980,8 +7088,16 @@ function confirmUploadFiles() {
      шифрованный режим — VAULT_PW уйдёт заголовком, «без шифрования» —
      пароль Сейфа (если ввёл) телом init. Закрытие мини аппа посреди
      окна имени больше НЕ теряет файлы: байты у бота, бот договорит сам. */
+  /* ВОЛНА 22.59: пароль перезаписываем, если ввели НОВЫЙ. Раньше поле
+     фиксировалось только при «undefined» — повторный ввод пароля после
+     wrong_password уходил на complete со СТАРЫМ пустым значением, и
+     перенацеливание в Сейф не срабатывало. Пустой пароль по-прежнему
+     НЕ наследуется (защита 22.50 на месте). */
   for (const f of pendingFiles) {
-    if (f && typeof f._uploadPw === 'undefined') f._uploadPw = UPLOAD_PLAIN_PW || '';
+    if (!f) continue;
+
+    if (UPLOAD_PLAIN_PW) f._uploadPw = UPLOAD_PLAIN_PW;
+    else if (typeof f._uploadPw === 'undefined') f._uploadPw = '';
   }
   prestreamStart(pendingFiles.slice());
 
@@ -7114,6 +7230,37 @@ function uploadFiles(fileList) {
     openUploadModal();
   }
 
+  /* ═══ ВОЛНА 22.59: СРАЗУ В БОТА ═══
+     Байты каждого файла летят боту С МОМЕНТА ВЫБОРА — как при отправке
+     в чат бота: не дожидаясь кнопки «Отправить» и окон имени. Пользователь
+     может закрыть окно и вообще выйти — всё, что доехало до сервера,
+     бот закончит сам (финализация по последнему куску, 22.52 + hold 22.59).
+     Окно загрузки остаётся НАСТРОЙКОЙ поверх уже идущей передачи: пароль
+     (в Сейф), имена (догонят через rename), докидывание файлов.
+     В режиме шифрования без известного пароля init честно ответит 423 —
+     предохранка тихо отступит, движок спросит пароль как раньше. */
+  if (IS_TELEGRAM || WEB_TOKEN) {
+    let preStarted = 0;
+
+    for (const f of files) {
+      if (f && !f._preId && f._preState !== 'done' && !f._preStop &&
+          +f.size > 0) {
+        f._preHold = true;   /* 22.59: сессия «недорешённая» — сервер ждёт пароль/имя */
+        f._preQueued = true;
+        PRE_QUEUE.push(f);
+        preStarted++;
+      }
+    }
+
+    if (preStarted) {
+      prestreamKick();
+
+      if (STORAGE_ENCRYPTED !== true || VAULT_PW) {
+        showToast('📨 Файлы сразу пошли боту — грузятся в фоне, можно закрыть приложение');
+      }
+    }
+  }
+
   pickerAppend = false;
 }
 
@@ -7139,6 +7286,7 @@ function showDropLoader(files) {
   }
 
   filenameEl.style.display = 'block';
+  softReveal(filenameEl);   /* 22.59: имя файла появляется мягко */
 
   initial.style.display = 'none';
   wrap.classList.add('active');
@@ -7310,6 +7458,17 @@ function proceedUpload(files, opts) {
   isPaused = false;
   uploadAbortFlag = false;
   uploadQueue = files.slice();
+
+  /* ВОЛНА 22.59: строки предохранки гасим — визуализацию пачки берёт
+     на себя кольцо прогресса (движок перехватывает те же сессии) */
+  for (const f of uploadQueue) {
+    if (f && f._preTid && TRANSFERS.has(f._preTid)) {
+      TRANSFERS.delete(f._preTid);
+      f._preTid = '';
+    }
+  }
+
+  ctSync();
 
   /* ВОЛНА 22.54: движок вступает — очередь предохранки гасим (файлы из неё
      движок загрузит сам, двойной отправки не будет). Уже ЛЕТЯЩИЕ предохранки
@@ -7521,6 +7680,13 @@ function sendChunk(uploadId, index, blobPart, offset, onLoaded) {
 let PRE_CONCURRENCY = 3;        /* сколько файлов грузим «впрок» одновременно */
 let PRE_RUNNING = 0;
 const PRE_QUEUE = [];
+/* ВОЛНА 22.59: PRE стал ГЛАВНЫМ путём («сразу в бота») — ведём учёт:
+   • PRE_ACTIVE — файлы в полёте (для честного closed-уведомления,
+     включая те, чьё окно уже закрыли);
+   • PRE_HELD — uploadId «недорешённых» сессий (hold: пароль/имя ещё
+     могут прийти) — при закрытии приложения сообщаем серверу release. */
+const PRE_ACTIVE = new Set();
+const PRE_HELD = new Set();
 
 function prestreamKick() {
   while (PRE_RUNNING < PRE_CONCURRENCY && PRE_QUEUE.length) {
@@ -7529,9 +7695,11 @@ function prestreamKick() {
     if (!f || f._preStop || f._preId || f._preState === 'done') continue;
 
     PRE_RUNNING++;
+    PRE_ACTIVE.add(f);
 
     _preStreamFile(f).catch(() => {}).finally(() => {
       PRE_RUNNING--;
+      PRE_ACTIVE.delete(f);
       prestreamKick();
     });
   }
@@ -7544,11 +7712,78 @@ function prestreamStart(files) {
 
   for (const f of files) {
     if (f && !f._preId && f._preState !== 'done' && !f._preStop && +f.size > 0) {
+      f._preQueued = true;
       PRE_QUEUE.push(f);
     }
   }
 
   prestreamKick();
+}
+
+/* 22.59: отмена конкретного файла из панели передач (предохранка —
+   теперь главный путь, у каждой строки есть крестик) */
+function prestreamCancelFile(file) {
+  if (!file) return;
+
+  file._preStop = true;
+  file._preQueued = false;
+
+  if (file._preTid) transferFinish(file._preTid, false, 'Отменено');
+
+  if (file._preId) {
+    PRE_HELD.delete(file._preId);
+
+    apiJson('/api/upload/abort', {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ uploadId: file._preId })
+    }).catch(() => {});
+  }
+
+  if (file._entryKey) upqDel(file._entryKey);
+
+  /* из окна загрузки файл тоже убираем (если окно открыто) */
+  if (pendingFiles && pendingFiles.includes(file)) {
+    pendingFiles = pendingFiles.filter((x) => x !== file);
+
+    try { refreshUploadModal(); } catch (e) {}
+  }
+}
+
+/* 22.59: файл доехал до бота БЕЗ движка (пользователь закрыл окно или
+   ничего не нажимал) — сразу показываем его в списке + итоговый тост */
+let _preDoneT = null;
+let _preDoneN = 0;
+
+function prestreamReportDone(rec) {
+  if (rec && rec.id) {
+    ALL_FILES.unshift({
+      id: rec.id, name: rec.name, kind: rec.kind,
+      size: +rec.size || 0, ts: rec.ts || '', vault: !!rec.vault
+    });
+
+    renderAll({ animate: true });
+  }
+
+  _preDoneN++;
+  clearTimeout(_preDoneT);
+  _preDoneT = setTimeout(() => {
+    showToast('✅ Загрузилось без вас: ' + _preDoneN +
+      ' файл(ов) — уже в облаке');
+    _preDoneN = 0;
+  }, 900);
+}
+
+/* 22.59: тост-предупреждение «нужен пароль» — не чаще раза на пачку */
+let _prePwToastTs = 0;
+
+function prePwToastAllowed() {
+  const now = Date.now();
+
+  if (now - _prePwToastTs < 5000) return false;
+
+  _prePwToastTs = now;
+  return true;
 }
 
 /* Ожидание окончания предохранки файла (ограниченно по времени). */
@@ -7568,18 +7803,28 @@ async function _preStreamFile(file) {
   const upName = String(file.uploadName || file.name || 'file.bin').slice(0, 120);
   let uploadId = '';
   let serverParts = null;
+  let initData = null;
 
   file._preState = 'run';
 
+  /* 22.59: строка в панели передач — предохранка теперь ГЛАВНЫЙ путь
+     («сразу в бота»), прогресс и отмена обязаны быть видимыми */
+  const tid = 'pre_' + Date.now().toString(36) +
+    Math.random().toString(36).slice(2, 6);
+
+  file._preTid = tid;
+
   try {
-    const initData = await apiJson('/api/upload/init', {
+    initData = await apiJson('/api/upload/init', {
       method: 'POST',
       headers: vaultHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({
         name: upName,
         size: +file.size || 0,
         mime: file.type || '',
-        password: file._uploadPw || ''
+        password: file._uploadPw || '',
+        /* 22.59: «недорешённая» сессия — сервер ждёт пароль/имя из окна */
+        hold: !!file._preHold
       })
     });
 
@@ -7593,12 +7838,28 @@ async function _preStreamFile(file) {
     }
   } catch (e) {
     /* предохранка не удалась (лимит/сеть/пароль) — НЕ страшно: движок после
-       окон имени сделает всё как раньше, с честной ошибкой при необходимости */
+     окон имени сделает всё как раньше, с честной ошибкой при необходимости */
     file._preState = 'fail';
+
+    /* 22.59: байты НЕ летят — честно говорим про пароль (один тост на пачку) */
+    if (e && e.code === 'safe_locked' && prePwToastAllowed()) {
+      showToast('🔒 Файлы ждут пароль Сейфа — введите его в окне и нажмите «Отправить»');
+    }
+
     return;
   }
 
   file._preId = uploadId;
+
+  /* 22.59: сервер держит «окно решения» ТОЛЬКО на plain-сессиях
+     (encrypt:false) — шифрованные уже решены паролем при init, их можно
+     финализировать сразу. Ответ init говорит правду независимо от режима. */
+  const heldSession = !!(file._preHold && initData && initData.encrypt === false);
+
+  file._preHeld = heldSession;
+
+  /* 22.59: «недорешённые» сессии — на учёт (release при закрытии аппа) */
+  if (heldSession) PRE_HELD.add(uploadId);
 
   /* uploadId — в очередь докачки сразу: закрыл мини апп на окне имени —
      при следующем открытии докачка подхватит ИМЕННО эту сессию */
@@ -7610,10 +7871,41 @@ async function _preStreamFile(file) {
     });
   }
 
+  /* 22.59: файл официально летит боту — строка в панели передач */
+  transferStart({
+    id: tid,
+    type: 'upload',
+    name: upName,
+    total: +file.size || 0,
+    cancel: () => prestreamCancelFile(file)
+  });
+
   file._prePromise = new Promise((resolvePre) => {
     const totalChunks = Math.ceil((+file.size || 0) / CHUNK_SIZE);
     let nextIndex = 0;
     let alive = true;
+
+    /* 22.59: прогресс по принятым кускам — как у движка */
+    const chunkGot = new Map();
+
+    const reportPre = () => {
+      let sum = 0;
+
+      for (const v of chunkGot.values()) sum += v;
+
+      transferProgress(tid, Math.min(sum, +file.size || sum));
+    };
+
+    if (serverParts) {
+      for (const pi of serverParts) {
+        const po = pi * CHUNK_SIZE;
+        const pe = Math.min(po + CHUNK_SIZE, +file.size || 0);
+
+        if (po < pe) chunkGot.set(pi, pe - po);
+      }
+
+      reportPre();
+    }
 
     const worker = async () => {
       while (alive) {
@@ -7638,6 +7930,8 @@ async function _preStreamFile(file) {
 
           try {
             await sendChunk(uploadId, idx, file.slice(off, end), off);
+            chunkGot.set(idx, end - off);
+            reportPre();
             break;
           } catch (e) {
             if (e && e.message === 'aborted') return;
@@ -7658,19 +7952,41 @@ async function _preStreamFile(file) {
 
   await file._prePromise;
 
-  /* Все байты у бота — зовём complete ПРЯМО ИЗ ПРЕДОХРАНКИ: файл уходит в
-     канал/Сейф сразу (2.5-секундная авто-финализация сервера сделала бы то
-     же самое). Неудача не фатальна: движок после окон имени добьёт через
-     status/complete. Пароль у complete — как у движка (заголовок/сессия). */
-  if (file._preState === 'done' && !file._preStop && !uploadAbortFlag) {
+  /* 22.59: финал строки передачи */
+  if (file._preStop || uploadAbortFlag) {
+    transferFinish(tid, false, 'Отменено');
+    return;
+  }
+
+  if (file._preState !== 'done') {
+    transferFinish(tid, false, 'Сбой сети — движок повторит');
+    return;
+  }
+
+  /* Все байты у бота. «Недорешённую» (hold на сервере) сессию НЕ
+     финализируем сами — её завершит complete от движка (пароль/имя из
+     окна) или сторож сервера после окна решения. Решённую — сразу. */
+  if (!file._preHeld) {
     try {
-      await apiJson('/api/upload/complete', {
+      const resp = await apiJson('/api/upload/complete', {
         method: 'POST',
         headers: vaultHeaders({ 'Content-Type': 'application/json' }),
-        body: JSON.stringify({ uploadId })
+        body: JSON.stringify({ uploadId, password: file._uploadPw || '' })
       });
-    } catch (e) { /* бот догрузит сам / добьёт движок */ }
+
+      PRE_HELD.delete(uploadId);
+      transferFinish(tid, true, 'Готово — у бота');
+      prestreamReportDone((resp && resp.file) || resp);
+      return;
+    } catch (e) {
+      /* бот догрузит сам / добьёт движок — байты в безопасности */
+    }
+
+    transferFinish(tid, true, 'У бота — бот сохраняет в облако');
+    return;
   }
+
+  transferFinish(tid, true, 'Байты у бота — ждёт пароль/имя из окна');
 }
 
 /* Имя из окна имени — догоняет уже летящую/готовую загрузку. */
@@ -7912,7 +8228,9 @@ async function _uploadOneSession(file, reportBytes) {
       done = await apiJson('/api/upload/complete', {
         method: 'POST',
         headers: vaultHeaders({ 'Content-Type': 'application/json' }),
-        body: JSON.stringify({ uploadId })
+        /* 22.59: пароль ИМЕННО этой загрузки — в теле: им сервер
+           перенацеливает plain-сессию в Сейф (файл уже у бота) */
+        body: JSON.stringify({ uploadId, password: file._uploadPw || '' })
       });
 
       cErr = null;
@@ -7987,7 +8305,10 @@ async function pollUploadStatus(uploadId, file) {
         const d2 = await apiJson('/api/upload/complete', {
           method: 'POST',
           headers: vaultHeaders({ 'Content-Type': 'application/json' }),
-          body: JSON.stringify({ uploadId })
+          body: JSON.stringify({
+            uploadId,
+            password: (file && file._uploadPw) || ''
+          })
         });
 
         return d2.file;
@@ -8130,8 +8451,11 @@ async function uploadEngine(bar) {
         }
 
         /* 22.49: помечаем ДОСТИГНУТЫМ — notifyUploadClosed считает
-           только недогруженные, «⏸ пауза» больше не преувеличивает */
+           только недогруженные, «⏸ пауза» больше не преувеличивает.
+           22.59: сессия решена — из реестра «недорешённых» убираем */
         file._doneFlag = true;
+
+        if (file._preId) PRE_HELD.delete(file._preId);
       } catch (e) {
         if (e.message === 'aborted' || uploadAbortFlag) {
           topUpFile(file);
@@ -8498,6 +8822,9 @@ function ctSubText(t) {
     if (t.ok) {
       /* для Сейфа байты не считаются — честное «Готово» */
       if (t.type === 'safe' || t.type === 'safe_out') return 'Готово';
+
+      /* 22.59: загрузка в бота — свой честный итог («Готово — у бота») */
+      if (t.type === 'upload' && t.note) return t.note;
 
       return 'Завершено · ' + fmtSize(t.total || t.loaded || 0);
     }
@@ -9001,6 +9328,7 @@ function mpResetCover() {
   }
 
   mpEl.mpArtCover.removeAttribute('src');
+  mpEl.mpArtCover.classList.remove('shown');   /* 22.59: мягкое скрытие */
   mpEl.mpArtCover.style.display = 'none';
   mpEl.mpArtFallback.style.opacity = '1';
 
@@ -9008,8 +9336,26 @@ function mpResetCover() {
 }
 
 function mpShowCover(src) {
-  mpEl.mpArtCover.src = src;
-  mpEl.mpArtCover.style.display = 'block';
+  const img = mpEl.mpArtCover;
+
+  /* 22.59: обложка проявляется, когда КАРТИНКА реально загрузилась —
+     раньше пустой квадрат «выскакивал» сразу (display:block), а сама
+     картинка дорисовывалась позже */
+  img.classList.remove('shown');
+  img.style.display = 'block';
+
+  const reveal = () => {
+    try { requestAnimationFrame(() => img.classList.add('shown')); } catch (e) {}
+  };
+
+  if (img.complete && img.naturalWidth) {
+    img.src = src;
+    reveal();
+  } else {
+    img.onload = reveal;
+    img.src = src;
+  }
+
   mpEl.mpArtFallback.style.opacity = '0';
 }
 
@@ -9187,6 +9533,8 @@ function mpRenderDots() {
 
   dots.style.display = 'flex';
   dots.innerHTML = '';
+
+  softReveal(dots);   /* 22.59: точки появляются мягко */
 
   mpList.forEach((_, i) => {
     const d = document.createElement('div');
