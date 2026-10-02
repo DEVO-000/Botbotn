@@ -6409,7 +6409,8 @@ async def _pub_send(channel_id, coro_factory):
 
 
 async def _storage_upload_document(context, data: bytes, filename: str, caption: str = "",
-                                   channel_id=None, user=None, data_path=None):
+                                   channel_id=None, user=None, data_path=None,
+                                   silent=False):
     """Загружает документ в канал-хранилище.
 
     НОВОЕ (волна 7): если channel_id не задан явно — грузим по КРУГУ во все
@@ -6423,6 +6424,8 @@ async def _storage_upload_document(context, data: bytes, filename: str, caption:
     шлагбаумом): раньше каждый complete читал свой файл в ОЗУ ДО очереди,
     и пачка больших файлов съедала гигабайты ОЗУ сразу (до OOM на Render),
     из-за чего пакетная загрузка падала, а по одной — работала.
+    ВОЛНА 22.56: silent=True → disable_notification (снапшоты/бэкапы в
+    db-каналы больше не звонят разработчику в телефон).
     Возвращает ({"message_id", "file_id", "size", "channel_id", "queue_pos"}) или None."""
 
     def _payload_bytes():
@@ -6466,6 +6469,7 @@ async def _storage_upload_document(context, data: bytes, filename: str, caption:
                     chat_id=ch,
                     document=InputFile(await _payload_bytes_async(), filename=filename or "file.bin"),
                     caption=(caption or "")[:1024] or None,
+                    disable_notification=bool(silent),
                 )
 
             sent, queue_pos = await _pub_send(ch, _send_doc)
@@ -6511,7 +6515,7 @@ STORAGE_PART_BYTES = 19 * 1024 * 1024
 
 
 async def _storage_upload_big(context, data: bytes, base_filename: str, caption: str = "",
-                              channel_id=None):
+                              channel_id=None, silent=False):
     """Загрузка данных любого размера: до 19 МБ — одним документом, больше —
     ЧАСТЯМИ по 19 МБ (Telegram не даёт ботам отправлять файлы >50 МБ, а
     скачивать >20 МБ; поэтому честный путь — части).
@@ -6524,7 +6528,7 @@ async def _storage_upload_big(context, data: bytes, base_filename: str, caption:
                 список_частей: [{"message_id", "file_id", "size", "channel_id"}])."""
     if len(data) <= STORAGE_PART_BYTES:
         res = await _storage_upload_document(context, data, base_filename, caption,
-                                             channel_id=channel_id)
+                                             channel_id=channel_id, silent=silent)
         if res is None:
             return False, "Telegram отклонил загрузку документа в канал.", []
         return True, None, [res]
@@ -6537,7 +6541,7 @@ async def _storage_upload_big(context, data: bytes, base_filename: str, caption:
         res = await _storage_upload_document(
             context, chunk, name,
             caption=f"📦 Часть {i + 1}/{n_parts} • {caption}"[:1024],
-            channel_id=channel_id,
+            channel_id=channel_id, silent=silent,
         )
         if res is None:
             return (False,
@@ -6670,7 +6674,7 @@ async def _storage_do_backup(context):
     for ch in db_ids:
         ok_up, err_up, parts = await _storage_upload_big(
             context, payload, f"devorks_backup_{today}.zip", caption[:800],
-            channel_id=ch,
+            channel_id=ch, silent=True,  # 22.56: бэкап без звука
         )
         if ok_up:
             per_channel_parts[ch] = parts
@@ -6906,11 +6910,12 @@ async def _cdb_flush(context, force: bool = False, reason: str = ""):
             for _k, _v in _raw_sent.items():
                 if isinstance(_v, list):
                     cdb_sent[str(_k)] = [int(m) for m in _v if str(m).strip().lstrip("-").isdigit()][:50]
-        ok_ch, fail_ch, pin_warn, pruned_n = [], [], [], 0
+        ok_ch, fail_ch, pin_warn = [], [], []
         for ch in db_ids:
             try:
                 res = await _storage_upload_document(
                     context, payload, fname, caption[:1024], channel_id=ch,
+                    silent=True,  # 22.56: снапшот без звука — канал не «звонит»
                 )
                 if not res:
                     fail_ch.append(f"{ch}: загрузка не удалась")
@@ -6936,27 +6941,18 @@ async def _cdb_flush(context, force: bool = False, reason: str = ""):
                 if not pin_ok:
                     fail_ch.append(f"{ch}: пин не удался (файл в канале, но указатель не обновлён)")
                     continue
-                # ВОЛНА 12: свежий снапшот закреплён → старые СТИРАЕМ
-                # (best-effort), чтобы в канале остался ОДИН актуальный.
-                # Источники старых id: cdb_sent (наш список) + предыдущая
-                # запись реестра (msg_id прошлого снапшота — работает и для
-                # ПЕРВОГО слива после обновления, когда cdb_sent ещё пуст).
-                _old_ids = list(cdb_sent.get(str(ch), []))
-                _prev_reg = (registry.get(str(ch)) or {}).get("msg_id")
-                if _prev_reg:
-                    try:
-                        _old_ids.append(int(_prev_reg))
-                    except (TypeError, ValueError):
-                        pass
-                for _old in _old_ids:
-                    if int(_old) == int(msg_id):
-                        continue
-                    try:
-                        await context.bot.delete_message(chat_id=ch, message_id=int(_old))
-                        pruned_n += 1
-                    except Exception:
-                        pass
-                cdb_sent[str(ch)] = [int(msg_id)]
+                # ВОЛНА 22.56: старые снапшоты НЕ стираем — канал-БД хранит
+                # ПОЛНУЮ историю версий (просьба разработчика: «снапшоты в
+                # канале бот не должен удалять»). Закреп остаётся указателем
+                # на АКТУАЛЬНЫЙ снапшот, а всё, что ниже закрепа, — история.
+                _hist = list(cdb_sent.get(str(ch), []))
+                try:
+                    _hist.append(int(msg_id))
+                except (TypeError, ValueError):
+                    pass
+                # в реестре держим последние 50 id (только память конфига,
+                # сообщения в канале не трогаем)
+                cdb_sent[str(ch)] = _hist[-50:]
                 registry[str(ch)] = {
                     "msg_id": msg_id,
                     "file_id": res.get("file_id"),
@@ -6977,8 +6973,6 @@ async def _cdb_flush(context, force: bool = False, reason: str = ""):
             _CDB_LAST_FLUSH_MONO = _time.monotonic()
             report = (f"✅ Снапшот базы слит в канал(ы): {', '.join(map(str, ok_ch))} "
                       f"({len(payload)} байт, файлов данных {files_n}, {stamp})")
-            if pruned_n:
-                report += f" • 🧹 старых снапшотов стёрто: {pruned_n} (остался один актуальный)"
             if reason:
                 report += f" • причина: {reason}"
             if fail_ch:
@@ -21534,7 +21528,11 @@ async def _upload_pause_check_once(app, now=None):
                       "\nМини апп закрыли посреди загрузки, и файлы "
                       "перестали лететь на сервер.\n\n"
                       "Файлы НЕ потеряны: откройте мини апп — загрузка "
-                      "продолжится сама с того же места."),
+                      "продолжится сама с того же места.\n\n"
+                      "💡 Можно и без мини-аппа: отправьте нужные файлы "
+                      "прямо в ЭТОТ чат — Telegram сам доставит их боту "
+                      "(даже с закрытым мини-аппом), и я сохраню всё "
+                      "в облако."),
                 reply_markup=kb,
             )
             sent += 1
@@ -21571,7 +21569,13 @@ _UPLOAD_AUTO_COOLDOWN = 90.0    # не спамим: не чаще раза в 1
 
 
 def _upload_autocomplete_candidates(now: float):
-    """Незавершённые сессии, где ВСЕ байты уже на сервере и клиент молчит."""
+    """Незавершённые сессии, где ВСЕ байты уже на сервере и клиент молчит.
+
+    ВОЛНА 22.56: порог тишины стал умнее. Если клиент ЧЕСТНО сказал, что
+    мини апп закрывается (closed_hint) или сторож паузы уже признал сессию
+    остановившейся (pause_notified) — бот не тянет 20 секунд, а финализирует
+    файл уже через 6: пользователь закрыл Telegram, все байты на сервере —
+    файл должен уехать в канал НЕМЕДЛЕННО, а не «когда-нибудь»."""
     out = []
     for upid, s in list(_MINIAPP_UPLOADS.items()):
         size = int(s.get("size") or 0)
@@ -21583,7 +21587,10 @@ def _upload_autocomplete_candidates(now: float):
             continue              # уже в работе / отложено / закрыта / клиент решает
         if int(s.get("auto_fail_n") or 0) >= 3:
             continue                      # три неудачи — не долбим
-        if now - float(s.get("ts", now)) < 20.0:
+        silence = 20.0
+        if s.get("closed_hint") or s.get("pause_notified"):
+            silence = 6.0                 # апп точно закрыт — не ждём зря
+        if now - float(s.get("ts", now)) < silence:
             continue                      # клиент ещё может прислать complete сам
         out.append((upid, s))
     return out
@@ -21719,7 +21726,6 @@ def _upload_session_persist(s):
             "parts": sorted(int(i) for i in (s.get("parts") or ())),
             "ts": float(s.get("ts") or time.time()),
         }
-        _parts = s.get("parts")
         with open(_upload_session_meta_path(s), "w", encoding="utf-8") as f:
             json.dump(meta, f)
     except Exception:
@@ -23481,43 +23487,32 @@ async def _cdb_ingest_post(context, post, doc, fname, chat_id):
                                         "НЕ удалось ЗАКРЕПИТЬ снапшот — при старте бот "
                                         "его не прочитает. Проверьте право бота на "
                                         "закрепление сообщений в канале.")
-                                # Реестр указателей + удаление СТАРЫХ снапшотов
-                                # этого канала (правило: один актуальный снапшот).
+                                # Реестр указателей (ВОЛНА 22.56: старые
+                                # снапшоты НЕ удаляем — канал хранит историю
+                                # версий; закреп — указатель на актуальный).
                                 cfg = load_storage_config()  # ПОСЛЕ apply — конфиг мог приехать из снапшота
                                 reg = dict(cfg.get("cdb_registry") or {})
                                 sent = dict(cfg.get("cdb_sent") or {})
-                                _old_ids = []
+                                _hist = []
                                 for _v in (sent.get(str(chat_id)) or []):
                                     try:
                                         _iv = int(_v)
                                     except (TypeError, ValueError):
                                         continue
-                                    if _iv not in _old_ids:
-                                        _old_ids.append(_iv)
-                                _prev = (reg.get(str(chat_id)) or {}).get("msg_id")
+                                    if _iv not in _hist:
+                                        _hist.append(_iv)
                                 try:
-                                    _prev = int(_prev)
-                                    if _prev and _prev not in _old_ids:
-                                        _old_ids.append(_prev)
+                                    if int(post.message_id) not in _hist:
+                                        _hist.append(int(post.message_id))
                                 except (TypeError, ValueError):
                                     pass
-                                pruned = 0
-                                for _old in _old_ids:
-                                    if int(_old) == int(post.message_id):
-                                        continue
-                                    try:
-                                        await context.bot.delete_message(
-                                            chat_id=chat_id, message_id=int(_old))
-                                        pruned += 1
-                                    except Exception:
-                                        pass
                                 reg[str(chat_id)] = {
                                     "msg_id": int(post.message_id),
                                     "file_id": getattr(doc, "file_id", None),
                                     "ts": stamp,
                                     "size": len(payload),
                                 }
-                                sent[str(chat_id)] = [int(post.message_id)]
+                                sent[str(chat_id)] = _hist[-50:]
                                 cfg["cdb_registry"] = reg
                                 cfg["cdb_sent"] = sent
                                 if stamp:
@@ -23535,9 +23530,6 @@ async def _cdb_ingest_post(context, post, doc, fname, chat_id):
                                              f"текущей базы ({last}) — применён "
                                              "ПРИНУДИТЕЛЬНО: файл дан вручную, "
                                              "он и есть актуальная база.")
-                                if pruned:
-                                    _rep += (f" • 🧹 старых снапшотов стёрто: {pruned} "
-                                             "(остался один актуальный)")
                                 if problems:
                                     _rep += f"\n⚠️ Проблемы: {'; '.join(problems[:3])}"
                                 for _pn in pin_notes:
@@ -23549,13 +23541,12 @@ async def _cdb_ingest_post(context, post, doc, fname, chat_id):
     except Exception as e:
         logger.error(f"cdb ingest crashed: {e}")
         _reports.append(f"❌ Снапшот из канала не принят (внутренняя ошибка): {e}")
+    # ВОЛНА 22.56: отчёты об инжесте снапшотов больше НЕ отправляются
+    # разработчику в личку («уведомления разработчику о снапшотах не к
+    # чему») — всё пишется в журнал бота, панель разработчика по-прежнему
+    # показывает статус канала-БД.
     for _t in _reports:
-        try:
-            if DEVELOPER_ID:
-                await context.bot.send_message(
-                    chat_id=int(str(DEVELOPER_ID).strip()), text=str(_t)[:3500])
-        except Exception:
-            pass
+        logger.info(f"cdb ingest: {_t}")
 
 
 async def _storage_channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -23568,8 +23559,9 @@ async def _storage_channel_post_handler(update: Update, context: ContextTypes.DE
     файл — сохраняет только указатель (chat/message_id, file_id, размер).
 
     ВОЛНА 13: документ с именем devorks_db_snapshot_… — это ВСТАВЛЕННЫЙ
-    пользователем снапшот базы: принимаем (latest-wins), ЗАКРЕПЛЯЕМ и
-    стираем старые снапшоты (_cdb_ingest_post) в любом канале-хранилище."""
+    пользователем снапшот базы: принимаем (latest-wins) и ЗАКРЕПЛЯЕМ
+    (22.56: старые снапшоты НЕ стираем — канал хранит историю версий)
+    в любом канале-хранилище."""
     try:
         post = getattr(update, "channel_post", None) or getattr(update, "edited_channel_post", None)
         if post is None:
@@ -23655,8 +23647,8 @@ async def _storage_channel_post_handler(update: Update, context: ContextTypes.DE
 #      пользователю САМ файл базы — его можно хранить где угодно;
 #   2) этот файл можно просто ОТПРАВИТЬ БОТУ В ЛИЧКУ из любого состояния —
 #      бот подтвердит, применит базу (latest-wins), скопирует файл в
-#      канал-хранилище, ЗАКРЕПИТ его и сотрёт старые снапшоты — после
-#      рестарта бот вспомнит всё именно из этого закрепа.
+#      канал-хранилище и ЗАКРЕПИТ его (22.56: старые снапшоты остаются —
+#      история версий) — после рестарта бот вспомнит всё именно из закрепа.
 # Фильтр-перехватчик зарегистрирован ПЕРЕД ConversationHandler (группа 0):
 # снапшот не попадает ни в Сейф, ни в облако, ни в старое восстановление
 # панели — двойной обработки нет; кнопки подтверждения живут вне FSM и
@@ -23738,8 +23730,9 @@ async def _cdb_private_doc_handler(update: Update, context: ContextTypes.DEFAULT
             "• применит ЭТОТ файл как актуальную базу — БЕЗ отказов «не "
             "новее»: вы дали файл вручную, значит он и есть последний "
             "(ответ — «Готово!»);\n"
-            "• скопирует файл в канал-хранилище, ЗАКРЕПИТ его и сотрёт "
-            "старые снапшоты — после рестарта бот вспомнит всё из закрепа.\n\n"
+            "• скопирует файл в канал-хранилище и ЗАКРЕПИТ его — после "
+            "рестарта бот вспомнит всё из закрепа (старые снапшоты "
+            "сохранятся как история версий).\n\n"
             "Продолжить?",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("✅ Восстановить", callback_data="cdb_rst_yes"),
@@ -23885,7 +23878,7 @@ async def _cdb_private_restore_cb(update: Update, context: ContextTypes.DEFAULT_
             _CDB_DIRTY.clear()  # данные только что из файла — заливать обратно нечего
             cfg = load_storage_config()  # ПОСЛЕ apply: каналы могли приехать из снапшота
             db_ids = get_db_channel_ids()
-            pinned_ch, fail_ch, pruned_n = [], [], 0
+            pinned_ch, fail_ch = [], []
             reg = dict(cfg.get("cdb_registry") or {})
             sent = dict(cfg.get("cdb_sent") or {})
             for ch in db_ids:
@@ -23894,6 +23887,7 @@ async def _cdb_private_restore_cb(update: Update, context: ContextTypes.DEFAULT_
                     _copy = await context.bot.copy_message(
                         chat_id=int(ch), from_chat_id=_src_chat,
                         message_id=_src_msg,
+                        disable_notification=True,  # 22.56: беззвучно
                     )
                     new_msg_id = int(getattr(_copy, "message_id", 0) or 0)
                 except Exception as e:
@@ -23915,38 +23909,28 @@ async def _cdb_private_restore_cb(update: Update, context: ContextTypes.DEFAULT_
                     _notes.append(
                         f"НЕ удалось ЗАКРЕПИТЬ в канале {ch} — при старте бот "
                         "его не прочитает. Проверьте право бота на закрепление.")
-                # Чистка СТАРЫХ снапшотов канала (правило: один актуальный).
-                _old_ids = []
+                # ВОЛНА 22.56: старые снапшоты НЕ удаляем — канал хранит
+                # историю версий, закреп — указатель на актуальный.
+                _hist = []
                 for _v in (sent.get(str(ch)) or []):
                     try:
                         _iv = int(_v)
                     except (TypeError, ValueError):
                         continue
-                    if _iv not in _old_ids:
-                        _old_ids.append(_iv)
-                _prev = (reg.get(str(ch)) or {}).get("msg_id")
+                    if _iv not in _hist:
+                        _hist.append(_iv)
                 try:
-                    _prev = int(_prev)
-                    if _prev and _prev not in _old_ids:
-                        _old_ids.append(_prev)
+                    if int(new_msg_id) and int(new_msg_id) not in _hist:
+                        _hist.append(int(new_msg_id))
                 except (TypeError, ValueError):
                     pass
-                for _old in _old_ids:
-                    if int(_old) == int(new_msg_id):
-                        continue
-                    try:
-                        await context.bot.delete_message(
-                            chat_id=int(ch), message_id=int(_old))
-                        pruned_n += 1
-                    except Exception:
-                        pass
                 reg[str(ch)] = {
                     "msg_id": int(new_msg_id),
                     "file_id": str(pend.get("file_id") or ""),
                     "ts": stamp,
                     "size": len(payload),
                 }
-                sent[str(ch)] = [int(new_msg_id)]
+                sent[str(ch)] = _hist[-50:]
             if stamp:
                 cfg["cdb_last_flush"] = stamp
             cfg["cdb_registry"] = reg
@@ -23968,7 +23952,7 @@ async def _cdb_private_restore_cb(update: Update, context: ContextTypes.DEFAULT_
         f"• файлов данных восстановлено: {len(restored)}\n"
         f"• закреплено в каналах: {len(pinned_ch)}"
         + (f" ({', '.join(str(c) for c in pinned_ch)})" if pinned_ch else "")
-        + (f"\n• 🧹 старых снапшотов стёрто: {pruned_n}" if pruned_n else "")
+        + "\n• старые снапшоты в канале сохранены (история версий)"
     )
     if problems:
         _rep += f"\n⚠️ Проблемы: {'; '.join(problems[:3])}"
