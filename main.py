@@ -3641,7 +3641,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.57"
+BOT_BUILD = "22.58"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -7880,6 +7880,115 @@ _BG_UPLOAD_BATCHES = {}
 _BG_UPLOAD_DEBOUNCE = 1.6      # сек — Telegram присылает альбом несколькими сообщениями
 _BG_UPLOAD_MAX_MENTION = 20    # сколько файлов показывать в итоговом списке
 
+# ВОЛНА 22.58: ЖИВАЯ ВИДИМОСТЬ бот-загрузок в мини-аппе. Пока файлы из чата
+# сохраняются в облако (мгновенная пересылка по file_id или MTProto-поток
+# для больших), сервер держит их статусы в реестре _BG_UPLOAD_LIVE — мини-апп
+# забирает их обычным опросом /api/files (поле bg_live) и рисует живой
+# прогресс в панели передач: «Качаю с Telegram: 45%», «Сохраняю в облако…».
+# Реестр в памяти процесса: записи живут секунды (пока файл сохраняется),
+# зависшие чистит TTL-уборка — файлы и очередь НИКОГДА не теряются.
+_BG_UPLOAD_LIVE = {}          # user_id(str) -> {key: {"name","size","stage","pct","ts"}}
+_BG_LIVE_TTL = 6 * 3600       # самозачистка зависших записей (страховка)
+_BG_LIVE_GC_AT = [0.0]        # когда последний раз бегала уборка (throttle 5 мин)
+
+
+def _bg_live_add(user_id, key, name, size, stage="recv", pct=0):
+    """Файл из чата принят — начинаем показывать его статус в мини-аппе."""
+    try:
+        _bg_live_gc()
+        _BG_UPLOAD_LIVE.setdefault(str(user_id), {})[str(key)] = {
+            "name": str(name or "файл")[:120],
+            "size": int(size or 0),
+            "stage": str(stage or "recv"),
+            "pct": int(pct or 0),
+            "ts": time.time(),
+        }
+    except Exception:
+        pass
+
+
+def _bg_live_set(user_id, key, stage=None, pct=None):
+    """Обновляем стадию/проценты живой бот-загрузки (мини-апп увидит их
+        следующим опросом /api/files)."""
+    try:
+        ent = _BG_UPLOAD_LIVE.get(str(user_id), {}).get(str(key))
+        if ent is None:
+            return
+        if stage is not None:
+            ent["stage"] = str(stage)
+        if pct is not None:
+            ent["pct"] = max(0, min(100, int(pct)))
+        ent["ts"] = time.time()
+    except Exception:
+        pass
+
+
+def _bg_live_del(user_id, key):
+    """Файл сохранён (или честно не вышел) — убираем его из живых статусов."""
+    try:
+        d = _BG_UPLOAD_LIVE.get(str(user_id))
+        if d is not None:
+            d.pop(str(key), None)
+            if not d:
+                _BG_UPLOAD_LIVE.pop(str(user_id), None)
+    except Exception:
+        pass
+
+
+def _bg_live_gc():
+    """Раз в 5 минут выметаем записи, зависшие дольше TTL (страховка от
+        упавших посреди пути задач — на сами файлы не влияет)."""
+    try:
+        now = time.time()
+        if _BG_LIVE_GC_AT[0] and now - _BG_LIVE_GC_AT[0] < 300:
+            return
+        _BG_LIVE_GC_AT[0] = now
+        for uid in list(_BG_UPLOAD_LIVE.keys()):
+            d = _BG_UPLOAD_LIVE.get(uid) or {}
+            for k in list(d.keys()):
+                try:
+                    if now - float(d[k].get("ts") or 0) > _BG_LIVE_TTL:
+                        d.pop(k, None)
+                except Exception:
+                    d.pop(k, None)
+            if not d:
+                _BG_UPLOAD_LIVE.pop(uid, None)
+    except Exception:
+        pass
+
+
+def _bg_live_out(user_id):
+    """Список живых бот-загрузок для ответа /api/files (поле bg_live)."""
+    try:
+        _bg_live_gc()
+        d = _BG_UPLOAD_LIVE.get(str(user_id))
+        if not d:
+            return []
+        return [{"name": v.get("name", "файл"), "size": int(v.get("size") or 0),
+                 "stage": v.get("stage", "recv"), "pct": int(v.get("pct") or 0)}
+                for v in d.values()]
+    except Exception:
+        return []
+
+
+class _BgLiveProgressBar:
+    """ВОЛНА 22.58: адаптер прогресса для _mt_download_stream — вместо
+    редактирования сообщения в чате обновляет живой реестр для мини-аппа
+    (панель передач: «Качаю с Telegram: 45%»)."""
+
+    def __init__(self, user_id, key):
+        self._uid = str(user_id)
+        self._key = str(key)
+
+    async def edit(self, text, done=0, total=0):
+        try:
+            if not total:
+                return          # размера нет — проценты не трогаем
+            pct = int(done) * 100 // int(total)
+            _bg_live_set(self._uid, self._key, "mt_dl", pct)
+        except Exception:
+            pass
+
 
 def _bg_upload_target(user):
     """Куда кладём файлы из чата: ЛИЧНЫЙ канал пользователя («Моё облако»)
@@ -7938,10 +8047,12 @@ def _bg_new_file_id(sent, kind):
     return getattr(getattr(sent, "document", None), "file_id", None)
 
 
-async def _bg_upload_big_mtproto(update, context, user, item, chat_msg):
+async def _bg_upload_big_mtproto(update, context, user, item, chat_msg, live=None):
     """>49 МБ: качаем сообщение пользователя из личного чата ПОТОКОМ через
     MTProto во временный файл и заливаем в канал контейнером (до 2 ГБ).
-    Возвращает rec-словарь или None (причина — в item['_why'])."""
+    Возвращает rec-словарь или None (причина — в item['_why']).
+    ВОЛНА 22.58: live=(user_id, key) — живые проценты для мини-аппа
+    (реестр _BG_UPLOAD_LIVE: «качаю с Telegram 45%» → «загружаю 80%»)."""
     fsize = int(item.get("size") or 0)
     if fsize > VAULT_MTPROTO_MAX_BYTES:
         item["_why"] = "big_hard_limit"
@@ -7970,6 +8081,9 @@ async def _bg_upload_big_mtproto(update, context, user, item, chat_msg):
     job_dir = _dvf2_make_job_dir()
     tmp_path = os.path.join(job_dir, _dvf2_safe_name(item.get("name") or "file.bin"))
     status = None
+    if live:
+        # ВОЛНА 22.58: сообщаем мини-аппу, что большой файл поехал потоком.
+        _bg_live_set(live[0], live[1], "mt_dl", 0)
     try:
         try:
             status = await context.bot.send_message(
@@ -7984,16 +8098,24 @@ async def _bg_upload_big_mtproto(update, context, user, item, chat_msg):
             async def _sink(chunk):
                 fh.write(chunk)
             got = await _mt_download_stream(
-                client, doc, int(getattr(doc, "size", 0) or fsize), _sink)
+                client, doc, int(getattr(doc, "size", 0) or fsize), _sink,
+                progress=(_BgLiveProgressBar(live[0], live[1]) if live else None))
         finally:
             fh.close()
         if got < fsize:
             raise RuntimeError(f"скачано {got} из {fsize} байт")
 
+        def _live_up(cur, tot, _uid=(live[0] if live else None),
+                     _key=(live[1] if live else None)):
+            # ВОЛНА 22.58: заливка контейнера в канал — живые проценты.
+            if _uid and tot:
+                _bg_live_set(_uid, _key, "mt_up", cur * 100 // tot)
+
         sent = await _mt_upload_container(
             client, tmp_path, os.path.getsize(tmp_path),
             (item.get("name") or "file.bin")[:100],
-            filename=(item.get("name") or "file.bin"), user=user)
+            filename=(item.get("name") or "file.bin"), user=user,
+            progress_cb=(_live_up if live else None))
         if not sent:
             item["_why"] = "mt_failed"
             return None
@@ -8052,23 +8174,31 @@ async def _bg_upload_items(update, context, items):
     saved, skipped_big, failed, limit_hit = [], [], [], False
     warned_quality = False
 
-    for item in items:
+    _msg_mid = int(getattr(msg, "message_id", 0) or 0)
+
+    for _li, item in enumerate(items):
         if len(files) >= limit:
             limit_hit = True
             skipped_big.append(item)
             continue
         size = int(item.get("size") or 0)
         name = str(item.get("name") or "файл")
+        # ВОЛНА 22.58: живой статус файла для панели передач мини-аппа.
+        _lk = f"{_msg_mid}-{_li}"
+        _bg_live_add(user_id, _lk, name, size)
         rec = None
         if 0 < size <= STORAGE_MAX_FILE_BYTES:
             # Быстрый путь: пересылка по file_id — сервер не качает байты.
             channel_id = _bg_upload_target(user)
             if channel_id is None:
+                _bg_live_del(user_id, _lk)
                 await msg.reply_text(
                     "❌ Хранилище не настроено — файл не сохранён.")
                 return
+            _bg_live_set(user_id, _lk, "save")
             sent = await _bg_send_media(context, channel_id, item)
             if sent is None:
+                _bg_live_del(user_id, _lk)
                 failed.append(f"{name[:40]}: Telegram не принял")
                 continue
             rec = {
@@ -8086,8 +8216,10 @@ async def _bg_upload_items(update, context, items):
             }
         else:
             # >49 МБ — поток MTProto (до 2 ГБ); недоступен — честный совет.
-            rec = await _bg_upload_big_mtproto(update, context, user, item, msg)
+            rec = await _bg_upload_big_mtproto(
+                update, context, user, item, msg, live=(user_id, _lk))
             if rec is None:
+                _bg_live_del(user_id, _lk)
                 why = item.get("_why")
                 if why == "big_hard_limit":
                     await msg.reply_text(
@@ -8102,6 +8234,7 @@ async def _bg_upload_items(update, context, items):
                 else:
                     skipped_big.append(item)
                 continue
+        _bg_live_del(user_id, _lk)
         files.append(rec)
         saved.append(rec)
         # Подсказка про качество — ОДНА строка и один раз за пачку.
@@ -19070,6 +19203,9 @@ async def miniapp_files_get(request):
         # ВОЛНА 22.26: сервер сам подтверждает связь — кем и чем отвечает.
         "build": BOT_BUILD,
         "bot": _miniapp_bot_username(),
+        # ВОЛНА 22.58: живые бот-загрузки — панель передач мини-аппа рисует
+        # «Качаю с Telegram: 45%» / «Сохраняю в облако…» для файлов из чата.
+        "bg_live": _bg_live_out(uid),
     })
 
 
@@ -21895,7 +22031,9 @@ async def _upload_pause_check_once(app, now=None):
                       "приложением — отправьте файлы прямо в ЭТОТ чат "
                       "(в мини-аппе для этого есть кнопка «📤 Загрузить "
                       "через Telegram»): Telegram сам доносит их боту, "
-                      "а я сохраню всё в облако."),
+                      "а я сохраню всё в облако. Прогресс виден в мини-"
+                      "аппе — карточка «Загрузка через Telegram» в панели "
+                      "передач."),
                 reply_markup=kb,
             )
             sent += 1
