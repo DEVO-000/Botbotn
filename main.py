@@ -3641,7 +3641,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.54"
+BOT_BUILD = "22.57"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -6146,7 +6146,12 @@ async def _voice_transcription_middleware(update: Update, context: ContextTypes.
         msg = getattr(update, "message", None)
         if msg is None or getattr(update, "edited_message", None) is not None:
             return
-        att = getattr(msg, "voice", None) or getattr(msg, "audio", None)
+        # ВОЛНА 22.57: транскрибируем ТОЛЬКО голосовые (voice) — ими
+        # управляют ботом. Аудио-ФАЙЛЫ (музыка, mp3 и пр.) больше НЕ
+        # гоняются через Whisper: они проваливаются к глобальному роутеру
+        # bg_chat_upload_receive и сохраняются в облако («загрузка через
+        # бота»). Раньше mp3 «расшифровывался» в мусор и терялся.
+        att = getattr(msg, "voice", None)
         # === Облако и Сейф (режимы загрузки файлов): аудио и голосовые НЕ
         # транскрибируются — пользователь сохраняет/шифрует сам файл. Флаги
         # self-heal: любой текстовый апдейт выводит из режима загрузки.
@@ -7849,6 +7854,359 @@ async def _cloud_upload_items(update: Update, context: ContextTypes.DEFAULT_TYPE
     return CLOUD_UPLOAD_WAIT
 
 
+# ═══ ВОЛНА 22.57: ЗАГРУЗКА «ЧЕРЕЗ БОТА» — файлы из ЧАТА в ЛЮБОМ СОСТОЯНИИ ═══
+# Требование пользователя: «файлы в мини приложении должны загружаться через
+# бота, чтобы загружались в фоне — если выйти из мини приложения, все файлы
+# должны загружаться в фоне». Физика: WebView мини-аппа умирает вместе с ним,
+# и байты с телефона перестают идти НАВСЕГДА. Единственный НАСТОЯЩЕЙ фон —
+# нативная загрузка Telegram: пользователь прикладывает файлы в ЧАТ бота,
+# Telegram сам доносит их (даже с закрытым мини-аппом; на Android — даже со
+# свёрнутым Telegram), а бот сохраняет всё в облако НА СЕРВЕРЕ.
+#
+# Раньше файл, присланный в чат «просто так» (вне режима «Загрузить файлы»),
+# молча ПРОПАДАЛ — его не съедал ни один обработчик. Теперь глобальный
+# роутер ловит ВСЕ медиа-сообщения, которые не забрал ConversationHandler
+# (то есть пользователь не в режиме загрузки/Сейфа/ДЗ), и кладёт их в
+# облако — как это делает кнопка «📤 Загрузить через Telegram» в мини-аппе.
+#
+# Пачки/альбомы собираются с дебаунсом 1.6 с (как в cloud_upload_receive),
+# ≤49 МБ пересылаются в канал по file_id БЕЗ скачивания (сервер только
+# просит Telegram скопировать файл), >49 МБ — качаются потоком через
+# MTProto во временный файл и заливаются в канал (до 2 ГБ), публикации
+# идут через «шлагбаум» _pub_send (не быстрее лимитов Telegram на канал).
+
+# Пачки фоновой загрузки: (user_id, media_group_id) → {"items": [...]}
+_BG_UPLOAD_BATCHES = {}
+_BG_UPLOAD_DEBOUNCE = 1.6      # сек — Telegram присылает альбом несколькими сообщениями
+_BG_UPLOAD_MAX_MENTION = 20    # сколько файлов показывать в итоговом списке
+
+
+def _bg_upload_target(user):
+    """Куда кладём файлы из чата: ЛИЧНЫЙ канал пользователя («Моё облако»)
+    приоритетнее, дальше — cloud-каналы по кругу. Возвращает channel_id
+    или None, если хранилища нет вообще."""
+    _uch = _user_vault_channel(user)
+    if _uch:
+        return int(_uch[0])
+    cloud_ids = get_cloud_channel_ids()
+    if not cloud_ids:
+        return None
+    try:
+        rr = int(load_storage_config().get("cloud_rr", 0) or 0) % len(cloud_ids)
+    except Exception:
+        rr = 0
+    return int(cloud_ids[rr])
+
+
+async def _bg_send_media(context, channel_id, item):
+    """Пересылает медиа в канал по file_id (БЕЗ скачивания) через шлагбаум.
+    Возвращает sent-объект или None (канал лёг/файл не прошёл)."""
+    kind = item["kind"]
+    fid = item["file_id"]
+    cap = (item.get("name") or "")[:1024] or None
+
+    async def _mk():
+        if kind == "photo":
+            return await context.bot.send_photo(chat_id=channel_id, photo=fid, caption=cap)
+        if kind == "video":
+            return await context.bot.send_video(chat_id=channel_id, video=fid, caption=cap)
+        if kind == "audio":
+            return await context.bot.send_audio(chat_id=channel_id, audio=fid, caption=cap)
+        if kind == "voice":
+            return await context.bot.send_voice(chat_id=channel_id, voice=fid, caption=cap)
+        return await context.bot.send_document(chat_id=channel_id, document=fid, caption=cap)
+
+    try:
+        sent, _pos = await _pub_send(channel_id, _mk)
+        return sent
+    except Exception as e:
+        logger.error(f"bg upload: пересылка в канал {channel_id} не удалась: {e}")
+        return None
+
+
+def _bg_new_file_id(sent, kind):
+    """file_id из отправленного в канал сообщения (для мгновенной выдачи)."""
+    if kind == "photo":
+        arr = getattr(sent, "photo", None)
+        return getattr(arr[-1], "file_id", None) if arr else None
+    if kind == "video":
+        return getattr(getattr(sent, "video", None), "file_id", None)
+    if kind == "audio":
+        return getattr(getattr(sent, "audio", None), "file_id", None)
+    if kind == "voice":
+        return getattr(getattr(sent, "voice", None), "file_id", None)
+    return getattr(getattr(sent, "document", None), "file_id", None)
+
+
+async def _bg_upload_big_mtproto(update, context, user, item, chat_msg):
+    """>49 МБ: качаем сообщение пользователя из личного чата ПОТОКОМ через
+    MTProto во временный файл и заливаем в канал контейнером (до 2 ГБ).
+    Возвращает rec-словарь или None (причина — в item['_why'])."""
+    fsize = int(item.get("size") or 0)
+    if fsize > VAULT_MTPROTO_MAX_BYTES:
+        item["_why"] = "big_hard_limit"
+        return None
+    try:
+        client = await _mt_client()
+    except Exception as e:
+        logger.error(f"bg upload: _mt_client упал: {e}")
+        client = None
+    if client is None:
+        item["_why"] = "mt_unavailable"
+        return None
+    if not _dvf2_disk_ok(fsize):
+        item["_why"] = "no_disk"
+        return None
+    try:
+        _m, doc = await _mt_fetch_document(
+            client, int(chat_msg.chat_id), int(chat_msg.message_id))
+    except Exception as e:
+        logger.error(f"bg upload: MTProto не открыл источник: {e}")
+        item["_why"] = "mt_failed"
+        return None
+    if doc is None:
+        item["_why"] = "mt_failed"
+        return None
+    job_dir = _dvf2_make_job_dir()
+    tmp_path = os.path.join(job_dir, _dvf2_safe_name(item.get("name") or "file.bin"))
+    status = None
+    try:
+        try:
+            status = await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=(f"📦 «{item['name'][:48]}» ({_fmt_bytes(fsize)}) — "
+                      "большой: качаю с Telegram потоком и сохраняю в облако…"))
+        except Exception:
+            status = None
+
+        fh = open(tmp_path, "wb")
+        try:
+            async def _sink(chunk):
+                fh.write(chunk)
+            got = await _mt_download_stream(
+                client, doc, int(getattr(doc, "size", 0) or fsize), _sink)
+        finally:
+            fh.close()
+        if got < fsize:
+            raise RuntimeError(f"скачано {got} из {fsize} байт")
+
+        sent = await _mt_upload_container(
+            client, tmp_path, os.path.getsize(tmp_path),
+            (item.get("name") or "file.bin")[:100],
+            filename=(item.get("name") or "file.bin"), user=user)
+        if not sent:
+            item["_why"] = "mt_failed"
+            return None
+        rec = {
+            "id": _cloud_gen_file_id(user),
+            "name": (item.get("name") or "file.bin")[:120],
+            "kind": item.get("kind") or "document",
+            "msg_id": int(sent.get("message_id") or 0),
+            "file_id": sent.get("file_id"),
+            "size": fsize,
+            "mime": item.get("mime", ""),
+            "ts": _file_ts_now(), "tss": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "channel_id": sent.get("channel_id"),
+            "src": "chat",  # ВОЛНА 22.57: загружено «через бота» (из чата)
+        }
+        if isinstance(sent.get("mt_doc"), dict):
+            rec["mt_doc"] = sent["mt_doc"]
+        return rec
+    except Exception as e:
+        logger.error(f"bg upload: большой файл не удался: {e}")
+        item["_why"] = "mt_failed"
+        return None
+    finally:
+        if status is not None:
+            try:
+                await status.delete()
+            except Exception:
+                pass
+        _shutil.rmtree(job_dir, ignore_errors=True)
+
+
+async def _bg_upload_items(update, context, items):
+    """Сохраняет пачку файлов из чата в облако и пишет ОДИН компактный итог.
+    Вызывается из bg_chat_upload_receive (глобальный роутер 22.57)."""
+    msg = update.message
+    user_id = str(update.effective_user.id)
+    user = get_user(user_id)
+    if not user:
+        return
+    if not get_cloud_channel_ids() and not _user_vault_channel(user):
+        await msg.reply_text(
+            "❌ Хранилище не настроено — файл не сохранён. Попросите "
+            "разработчика подключить канал, либо подключите СВОЙ: "
+            "🔐 Сейф → 🔗 Моё облако.")
+        return
+
+    files = [f for f in (getattr(user, "cloud_files", []) or []) if isinstance(f, dict)]
+    limit = get_price('cloud_max_files', 50)
+
+    try:
+        await context.bot.send_chat_action(
+            chat_id=update.effective_chat.id, action="upload_document")
+    except Exception:
+        pass
+
+    saved, skipped_big, failed, limit_hit = [], [], [], False
+    warned_quality = False
+
+    for item in items:
+        if len(files) >= limit:
+            limit_hit = True
+            skipped_big.append(item)
+            continue
+        size = int(item.get("size") or 0)
+        name = str(item.get("name") or "файл")
+        rec = None
+        if 0 < size <= STORAGE_MAX_FILE_BYTES:
+            # Быстрый путь: пересылка по file_id — сервер не качает байты.
+            channel_id = _bg_upload_target(user)
+            if channel_id is None:
+                await msg.reply_text(
+                    "❌ Хранилище не настроено — файл не сохранён.")
+                return
+            sent = await _bg_send_media(context, channel_id, item)
+            if sent is None:
+                failed.append(f"{name[:40]}: Telegram не принял")
+                continue
+            rec = {
+                "id": _cloud_gen_file_id(user),
+                "name": name[:120],
+                "kind": item.get("kind") or "document",
+                "msg_id": int(sent.message_id),
+                "file_id": _bg_new_file_id(sent, item.get("kind") or "document"),
+                "size": size,
+                "mime": item.get("mime", ""),
+                "ts": _file_ts_now(),
+                "tss": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "channel_id": channel_id,
+                "src": "chat",
+            }
+        else:
+            # >49 МБ — поток MTProto (до 2 ГБ); недоступен — честный совет.
+            rec = await _bg_upload_big_mtproto(update, context, user, item, msg)
+            if rec is None:
+                why = item.get("_why")
+                if why == "big_hard_limit":
+                    await msg.reply_text(
+                        f"🚫 «{name[:40]}» больше 2 ГБ — потолок Telegram "
+                        "для ботов. Разделите файл на части по ~1,5 ГБ.")
+                elif why == "mt_failed":
+                    failed.append(f"{name[:40]}: не докачался — "
+                                  "попробуйте ещё раз")
+                elif why == "no_disk":
+                    failed.append(f"{name[:40]}: на сервере нет места "
+                                  "под временный файл")
+                else:
+                    skipped_big.append(item)
+                continue
+        files.append(rec)
+        saved.append(rec)
+        # Подсказка про качество — ОДНА строка и один раз за пачку.
+        if not warned_quality and item.get("kind") in ("photo", "video"):
+            warned_quality = True
+
+    if saved:
+        user.cloud_files = files
+        save_user(user)
+
+    lines = []
+    if len(saved) == 1:
+        lines.append(f"☁️ Сохранено в облако: «{saved[0]['name']}» "
+                     f"({_fmt_bytes(saved[0]['size'])}).")
+    elif saved:
+        total = sum(int(r.get("size") or 0) for r in saved)
+        lines.append(f"☁️ Сохранено в облако: {len(saved)} файл(ов), "
+                     f"{_fmt_bytes(total)}:")
+        for r in saved[:_BG_UPLOAD_MAX_MENTION]:
+            lines.append(f"  • {r['name']} ({_fmt_bytes(r['size'])})")
+        if len(saved) > _BG_UPLOAD_MAX_MENTION:
+            lines.append(f"  …и ещё {len(saved) - _BG_UPLOAD_MAX_MENTION} шт.")
+    if saved:
+        lines.append("🌐 Уже видно в мини-аппе (обновится само).")
+    if warned_quality:
+        lines.append("💡 Фото/видео Telegram сжал ещё на телефоне: для "
+                     "оригинала отправляйте «как файл» (скрепка → «Файл»).")
+    if limit_hit:
+        lines.append(f"🚫 Лимит облака ({limit} файлов) достигнут — остальное "
+                     "не влезло. Удалите что-нибудь в мини-аппе.")
+    if skipped_big:
+        lines.append(_big_file_advice_text(skipped_big[0]["size"]))
+        for item in skipped_big[1:]:
+            lines.append(f"🚫 «{item['name'][:40]}» тоже больше 49 МБ.")
+    if failed:
+        lines.append("⚠️ Не удалось: " + "; ".join(failed[:5]))
+    if lines:
+        kb = None
+        if MINIAPP_URL:
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🌐 Открыть облако",
+                                     web_app=WebAppInfo(url=MINIAPP_URL))]])
+        try:
+            if skipped_big:
+                await msg.reply_text("\n".join(lines),
+                                     reply_markup=get_big_file_keyboard())
+            else:
+                await msg.reply_text("\n".join(lines), reply_markup=kb)
+        except Exception:
+            pass
+
+
+async def bg_chat_upload_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.57: глобальный роутер «файл в чате = файл в облаке».
+
+    Срабатывает ТОЛЬКО для медиа, которые НЕ забрал ConversationHandler
+    (зарегистрирован ПОСЛЕ него): пользователь не в режиме загрузки/Сейфа/
+    ДЗ — значит, прислал файл «просто так», и это значит «загрузи в облако».
+    Живёт вне FSM, поэтому работает в любом состоянии, после рестарта и
+    при потерянном разговоре — файлы больше не пропадают молча.
+    Возвращает None (обработчик НЕ меняет состояние разговора)."""
+    msg = update.message
+    if msg is None or getattr(update, "edited_message", None) is not None:
+        return None
+    # Страховка: в режимах загрузки файлы забирает FSM — сюда они не дошли бы.
+    if context.user_data.get('cloud_file_mode') or context.user_data.get('vault_put_mode'):
+        return None
+    user_id = str(update.effective_user.id)
+    user = get_user(user_id)
+    if not user:
+        return None                      # незарегистрированный — /start сам всё расскажет
+    if is_user_blocked(user_id):
+        return None                      # заблокированным файлы не сохраняем
+
+    item = _cloud_item_from_message(msg)
+    if item is None:
+        return None                      # не файл (стикер/локация/контакт) — молча
+
+    # Альбом/пачка: собираем с дебаунсом (как cloud_upload_receive).
+    mgid = getattr(msg, "media_group_id", None)
+    if mgid:
+        key = (user_id, str(mgid))
+        batch = _BG_UPLOAD_BATCHES.setdefault(key, {"items": []})
+        batch["items"].append(item)
+        await asyncio.sleep(_BG_UPLOAD_DEBOUNCE)
+        cur = _BG_UPLOAD_BATCHES.get(key)
+        if cur is not batch:
+            return None                  # нас опередили — пачку забрала другая задача
+        _BG_UPLOAD_BATCHES.pop(key, None)
+        items = list(batch["items"])
+    else:
+        items = [item]
+
+    try:
+        await _bg_upload_items(update, context, items)
+    except Exception as e:
+        logger.error(f"bg upload: пачка не удалась: {e}")
+        try:
+            await msg.reply_text(
+                "⚠️ Не удалось сохранить файл(ы) в облако — попробуйте "
+                "ещё раз чуть позже.")
+        except Exception:
+            pass
+    return None
+
 
 async def cloud_files_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -8236,6 +8594,10 @@ def _miniapp_rec_out(rec):
         "size": int(rec.get("size") or 0),
         "ts": _ts,
         "vault": False,
+        # ВОЛНА 22.57: откуда файл («web» = из мини-аппа, «chat» = «через
+        # бота», из чата) — клиент отличает фоновые загрузки для тостов
+        # «Пока вас не было».
+        "src": str(rec.get("src") or ""),
     }
 
 
@@ -21529,10 +21891,11 @@ async def _upload_pause_check_once(app, now=None):
                       "перестали лететь на сервер.\n\n"
                       "Файлы НЕ потеряны: откройте мини апп — загрузка "
                       "продолжится сама с того же места.\n\n"
-                      "💡 Можно и без мини-аппа: отправьте нужные файлы "
-                      "прямо в ЭТОТ чат — Telegram сам доставит их боту "
-                      "(даже с закрытым мини-аппом), и я сохраню всё "
-                      "в облако."),
+                      "💡 А чтобы грузилось В ФОНЕ даже с закрытым "
+                      "приложением — отправьте файлы прямо в ЭТОТ чат "
+                      "(в мини-аппе для этого есть кнопка «📤 Загрузить "
+                      "через Telegram»): Telegram сам доносит их боту, "
+                      "а я сохраню всё в облако."),
                 reply_markup=kb,
             )
             sent += 1
@@ -56716,9 +57079,10 @@ def main():
             ],
             MAIN_MENU: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_main_menu),
-                # ВОЛНА 22.4: AI больше не принимает фото — честный отказ вместо
-                # прежнего роутинга в Groq Vision (handle_main_menu_photo удалён).
-                MessageHandler(filters.PHOTO | filters.Document.IMAGE, ai_photo_reject_handler),
+                # ВОЛНА 22.57: фото/документы/видео/аудио в главном меню больше
+                # НЕ отклоняются («AI не принимает фото») и НЕ пропадают молча —
+                # они проваливаются к глобальному роутеру bg_chat_upload_receive
+                # и сохраняются в облако («загрузка через бота», работает в фоне).
                 CallbackQueryHandler(handle_callback),
             ],
             CLASS_MANAGEMENT: [
@@ -57389,6 +57753,19 @@ def main():
         filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND
         & _BELLS_BULK_FILTER,
         _bells_bulk_text_handler))
+
+    # 📤 ВОЛНА 22.57: ГЛОБАЛЬНЫЙ РОУТЕР «ФАЙЛ В ЧАТЕ = ФАЙЛ В ОБЛАКЕ».
+    # Стоит ПОСЛЕ ConversationHandler: медиа забирают FSM-состояния
+    # (загрузка облака/Сейф/ДЗ/восстановление), а всё, что НЕ забрали
+    # (главное меню, любой текстовый режим, потерянный после рестарта
+    # разговор) — сохраняется в облако как «загрузка через бота».
+    # Так файлы, отправленные в чат, больше никогда не пропадают молча,
+    # а фоновая загрузка работает даже с закрытым мини-аппом и свёрнутым
+    # Telegram: доносит сам Telegram, сохраняет бот на сервере.
+    application.add_handler(MessageHandler(
+        (filters.Document.ALL | filters.PHOTO | filters.VIDEO
+         | filters.AUDIO | filters.VOICE) & filters.ChatType.PRIVATE,
+        bg_chat_upload_receive))
 
     # ВОЛНА 12: standalone-перехватчик отмены ПОСЛЕ ConversationHandler —
     # срабатывает, когда FSM-состояние ПОТЕРЯНО (state=None после
