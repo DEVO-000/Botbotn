@@ -3641,7 +3641,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.53"
+BOT_BUILD = "22.54"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -14386,6 +14386,12 @@ function closeNameModal(e) {
 function startActualUpload() {
   if (!pendingFiles.length) return;
 
+  /* ВОЛНА 22.54: файлы уже летят в бота (предохранка стартовала в момент
+     подтверждения окна загрузки). Введённые имена «догоняют» загрузку:
+     живая сессия — сервер переименует до финализации, готовый файл —
+     переименуется запись и подпись в канале. */
+  prestreamApplyNames(pendingFiles);
+
   proceedUpload(pendingFiles);
 }
 
@@ -14669,12 +14675,21 @@ window.addEventListener('pageshow', () => {
    сообщений нет). Файлы не теряются в любом случае: при переоткрытии
    очередь подхватывается из IndexedDB (22.39/22.47) и догружается сама. */
 function notifyUploadClosed() {
-  if (!isUploading || !uploadQueue || !uploadQueue.length) return;
-
   try {
     /* 22.49: считаем ТОЛЬКО ещё не догруженные (загруженные файлы остаются
        в uploadQueue до конца пачки — раньше N было завышено) */
-    const pending = uploadQueue.filter(function (f) { return !f._doneFlag; });
+    let pending = (isUploading && uploadQueue && uploadQueue.length)
+      ? uploadQueue.filter(function (f) { return !f._doneFlag; })
+      : [];
+
+    /* ВОЛНА 22.54: плюс файлы ПРЕДОХРАНКИ — они летят в бота параллельно
+       с окнами имени (движок ещё не запущен). closed_hint придёт сразу:
+       сторож сообщит о паузе через ~6 с тишины, а не через 30. */
+    const preRun = (pendingFiles || []).filter(function (f) {
+      return f && f._preId && f._preState === 'run' && !f._preStop;
+    });
+
+    pending = pending.concat(preRun);
 
     if (!pending.length) return;
 
@@ -14781,6 +14796,14 @@ function openUploadModal() {
 function closeUploadModal(e) {
   if (e) e.stopPropagation();
 
+  /* ВОЛНА 22.54: крестик ДО подтверждения — как раньше, «отмена»: файлы,
+     которые ещё не начали лететь в бота (нет сессии), убираем из очереди
+     докачки, чтобы при следующем открытии не всплывала фантомная докачка.
+     Файлы предохранки (сессия уже создана) НЕ трогаем — они уже у бота. */
+  for (const f of pendingFiles) {
+    if (f && f._entryKey && !f._preId) upqDel(f._entryKey);
+  }
+
   pendingFiles = [];
   pickerAppend = false;
 
@@ -14818,6 +14841,16 @@ function confirmUploadFiles() {
   if (passInput) passInput.value = '';
 
   closeModalEl('uploadModal');
+
+  /* ВОЛНА 22.54: ПРЕДОХРАНКА — байты каждого файла летят в бота СРАЗУ,
+     пока пользователь отвечает на окна имени. Пароль уже решён (выше):
+     шифрованный режим — VAULT_PW уйдёт заголовком, «без шифрования» —
+     пароль Сейфа (если ввёл) телом init. Закрытие мини аппа посреди
+     окна имени больше НЕ теряет файлы: байты у бота, бот договорит сам. */
+  for (const f of pendingFiles) {
+    if (f && typeof f._uploadPw === 'undefined') f._uploadPw = UPLOAD_PLAIN_PW || '';
+  }
+  prestreamStart(pendingFiles.slice());
 
   /* ВОЛНА 22.43: окно имени открывается для ЛЮБОГО количества файлов —
      один файл можно назвать или пропустить, пачка — как раньше
@@ -14868,6 +14901,29 @@ function uploadFiles(fileList) {
 
   const modalOpen = !!(document.getElementById('uploadModal') || {}).classList &&
     document.getElementById('uploadModal').classList.contains('open');
+
+  /* ВОЛНА 22.54: файлы сохраняются в очередь докачки (IndexedDB) ПРЯМО В
+     МОМЕНТ ВЫБОРА — раньше запись происходила только после всех окон
+     (пароль + имя), и закрытие мини аппа до старта загрузки теряло файлы
+     целиком. Теперь даже внезапное закрытие на любом шаге оставляет файл
+     в очереди: при следующем открытии мини апп сам предложит докачку. */
+  for (const f of files) {
+    if (f._entryKey) continue;
+
+    if ((+f.size || 0) > UPQ_MAX_PERSIST) {
+      f._entryKey = '';
+      continue;
+    }
+
+    const k = 'up_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+
+    f._entryKey = k;
+
+    upqPut({
+      k: k, blob: f, name: f.name, uploadName: f.uploadName || f.name,
+      size: +f.size || 0, mime: f.type || '', uploadId: '', added: Date.now()
+    });
+  }
 
   if (pickerAppend && modalOpen) {
     pendingFiles = pendingFiles.concat(files);
@@ -15074,6 +15130,11 @@ function proceedUpload(files, opts) {
   uploadAbortFlag = false;
   uploadQueue = files.slice();
 
+  /* ВОЛНА 22.54: движок вступает — очередь предохранки гасим (файлы из неё
+     движок загрузит сам, двойной отправки не будет). Уже ЛЕТЯЩИЕ предохранки
+     не трогаем: uploadOneFile мягко перехватит их сессии. */
+  try { PRE_QUEUE.length = 0; } catch (e) {}
+
   /* ВОЛНА 22.50: пароль именно ЭТОЙ загрузки — на каждый файл. Раньше
      UPLOAD_PLAIN_PW был глобальным: если пользователь один раз ввёл пароль
      Сейфа (загрузка в Сейф при «без шифрования»), то ПЕРЕЗАПУЩЕННАЯ сессия
@@ -15248,6 +15309,202 @@ function sendChunk(uploadId, index, blobPart, offset, onLoaded) {
   });
 }
 
+/* ═══ ВОЛНА 22.54: ПРЕДОХРАНКА — ФАЙЛЫ ИДУТ В БОТА СРАЗУ ═══
+   После подтверждения окна загрузки (пароль решён) байты КАЖДОГО файла
+   начинают уходить на сервер НЕМЕДЛЕННО — параллельно с окнами «Назовите
+   файл». Что это даёт:
+   • закрыл мини апп / Telegram посреди окна имени — байты уже у бота:
+     бот сам финализирует сессию (авто-догрузка 22.51/22.52), файл НЕ
+     теряется и появляется в облаке/Сейфе;
+   • предохранка сама зовёт complete, когда все байты на сервере — файл
+     уходит в канал ещё до конца Naming-окон;
+   • имя из окна имени применяется задним числом: живая сессия — через
+     /api/upload/rename (бот зальёт уже с новым именем), готовый файл —
+     тот же эндпоинт переименует запись и подпись в канале;
+   • движок загрузки после Naming-окон подхватывает ТУ ЖЕ сессию
+     (uploadId): перекачки байтов нет, кольцо прогресса просто честно
+     добегает до конца.
+   Дизайн и порядок окон НЕ изменились. */
+
+let PRE_CONCURRENCY = 2;        /* сколько файлов грузим «впрок» одновременно */
+let PRE_RUNNING = 0;
+const PRE_QUEUE = [];
+
+function prestreamKick() {
+  while (PRE_RUNNING < PRE_CONCURRENCY && PRE_QUEUE.length) {
+    const f = PRE_QUEUE.shift();
+
+    if (!f || f._preStop || f._preId || f._preState === 'done') continue;
+
+    PRE_RUNNING++;
+
+    _preStreamFile(f).catch(() => {}).finally(() => {
+      PRE_RUNNING--;
+      prestreamKick();
+    });
+  }
+}
+
+function prestreamStart(files) {
+  /* без входа предохранка бессмысленна (init ответит 401) — движок сам
+     покажет окно входа, как раньше */
+  if (!IS_TELEGRAM && !WEB_TOKEN) return;
+
+  for (const f of files) {
+    if (f && !f._preId && f._preState !== 'done' && !f._preStop && +f.size > 0) {
+      PRE_QUEUE.push(f);
+    }
+  }
+
+  prestreamKick();
+}
+
+/* Ожидание окончания предохранки файла (ограниченно по времени). */
+async function _preSettle(file, timeoutSec) {
+  if (!file || file._preState !== 'run') return;
+
+  const t0 = Date.now();
+  const lim = Math.max(5, +timeoutSec || 120) * 1000;
+
+  while (file._preState === 'run' && Date.now() - t0 < lim) {
+    if (file._prePromise) { await file._prePromise; break; }
+    await sleepMs(120);
+  }
+}
+
+async function _preStreamFile(file) {
+  const upName = String(file.uploadName || file.name || 'file.bin').slice(0, 120);
+  let uploadId = '';
+  let serverParts = null;
+
+  file._preState = 'run';
+
+  try {
+    const initData = await apiJson('/api/upload/init', {
+      method: 'POST',
+      headers: vaultHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({
+        name: upName,
+        size: +file.size || 0,
+        mime: file.type || '',
+        password: file._uploadPw || ''
+      })
+    });
+
+    uploadId = initData.uploadId;
+
+    if (!uploadId) throw new Error('сервер не выдал сессию');
+
+    if (initData.resumed && Array.isArray(initData.parts) &&
+        initData.parts.length) {
+      serverParts = new Set(initData.parts);
+    }
+  } catch (e) {
+    /* предохранка не удалась (лимит/сеть/пароль) — НЕ страшно: движок после
+       окон имени сделает всё как раньше, с честной ошибкой при необходимости */
+    file._preState = 'fail';
+    return;
+  }
+
+  file._preId = uploadId;
+
+  /* uploadId — в очередь докачки сразу: закрыл мини апп на окне имени —
+     при следующем открытии докачка подхватит ИМЕННО эту сессию */
+  if (file._entryKey) {
+    upqPut({
+      k: file._entryKey, blob: file, name: file.name, uploadName: upName,
+      size: +file.size || 0, mime: file.type || '',
+      uploadId: uploadId, added: Date.now()
+    });
+  }
+
+  file._prePromise = new Promise((resolvePre) => {
+    const totalChunks = Math.ceil((+file.size || 0) / CHUNK_SIZE);
+    let nextIndex = 0;
+    let alive = true;
+
+    const worker = async () => {
+      while (alive) {
+        /* preStop — движок перехватил файл; uploadAbortFlag — пользователь
+           нажал «отмену» в кольце прогресса: гасим предохранку, как раньше */
+        if (file._preStop || uploadAbortFlag) return;
+
+        const idx = nextIndex;
+
+        if (idx >= totalChunks) return;
+
+        nextIndex++;
+
+        /* сервер уже принял этот кусок (докачка/повторный выбор) — скип */
+        if (serverParts && serverParts.has(idx)) continue;
+
+        const off = idx * CHUNK_SIZE;
+        const end = Math.min(off + CHUNK_SIZE, file.size);
+
+        for (let attempt = 0; attempt < 3; attempt++) {
+          if (!alive || file._preStop || uploadAbortFlag) return;
+
+          try {
+            await sendChunk(uploadId, idx, file.slice(off, end), off);
+            break;
+          } catch (e) {
+            if (e && e.message === 'aborted') return;
+            if (e && e.code === 'session_not_found') { alive = false; return; }
+            if (attempt < 2) await sleepMs(1200 * (attempt + 1));
+            else { alive = false; return; }
+          }
+        }
+      }
+    };
+
+    Promise.all(
+      Array.from({ length: Math.max(1, Math.min(UPLOAD_PARALLEL, 6)) }, worker))
+      .then(() => { file._preState = alive ? 'done' : 'fail'; })
+      .catch(() => { file._preState = 'fail'; })
+      .finally(resolvePre);
+  });
+
+  await file._prePromise;
+
+  /* Все байты у бота — зовём complete ПРЯМО ИЗ ПРЕДОХРАНКИ: файл уходит в
+     канал/Сейф сразу (2.5-секундная авто-финализация сервера сделала бы то
+     же самое). Неудача не фатальна: движок после окон имени добьёт через
+     status/complete. Пароль у complete — как у движка (заголовок/сессия). */
+  if (file._preState === 'done' && !file._preStop && !uploadAbortFlag) {
+    try {
+      await apiJson('/api/upload/complete', {
+        method: 'POST',
+        headers: vaultHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ uploadId })
+      });
+    } catch (e) { /* бот догрузит сам / добьёт движок */ }
+  }
+}
+
+/* Имя из окна имени — догоняет уже летящую/готовую загрузку. */
+function prestreamApplyNames(files) {
+  for (const f of files || []) {
+    if (!f || !f._preId || !f.uploadName) continue;
+
+    const nm = String(f.uploadName).slice(0, 120);
+
+    f._preRename = apiJson('/api/upload/rename', {
+      method: 'POST',
+      headers: vaultHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ uploadId: f._preId, name: nm })
+    }).catch(() => {});
+
+    /* имя и в очереди докачки — резюм покажет правильное */
+    if (f._entryKey) {
+      upqPut({
+        k: f._entryKey, blob: f, name: f.name, uploadName: nm,
+        size: +f.size || 0, mime: f.type || '',
+        uploadId: f._preId, added: Date.now()
+      });
+    }
+  }
+}
+
 /* ═══ 22.39: ПАРАЛЛЕЛЬНАЯ ЗАГРУЗКА ═══
    Файл режется на куски по 6 МиБ, куски летят на сервер тремя параллельными
    потоками (сервер пишет их по offset — порядок прилёта не важен).
@@ -15278,6 +15535,14 @@ async function _uploadOneSession(file, reportBytes) {
         if (key) upqDel(key);
 
         return (st0.resp && st0.resp.file) || st0.resp;
+      }
+
+      if (st0 && st0.state === 'processing' &&
+          Array.isArray(st0.parts) && st0.parts.length) {
+        /* ВОЛНА 22.54: предохранка уложила все байты, бот ещё финализирует —
+           куски уже у сервера, перекачивать нечего; complete мягко поймает
+           already_processing и дождётся результата через статус */
+        serverParts = new Set(st0.parts);
       }
 
       if (st0 && st0.state === 'ready' &&
@@ -15555,6 +15820,25 @@ async function pollUploadStatus(uploadId, file) {
 }
 
 async function uploadOneFile(file, reportBytes) {
+  /* ВОЛНА 22.54: файл мог УЖЕ улететь в бота (предохранка стартует с момента
+     подтверждения окна загрузки). Гасим её воркеры, дожидаемся тишины и
+     продолжаем ТУ ЖЕ сессию: /api/upload/status скажет completed (файл готов —
+     честный успех без перекачки) или ready+parts (дошлём только остаток). */
+  file._preStop = true;
+
+  try { await _preSettle(file, 120); } catch (e) {}
+
+  /* имя из окна имени должно успеть «догнать» сессию до complete */
+  if (file._preRename) {
+    try { await Promise.race([file._preRename, sleepMs(10000)]); } catch (e) {}
+  }
+
+  if (file._preId && file._preState !== 'fail') {
+    file._resumeId = file._resumeId || file._preId;
+  }
+  /* _preState === 'fail' → init на сервере узнает сессию по отпечатку (22.53)
+     и продолжит с принятых кусков; совсем без сессии — обычная загрузка */
+
   for (let session = 0; session < 3; session++) {
     const r = await _uploadOneSession(file, reportBytes);
 
@@ -15590,6 +15874,19 @@ async function uploadEngine(bar) {
       });
 
       if (rec) added.push(rec);
+
+      /* ВОЛНА 22.54: страховка имени. Файл уходил в бота под оригинальным
+         именем (предохранка), пользователь назвал его в окне имени — если
+         сервер всё же записал старое имя (финализация обогнала ренейм),
+         тихо переименовываем запись и подпись в канале (как ✏️). */
+      if (rec && rec.id && file.uploadName && rec.name &&
+          String(rec.name) !== String(file.uploadName)) {
+        apiJson('/api/files/' + encodeURIComponent(rec.id), {
+          method: 'PATCH',
+          headers: authHeaders({ 'Content-Type': 'application/json' }),
+          body: JSON.stringify({ name: file.uploadName })
+        }).catch(() => {});
+      }
 
       /* 22.49: помечаем ДОСТИГНУТЫМ — notifyUploadClosed считает
          только недогруженные, «⏸ пауза» больше не преувеличивает */
@@ -17125,8 +17422,8 @@ function vpCache() {
   vpWrapperEl.addEventListener('mouseup', vpEndPress);
   vpWrapperEl.addEventListener('mouseleave', vpEndPress);
   vpWrapperEl.addEventListener('touchstart', vpStartPress, { passive: true });
-  vpWrapperEl.addEventListener('touchend', vpEndPress);
-  vpWrapperEl.addEventListener('touchcancel', vpEndPress);
+  vpWrapperEl.addEventListener('touchend', vpEndPress, { passive: true });
+  vpWrapperEl.addEventListener('touchcancel', vpEndPress, { passive: true });
 
   vpWrapperEl.addEventListener('touchstart', (e) => {
     if (e.touches.length === 2) {
@@ -17205,7 +17502,7 @@ function vpCache() {
         if (!vpForcedLandscape) vpPlayerEl.style.objectFit = 'contain';
       }
     }, 300);
-  });
+  }, { passive: true });
 
   vpPlayerEl.ontimeupdate = vpOnTimeUpdate;
 
@@ -20592,10 +20889,17 @@ async def miniapp_upload_status(request):
     s = _MINIAPP_UPLOADS.get(upid)
     if s and s.get("uid") == uid:
         if s.get("completing"):
+            # ВОЛНА 22.54: parts и в processing — предохранка могла уложить
+            # ВСЕ байты, пока бот ещё шифрует/заливает: клиент-движок, взяв
+            # сессию, не перекачивает куски (все уже в parts), а complete
+            # мягко поймает already_processing и дождётся результата.
+            _pparts = s.get("parts")
             return web.json_response({
                 "state": "processing",
                 "received": int(s.get("received") or 0),
                 "size": int(s.get("size") or 0),
+                "parts": sorted(int(i) for i in _pparts)
+                if isinstance(_pparts, (set, list)) else [],
             })
         # ВОЛНА 22.51: parts — индексы УЖЕ ПРИНЯТЫХ кусков (клиентские, по
         # 6 МиБ): докачка после закрытия мини апп шлёт только НЕДОСТАЮЩИЕ
@@ -20610,6 +20914,84 @@ async def miniapp_upload_status(request):
             "parts": sorted(int(i) for i in _parts) if isinstance(_parts, (set, list)) else [],
         })
     return web.json_response({"state": "gone"})
+
+
+async def miniapp_upload_rename(request):
+    """ВОЛНА 22.54: имя «догоняет» уже летящую загрузку.
+
+    Файлы теперь уходят в бота СРАЗУ после выбора (предохранка: init + куски
+    летят, пока пользователь ещё отвечает на окна «Назовите файл»). Введённое
+    имя применяется задним числом:
+      • сессия жива и ещё не финализируется — меняем s["name"] (файл уйдёт
+        в канал уже с новым именем), метаданные на диске обновляются;
+      • сессия уже завершена (_MINIAPP_COMPLETED, 1 ч) — переименовываем
+        созданную запись и подпись сообщения-хранилища в канале пользователя
+        (тот же механизм, что ✏️ в чате, волна 22.48);
+      • сессии нет и результата нет (предохранка не успела начаться) —
+        «none»: движок загрузит файл с новым именем как обычно."""
+    user, uid, err = await _api_get_user_any(request)
+    if err is not None:
+        return err
+    try:
+        body = await request.json()
+    except Exception:
+        return _miniapp_err(400, "bad_json", "Ожидался JSON.")
+    upid = str(body.get("uploadId") or "")
+    # сырую строку проверяем ДО санитизации: _dvf2_safe_name("") вернул бы
+    # фолбэк «file.bin», и пробельное имя молча стало бы «file.bin»
+    _raw_name = str(body.get("name") or "").strip()
+    if not _raw_name:
+        return _miniapp_err(400, "bad_name", "Пустое имя файла.")
+    # _dvf2_safe_name — как в init: имя без разделителей пути (безопасность)
+    new_name = _dvf2_safe_name(_raw_name)
+    if not upid:
+        return _miniapp_err(400, "bad_request", "Не указан uploadId.")
+    s = _MINIAPP_UPLOADS.get(upid)
+    if s and s.get("uid") == uid:
+        if s.get("completing"):
+            # финализация в разгаре: имя применит catch-all клиента после
+            # complete (PATCH /api/files/<id>) — здесь честно отвечаем busy
+            return web.json_response({"renamed": "busy"})
+        s["name"] = new_name
+        s["ts"] = time.time()
+        _upload_session_persist(s)
+        return web.json_response({"renamed": "session", "name": new_name})
+    _done = _MINIAPP_COMPLETED.get(upid)
+    if _done and _done.get("uid") == uid and \
+            time.time() - float(_done.get("ts", 0)) < 3600:
+        fid = ""
+        try:
+            fid = str((((_done.get("resp") or {}).get("file")) or {}).get("id") or "")
+        except Exception:
+            fid = ""
+        if fid:
+            rec, where = _miniapp_find_any(user, fid)
+            if rec:
+                if where == "safe":
+                    rec["label"] = new_name[:120]
+                else:
+                    rec["name"] = new_name[:120]
+                save_user(user)
+                # подпись сообщения-хранилища в канале — как ✏️ (best-effort)
+                try:
+                    _app = _MINIAPP_PTB_APP
+                    if _app is not None:
+                        await _storage_rename_caption(
+                            _app.bot, rec,
+                            rec.get("label") if where == "safe"
+                            else rec.get("name"))
+                except Exception:
+                    pass
+                if where == "safe":
+                    _idx = next(
+                        (i for i, f in enumerate(user.vault_files or [], 1)
+                         if isinstance(f, dict) and f.get("id") == rec.get("id")),
+                        1)
+                    return web.json_response(
+                        {"renamed": "file", "file": _miniapp_safe_rec_out(_idx, rec)})
+                return web.json_response(
+                    {"renamed": "file", "file": _miniapp_rec_out(rec)})
+    return web.json_response({"renamed": "none"})
 
 
 # uid → ts последнего отправленного сообщения «⏸ Загрузка на паузе»
@@ -22123,6 +22505,8 @@ def mount_miniapp_routes(app):
     app.router.add_post("/api/upload/closed", miniapp_upload_closed)
     # ВОЛНА 22.50: статус сессии загрузки — честный успех вместо фантомных ошибок
     app.router.add_get("/api/upload/status", miniapp_upload_status)
+    # ВОЛНА 22.54: имя «догоняет» уже летящую загрузку (предохранка)
+    app.router.add_post("/api/upload/rename", miniapp_upload_rename)
     # ВОЛНА 22.23: «Моё облако» в мини-аппе (статус/подключить/отключить канал)
     app.router.add_get("/api/storage", miniapp_storage_get)
     app.router.add_post("/api/storage/connect", miniapp_storage_connect)
