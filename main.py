@@ -3641,7 +3641,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.58"
+BOT_BUILD = "22.59"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -21506,6 +21506,13 @@ async def miniapp_upload_init(request):
     # перезапись/удаление файлов на сервере.
     name = _dvf2_safe_name(str(body.get("name") or "").strip() or "file.bin")
     mime = str(body.get("mime") or "")[:120]
+    # ВОЛНА 22.59: hold — «недорешённая» сессия. Байты летят боту С РАБОТА
+    # ВЫБОРА файла (пользователь ещё вводит пароль/имя в окне загрузки).
+    # Сервер НЕ финализирует такую plain-сессию сам, пока открыто окно
+    # решения (hold_until) — иначе файл «убегал» в облако БЕЗ пароля раньше,
+    # чем пользователь выберет «в Сейф». Шифрованным сессиям hold не нужен:
+    # их пароль уже решён при init. Вычисляется ПОСЛЕ финального plain_mode.
+    want_hold_flag = bool(body.get("hold"))
     try:
         size = int(body.get("size") or 0)
     except (TypeError, ValueError):
@@ -21609,6 +21616,10 @@ async def miniapp_upload_init(request):
     if _reuse is not None:
         _upid, _s = _reuse
         _s["ts"] = time.time()
+        # 22.59: повторный выбор того же файла — окно решения продлеваем
+        if want_hold_flag and _s.get("plain"):
+            _s["hold_until"] = time.time() + 120.0
+            _upload_session_persist(_s)
         # пароль из ЭТОГО init (уже проверен гардом выше): сессия после
         # рестарта бота ждала пароль — теперь он есть и в RAM, значит
         # авто-догрузка сможет закончить файл даже без клиента
@@ -21655,6 +21666,10 @@ async def miniapp_upload_init(request):
         # загрузки (до complete), в базу не пишем никогда.
         "vault_pw": vault_pw or "",
         "plain": plain_mode,
+        # ВОЛНА 22.59: окно решения для plain-сессии (пароль могут ввести
+        # задним числом — complete перенацелит файл в Сейф)
+        "hold_until": (time.time() + 120.0)
+        if (want_hold_flag and plain_mode) else 0.0,
         # ВОЛНА 22.49: согласованный размер куска — фолбэк index→offset
         # работает даже если клиент шлёт куски нестандартного размера.
         "chunk": _MINIAPP_CHUNK,
@@ -21742,6 +21757,10 @@ async def miniapp_upload_chunk(request):
     if _idx >= 0:
         parts.add(_idx)
     s["ts"] = time.time()
+    # ВОЛНА 22.59: окно решения живо, пока идут байты (пользователь ещё
+    # может ввести пароль в окне загрузки)
+    if s.get("hold_until"):
+        s["hold_until"] = time.time() + 120.0
     # ВОЛНА 22.52: метаданные сессии — на диск (загрузка переживает рестарт
     # бота и «продолжается через самого бота»)
     _upload_session_persist(s)
@@ -21795,11 +21814,23 @@ async def miniapp_upload_closed(request):
     user, uid, err = await _api_get_user_any(request)
     if err is not None:
         return err
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    # ВОЛНА 22.59: release — приложение закрывается, решение по паролю
+    # принимать некому: снимаем hold, бот заканчивает файлы сам
+    release = bool((body or {}).get("release"))
     now = time.time()
     marked = 0
     for s in _MINIAPP_UPLOADS.values():
         if s.get("uid") != uid:
             continue
+        if release and s.get("hold_until") and not s.get("pw_tried"):
+            # 22.59: только «нерешённые» — сессии с неудачной попыткой
+            # пароля (pw_tried) не отпускаем: решение уже пытались принять
+            s["hold_until"] = 0.0
+            _upload_session_persist(s)
         size = int(s.get("size") or 0)
         received = int(s.get("received") or 0)
         if size > 0 and received < size:
@@ -22086,6 +22117,10 @@ def _upload_autocomplete_candidates(now: float):
         if s.get("completing") or s.get("auto_done") or s.get("auto_giveup") \
                 or s.get("auto_scheduled"):
             continue              # уже в работе / отложено / закрыта / клиент решает
+        # ВОЛНА 22.59: окно решения ещё открыто (plain + пароль могут ещё
+        # прийти с complete) — не финализируем раньше пользователя
+        if s.get("hold_until") and float(s["hold_until"]) > now:
+            continue
         if int(s.get("auto_fail_n") or 0) >= 3:
             continue                      # три неудачи — не долбим
         silence = 20.0
@@ -22198,6 +22233,12 @@ async def _upload_auto_complete_delayed(upid, delay=2.5):
         s = _MINIAPP_UPLOADS.get(upid)
         if s is None or s.get("completing") or s.get("auto_done"):
             return
+        # ВОЛНА 22.59: «недорешённая» plain-сессия (пароль могут ввести в
+        # окне загрузки) — финализацию отдаём сторожу: он закончит файл
+        # после истечения hold (или complete решит раньше)
+        if s.get("hold_until") and float(s["hold_until"]) > time.time():
+            s["auto_scheduled"] = False
+            return
         await _upload_auto_complete_task(_MINIAPP_PTB_APP, upid)
     except asyncio.CancelledError:
         raise
@@ -22224,6 +22265,7 @@ def _upload_session_persist(s):
             "received": int(s.get("received") or 0),
             "chunk": int(s.get("chunk") or _MINIAPP_CHUNK),
             "plain": bool(s.get("plain")),
+            "hold_until": float(s.get("hold_until") or 0),
             "parts": sorted(int(i) for i in (s.get("parts") or ())),
             "ts": float(s.get("ts") or time.time()),
         }
@@ -22288,6 +22330,7 @@ def _miniapp_restore_upload_sessions():
                     "ts": float(meta.get("ts") or now),
                     "vault_pw": "",          # на диск не пишем и не читаем
                     "plain": bool(meta.get("plain")),
+                    "hold_until": float(meta.get("hold_until") or 0),
                     "chunk": int(meta.get("chunk") or _MINIAPP_CHUNK),
                     "parts": set(int(i) for i in (_parts or [])
                                  if isinstance(i, (int, float))),
@@ -22615,10 +22658,19 @@ async def miniapp_upload_complete(request):
             return web.json_response(_done["resp"])
         return _miniapp_err(404, "session_not_found",
                             "Загрузка не найдена или устарела — начните заново.")
+    # ВОЛНА 22.59: пароль из ТЕЛА complete — явное желание пользователя
+    # (поле в окне загрузки): им plain-сессия перенацеливается в Сейф.
+    # ВНИМАНИЕ: пароль из ЗАГОЛОВКА для этого НЕ годится — он наследуется
+    # от прежней разблокировки Сейфа и молча шифровал бы все загрузки.
+    body_pw = str((body or {}).get("password") or "")
+    # 22.59: решение принято (или файл уже не «недорешённый») — hold снимаем
+    if s.get("hold_until"):
+        s["hold_until"] = 0.0
     vault_pw_raw = _miniapp_vault_pw_from(request, body, upload_sess=s)
     ok, payload = await _miniapp_upload_finalize(user, uid, upid, s,
                                                  pw_raw=vault_pw_raw,
-                                                 http_request=request)
+                                                 http_request=request,
+                                                 body_pw=body_pw)
     if ok:
         return web.json_response(payload)
     return _payload_as_response(payload)
@@ -22637,7 +22689,7 @@ def _payload_as_response(payload):
 
 
 async def _miniapp_upload_finalize(user, uid, upid, s, pw_raw="",
-                                   http_request=None):
+                                   http_request=None, body_pw=""):
     """ВОЛНА 22.51: ОБЩЕЕ ЯДРО завершения загрузки (валидация размеров →
     шифрование в Сейф / заливка в канал → запись в базу).
     Вызывается из двух мест: HTTP-обработчик /api/upload/complete и сторож
@@ -22689,6 +22741,35 @@ async def _miniapp_upload_finalize(user, uid, upid, s, pw_raw="",
                                       f"{s['size']} байт — загрузка не завершена."}
         name = s["name"]
         size = s["size"]
+        # === ВОЛНА 22.59: ПЕРЕНАЦЕЛИВАНИЕ В СЕЙФ ПАРОЛЕМ ИЗ ТЕЛА ===
+        # Файл полетел боту СРАЗУ при выборе (hold-сессия без пароля),
+        # а пароль пользователь ввёл уже потом — файл НЕ перекачиваем:
+        # plain-сессия прямо здесь становится шифрованной (байты уже на
+        # диске сервера, они никуда не денутся).
+        if s.get("plain") and body_pw:
+            _cand = await asyncio.to_thread(
+                _miniapp_vault_pw_pick, user, _vault_pw_candidates(body_pw))
+            if _cand:
+                _okv = await asyncio.to_thread(
+                    _miniapp_vault_pw_verify, user, _cand)
+                if _okv is False:
+                    # пароль не подошёл: байты не теряем — держим сессию
+                    # (пользователь введёт правильный и повторит complete).
+                    # pw_tried: release при закрытии аппа такую сессию НЕ
+                    # отпускает — решение уже пытались принять, ждём клиента
+                    s["pw_tried"] = True
+                    s["hold_until"] = time.time() + 3600.0
+                    return False, {"error": "wrong_password",
+                                   "message": "Пароль Сейфа не подходит — "
+                                              "введите правильный: файл уже "
+                                              "у бота и никуда не пропадёт."}
+                s["plain"] = False
+                s["vault_pw"] = _cand
+                # шифрованная ветка ниже берёт пароль из pw_raw — отдаём
+                # ей проверенный пароль перенацеливания (иначе safe_locked)
+                pw_raw = _cand
+                logger.info("upload %s: plain-сессия перенацелена в Сейф "
+                            "паролем из complete", upid)
         # === ВОЛНА 22.32: ШИФРОВАННАЯ ЗАГРУЗКА (режим по умолчанию) ===
         if not s.get("plain"):
             # ВОЛНА 22.51: pw_raw приходит ИЗ ТЕЛА/ЗАГОЛОВОВ (HTTP-путь) или
