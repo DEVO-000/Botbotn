@@ -2,6 +2,7 @@ python-telegram-bot[job-queue]==21.6
 aiohttp>=3.9
 groq>=0.11
 pymongo>=4.6
+requests
 # === СЕЙФ: ДО 2 ГБ (волна 14) — гибрид Bot API + MTProto ===
 # Telethon — MTProto-клиент под тем же бот-токеном: качает и заливает файлы
 # до 2 ГБ (Bot API умеет только 20 МБ вниз / 50 МБ вверх). Без библиотеки
