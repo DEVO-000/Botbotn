@@ -417,9 +417,6 @@ AI_CHAT = 86
 VIEW_ANONYMOUS_MESSAGES = 87
 DEV_BLOCK_USER_PRICE = 88
 MANAGE_BUTTON_VISIBILITY = 89
-# ВОЛНА 22.66: «Расписание с сайтов» — ожидание ссылки от админа.
-# (93 занято DEV_EDIT_INSTRUCTIONS — берём свободный слот 106.)
-SCHEDMON_URL = 106
 DEV_EDIT_INSTRUCTIONS = 93
 DEV_MESSAGE_USER_SELECT = 94
 DEV_MESSAGE_USER_TEXT = 95
@@ -1452,54 +1449,6 @@ def _ensure_parent_dir(path: str) -> None:
         os.makedirs(directory, exist_ok=True)
 
 
-# === ВОЛНА 22.64: СЧЁТЧИК ЗАПИСЕЙ ДАННЫХ (защита от отката базы) ===
-# Жалоба пользователя: «файлы исчезают при обновлении», «иногда бот опять
-# просит день рождения у уже зарегистрированного». Причина: при старте бот
-# применяет ЗАКРЕПЛЁННЫЙ снапшот канала БЕЗУСЛОВНО — если последний слив не
-# успел (рестарт/kill/неудачный пин), снапшот СТАРЕЕ локальных данных, и
-# свежие регистрации/файлы откатываются. Теперь каждое успешное save_data
-# увеличивает монотонный счётчик в служебном файле .data_epoch (рядом с
-# users.json), снапшот несёт ЗНАЧЕНИЕ счётчика на момент сборки (_meta.json
-# data_epoch), а восстановление на старте пропускает снапшот, если локальный
-# счётчик БОЛЬШЕ — локальные данные новее, откатывать их нельзя.
-def _data_epoch_path() -> str:
-    try:
-        return os.path.join(
-            os.path.dirname(os.path.abspath(str(USERS_FILE))) or ".",
-            ".data_epoch")
-    except Exception:
-        return os.path.join(".", ".data_epoch")
-
-
-def _data_epoch_bump() -> None:
-    """Инкремент счётчика записей данных (вызывается из save_data).
-    Служебный файл НЕ шифруется и НЕ входит в снапшот — это только
-    локальный маркер свежести. Любая ошибка гасится: счётчик не должен
-    ломать сохранение данных."""
-    try:
-        p = _data_epoch_path()
-        cur = 0.0
-        try:
-            with open(p, "r", encoding="utf-8") as f:
-                cur = float((f.read() or "0").strip() or 0)
-        except Exception:
-            cur = 0.0
-        tmp = p + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(repr(cur + 1.0))
-        os.replace(tmp, p)
-    except Exception:
-        pass
-
-
-def _data_epoch_read() -> float:
-    try:
-        with open(_data_epoch_path(), "r", encoding="utf-8") as f:
-            return float((f.read() or "0").strip() or 0)
-    except Exception:
-        return 0.0
-
-
 # ==================================
 # === ВОЛНА 22.18: ШИФРОВАНИЕ ХРАНИЛИЩА (DVF3, AES-256-GCM, DB_KEY) ===
 # ==================================
@@ -1623,17 +1572,14 @@ def save_data(filename, data):
     if _supabase_ready:
         if _supabase_save(filename, data):
             _cdb_mark_dirty(filename)
-            _data_epoch_bump()   # 22.64: маркер свежести для защиты от отката
             return True
     elif SUPABASE_URL and SUPABASE_KEY:
         if _supabase_try_late_init() and _supabase_save(filename, data):
             _cdb_mark_dirty(filename)
-            _data_epoch_bump()   # 22.64: маркер свежести для защиты от отката
             return True
     # 2) Mongo (legacy)
     if _mongo_kv is not None and _mongo_save(filename, data):
         _cdb_mark_dirty(filename)
-        _data_epoch_bump()       # 22.64: маркер свежести для защиты от отката
         return True
     # 3) Локальный файл — последний шанс. На Render Free данные пропадут
     # после рестарта, но это лучше, чем потерять прямо сейчас.
@@ -1646,7 +1592,6 @@ def save_data(filename, data):
             json.dump(data, f, ensure_ascii=False, indent=2)
         os.replace(_tmpf, filename)
         _cdb_mark_dirty(filename)
-        _data_epoch_bump()       # 22.64: маркер свежести для защиты от отката
         return True
     except Exception as e:
         logger.error(f"Ошибка при сохранении {filename}: {e}")
@@ -2281,14 +2226,8 @@ class User:
         # (TTL 3 ч) — переживает рестарт сервера, как duty_pending.
         self.ct_pending = None
         # ВОЛНА 22.41: бот ждёт от админа СПИСОК ЗВОНКОВ целиком («весь
-        # список вручную"). {"ts": epoch} или None, TTL 3 ч.
+        # список вручную»). {"ts": epoch} или None, TTL 3 ч.
         self.bells_pending = None
-        # ВОЛНА 22.67: бот ждёт НАЗВАНИЕ КЛАССА («➕ Создать класс»). ПЕРСИСТЕНТЕН
-        # (TTL 2 ч): после рестарта/деплоя бота FSM-состояние CREATE_CLASS_NAME
-        # терялось, присланное название молча пропадало («класс не создаётся, а
-        # потом пишет, что нет прав к админке»). Теперь название доведёт
-        # глобальный приёмник _cls_pending_text_handler.
-        self.cls_pending = None
         self.birthday = None
         # ВОЛНА 22.28: пропустить ввод ДР больше нельзя — дата обязательна.
         # Флаг остался только для совместимости старых JSON-записей; при
@@ -2520,8 +2459,6 @@ class User:
             'ct_pending': getattr(self, 'ct_pending', None),
             # ВОЛНА 22.41: ожидаемый список звонков целиком (переживает рестарт)
             'bells_pending': getattr(self, 'bells_pending', None),
-            # ВОЛНА 22.67: ожидаемое название класса (переживает рестарт)
-            'cls_pending': getattr(self, 'cls_pending', None),
             'birthday': self.birthday,
             'birthday_skipped': getattr(self, 'birthday_skipped', False),
             'show_birthday_countdown': self.show_birthday_countdown,
@@ -2668,20 +2605,6 @@ class User:
                     user.bells_pending = None
             except Exception:
                 user.bells_pending = None
-        # ВОЛНА 22.67: флаг «ждём название класса» (TTL 2 ч).
-        if not hasattr(user, 'cls_pending') or not isinstance(user.cls_pending, dict):
-            user.cls_pending = None
-        else:
-            try:
-                if (time.time() - float(user.cls_pending.get('ts') or 0)) > 2 * 3600:
-                    user.cls_pending = None
-            except Exception:
-                user.cls_pending = None
-        # ВОЛНА 22.67: старые записи могли сохранить created_classes=None —
-        # create_class_handler падал на .append ДО сохранения класса
-        # («класс не создаётся»), молча для пользователя.
-        if not isinstance(user.created_classes, list):
-            user.created_classes = []
         if not hasattr(user, 'birthday_eve_notify') or user.birthday_eve_notify is None:
             user.birthday_eve_notify = True
         if not hasattr(user, 'dnd_enabled') or user.dnd_enabled is None:
@@ -2918,12 +2841,6 @@ class Class:
         # Утром бот просто присылает имена из плана («сегодня дежурит тот или
         # такоже»); план строит ИИ по списку, либо админ присылает даты сам.
         self.duty_custom = None
-        # ВОЛНА 22.67: «Расписание с сайтов» — последний расписание/файл,
-        # присланные классу монитором или выбранные админом:
-        # {"text": str|"", "kind": "text"|"file", "name": str, "url": str,
-        #  "host": str, "title": str, "ts": "YYYY-MM-DD HH:MM"}
-        # Показывается ученикам в «📅 Расписание» секцией «🌐 Расписание с сайтов».
-        self.schedule_web = None
 
     def to_dict(self):
         return {
@@ -2956,8 +2873,6 @@ class Class:
             'duty_last_date': getattr(self, 'duty_last_date', None),
             # ВОЛНА 22.35: свой график (имена без ТГ-аккаунтов)
             'duty_custom': getattr(self, 'duty_custom', None),
-            # ВОЛНА 22.67: «Расписание с сайтов» (последнее присланное классу)
-            'schedule_web': getattr(self, 'schedule_web', None),
         }
 
     @classmethod
@@ -2989,26 +2904,6 @@ class Class:
             class_obj.duty_count = max(1, min(3, int(getattr(class_obj, 'duty_count', 1) or 1)))
         except (TypeError, ValueError):
             class_obj.duty_count = 1
-        # ВОЛНА 22.67: «Расписание с сайтов» — старые классы без поля не падают.
-        if not isinstance(getattr(class_obj, 'schedule_web', None), dict):
-            class_obj.schedule_web = None
-        else:
-            class_obj.schedule_web = {
-                'text': str(class_obj.schedule_web.get('text') or '')[:4000],
-                'kind': str(class_obj.schedule_web.get('kind') or 'text'),
-                'name': str(class_obj.schedule_web.get('name') or '')[:120],
-                'url': str(class_obj.schedule_web.get('url') or '')[:500],
-                'host': str(class_obj.schedule_web.get('host') or '')[:120],
-                'title': str(class_obj.schedule_web.get('title') or '')[:200],
-                'ts': str(class_obj.schedule_web.get('ts') or '')[:16],
-                # ВОЛНА 22.68: file_id последней отправки — кнопка «📅
-                # Расписание» переигрывает файл без перекачки с сайта.
-                'file_id': str(class_obj.schedule_web.get('file_id') or '')[:200],
-                'file_kind': str(class_obj.schedule_web.get('file_kind') or '')[:16],
-            }
-            if not (class_obj.schedule_web['text']
-                    or class_obj.schedule_web['name']):
-                class_obj.schedule_web = None
         return class_obj
 
 
@@ -3181,25 +3076,9 @@ def load_classes():
     _cache_last_update['classes'] = current_time
     return classes
 
-def _classes_force_reload():
-    """ВОЛНА 22.67: принудительное перечитывание классов С ДИСКА/ИЗ БД,
-    минуя TTL-кэш. Нужен там, где права критичны СЕЙЧАС: admin_panel не
-    должен врать «нет прав», если кэш отстал от сохранённых данных."""
-    try:
-        _cache_last_update.pop('classes', None)
-    except Exception:
-        pass
-    return load_classes()
-
-
 def save_classes(classes):
     global _classes_cache
     _classes_cache = classes
-    # ВОЛНА 22.67: кэш обязан считаться СВЕЖИМ после записи — раньше метка
-    # _cache_last_update['classes'] не обновлялась, и первое же load_classes()
-    # после истечения TTL перечитывало источник заново (Supabase/диск), хотя
-    # в памяти уже лежали только что сохранённые данные.
-    _cache_last_update['classes'] = time.time()
     data = {class_code: class_obj.to_dict() for class_code, class_obj in classes.items()}
     return save_data(CLASSES_FILE, data)
 
@@ -3762,7 +3641,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.68"
+BOT_BUILD = "22.63"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -4514,9 +4393,6 @@ def get_admin_panel_keyboard():
         [InlineKeyboardButton("🔑 Показать код класса", callback_data="show_class_code_admin")],
         # ВОЛНА 22.13: настройки базы решений (авто-модерация, автоудаление).
         [InlineKeyboardButton("📚 База решений · настройки", callback_data="sol_admin_menu")],
-        # ВОЛНА 22.66: «Расписание с сайтов» — следим за страницами школы и
-        # присылаем классу обновления (фото/файл/текст) не чаще 1 раза в день.
-        [InlineKeyboardButton("🌐 Расписание с сайтов", callback_data="schmon_menu")],
         # ВОЛНА 22.30: дежурные — время, дни, очередь, кнопка «заболел».
         [InlineKeyboardButton("🕐 Дежурные", callback_data="duty_admin")],
         [InlineKeyboardButton("❌ Отмена", callback_data="cancel_action")]
@@ -6760,12 +6636,6 @@ def _storage_pack_payload():
         "users": users_n,
         "classes": classes_n,
         "bot": "DEVORKS+",
-        # ВОЛНА 22.64: значение счётчика записей данных НА МОМЕНТ СБОРКИ.
-        # Восстановление на старте сравнивает его с локальным счётчиком:
-        # локальный больше → на диске есть записи ПОЗЖЕ этого снапшота —
-        # применять снапшот нельзя (откат свежих данных). Если снапшот
-        # старого формата (поля нет) — фолбэк: created_utc против mtime.
-        "data_epoch": _data_epoch_read(),
     }
     buf = io.BytesIO()
     # ВОЛНА 9: LZMA (алгоритм 7-Zip) — снапшот базы в канале занимает заметно
@@ -7151,86 +7021,7 @@ def _vault_flush_soon(context, reason="сейф"):
         return None
 
 
-# ВОЛНА 22.67: троттлинг «быстрых» сливов после критических сохранений
-# (создание/вход/выход из класса, регистрация). Полный force-слив — дорогая
-# операция (zip+загрузка+пин в каждый канал), поэтому чаще раза в 10 секунд
-# его не делаем: остальное довезёт тикер (30 с) или post_shutdown.
-_CDB_SOON_LAST_MONO = 0.0
-
-
-def _cdb_flush_soon(context, reason="критичные данные"):
-    """ВОЛНА 22.67: НЕМЕДЛЕННЫЙ слив базы в канал после критических событий —
-    жалоба: «пользователь создаёт класс, и он сразу удаляется» (рестарт/
-    деплой бота в первые 30 секунд после создания съедал класс: тикер не
-    успевал слить снапшот, а на Render диск при деплое стирается)."""
-    global _CDB_SOON_LAST_MONO
-    try:
-        import time as _time
-        now_mono = _time.monotonic()
-        if now_mono - _CDB_SOON_LAST_MONO < 10.0:
-            return None  # недавно сливали — довезёт тикер
-        _CDB_SOON_LAST_MONO = now_mono
-        task = asyncio.create_task(
-            _cdb_flush(context, force=True, reason=reason))
-        _bd = getattr(getattr(context, "application", None), "bot_data", None)
-        if isinstance(_bd, dict):
-            _bd.setdefault("_bg_tasks", []).append(task)
-        return task
-    except Exception as e:
-        logger.warning(f"cdb flush soon: {e}")
-        return None
-
-
-def _cdb_freshness_skip(payload: bytes, fname: str) -> "tuple[bool, str]":
-    """ВОЛНА 22.64: (skip, причина) — НЕ откатывать ли локальную базу этим
-    снапшотом при старте. Жалоба пользователя: «файлы исчезают при
-    обновлении», «бот опять просит день рождения у зарегистрированного» —
-    так выглядел откат свежих данных старым закреплённым снапшотом (последний
-    слив не успел из-за рестарта/kill/неудачного пина). Если на диске есть
-    записи ПОЗЖЕ снапшота — снапшот применять НЕЛЬЗЯ."""
-    try:
-        zf = zipfile.ZipFile(io.BytesIO(payload))
-        try:
-            meta = json.loads(zf.read("_meta.json").decode("utf-8"))
-        finally:
-            zf.close()
-        if not isinstance(meta, dict):
-            return False, ""
-    except Exception:
-        return False, ""
-    # 1) Точный путь (22.64+): счётчик записей в мете против локального.
-    try:
-        snap_epoch = float(meta.get("data_epoch") or 0)
-    except (TypeError, ValueError):
-        snap_epoch = 0.0
-    if snap_epoch > 0:
-        local_epoch = _data_epoch_read()
-        if local_epoch > snap_epoch + 0.5:
-            return True, (f"локальная база НОВЕЕ снапшота «{fname}» (записей: "
-                          f"локально {int(local_epoch)}, в снапшоте "
-                          f"{int(snap_epoch)}) — снапшот НЕ применён, данные "
-                          "остались на месте")
-        return False, ""
-    # 2) Фолбэк (снапшоты до 22.64, без data_epoch): created_utc против
-    #    времени последней записи users.json на диске.
-    try:
-        import calendar as _calendar
-        snap_ts = _calendar.timegm(time.strptime(
-            str(meta.get("created_utc") or ""), "%Y-%m-%d %H:%M:%S"))
-    except Exception:
-        return False, ""
-    try:
-        lm = os.path.getmtime(str(USERS_FILE))
-    except Exception:
-        return False, ""
-    if lm > snap_ts + 5:
-        return True, (f"локальная база НОВЕЕ снапшота «{fname}» (users.json "
-                      "записан позже снапшота) — снапшот НЕ применён")
-    return False, ""
-
-
-async def _cdb_recall(context, suppress_dirty: bool = True,
-                      freshness_guard: bool = False):
+async def _cdb_recall(context, suppress_dirty: bool = True):
     """ВОЛНА 10: «ВСПОМНИТЬ ВСЁ» — вытянуть базу ИЗ КАНАЛА по требованию.
 
     Отличия от восстановления на старте (волна 8):
@@ -7243,12 +7034,6 @@ async def _cdb_recall(context, suppress_dirty: bool = True,
 
     suppress_dirty=True гасит «грязь» после применения (данные только что
     пришли из канала — заливать их обратно немедленно незачем).
-
-    freshness_guard=True (только АВТО-восстановление на старте, 22.64):
-    снапшот, СТАРЕЕ локальных данных, НЕ применяется — раньше это откатывало
-    свежие регистрации/файлы («файлы исчезают», «опять просит ДР»). Ручное
-    «📦 Вспомнить всё» работает БЕЗ этой проверки — человек нажал кнопку,
-    значит хочет применить снапшот именно этот.
 
     Возвращает (ok: bool, отчёт: str)."""
     # ВОЛНА 13: снапшот мог быть ВСТАВЛЕН пользователем и закреплён в любом
@@ -7313,13 +7098,6 @@ async def _cdb_recall(context, suppress_dirty: bool = True,
     # Сериализация со сливом: пока применяем снапшот, тикер не должен
     # параллельно заливать в канал «полустарую» базу.
     async with _get_cdb_flush_lock():
-        # ВОЛНА 22.64: защита от отката — снапшот старше локальных данных
-        # не применяется (только для авто-восстановления на старте).
-        if freshness_guard:
-            _skip, _why = _cdb_freshness_skip(payload, fname)
-            if _skip:
-                logger.info(f"cdb recall: {_why}")
-                return False, _why
         restored, problems = _storage_restore_apply(payload)
         if not restored:
             if problems:
@@ -7467,17 +7245,11 @@ async def _cdb_restore_on_boot(application):
             return
         class _CtxStub:
             bot = application.bot
-        ok, report = await _cdb_recall(_CtxStub(), suppress_dirty=True,
-                                       freshness_guard=True)
+        ok, report = await _cdb_recall(_CtxStub(), suppress_dirty=True)
         if ok:
             logger.info(f"cdb boot: ВСПОМНИЛИ ВСЁ ИЗ КАНАЛА:\n{report}")
             if empty_base:
                 await _boot_dev_restore_hint(application, ok=True, report=report)
-        elif report.startswith("локальная база НОВЕЕ"):
-            # ВОЛНА 22.64: это НЕ ошибка — просто на диске данные свежее
-            # закреплённого снапшота. Честно фиксируем в логе и продолжаем
-            # на локальной базе; слияние в канал выполнит тикер.
-            logger.info(f"cdb boot: восстановление из канала пропущено: {report}")
         else:
             logger.info(f"cdb boot: восстановление не состоялось: {report}")
             if empty_base:
@@ -8375,112 +8147,20 @@ async def _bg_upload_big_mtproto(update, context, user, item, chat_msg, live=Non
         _shutil.rmtree(job_dir, ignore_errors=True)
 
 
-# ═══ ВОЛНА 22.62: АНТИ-ДУБЛИ «АВТОПЕРЕДАЧА + ПРЯМОЙ СТРИМ» ═══
-# Пользователь выбрал файлы — они летят боту ДВУМЯ путями одновременно:
-#   1) прямой стрим из мини-аппа (22.59/22.61 — байты идут, пока жив
-#      WebView);
-#   2) автопередача в Telegram (22.62 — системная панель «поделиться»
-#      через navigator.share → чат бота → нативная очередь Telegram,
-#      настоящий фон).
-# Кто первый довёз — тот и сохранил. Второй путь — дубликат: один и
-# тот же файл НЕ должен появляться в облаке дважды. Реестр ниже держит
-# «клеймы» имя+размер на окно 10 минут для обоих путей: чат-роутер
-# (_bg_upload_items) и финализация стрима (_miniapp_upload_finalize)
-# сверяются перед сохранением.
-_DUP_RECENT = {}        # uid -> {"имя|размер": [ts_claim, ts_saved?]
-_DUP_WINDOW = 600.0     # секунд
-
-
-def _dup_key(name, size):
-    return f"{str(name or '')[:200]}|{int(size or 0)}"
-
-
-def _dup_prune(uid):
-    ent = _DUP_RECENT.get(uid)
-    if not ent:
-        return
-    now = time.time()
-    for k in [k for k, v in ent.items() if now - max(v) > _DUP_WINDOW]:
-        ent.pop(k, None)
-    if not ent:
-        _DUP_RECENT.pop(uid, None)
-
-
-def _dup_claim(uid, name, size):
-    """True — такой файл УЖЕ сохраняют/сохраняли в окне 10 минут.
-    False — свободно, и мы сами поставили клейм (не забудьте
-    _dup_release при неудаче или _dup_saved при успехе)."""
-    _dup_prune(uid)
-    ent = _DUP_RECENT.setdefault(uid, {})
-    v = ent.get(_dup_key(name, size))
-    if v and time.time() - max(v) < _DUP_WINDOW:
-        return True
-    ent[_dup_key(name, size)] = [time.time()]
-    return False
-
-
-def _dup_held(uid, name, size):
-    """Клейм занят (кем-то) — без захвата, только проверка."""
-    ent = _DUP_RECENT.get(uid)
-    if not ent:
-        return False
-    v = ent.get(_dup_key(name, size))
-    return bool(v and time.time() - max(v) < _DUP_WINDOW)
-
-
-def _dup_release(uid, name, size):
-    """Наш клейм не понадобился (сохранение не удалось) — снимаем,
-    чтобы другой путь мог сохранить файл без потерь."""
-    ent = _DUP_RECENT.get(uid)
-    if ent:
-        ent.pop(_dup_key(name, size), None)
-        if not ent:
-            _DUP_RECENT.pop(uid, None)
-
-
-def _dup_saved(uid, name, size):
-    """Файл реально сохранён — клейм живёт от момента СОХРАНЕНИЯ."""
-    ent = _DUP_RECENT.setdefault(uid, {})
-    ent[_dup_key(name, size)] = [time.time(), time.time()]
-
-
-def _cloud_recent_dup(user, name, size):
-    """ВОЛНА 22.62: свежая запись в облаке с тем же именем и размером —
-    автопередача уже сохранила этот файл из чата.
-    ВОЛНА 22.68: ОКНО ЗАВИСИТ ОТ ИСТОЧНИКА записи:
-      • src="chat" — 900 с (как было): файл приехал из чата, прямой стрим
-        мини-аппа мог финализироваться минутами (2 ГБ) — окно широкое;
-      • src="web"  — 600 с (= _DUP_WINDOW): защита ТОЛЬКО от повторного
-        complete той же загрузки (потерянный ответ, рестарт сервера), а не
-        от намеренной повторной загрузки. Раньше окно было 900 с для ВСЕХ
-        записей — вторая музыка с теми же именем+размером (типично для
-        треков из Telegram!) молча сводилась с первой, и пользователь
-        видел «загрузил ещё — пропала, потом пропала первая»."""
-    try:
-        now = time.time()
-        for f in reversed(getattr(user, "cloud_files", []) or []):
-            if not isinstance(f, dict):
-                continue
-            if str(f.get("name") or "")[:200] == str(name or "")[:200] and \
-                    int(f.get("size") or 0) == int(size or 0):
-                _win = 900.0 if str(f.get("src") or "") == "chat" else 600.0
-                cut = now - _win
-                try:
-                    if float(f.get("ts") or 0) >= cut:
-                        return f
-                except Exception:
-                    return f
-    except Exception:
-        pass
-    return None
-
-
-# ВОЛНА 22.62: пометка «файлы сейчас передаются боту через Telegram»
-# (мини-апп ставит её перед автопередачей, POST /api/upload/tg_mark).
-# Пока пометка свежая — итоги сохранения из чата отправляются
-# БЕЗЗВУЧНО (disable_notification): «как в обычном чате, но БЕЗ
-# оповещений», прогресс виден только в панели передач мини-аппа.
-_TG_AUTOSHARE_MARK = {}
+# ═══ ВОЛНА 22.63: АНТИ-ДУБЛИ И АВТОПЕРЕДАЧА 22.62 ПОЛНОСТЬЮ УБРАНЫ ═══
+# Пользователь: «файлы вообще не синхронизируются… убери новые кнопки
+# "загрузить через телеграм" и "авто передача в телеграм" — всё должно
+# быть включено по умолчанию». Реестр анти-дублей 22.62 оказался ВРЕДНЫМ:
+#   • _dup_claim в финализации ставил клейм на файл КАК ПОБОЧНЫЙ ЭФФЕКТ
+#     проверки — и чат-роутер потом МОЛКА глотал те же файлы 10 минут;
+#   • финализация стрима могла ЖДАТЬ чужой клейм до 20 секунд — клиент
+#     видел «зависшую» загрузку и таймауты;
+#   • повторная загрузка того же файла (то же имя+размер) в течение
+#     15 минут молча «сводилась» — файл НЕ появлялся в облаке.
+# Пути загрузки снова ДВА и они НЕ пересекаются: прямой стрим из
+# мини-аппа (22.59/22.61, включён всегда) и файлы, присланные в чат
+# бота вручную («как в обычном чате», роутер 22.57). Каждый файл
+# сохраняется честно, без клеймов и ожиданий.
 
 
 async def _bg_upload_items(update, context, items):
@@ -8491,15 +8171,14 @@ async def _bg_upload_items(update, context, items):
     user = get_user(user_id)
     if not user:
         return
-    # ВОЛНА 22.62: автопередача из мини-аппа — работаем максимально тихо:
-    # итог в чат БЕЗ звука и пуша (пользователь просил «без оповещений»,
-    # прогресс он видит в панели передач мини-аппа)
-    _tg_silent = time.time() - _TG_AUTOSHARE_MARK.get(user_id, 0.0) < 900.0
+    # 22.63: беззвучность автопередачи убрана вместе с ней — файлы из
+    # чата отправлены ВРУЧНУЮ, пользователь смотрит в чат: обычный
+    # ответ бота уместен («как в обычном чате»)
     if not get_cloud_channel_ids() and not _user_vault_channel(user):
         await msg.reply_text(
             "❌ Хранилище не настроено — файл не сохранён. Попросите "
             "разработчика подключить канал, либо подключите СВОЙ: "
-            "🔐 Сейф → 🔗 Моё облако.", disable_notification=_tg_silent)
+            "🔐 Сейф → 🔗 Моё облако.")
         return
 
     files = [f for f in (getattr(user, "cloud_files", []) or []) if isinstance(f, dict)]
@@ -8512,7 +8191,6 @@ async def _bg_upload_items(update, context, items):
         pass
 
     saved, skipped_big, failed, limit_hit = [], [], [], False
-    deduped = []            # 22.62: имена, сведённые с прямым стримом
     warned_quality = False
 
     _msg_mid = int(getattr(msg, "message_id", 0) or 0)
@@ -8524,12 +8202,6 @@ async def _bg_upload_items(update, context, items):
             continue
         size = int(item.get("size") or 0)
         name = str(item.get("name") or "файл")
-        # ВОЛНА 22.62: дубль прямого стрима — автопередача и стрим грузили
-        # ОДНИ И ТЕ ЖЕ файлы одновременно. Файл уже в облаке (или стрим
-        # сохраняет его прямо сейчас) — второго не создаём, тихо пропускаем
-        if _dup_claim(user_id, name, size):
-            deduped.append(name)
-            continue
         # ВОЛНА 22.58: живой статус файла для панели передач мини-аппа.
         _lk = f"{_msg_mid}-{_li}"
         _bg_live_add(user_id, _lk, name, size)
@@ -8539,16 +8211,13 @@ async def _bg_upload_items(update, context, items):
             channel_id = _bg_upload_target(user)
             if channel_id is None:
                 _bg_live_del(user_id, _lk)
-                _dup_release(user_id, name, size)
                 await msg.reply_text(
-                    "❌ Хранилище не настроено — файл не сохранён.",
-                    disable_notification=_tg_silent)
+                    "❌ Хранилище не настроено — файл не сохранён.")
                 return
             _bg_live_set(user_id, _lk, "save")
             sent = await _bg_send_media(context, channel_id, item)
             if sent is None:
                 _bg_live_del(user_id, _lk)
-                _dup_release(user_id, name, size)
                 failed.append(f"{name[:40]}: Telegram не принял")
                 continue
             rec = {
@@ -8570,13 +8239,11 @@ async def _bg_upload_items(update, context, items):
                 update, context, user, item, msg, live=(user_id, _lk))
             if rec is None:
                 _bg_live_del(user_id, _lk)
-                _dup_release(user_id, name, size)
                 why = item.get("_why")
                 if why == "big_hard_limit":
                     await msg.reply_text(
                         f"🚫 «{name[:40]}» больше 2 ГБ — потолок Telegram "
-                        "для ботов. Разделите файл на части по ~1,5 ГБ.",
-                        disable_notification=_tg_silent)
+                        "для ботов. Разделите файл на части по ~1,5 ГБ.")
                 elif why == "mt_failed":
                     failed.append(f"{name[:40]}: не докачался — "
                                   "попробуйте ещё раз")
@@ -8586,22 +8253,7 @@ async def _bg_upload_items(update, context, items):
                 else:
                     skipped_big.append(item)
                 continue
-            # ВОЛНА 22.62: большая загрузка шла минутами — за это время
-            # прямой стрим мог сохранить ЭТОТ ЖЕ файл. Проверяем свежий
-            # список облака: дубль не добавляем (файл уже там).
-            # ВОЛНА 22.68: раньше сверка была БЕЗ окна времени — любой
-            # ОДНОИМЁННЫЙ файл того же размера (даже месячной давности)
-            # «проглатывал» свежескачанный. Теперь честное окно
-            # _cloud_recent_dup (chat 900 с / web 600 с).
-            try:
-                _fc_user = get_user(user_id)
-                if _cloud_recent_dup(_fc_user, name, size) is not None:
-                    deduped.append(name)
-                    continue
-            except Exception:
-                pass
         _bg_live_del(user_id, _lk)
-        _dup_saved(user_id, name, size)   # 22.62: анти-дубль: файл сохранён
         files.append(rec)
         saved.append(rec)
         # Подсказка про качество — ОДНА строка и один раз за пачку.
@@ -8638,10 +8290,6 @@ async def _bg_upload_items(update, context, items):
             lines.append(f"🚫 «{item['name'][:40]}» тоже больше 49 МБ.")
     if failed:
         lines.append("⚠️ Не удалось: " + "; ".join(failed[:5]))
-    if deduped:
-        # 22.62: файлы, которые уже доехали прямым стримом — дублей нет
-        lines.append(f"♻️ {len(deduped)} файл(ов) уже загружен(ы) напрямую — "
-                     "дубли не созданы.")
     if lines:
         kb = None
         if MINIAPP_URL:
@@ -8651,11 +8299,9 @@ async def _bg_upload_items(update, context, items):
         try:
             if skipped_big:
                 await msg.reply_text("\n".join(lines),
-                                     reply_markup=get_big_file_keyboard(),
-                                     disable_notification=_tg_silent)
+                                     reply_markup=get_big_file_keyboard())
             else:
-                await msg.reply_text("\n".join(lines), reply_markup=kb,
-                                     disable_notification=_tg_silent)
+                await msg.reply_text("\n".join(lines), reply_markup=kb)
         except Exception:
             pass
 
@@ -8892,10 +8538,7 @@ _CLOSED_ANCHOR_COOLDOWN = 180.0
 # результат, вместо дубля файла в Сейфе.
 _MINIAPP_COMPLETED = {}
 _MINIAPP_COMPLETED_TTL = 3600
-_MINIAPP_AUTH_TTL = 604800     # 7 суток — ВОЛНА 22.63: длинные сессии мини-аппа
-                               # больше не отваливаются от бота (раньше было 24 ч:
-                               # подпись initData «старела», /api/* начинал отвечать
-                               # 401, и облако «переставало синхронизироваться»)
+_MINIAPP_AUTH_TTL = 86400      # 24 часа — как рекомендует Telegram
 _MINIAPP_CHUNK = 4 * 1024 * 1024  # клиент шлёт кусками по 4 МБ (документация)
 
 
@@ -8905,73 +8548,6 @@ def _miniapp_prune_completed():
     for k in [k for k, v in _MINIAPP_COMPLETED.items()
               if now - float(v.get("ts", 0)) > _MINIAPP_COMPLETED_TTL]:
         _MINIAPP_COMPLETED.pop(k, None)
-
-
-def _miniapp_completed_path():
-    """ВОЛНА 22.68: файл-карта завершённых загрузок (uploadId → ответ).
-    Раньше карта была только в ОЗУ: рестарт сервера стирал её, повторный
-    complete недогруженного файла создавал ВТОРУЮ запись (дубль карточки
-    в облаке). Теперь карта живёт на диске рядом с сессиями."""
-    try:
-        return os.path.join(_miniapp_tmpdir(), "completed_uploads.json")
-    except Exception:
-        return os.path.join("miniapp_uploads", "completed_uploads.json")
-
-
-def _miniapp_completed_save():
-    """Атомарно слить карту завершённых загрузок на диск (best-effort)."""
-    try:
-        p = _miniapp_completed_path()
-        _ensure_parent_dir(p)
-        tmp = p + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(_MINIAPP_COMPLETED, f, ensure_ascii=False)
-        os.replace(tmp, p)
-    except Exception:
-        pass
-
-
-def _miniapp_completed_put(upid, uid, resp):
-    """Единая точка записи результата complete: память + диск.
-    (Раньше три места присваивали _MINIAPP_COMPLETED[upid] напрямую —
-    диск при этом молчал, и рестарт между complete и повторным complete
-    рождал дубль файла.)"""
-    _MINIAPP_COMPLETED[str(upid or "")] = {
-        "ts": time.time(), "uid": str(uid or ""), "resp": resp}
-    _miniapp_prune_completed()
-    _miniapp_completed_save()
-
-
-def _miniapp_completed_restore():
-    """При старте сервера: прочитать карту завершённых загрузок с диска.
-    Просроченные (TTL 1 ч) и битые записи честно выбрасываются."""
-    try:
-        p = _miniapp_completed_path()
-        if not os.path.exists(p):
-            return 0
-        with open(p, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, dict):
-            return 0
-        now = time.time()
-        n = 0
-        for k, v in data.items():
-            if not isinstance(k, str) or not isinstance(v, dict):
-                continue
-            if now - float(v.get("ts", 0) or 0) > _MINIAPP_COMPLETED_TTL:
-                continue
-            if not isinstance(v.get("resp"), dict):
-                continue
-            _MINIAPP_COMPLETED[k] = v
-            n += 1
-        if not _MINIAPP_COMPLETED:
-            try:
-                os.remove(p)
-            except OSError:
-                pass
-        return n
-    except Exception:
-        return 0
 
 # ВОЛНА 22.30: ОДНОРАЗОВЫЕ ССЫЛКИ СКАЧИВАНИЯ. Заголовки авторизации в ссылке
 # не передашь, а blob-загрузки в WebView Telegram часто блокированы — поэтому
@@ -9167,16 +8743,10 @@ def _miniapp_rec_out(rec):
         pass  # epoch — отдаём число
     else:
         _ts = str(_ts or "")
-    # ВОЛНА 22.68: голосовые (kind="voice") показываем как музыку — фильтр
-    # «Музыка» и иконка в мини-аппе иначе их не видели (клиент знает только
-    # photo/video/audio/document).
-    _kind = str(rec.get("kind") or "document")
-    if _kind == "voice":
-        _kind = "audio"
     return {
         "id": str(rec.get("id") or ""),
         "name": str(rec.get("name") or "файл"),
-        "kind": _kind,
+        "kind": str(rec.get("kind") or "document"),
         "size": int(rec.get("size") or 0),
         "ts": _ts,
         "vault": False,
@@ -9245,12 +8815,7 @@ def _miniapp_vault_pw_from_request(request):
 
 def _miniapp_kind_from(mime, name):
     """Тип для фильтров мини-аппа по mime/расширению. Сам файл в канале
-    хранится ДОКУМЕНТОМ (без сжатия) — kind нужен только интерфейсу.
-    ВОЛНА 22.68: расширена таблица расширений — раньше музыка .aac/.opus и
-    фото .jfif/.bmp/.webp-двойники, видео .3gp/.m4v показывались как
-    «документ» («неправильное распознавание файлов»). Проверка
-    .endswith(…), поэтому длинные хвосты («.mp3.upload») не совпадут, а
-    «.MP3» в верхнем регистре — совпадёт (имя уже приведено к нижнему)."""
+    хранится ДОКУМЕНТОМ (без сжатия) — kind нужен только интерфейсу."""
     m = (mime or "").lower()
     if m.startswith("image/"):
         return "photo"
@@ -9259,24 +8824,12 @@ def _miniapp_kind_from(mime, name):
     if m.startswith("audio/"):
         return "audio"
     n = (name or "").lower()
-    for ext, k in (
-            # картинки
-            (".jpg", "photo"), (".jpeg", "photo"), (".png", "photo"),
-            (".gif", "photo"), (".webp", "photo"), (".heic", "photo"),
-            (".heif", "photo"), (".jfif", "photo"), (".bmp", "photo"),
-            (".tif", "photo"), (".tiff", "photo"), (".avif", "photo"),
-            (".svg", "photo"),
-            # видео
-            (".mp4", "video"), (".mov", "video"), (".avi", "video"),
-            (".mkv", "video"), (".webm", "video"), (".m4v", "video"),
-            (".3gp", "video"), (".3g2", "video"), (".mpg", "video"),
-            (".mpeg", "video"), (".wmv", "video"), (".ts", "video"),
-            # музыка
-            (".mp3", "audio"), (".wav", "audio"), (".ogg", "audio"),
-            (".oga", "audio"), (".opus", "audio"), (".m4a", "audio"),
-            (".m4b", "audio"), (".flac", "audio"), (".aac", "audio"),
-            (".wma", "audio"), (".amr", "audio"), (".mid", "audio"),
-            (".midi", "audio"), (".weba", "audio")):
+    for ext, k in ((".jpg", "photo"), (".jpeg", "photo"), (".png", "photo"),
+                   (".gif", "photo"), (".webp", "photo"), (".heic", "photo"),
+                   (".mp4", "video"), (".mov", "video"), (".avi", "video"),
+                   (".mkv", "video"), (".webm", "video"),
+                   (".mp3", "audio"), (".wav", "audio"), (".ogg", "audio"),
+                   (".m4a", "audio"), (".flac", "audio")):
         if n.endswith(ext):
             return k
     return "document"
@@ -10904,17 +10457,6 @@ html.low-end #cornerTransfers.panel-open .ct-panel {
   animation: ctItemIn 0.35s var(--ease-snap);
 }
 
-/* ВОЛНА 22.65: строка «ждёт пароль Сейфа» нажимается целиком */
-.ct-item.ct-clickable {
-  cursor: pointer;
-  -webkit-tap-highlight-color: rgba(10, 132, 255, 0.15);
-}
-
-.ct-item.ct-clickable:active {
-  transform: scale(0.98);
-  border-color: rgba(10, 132, 255, 0.55);
-}
-
 @keyframes ctItemIn {
   from { opacity: 0; transform: translateY(8px) scale(0.97); }
   to   { opacity: 1; transform: none; }
@@ -12186,11 +11728,6 @@ body.vp-lock {
     </p>
 
     <div style="display:flex;flex-direction:column;gap:8px">
-      <!-- ВОЛНА 22.63: кнопки «Загрузить через Telegram» и «Автопередача
-           в Telegram» УДАЛЕНЫ по просьбе пользователя. Файлы всегда (по
-           умолчанию) летят боту напрямую стримом с момента выбора —
-           никаких переключателей и лишних кнопок. -->
-
       <button class="sound-item-btn" id="uploadAddBtn" onclick="pickUploadFiles()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
         <span>Добавить файл</span>
         <i data-lucide="plus" style="width:18px;height:18px"></i>
@@ -13372,132 +12909,6 @@ function handleSoundSelect(e, id) {
 const IS_TELEGRAM = !!(tg && tg.initData);
 let WEB_TOKEN = localStorage.getItem('devo_web_token') || '';
 
-/* ═══ ВОЛНА 22.66: КЭШ СПИСКА ФАЙЛОВ — «после обновления страницы всё
-   сбрасывается и ничего не остаётся» — БОЛЬШЕ НЕ ДОЛЖНО. ═══
-   При обновлении страницы список стартует пустым и наполняется только
-   после первого успешного /api/files. Пока сервер просыпается (бесплатный
-   хостинг), тихий старт ретраит 3с→7с→15с→30с→60с — и всё это время
-   пользователь видит ПУСТОЕ облако: выглядит, будто «файлы исчезли».
-   Фикс: последний успешный ответ /api/files хранится в localStorage
-   (с проверкой принадлежности текущему пользователю) и мгновенно
-   рисуется при старте — обновление страницы показывает файлы СРАЗУ,
-   а тихая досинхронизация подхватывает свежие данные в фоне. */
-const FILES_CACHE_KEY = 'dv_files_cache_v1';
-
-function filesCacheIdentity() {
-  /* Кому принадлежит кэш: Telegram → id пользователя из initData;
-     веб-вход → токен сессии. Пусто → кэшем не пользуемся. */
-  try {
-    if (IS_TELEGRAM && tg && tg.initDataUnsafe && tg.initDataUnsafe.user) {
-      return 'tg:' + (tg.initDataUnsafe.user.id || '');
-    }
-  } catch (e) {}
-
-  if (WEB_TOKEN) return 'wt:' + WEB_TOKEN;
-
-  return '';
-}
-
-function filesCacheClear() {
-  try { localStorage.removeItem(FILES_CACHE_KEY); } catch (e) {}
-}
-
-function filesCacheLoad() {
-  try {
-    const raw = localStorage.getItem(FILES_CACHE_KEY);
-
-    if (!raw) return null;
-
-    const rec = JSON.parse(raw);
-
-    if (!rec || !rec.d || !rec.k) return null;
-
-    const id = filesCacheIdentity();
-
-    if (!id || rec.k !== id) return null;  /* чужие данные не показываем */
-
-    return rec;
-  } catch (e) {
-    return null;
-  }
-}
-
-function filesCacheSave(raw, force) {
-  try {
-    const id = filesCacheIdentity();
-
-    if (!id || !raw) return;
-
-    const now = Date.now();
-
-    /* без force — не чаще раза в 60с (живой опрос 2.5с не должен
-       писать в localStorage на каждый тик) */
-    if (!force && filesCacheSave._ts && (now - filesCacheSave._ts) < 60000) return;
-
-    const rec = {
-      k: id,
-      ts: now,
-      d: {
-        files: raw.files || [],
-        bot: String(raw.bot || ''),
-        build: String(raw.build || ''),
-        plain: (typeof raw.plain === 'boolean') ? raw.plain : null,
-        pending: Array.isArray(raw.pending) ? raw.pending : [],
-        bg_live: raw.bg_live || null,
-        safe_count: +raw.safe_count || 0,
-        limit: +raw.limit || 0
-      }
-    };
-
-    localStorage.setItem(FILES_CACHE_KEY, JSON.stringify(rec));
-    filesCacheSave._ts = now;
-  } catch (e) {}
-}
-
-function filesMapAll(f) {
-  /* Единое отображение записи /api/files → карточка (используется и при
-     обычной загрузке, и при восстановлении из кэша) */
-  return {
-    id: String(f.id || ''),
-    name: String(f.name || 'файл'),
-    kind: String(f.kind || 'document'),
-    size: +f.size || 0,
-    ts: String(f.ts || ''),
-    vault: !!f.vault,
-    /* ВОЛНА 22.50: признаки Сейфа — «Достать из Сейфа» для файлов режима
-       «без шифра» (plain) идёт БЕЗ пароля (сервер 22.50 это умеет) */
-    safe: !!f.safe,
-    plain: !!f.plain,
-    /* ВОЛНА 22.57: откуда файл — «через бота» (из чата) или из веба;
-       нужно для тоста «Пока вас не было» после фоновых загрузок */
-    src: String(f.src || '')
-  };
-}
-
-function filesCacheBoot() {
-  /* Мгновенный рендер из кэша ДО первого запроса: обновление страницы
-     показывает файлы сразу, даже если сервер ещё спит. */
-  const rec = filesCacheLoad();
-
-  if (!rec) return false;
-
-  const d = rec.d;
-
-  ALL_FILES = (d.files || []).map(filesMapAll);
-  CONN.bot = String(d.bot || CONN.bot || '');
-  CONN.build = String(d.build || CONN.build || '');
-
-  if (typeof d.plain === 'boolean') STORAGE_ENCRYPTED = !d.plain;
-  else if (ALL_FILES.some((f) => f.vault && !f.plain)) STORAGE_ENCRYPTED = true;
-
-  try { renderAll({}); } catch (e) {}
-  /* 22.65: панель передач тоже оживает из кэша (недогруженное/ждёт пароль) */
-  try { srvPendingApply(d.pending); } catch (e) {}
-  try { bgUploadApply(d.bg_live); } catch (e) {}
-
-  return ALL_FILES.length > 0;
-}
-
 function authHeaders(extra) {
   const h = Object.assign({ 'Cache-Control': 'no-store' }, extra || {});
 
@@ -13526,38 +12937,11 @@ async function apiJson(url, options) {
          подпись initData может не пройти проверку — пользователь должен
          иметь возможность войти по ID и веб-паролю (путь Bearer в
          _api_get_user_any работает и внутри Telegram). */
-      /* ВОЛНА 22.63: ВНУТРИ TELEGRAM — сначала тихая перезагрузка ОДИН
-         раз: Telegram вносит в WebView СВЕЖИЙ initData при каждом старте
-         мини-аппа. Долгая сессия (или рестарт сервера с подвисшей
-         подписью) больше НЕ выкидывает пользователя на окно входа «ID +
-         пароль», которого у него может не быть, — синхронизация
-         восстанавливается сама. Флаг в sessionStorage страхует от
-         циклической перезагрузки; на любом УСПЕШНОМ ответе снимается. */
-      if (IS_TELEGRAM && tg && tg.initData) {
-        let reloaded = false;
-        try {
-          reloaded = sessionStorage.getItem('dv_relogin') === '1';
-        } catch (e) {}
-        if (!reloaded) {
-          try { sessionStorage.setItem('dv_relogin', '1'); } catch (e) {}
-          /* 22.66: кэш файлов НЕ чистим — после перезагрузки тот же
-             пользователь увидит свой список мгновенно, без пустоты */
-          location.reload();
-        } else {
-          filesCacheClear();
-          openLoginModal();
-        }
-      } else {
-        filesCacheClear();
-        openLoginModal();
-      }
+      openLoginModal();
     }
 
     throw err;
   }
-
-  /* успех — снимаем страховку от циклической перезагрузки */
-  try { sessionStorage.removeItem('dv_relogin'); } catch (e) {}
 
   return data;
 }
@@ -13879,7 +13263,21 @@ async function loadFiles(silent, quiet) {
   try {
     const data = await apiJson('/api/files');
 
-    ALL_FILES = (data.files || []).map(filesMapAll);
+    ALL_FILES = (data.files || []).map((f) => ({
+      id: String(f.id || ''),
+      name: String(f.name || 'файл'),
+      kind: String(f.kind || 'document'),
+      size: +f.size || 0,
+      ts: String(f.ts || ''),
+      vault: !!f.vault,
+      /* ВОЛНА 22.50: признаки Сейфа — «Достать из Сейфа» для файлов режима
+         «без шифра» (plain) идёт БЕЗ пароля (сервер 22.50 это умеет) */
+      safe: !!f.safe,
+      plain: !!f.plain,
+      /* ВОЛНА 22.57: откуда файл — «через бота» (из чата) или из веба;
+         нужно для тоста «Пока вас не было» после фоновых загрузок */
+      src: String(f.src || '')
+    }));
 
     CONN.bot = String(data.bot || CONN.bot || '');
     CONN.build = String(data.build || CONN.build || '');
@@ -13935,21 +13333,11 @@ async function loadFiles(silent, quiet) {
     if (_sig !== LAST_FILES_SIG) {
       LAST_FILES_SIG = _sig;
       renderAll({ animate: !quiet });
-      /* 22.66: список изменился — обновляем кэш для мгновенного старта */
-      filesCacheSave(data, true);
-    } else {
-      /* список тот же — кэш обновляется не чаще раза в 60с (pending/bg_live) */
-      filesCacheSave(data, false);
     }
 
     /* ВОЛНА 22.58: живая карточка «Загрузка через Telegram» — считаем
        приехавшие из чата файлы и серверные статусы bg_live */
     bgUploadApply(data.bg_live);
-
-    /* ВОЛНА 22.65: недогруженное с сервера — восстановление строк панели
-       передач после обновления страницы («файлы сбрасываются и ничего
-       не остаётся» — больше не должно) */
-    srvPendingApply(data.pending);
 
     return true;
   } catch (e) {
@@ -14007,14 +13395,8 @@ async function syncNow() {
 let RESYNC_TIMER = null;
 
 function maybeAutoResync() {
-  /* ВОЛНА 22.64: авто-синхронизация работает и в БРАУЗЕРЕ (WEB_TOKEN) —
-     раньше (!IS_TELEGRAM) молча отключала её вне Telegram: файлы, добавленные
-     через бота в чат, не появлялись в веб-облаке без ручной синхронизации
-     («файлы не синхронизируются»). */
-  if (listLoading || isUploading) return;
-  if (!IS_TELEGRAM && !WEB_TOKEN) return;
-  /* ВОЛНА 22.68: 12 с → 4 с — обновления приходят «в несколько секунд» */
-  if (Date.now() - LAST_SYNC < 4000) return;
+  if (!IS_TELEGRAM || listLoading || isUploading) return;
+  if (Date.now() - LAST_SYNC < 20000) return;
 
   loadFiles(true);
 }
@@ -14035,19 +13417,16 @@ try {
   if (tg && tg.onEvent) tg.onEvent('activated', maybeAutoResync);
 } catch (e) {}
 
-/* ВОЛНА 22.50: тихая авто-синхронизация. Пользователь:
+/* ВОЛНА 22.50: тихая авто-синхронизация каждые 45 секунд. Пользователь:
    «автоматическая синхронизация мини приложения должна быть каждые сколько-то
    секунд/минут, чтобы всё было синхронизировано, но не уведомлять об этом».
-   ВОЛНА 22.64: тик 45 с → 10 с.
-   ВОЛНА 22.68: тик 10 с → 4 с и троттл 12 с → 4 с — «обновление нужно
-   больше В НЕСКОЛЬКО СЕКУНД». Запрос лёгкий (сервер отвечает из ОЗУ),
-   спама нет: пока летит загрузка или прошлый запрос не доехал — тик
-   пропускается (listLoading/isUploading). В фоне и без входа не тикает. */
+   loadFiles(true) молчит (без тостов и спиннеров) и обновляет файлы, режим
+   шифрования и статус канала. В фоне и без входа не тикает. */
 setInterval(function () {
   if (document.hidden) return;
   if (!IS_TELEGRAM && !WEB_TOKEN) return;   /* не вошли — нечего синхронизировать */
   maybeAutoResync();
-}, 4000);
+}, 45000);
 
 let FILTER = 'all';
 let SEARCH = '';
@@ -14530,11 +13909,8 @@ function openSafeModal(mode, fileId) {
   const m = document.getElementById('safeModal');
   if (!m) return;
 
-  /* ВОЛНА 22.40: контекстное окно Сейфа — подпись кнопки зависит от действия.
-     ВОЛНА 22.65: режим 'complete_upload' — файл уже у бота целиком и ждёт
-     пароль: верный пароль сохранит его в облако БЕЗ перекачки. */
-  SAFE_MODAL_MODE = (mode === 'to_safe' || mode === 'from_safe' ||
-                     mode === 'complete_upload') ? mode : 'unlock';
+  /* ВОЛНА 22.40: контекстное окно Сейфа — подпись кнопки зависит от действия */
+  SAFE_MODAL_MODE = (mode === 'to_safe' || mode === 'from_safe') ? mode : 'unlock';
   SAFE_MODAL_FILE_ID = fileId || null;
 
   const lbl = document.getElementById('safeActionLabel');
@@ -14542,9 +13918,7 @@ function openSafeModal(mode, fileId) {
   if (lbl) {
     lbl.textContent = SAFE_MODAL_MODE === 'to_safe'
       ? 'Переместить в сейф'
-      : SAFE_MODAL_MODE === 'complete_upload'
-        ? 'Сохранить файл в облако'
-        : 'Разблокировать';
+      : 'Разблокировать';
   }
 
   const input = document.getElementById('safePassword');
@@ -14568,15 +13942,12 @@ function closeSafeModal(e) {
   closeModalEl('safeModal');
 }
 
-/* Кнопка действия в окне Сейфа: разблокировать / переместить в сейф /
-   сохранить ждущий файл (22.65) */
+/* Кнопка действия в окне Сейфа: разблокировать / переместить в сейф */
 function onSafeAction() {
   if (SAFE_MODAL_MODE === 'to_safe') {
     safeDoTransfer('to_safe');
   } else if (SAFE_MODAL_MODE === 'from_safe') {
     safeDoTransfer('from_safe');
-  } else if (SAFE_MODAL_MODE === 'complete_upload') {
-    completePendingUpload();
   } else {
     unlockSafe();
   }
@@ -15363,14 +14734,16 @@ function botQueueTrack() {
 
 /* ═══ ВОЛНА 22.58: ЖИВАЯ КАРТОЧКА «ЗАГРУЗКА ЧЕРЕЗ БОТА» ═══
    Физика WebView: мини-апп не может сам «отдать» выбранные файлы в чат
-   бота — байты уходят только пока он жив. Поэтому главный путь (22.57) —
-   файлы прикладываются В ЧАТЕ бота, Telegram доносит их сам (настоящий
-   фон, 100%), а бот сохраняет всё в облако на сервере. Здесь этот путь
-   становится ПРОЗРАЧНЫМ: карточка в панели передач включается в момент
-   нажатия кнопки «📤 Загрузить через Telegram» и живёт, пока файлы
-   едут: считает приехавшие из чата файлы (src='chat' свежее пометки
-   dv_bg_wait_ts) и показывает серверные статусы bg_live — в том числе
-   живые проценты больших файлов («Качаю с Telegram: 45%»). */
+   бота — байты уходят только пока он жив. Роутер 22.57 сохраняет файлы,
+   присланные в чат бота вручную, в облако на сервере. Здесь этот путь
+   ПРОЗРАЧЕН: карточка в панели передач включается, когда пользователь
+   недавно отправлял файлы в чат (пометка dv_bg_wait_ts), и живёт, пока
+   файлы едут: считает приехавшие из чата файлы (src='chat' свежее
+   пометки dv_bg_wait_ts) и показывает серверные статусы bg_live — в том
+   числе живые проценты больших файлов («Качаю с Telegram: 45%»).
+   ВОЛНА 22.63: кнопки «через Telegram» (22.57) и автопередача (22.62)
+   убраны — пометку больше никто не ставит, карточка спит, а файлы из
+   чата честно показываются тостом «📨 Через бота загрузилось: N». */
 let bgUploadTimer = null;
 let bgUploadLastGrow = 0;
 let bgUploadCount = 0;
@@ -15550,179 +14923,6 @@ function bgUploadRestore() {
 
   bgUploadEnsureCard();
   bgUploadSchedule(800);
-}
-
-/* ═══ ВОЛНА 22.65: НЕДОГРУЖЕННОЕ ПОСЛЕ ОБНОВЛЕНИЯ СТРАНИЦЫ ═══
-   Жалоба: «после обновления страницы в мини апп файлы все сбрасываются
-   и в мини апп ничего не остаётся». Список файлов всегда жил на сервере
-   и возвращался, а вот строки передач — нет: они были только в памяти
-   вкладки, обновление их стирало, и недоконченная загрузка становилась
-   невидимой. Теперь сервер присылает недоконченные сессии в /api/files
-   (pending), панель передач восстанавливает строки:
-     • байты ещё едут или прервались — видно процент; выбрать файл заново
-       можно в любой момент: сервер узнаёт «свою» сессию по отпечатку и
-       продолжит с того же байта;
-     • все байты уже у бота, файл ждёт пароль Сейфа — строка НАЖИМАЕТСЯ:
-       ввод пароля сохраняет файл БЕЗ перекачки (байты уже на сервере). */
-const SRV_PEND_PREFIX = 'srvp_';
-
-function srvPendingId(upid) {
-  return SRV_PEND_PREFIX + String(upid || '');
-}
-
-function srvPendingApply(list) {
-  const arr = Array.isArray(list) ? list : [];
-  const seen = new Set();
-
-  for (const p of arr) {
-    if (!p || !p.uploadId) continue;
-
-    const upid = String(p.uploadId);
-    const id = srvPendingId(upid);
-
-    seen.add(id);
-
-    /* сессию прямо сейчас ведёт этот клиент (предохранка/движок) —
-       строка уже есть, серверную не дублируем */
-    if (LOCALLY_DRIVEN.has(upid)) continue;
-
-    const size = +p.size || 0;
-    const received = Math.max(0, Math.min(+p.received || 0, size));
-    const complete = size > 0 && received >= size;
-    const waitPw = complete && !!p.wait_pw;
-    const pct = size ? Math.floor((received / size) * 100) : 0;
-
-    let t = TRANSFERS.get(id);
-
-    if (!t) {
-      transferStart({
-        id: id,
-        type: 'srvpend',
-        name: String(p.name || 'файл'),
-        total: size,
-        cancel: () => srvPendingCancel(upid)
-      });
-
-      t = TRANSFERS.get(id);
-
-      if (!t) continue;
-    }
-
-    if (t.done) continue;
-
-    t.loaded = received;
-    t.waitPw = waitPw;
-    t.note = waitPw
-      ? 'Целиком у бота — ждёт пароль Сейфа · нажмите, чтобы ввести'
-      : complete
-        ? 'Целиком у бота — сохраняю в облако…'
-        : (pct > 0
-          ? 'В пути: ' + pct + '% — можно закрыть приложение, докачаю'
-          : 'Готовлю загрузку…');
-
-    ctSync();
-  }
-
-  /* сессии, которых больше нет на сервере, — файл сохранён (или отменён):
-     строку честно закрываем, панель сама её уберёт */
-  TRANSFERS.forEach((t, id) => {
-    if (t.type === 'srvpend' && !t.done && !seen.has(id)) {
-      transferFinish(id, true, 'Сохранено в облаке');
-    }
-  });
-}
-
-function srvPendingCancel(upid) {
-  /* отмена недогруженного: сервер стирает сессию и временные байты
-     (идемпотентно, владение проверяет сервер) */
-  apiJson('/api/upload/abort', {
-    method: 'POST',
-    headers: authHeaders({ 'Content-Type': 'application/json' }),
-    body: JSON.stringify({ uploadId: upid })
-  }).catch(() => {});
-
-  LOCALLY_DRIVEN.delete(upid);
-
-  transferFinish(srvPendingId(upid), false, 'Отменено — байты стёрты');
-}
-
-function srvPendingPwPrompt(upid) {
-  const t = TRANSFERS.get(srvPendingId(upid));
-
-  if (!t || t.done || !t.waitPw) return;
-
-  /* окно Сейфа в режиме «сохранить файл»: верный пароль завершит загрузку
-     прямо с сервера — перекачивать ничего не нужно */
-  openSafeModal('complete_upload', upid);
-}
-
-async function completePendingUpload() {
-  const input = document.getElementById('safePassword');
-  const pw = (input && input.value) || '';
-  const upid = SAFE_MODAL_FILE_ID || '';
-
-  if (!upid) {
-    closeSafeModal();
-    return;
-  }
-
-  if (!pw) {
-    showToast('Введите пароль Сейфа');
-    return;
-  }
-
-  /* пароль проверяем сразу: неверный — окно остаётся открытым */
-  try {
-    await apiJson('/api/safe/unlock', {
-      method: 'POST',
-      headers: authHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify({ password: pw })
-    });
-  } catch (e) {
-    showToast(cloudErrText(e));
-    return;
-  }
-
-  VAULT_PW = pw;
-  VAULT_SERVER_UNLOCKED = true;
-
-  if (input) input.value = '';
-
-  closeSafeModal();
-
-  const tid = srvPendingId(upid);
-  const t = TRANSFERS.get(tid);
-
-  if (t && !t.done) {
-    t.note = 'Шифрую и сохраняю в облако…';
-
-    ctSync();
-  }
-
-  try {
-    await apiJson('/api/upload/complete', {
-      method: 'POST',
-      headers: vaultHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify({ uploadId: upid, password: pw })
-    });
-
-    LOCALLY_DRIVEN.add(upid);   /* строку закроет следующий тик loadFiles */
-
-    transferFinish(tid, true, 'Готово — в облаке');
-    showToast('✅ Файл сохранён — уже в облаке');
-    loadFiles(true);
-  } catch (e) {
-    /* сессия на сервере жива: строка остаётся, пароль можно ввести снова */
-    if (t && !t.done) {
-      t.note = (e && e.code === 'wrong_password')
-        ? 'Пароль не подошёл — нажмите и введите снова'
-        : 'Не получилось: ' + cloudErrText(e).slice(0, 60);
-
-      ctSync();
-    }
-
-    showToast(cloudErrText(e));
-  }
 }
 
 async function enqueueBotDownload(ids) {
@@ -16681,13 +15881,13 @@ function refreshUploadModal() {
 
   if (info) {
     info.textContent = !has
-      /* ВОЛНА 22.59: файлы летят боту С МОМЕНТА ВЫБОРА — окно теперь
-         настройки (пароль/имена), а не «шлюз». ВОЛНА 22.61: текст честный:
-         что успело дойти — сохранится само; недокачанное продолжится при
-         следующем открытии, бот молча подскажет в чате.
-         ВОЛНА 22.63: упоминание кнопки «через Telegram» убрано — кнопки
-         больше нет, загрузка идёт напрямую всегда. */
-      ? 'Файлы, выбранные ниже, сразу летят боту. Что успеет дойти — сохранится само; недокачанное продолжится при следующем открытии (бот подскажет в чате).'
+      /* ВОЛНА 22.63: кнопки «через Telegram» и автопередача убраны по
+         просьбе пользователя («убери новые кнопки — всё должно быть
+         включено по умолчанию»). Единственный путь — прямой стрим боту,
+         он включён ВСЕГДА и стартует с момента выбора файлов (22.59):
+         что успело доехать — сохранится само, недокачанное продолжится
+         при следующем открытии облака (бот молча подскажет в чате). */
+      ? 'Файлы, выбранные ниже, сразу летят боту — загрузка включена всегда. Что успеет дойти — сохранится само; недокачанное продолжится при следующем открытии (бот подскажет в чате).'
       : pendingFiles.length === 1
         ? (pendingFiles[0].name || 'файл') + ' — уже летит боту. Пароль (в Сейф) и имя — по кнопке «Отправить», можно и просто закрыть окно.'
         : 'Выбрано файлов: ' + pendingFiles.length + ' — все уже летят боту. Пароль (в Сейф) и имена — по кнопке «Отправить», окно можно закрыть.';
@@ -16719,10 +15919,6 @@ function refreshUploadModal() {
   if (addBtn) addBtn.classList.toggle('hidden', has);
   if (sendBtn) sendBtn.classList.toggle('hidden', !has);
   if (moreBtn) moreBtn.classList.toggle('hidden', !has);
-
-  /* ВОЛНА 22.63: тумблер автопередачи и подзаголовок кнопки «через
-     Telegram» удалены вместе с самими кнопками — окно загрузки снова
-     простое: пароль, список файлов, «Отправить» / «Добавить ещё». */
 
   /* ВОЛНА 22.40: пароль ОБЯЗАТЕЛЕН только когда хранилище шифруется
      (STORAGE_ENCRYPTED === true). Раньше поле становилось обязательным,
@@ -16861,17 +16057,28 @@ function addMoreUploadFiles() {
   document.getElementById('fileInput').click();
 }
 
-/* ═══ ВОЛНА 22.63: ЕДИНЫЙ ПУТЬ ЗАГРУЗКИ — ПРЯМО БОТУ, ВСЕГДА ═══
-   Кнопки «Загрузить через Telegram» и «Автопередача в Telegram»
-   (волны 22.57/22.62) удалены по решению пользователя: они путали
-   поток и ломали привычную синхронизацию. Теперь всё включено по
-   умолчанию и работает само: файлы летят боту НАПРЯМУЮ стримом с
-   момента выбора (22.59/22.61), недокачанное бот доносит сам при
-   следующем открытии облака, прогресс — в панели передач. Никаких
-   переключателей, панелей «поделиться» и переходов в чат. */
+/* ═══ ВОЛНА 22.63: КНОПКИ «ЧЕРЕЗ TELEGRAM» И АВТОПЕРЕДАЧА УБРАНЫ ═══
+   Пользователь: «убери новые кнопки "загрузить через телеграм" и
+   "авто передача в телеграм" — всё должно быть включено по умолчанию.
+   Файлы вообще не синхронизируются». Причины убрать: системная панель
+   «поделиться» (22.62) открывалась ПОВЕРХ окна загрузки и путала поток,
+   а кнопка 22.57 вела в чат бота вместо загрузки. Единственный путь
+   теперь — прямой стрим боту (22.59/22.61), он включён ВСЕГДА, без
+   тумблеров: файлы летят боту с момента выбора, байты переживают
+   закрытие окна (hold-сессии), недокачанное продолжается при следующем
+   открытии облака из очереди IndexedDB. Файлы, присланные в чат бота
+   вручную («как в обычном чате»), по-прежнему сохраняются в облако
+   автоматически (сервер, роутер 22.57). */
 
 function uploadFiles(fileList) {
   let files = Array.from(fileList);
+
+  /* 22.49: раньше файлы, выбранные ВО ВРЕМЯ активной загрузки, молча
+     пропадали (return без тоста) — пользователь думал, что «не сработало» */
+  if (files.length && isUploading) {
+    showToast('⏳ Дождитесь окончания текущей загрузки — потом добавьте остальные');
+    return;
+  }
 
   if (!files.length) return;
 
@@ -16888,33 +16095,9 @@ function uploadFiles(fileList) {
 
   if (!files.length) return;
 
-  /* ВОЛНА 22.49: раньше файлы, выбранные ВО ВРЕМЯ активной загрузки, молча
-     пропадали (return без тоста) — пользователь думал, что «не сработало».
-     ВОЛНА 22.68: теперь они СНАЧАЛА сохраняются в очередь докачки (IndexedDB),
-     и сразу после окончания текущей пачки движок сам подхватит их
-     (soft-resume) — «дождитесь окончания» больше не означает «потеряйте». */
-  if (files.length && isUploading) {
-    for (const f of files) {
-      if (f._entryKey || (+f.size || 0) > UPQ_MAX_PERSIST) continue;
-
-      const k = 'up_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
-
-      f._entryKey = k;
-
-      upqPut({
-        k: k, blob: f, name: f.name, uploadName: f.uploadName || f.name,
-        size: +f.size || 0, mime: f.type || '', uploadId: '', added: Date.now()
-      });
-    }
-
-    showToast('⏳ Дождитесь окончания текущей загрузки — эти ' + files.length +
-      ' файл(ов) в очереди и полетят следом');
-    return;
-  }
-
-  /* ВОЛНА 22.63: автопередача (панель «поделиться») удалена — выбор
-     файлов сразу запускает ПРЯМОЙ стрим боту ниже: очередь IndexedDB,
-     prestreamInitAll, prestreamStart. Всё включено по умолчанию. */
+  /* ВОЛНА 22.63: перехват выбора файлов автопередачей (22.62) убран —
+     никакой системной панели «поделиться», поток не прерывается:
+     сразу окно загрузки, файлы летят боту напрямую с момента выбора. */
 
   const modalOpen = !!(document.getElementById('uploadModal') || {}).classList &&
     document.getElementById('uploadModal').classList.contains('open');
@@ -16981,10 +16164,9 @@ function uploadFiles(fileList) {
 
       prestreamKick();
 
-      /* ВОЛНА 22.65: тост ВСЕГДА — байты летят боту с момента выбора
-         и в шифрованном режиме (сервер 22.65 создаёт сессию без пароля,
-         pw_pending): пароль догонит из окна, файл уже в пути */
-      showToast('📨 Файлы сразу пошли боту — грузятся в фоне, можно закрыть приложение');
+      if (STORAGE_ENCRYPTED !== true || VAULT_PW) {
+        showToast('📨 Файлы сразу пошли боту — грузятся в фоне, можно закрыть приложение');
+      }
     }
   }
 
@@ -17117,41 +16299,7 @@ async function upqAll() {
 
 let RESUMING = false;
 
-/* ═══ ВОЛНА 22.67: АВТО-РЕТРАЙ ДОКАЧКИ, ПОКА АПП ОТКРЫТ ═══
-   Жалоба: «пользователь загружает большой файл, разработчик обновляет бота
-   — всё сбрасывается». Раньше после сбоя (редеплой бота = сеть отвалилась
-   на минуты) файл оставался в очереди IndexedDB, но ДОКАЧКА ЖДАЛА,
-   ПОКА пользователь не свернёт/не переоткроет апп (resume дёргался только
-   на visibilitychange/boot). Теперь движок сам переподнимает очередь
-   через растущие паузы (20с → 5мин), пока апп открыт. Soft-режим НЕ сжигает
-   бюджет tries (12) и молчит без тостов. */
-let _upRetryTimer = null;
-let _upRetryPlan = 0;   /* индекс текущей паузы */
-let _upSoftTries = 0;   /* мягких запусков за сессию (анти-зацикливание) */
-const UP_RETRY_DELAYS = [20000, 40000, 60000, 120000, 180000, 300000];
-
-function scheduleUploadRetry() {
-  if (!IS_TELEGRAM && !WEB_TOKEN) return;
-  if (_upSoftTries >= 120) return; /* ~несколько часов попыток — хватит */
-  const delay = UP_RETRY_DELAYS[Math.min(_upRetryPlan, UP_RETRY_DELAYS.length - 1)];
-  _upRetryPlan++;
-  clearTimeout(_upRetryTimer);
-  _upRetryTimer = setTimeout(() => {
-    if (isUploading || RESUMING || document.hidden) return;
-    _upSoftTries++;
-    resumePendingUploads({ soft: true });
-  }, delay);
-}
-
-function resetUploadRetry() {
-  /* успех — схема пауз начинается заново */
-  _upRetryPlan = 0;
-  clearTimeout(_upRetryTimer);
-}
-
-async function resumePendingUploads(opts) {
-  const soft = !!(opts && opts.soft);
-
+async function resumePendingUploads() {
   if (isUploading || RESUMING) return;
 
   /* ВОЛНА 22.47: без входа — тихий выход (раньше этот вызов при каждом
@@ -17163,7 +16311,7 @@ async function resumePendingUploads(opts) {
 
   try { entries = await upqAll(); } catch (e) {}
 
-  if (!entries.length) { resetUploadRetry(); return; }
+  if (!entries.length) return;
 
   RESUMING = true;
 
@@ -17178,16 +16326,11 @@ async function resumePendingUploads(opts) {
   const files = [];
 
   for (const e of entries) {
-    /* 22.67: soft-режим (авто-ретрай в открытом аппе) НЕ тратит бюджет
-       tries — он только для явных открытий аппа; иначе фоновые тики
-       выкинули бы файл из очереди через 12 тиков */
-    if (!soft) {
-      e.tries = (+e.tries || 0) + 1;
+    e.tries = (+e.tries || 0) + 1;
 
-      if (e.tries > 12) { upqDel(e.k); dropped++; continue; }
+    if (e.tries > 12) { upqDel(e.k); dropped++; continue; }
 
-      upqPut(e);
-    }
+    upqPut(e);
 
     try {
       const f = new File([e.blob], e.name || 'file.bin', { type: e.mime || '' });
@@ -17203,22 +16346,19 @@ async function resumePendingUploads(opts) {
     } catch (err) { upqDel(e.k); lostBlob++; }
   }
 
-  if (dropped && !soft) {
+  if (dropped) {
     showToast('🧹 ' + dropped + ' файл(ов) не удалось загрузить после 12 попыток — убран(ы) из очереди');
   }
 
   /* 22.61: телефон не сохранил байты между запусками (редко, но бывает
      на iOS) — пользователь ДОЛЖЕН знать, что файлы нужно загрузить заново,
      иначе «тихая потеря» выглядит как баг */
-  if (lostBlob && !soft) {
+  if (lostBlob) {
     showToast('⚠️ ' + lostBlob + ' файл(ов) не сохранились на телефоне для докачки — загрузите их заново');
   }
 
   if (files.length) {
-    /* 22.67: в soft-режиме молча — тосты только на явных открытиях */
-    if (!soft) {
-      showToast('⏳ Продолжаю прерванную загрузку: ' + files.length + ' файл(ов)');
-    }
+    showToast('⏳ Продолжаю прерванную загрузку: ' + files.length + ' файл(ов)');
 
     proceedUpload(files, { resume: true });
   }
@@ -17523,7 +16663,6 @@ async function prestreamInitAll(files) {
           if (!uploadId) return;
 
           f._preId = uploadId;
-          LOCALLY_DRIVEN.add(uploadId);   /* 22.65: сессию ведёт этот клиент */
           f._preHeld = !!(f._preHold && initData.encrypt === false);
 
           if (f._preHeld) PRE_HELD.add(uploadId);
@@ -17562,11 +16701,6 @@ async function prestreamInitAll(files) {
      могут прийти) — при закрытии приложения сообщаем серверу release. */
 const PRE_ACTIVE = new Set();
 const PRE_HELD = new Set();
-/* ВОЛНА 22.65: сессии, которые ПРЯМО СЕЙЧАС ведёт ЭТОТ клиент (предохранка/
-   движок/докачка). Панель недогруженного (srvp_, строки с сервера) такие
-   сессии не дублирует: своя строка уже есть. После обновления страницы
-   набор пуст — и серверные строки честно восстанавливаются. */
-const LOCALLY_DRIVEN = new Set();
 
 function prestreamKick() {
   while (PRE_RUNNING < PRE_CONCURRENCY && PRE_QUEUE.length) {
@@ -17752,7 +16886,6 @@ async function _preStreamFile(file) {
   }
 
   file._preId = uploadId;
-  LOCALLY_DRIVEN.add(uploadId);   /* 22.65: сессию ведёт этот клиент */
 
   /* 22.61: блок ниже — только при СОБСТВЕННОМ init (initData заполнен);
      при сессии от init-all значение уже вычислено и лежит в file._preHeld */
@@ -18002,7 +17135,6 @@ async function _uploadOneSession(file, reportBytes) {
   }
 
   file._lastUploadId = uploadId;
-  LOCALLY_DRIVEN.add(uploadId);   /* 22.65: сессию ведёт этот клиент */
 
   if (key) {
     upqPut({
@@ -18176,11 +17308,10 @@ async function _uploadOneSession(file, reportBytes) {
 
   /* ВОЛНА 22.50: pollUploadStatus отдаёт запись файла напрямую, обычный
      complete — объектом {file: …}; приводим к одному виду.
-     ВОЛНА 22.62: сервер свёл дубль (тот же файл уже приехал из чата):
-     помечаем файл, чтобы движок не добавлял вторую карточку и не
-     хвастался «загружено» дважды. */
+     ВОЛНА 22.63: ветка dedup убрана вместе с автопередачей 22.62 —
+     сервер снова честно сохраняет КАЖДУЮ загрузку, дублей в потоке
+     нет (путь загрузки теперь один). */
   if (done && done.file) {
-    if (done.dedup) file._dupFlag = true;
     return done.file;
   }
 
@@ -18313,7 +17444,6 @@ async function uploadEngine(bar) {
      старого движка больше не подходит */
   const fileBytes = new Map();
   let reportedTotal = 0;
-  let dedupedCount = 0;   /* 22.62: сколько файлов свёл сервер (уже из чата) */
 
   const reportTotal = () => {
     setUploadPct((reportedTotal / totalBytes) * 100, bar);
@@ -18356,23 +17486,17 @@ async function uploadEngine(bar) {
           }
         });
 
-        /* 22.62: дубль сведён сервером (файл уже приехал через
-           Telegram) — карточку и похвалу не дублируем */
-        if (rec && file._dupFlag) {
-          dedupedCount++;
-        } else if (rec) {
+        /* 22.63: dedup-ветки больше нет — путь загрузки один (прямой
+           стрим), каждый сохранённый файл честно попадает в карточки */
+        if (rec) {
           added.push(rec);
         }
 
         /* ВОЛНА 22.54: страховка имени. Файл уходил в бота под оригинальным
            именем (предохранка), пользователь назвал его в окне имени — если
            сервер всё же записал старое имя (финализация обогнала ренейм),
-           тихо переименовываем запись и подпись в канале (как ✏️).
-           ВОЛНА 22.68: ТОЛЬКО для СВОЕЙ записи! Раньше при сведении дубля
-           (dedup) сервер возвращал ЧУЖУЮ запись (первую музыку с теми же
-           именем+размером), и эта страховка ПЕРЕИМЕНОВЫВАЛА ЕЁ в имя новой
-           загрузки — «первая пропала, появилась вторая». */
-        if (rec && !file._dupFlag && rec.id && file.uploadName && rec.name &&
+           тихо переименовываем запись и подпись в канале (как ✏️). */
+        if (rec && rec.id && file.uploadName && rec.name &&
             String(rec.name) !== String(file.uploadName)) {
           apiJson('/api/files/' + encodeURIComponent(rec.id), {
             method: 'PATCH',
@@ -18385,9 +17509,6 @@ async function uploadEngine(bar) {
            только недогруженные, «⏸ пауза» больше не преувеличивает.
            22.59: сессия решена — из реестра «недорешённых» убираем */
         file._doneFlag = true;
-
-        /* 22.67: файл загрузился — паузы авто-ретрая начинаются заново */
-        resetUploadRetry();
 
         if (file._preId) PRE_HELD.delete(file._preId);
       } catch (e) {
@@ -18407,12 +17528,6 @@ async function uploadEngine(bar) {
         }
 
         failedFiles.push({ file: file, e: e });
-
-        /* 22.67: НЕ сдаваться, пока апп открыт — бот мог просто
-           обновляться (деплой). Переподнимем очередь из IndexedDB
-           через растущие паузы; файл остаётся в очереди и докачается
-           сам, когда бот проснётся. */
-        scheduleUploadRetry();
       }
 
       topUpFile(file);
@@ -18483,43 +17598,20 @@ async function uploadEngine(bar) {
 
   showToast(
     (anySafe ? '✅ Успешно! 🔒 Зашифровано и в Сейфе' : '✅ Загружено') +
-    (dedupedCount ? ' · ♻️ дублей не создано: ' + dedupedCount : '') +
     (maxQueuePos > 1 ? ' · ⏳ публикация в канале, перед вами: ' + (maxQueuePos - 1) : ''));
 
   added.forEach((rec) => {
-    /* ВОЛНА 22.68: защита от визуального дубля — живой опрос мог уже
-       принести эту запись с сервера ДО конца пачки. Раньше unshift
-       добавлял ВТОРУЮ карточку с тем же id («файлы дублируются»). */
-    if (rec && rec.id && ALL_FILES.some((f) => f.id === String(rec.id))) return;
-
-    ALL_FILES.unshift(filesMapAll({
+    ALL_FILES.unshift({
       id: rec.id,
       name: rec.name,
       kind: rec.kind,
       size: +rec.size || 0,
       ts: rec.ts || '',
-      vault: !!rec.vault,
-      safe: !!rec.safe,
-      plain: !!rec.plain,
-      src: 'web'
-    }));
+      vault: !!rec.vault
+    });
   });
 
   renderAll({ animate: true });
-
-  /* ВОЛНА 22.68: тихая сверка с сервером СРАЗУ после пачки — подхватывает
-     записи, завершённые ботом сами (авто-догрузка), и свежие значения
-     статистики/лимита; обновления больше не ждут до 12 с. */
-  setTimeout(() => { loadFiles(true, true).catch(() => {}); }, 400);
-
-  /* ВОЛНА 22.68: файлы, выбранные ВО ВРЕМЯ этой пачки, лежат в очереди
-     IndexedDB — подхватываем их следом (soft: без тостов и без сжигания
-     бюджета попыток). */
-  setTimeout(() => {
-    if (!isUploading && !RESUMING && !document.hidden) {
-      resumePendingUploads({ soft: true }).catch(() => {});
-    }
-  }, 1600);
 
   setTimeout(() => {
     resetUploadUI(bar, checkmark, squareStop);
@@ -18818,14 +17910,6 @@ function ctSubText(t) {
     return t.note || 'Ждём файлы из чата бота…';
   }
 
-  /* ВОЛНА 22.65: недогруженное с сервера — статус текстом (готовит
-     srvPendingApply): «в пути N%», «ждёт пароль Сейфа», «сохраняю…» */
-  if (t.type === 'srvpend') {
-    if (t.done) return t.note || 'Готово';
-
-    return t.note || 'В пути…';
-  }
-
   const sec = (Date.now() - t.t0) / 1000;
   const speed = (sec > 0.8 && t.loaded) ? fmtSize(t.loaded / sec) + '/с · ' : '';
 
@@ -18853,7 +17937,7 @@ function ctRow(t) {
           ? '<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 7.5-2"/><path d="m3 3 18 18"/>'
           : t.type === 'botqueue'
             ? '<path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/>'
-            : t.type === 'bgupload' || t.type === 'srvpend'
+            : t.type === 'bgupload'
               ? '<path d="M4 14.899A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.5 8.242"/><path d="M12 12v9"/><path d="m8 17 4-4 4 4"/>'
               : '<path d="M12 5v14"/><path d="m19 12-7 7-7-7"/>')
     + '</svg>';
@@ -18905,16 +17989,6 @@ function ctRow(t) {
     btn.innerHTML = '<svg viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg>';
     btn.addEventListener('click', (ev) => ctCancelTransfer(t.id, ev));
     row.appendChild(btn);
-  }
-
-  /* ВОЛНА 22.65: строка «ждёт пароль Сейфа» нажимается целиком — ввод
-     пароля сохраняет файл без перекачки (байты уже у бота) */
-  if (t.type === 'srvpend' && t.waitPw && !t.done) {
-    row.classList.add('ct-clickable');
-    row.addEventListener('click', (ev) => {
-      ev.stopPropagation();
-      srvPendingPwPrompt(String(t.id).slice(SRV_PEND_PREFIX.length));
-    });
   }
 
   return row;
@@ -21053,11 +20127,6 @@ function quietStartRetry() {
 }
 
 async function quietStart() {
-  /* 22.66: СНАЧАЛА мгновенно рисуем файлы из кэша — обновление страницы
-     больше не выглядит как «всё сбросилось и ничего не осталось»;
-     ниже обычная тихая досинхронизация подхватит свежие данные */
-  try { filesCacheBoot(); } catch (e) {}
-
   /* ТИХО: без тостов — «HTTP 500» и «нет связи» при старте убраны */
   const ok = await loadFiles(true);
 
@@ -21087,7 +20156,6 @@ if (!IS_TELEGRAM) {
           } else if (r.status === 401 || r.status === 403) {
             localStorage.removeItem('devo_web_token');
             WEB_TOKEN = '';
-            filesCacheClear();   /* 22.66: сессия закончилась — кэш подчищаем */
             setTimeout(openLoginModal, 500);
           } else {
             /* 5xx / сервер спит — тихий повтор по лестнице */
@@ -21356,34 +20424,6 @@ async def miniapp_files_get(request):
     # спрашивать ли пароль Сейфа в окне загрузки (без лишнего 423).
     plain_mode = (_user_vault_channel(user) is not None
                   and _vault_channel_plain(user))
-    # ВОЛНА 22.65: НЕДОГРУЖЕННЫЕ/ЖДУЩИЕ сессии этого пользователя — мини-апп
-    # показывает их в панели передач ПОСЛЕ обновления страницы (раньше строки
-    # передач жили только в памяти вкладки: обновление стирало их, и выгля-
-    # дела это как «всё сбросилось и ничего не осталось»). Показываем:
-    #   • байты ещё едут/прервались — процент, файл можно докачать повторным
-    #     выбором (сервер узнаёт сессию по отпечатку и продолжит);
-    #   • все байты у бота, ждёт пароль Сейфа — в мини-аппе строка нажимается:
-    #     ввод пароля сохраняет файл БЕЗ перекачки (байты уже на сервере).
-    _now_ts = time.time()
-    _pend = []
-    for _upid, _s in _MINIAPP_UPLOADS.items():
-        if str(_s.get("uid") or "") != str(_uid):
-            continue
-        if _s.get("completing") or _s.get("auto_done"):
-            continue              # финализируется/готово — покажет список файлов
-        _sz = int(_s.get("size") or 0)
-        if _sz <= 0:
-            continue
-        _rc = int(_s.get("received") or 0)
-        _pend.append({
-            "uploadId": _upid,
-            "name": str(_s.get("name") or "файл"),
-            "size": _sz,
-            "received": _rc,
-            "wait_pw": bool(not _s.get("plain") and not _s.get("vault_pw")),
-            "ts": float(_s.get("ts") or _now_ts),
-        })
-    _pend.sort(key=lambda x: x["ts"])
     return web.json_response({
         "files": out,
         "stats": {"count": len(out), "size": total + safe_total},
@@ -21395,12 +20435,7 @@ async def miniapp_files_get(request):
         "bot": _miniapp_bot_username(),
         # ВОЛНА 22.58: живые бот-загрузки — панель передач мини-аппа рисует
         # «Качаю с Telegram: 45%» / «Сохраняю в облако…» для файлов из чата.
-        # 22.65: ФИКС NameError — здесь был неопределённый uid (вместо _uid):
-        # /api/files падал 500-й с волны 22.58 — мини-апп не получал список
-        # файлов ВООБЩЕ («не синхронизируется», «после обновления пусто»).
-        "bg_live": _bg_live_out(_uid),
-        # ВОЛНА 22.65: недогруженное — восстановление панели после обновления
-        "pending": _pend,
+        "bg_live": _bg_live_out(uid),
     })
 
 
@@ -23729,7 +22764,6 @@ async def miniapp_upload_init(request):
     plain_mode = (_user_vault_channel(user) is not None
                   and _vault_channel_plain(user))
     vault_pw = None
-    pw_pending = False
     if not plain_mode:
         vault_pw_raw = _miniapp_vault_pw_from(request, body)
         # ВОЛНА 22.35: не-Latin1 пароль из заголовка URL-кодирован клиентом —
@@ -23739,26 +22773,14 @@ async def miniapp_upload_init(request):
         vault_pw = await asyncio.to_thread(
             _miniapp_vault_pw_pick, user, _vault_pw_candidates(vault_pw_raw)) \
             if vault_pw_raw else None
-        if vault_pw:
-            guard = await asyncio.to_thread(
-                _miniapp_vault_pw_guard, user, vault_pw)
-            if guard is None:
-                # страховка (пароль стёрся между pick и guard) — ниже
-                # сессия станет pw_pending и честно дождётся пароля
-                vault_pw = None
-            elif guard is not True:
-                return guard
-        if not vault_pw:
-            # ВОЛНА 22.65: пароля НЕТ — сессия ВСЁ РАВНО создаётся, байты
-            # летят боту СРАЗУ с момента выбора (жалоба: «после обновления
-            # страницы файлы сбрасываются, файл должен сразу лететь в бота,
-            # чтобы грузился даже при закрытии мини аппа»). Раньше init
-            # отвечал 423 и ни байта не ехало до ввода пароля: обновление
-            # страницы теряло выбор целиком. Теперь pw_pending-сессия
-            # ДЕРЖИТСЯ на сервере: пароль догонит из окна загрузки
-            # (complete) или из панели недогруженного; без пароля
-            # финализация честно ответит safe_locked и сессия будет ждать.
-            pw_pending = True
+        guard = await asyncio.to_thread(_miniapp_vault_pw_guard, user, vault_pw)
+        if guard is None:
+            return _miniapp_err(
+                423, "safe_locked",
+                "🔒 Файлы шифруются паролем Сейфа (как в чате). Введите пароль "
+                "Сейфа — и загрузка продолжится уже зашифрованной.")
+        if guard is not True:
+            return guard
     else:
         # ВОЛНА 22.40: «загружаю в мини-апп и шифрую» — ДОЛЖНО попадать в Сейф
         # бота. В режиме «без шифрования» пароль теперь ОПЦИОНАЛЕН: ввёл пароль
@@ -23836,12 +22858,6 @@ async def miniapp_upload_init(request):
             sess = _miniapp_session_of(request)
             if sess is not None:
                 sess["vault_pw"] = vault_pw
-        # ВОЛНА 22.65: повторный init принёс пароль pw_pending-сессии —
-        # «недорешённость» снята: держать окно больше не нужно, авто-догрузка
-        # закончит файл сама, даже если клиент исчезнет
-        if not plain_mode and vault_pw and _s.get("pw_pending"):
-            _s["pw_pending"] = False
-            _s["hold_until"] = 0.0
         _upload_session_persist(_s)
         # все байты уже были, клиента может снова не стать — страховка:
         # отложенная серверная финализация (клиент обычно успеет сам)
@@ -23857,7 +22873,6 @@ async def miniapp_upload_init(request):
             "uploadId": _upid,
             "chunkSize": int(_s.get("chunk") or _MINIAPP_CHUNK),
             "encrypt": not bool(_s.get("plain")),
-            "pw_pending": bool(_s.get("pw_pending")),
             "resumed": True,
             "received": _rc,
             "parts": _parts_out,
@@ -23884,16 +22899,10 @@ async def miniapp_upload_init(request):
         # загрузки (до complete), в базу не пишем никогда.
         "vault_pw": vault_pw or "",
         "plain": plain_mode,
-        # ВОЛНА 22.65: зашифрованная сессия БЕЗ пароля — ждёт его (окно
-        # загрузки / панель недогруженного / повторный выбор файла), байты
-        # при этом уже летят боту
-        "pw_pending": bool(pw_pending),
         # ВОЛНА 22.59: окно решения для plain-сессии (пароль могут ввести
-        # задним числом — complete перенацелит файл в Сейф).
-        # ВОЛНА 22.65: то же окно — и для pw_pending (пароль может приехать
-        # с опозданием, финализировать раньше нельзя)
+        # задним числом — complete перенацелит файл в Сейф)
         "hold_until": (time.time() + 120.0)
-        if (want_hold_flag and (plain_mode or pw_pending)) else 0.0,
+        if (want_hold_flag and plain_mode) else 0.0,
         # ВОЛНА 22.49: согласованный размер куска — фолбэк index→offset
         # работает даже если клиент шлёт куски нестандартного размера.
         "chunk": _MINIAPP_CHUNK,
@@ -23907,8 +22916,7 @@ async def miniapp_upload_init(request):
         if sess is not None:
             sess["vault_pw"] = vault_pw
     return web.json_response({"uploadId": upload_id, "chunkSize": _MINIAPP_CHUNK,
-                              "encrypt": not plain_mode,
-                              "pw_pending": bool(pw_pending)})
+                              "encrypt": not plain_mode})
 
 
 async def miniapp_upload_chunk(request):
@@ -24382,52 +23390,14 @@ async def _upload_auto_complete_task(app, upid):
                                            uid, upid)
             except Exception:
                 pass
-        return
-    # ВОЛНА 22.64: ТРАНЗИТНЫЕ ошибки — бот обязан ДОЖАТЬ файл сам, без
-    # клиента («файлы должны грузиться в облако без пользователя»). Раньше
-    # после 3 неудач сессия бросалась НАВСЕГДА: байты лежали на сервере,
-    # файл не появлялся в облаке и «исчезал» из списка при обновлении.
-    # Теперь повтор с нарастающей паузой: 30с → 1м → 2м → 4м → … ≤ 10м,
-    # пока Telegram не примет файл (сбой канала/MTProto/старт бота —
-    # всё проходит само со временем). no_bot: бот ещё поднимается —
-    # первая же попытка через 30 с почти всегда успешна.
-    if code in ("upload_failed", "no_bot", "mt_unavailable"):
-        s = _MINIAPP_UPLOADS.get(upid)
-        if s is not None:
-            _fails = int(s.get("auto_fail_n") or 1)
-            _delay = min(600.0, 30.0 * (2 ** max(0, _fails - 1)))
-            try:
-                asyncio.create_task(_upload_auto_complete_delayed(upid, _delay))
-            except Exception:
-                s["auto_scheduled"] = False
-            logger.warning(
-                f"upload auto-complete {upid}: «{code}» — повтор через "
-                f"{int(_delay)} с (попытка {_fails})")
-        return
-    # Неизвестный код — как раньше: считаем попытки исчерпанными.
-    s = _MINIAPP_UPLOADS.get(upid)
-    if s is not None:
-        s["auto_giveup"] = True
 
 
-async def miniapp_upload_tg_mark(request):
-    """ВОЛНА 22.62: пометка «файлы передаются боту через Telegram».
-
-    Мини-апп ставит её ПЕРЕД автопередачей (navigator.share → панель
-    «поделиться» → чат бота). Пока пометка свежая (15 минут), итоги
-    сохранения файлов ИЗ ЧАТА бот отправляет БЕЗЗВУЧНО
-    (disable_notification) — «как в обычном чате, но БЕЗ оповещений».
-    Прогресс пользователь видит в панели передач мини-аппа (bg_live),
-    а дубли с прямым стримом сводятся отдельно (_dup_*)."""
-    user, uid, err = await _api_get_user_any(request)
-    if err is not None:
-        return err
-    _TG_AUTOSHARE_MARK[uid] = time.time()
-    if len(_TG_AUTOSHARE_MARK) > 512:
-        cut = time.time() - 900.0
-        for k in [k for k, v in _TG_AUTOSHARE_MARK.items() if v < cut]:
-            _TG_AUTOSHARE_MARK.pop(k, None)
-    return web.json_response({"ok": True})
+# ВОЛНА 22.63: эндпоинт /api/upload/tg_mark и пометка _TG_AUTOSHARE_MARK
+# УБРАНЫ вместе с автопередачей 22.62. Старые кэшированные копии мини-аппа
+# (Service Worker) могут ещё слать POST /api/upload/tg_mark — получают
+# честный 404, клиентский вызов обёрнут в .catch(() => {}), это тихо и
+# безопасно. Чат-роутер 22.57 (файлы, присланные в чат вручную) работает
+# как раньше — обычным ответом, без беззвучного режима.
 
 
 def _notify_auto_complete(uid, s, payload, ok=True):
@@ -24503,7 +23473,6 @@ def _upload_session_persist(s):
             "received": int(s.get("received") or 0),
             "chunk": int(s.get("chunk") or _MINIAPP_CHUNK),
             "plain": bool(s.get("plain")),
-            "pw_pending": bool(s.get("pw_pending")),
             "hold_until": float(s.get("hold_until") or 0),
             "parts": sorted(int(i) for i in (s.get("parts") or ())),
             "ts": float(s.get("ts") or time.time()),
@@ -24569,7 +23538,6 @@ def _miniapp_restore_upload_sessions():
                     "ts": float(meta.get("ts") or now),
                     "vault_pw": "",          # на диск не пишем и не читаем
                     "plain": bool(meta.get("plain")),
-                    "pw_pending": bool(meta.get("pw_pending")),
                     "hold_until": float(meta.get("hold_until") or 0),
                     "chunk": int(meta.get("chunk") or _MINIAPP_CHUNK),
                     "parts": set(int(i) for i in (_parts or [])
@@ -24852,10 +23820,6 @@ async def _miniapp_upload_finalize(user, uid, upid, s, pw_raw="",
     # ВАЖНО: _mt_upload_container может ПЕРЕИМЕНОВАТЬ временный файл — чистим оба пути.
     mt_renamed = os.path.join(os.path.dirname(s["path"]), s["name"] or "file.bin")
     _finished = False   # сессия закрыта (успех или неисправимая порча)
-    # ВОЛНА 22.62: анти-дубль — переменные доступны в finally (ранние
-    # return'ы до присваивания name/size больше не роняют обработчик)
-    name, size = "", 0
-    _dup_mine = False   # клейм анти-дубля держим мы — при неудаче снимем
     try:
         if s["size"] <= 0:
             # ВОЛНА 22.38: 0-байтовые файлы невозможны (init их отвергает;
@@ -24964,36 +23928,17 @@ async def _miniapp_upload_finalize(user, uid, upid, s, pw_raw="",
                 "file": _miniapp_safe_rec_out(len(user.vault_files), new_rec),
                 "safe": True,
             }
-            # 22.68: результат — в память И на диск (рестарт не рождает дубль)
-            _miniapp_completed_put(upid, uid, _resp)
+            _MINIAPP_COMPLETED[upid] = {"ts": time.time(), "uid": uid,
+                                        "resp": _resp}
+            _miniapp_prune_completed()
             return True, _resp
         # === режим «БЕЗ ШИФРА» (личный канал) — прежний путь, облако ===
-        # ВОЛНА 22.62: СВЕДЕНИЕ ДУБЛЕЙ (автопередача + прямой стрим).
-        # Пользователь выбрал файлы — они полетели ДВУМЯ путями: эта
-        # сессия (прямой стрим) и автопередача в Telegram (панель
-        # «поделиться» → чат бота). Кто первый довёз — тот и сохранил.
-        # Файл уже сохранён из чата — второй раз не заливаем, отдаём
-        # клиенту УЖЕ СОХРАНЁННУЮ запись (dedup: true — без второй
-        # карточки в списке). Если файл из чата сохраняют прямо сейчас —
-        # коротко ждём (фаст-путь чата — секунды) и сверяемся ещё раз.
-        _dd = _cloud_recent_dup(user, name, size)
-        if _dd is None and (_dup_held(uid, name, size) or
-                            _dup_claim(uid, name, size)):
-            for _ in range(10):
-                await asyncio.sleep(2.0)
-                _dd = _cloud_recent_dup(user, name, size)
-                if _dd is not None or not _dup_held(uid, name, size):
-                    break
-        if _dd is not None:
-            _dup_saved(uid, name, size)
-            _finished = True
-            _resp = {"file": _miniapp_rec_out(_dd), "dedup": True}
-            _miniapp_completed_put(upid, uid, _resp)
-            logger.info(f"upload {upid}: дубль сведён — «{name[:40]}» "
-                        "уже в облаке (автопередача 22.62)")
-            return True, _resp
-        _dup_claim(uid, name, size)
-        _dup_mine = True
+        # ВОЛНА 22.63: сведение дублей 22.62 убрано ПОЛНОСТЬЮ. Оно вредило:
+        # клейм ставился как побочный эффект проверки и жил 10 минут, из-за
+        # чего повторная загрузка того же файла молча «сводилась», а живой
+        # клейм чата мог ЗАМОРОЗИТЬ финализацию на 20 секунд (клиент видел
+        # зависшую загрузку и рвал связь). Путь загрузки теперь один —
+        # прямой стрим из мини-аппа: каждый complete честно сохраняет файл.
         app = _MINIAPP_PTB_APP
         sent = None
         if size <= STORAGE_MAX_FILE_BYTES:
@@ -25044,8 +23989,6 @@ async def _miniapp_upload_finalize(user, uid, upid, s, pw_raw="",
                             if isinstance(f, dict)]
         user.cloud_files.append(rec)
         save_user(user)
-        _dup_saved(uid, name, size)   # 22.62: анти-дубль — файл сохранён
-        _dup_mine = False
         # ВОЛНА 22.38: «Скрыть» в канале больше не отправляем (см. выше).
         # ВОЛНА 22.35: позиция в очереди публикаций канала (1 = печатали сразу)
         out = _miniapp_rec_out(rec)
@@ -25055,7 +23998,9 @@ async def _miniapp_upload_finalize(user, uid, upid, s, pw_raw="",
             out["queue_pos"] = 1
         _finished = True
         _resp = {"file": out}
-        _miniapp_completed_put(upid, uid, _resp)
+        _MINIAPP_COMPLETED[upid] = {"ts": time.time(), "uid": uid,
+                                    "resp": _resp}
+        _miniapp_prune_completed()
         return True, _resp
     finally:
         # ВОЛНА 22.49: сессию и .part снимаем ТОЛЬКО при успехе или
@@ -25072,10 +24017,8 @@ async def _miniapp_upload_finalize(user, uid, upid, s, pw_raw="",
                     pass
         else:
             s["completing"] = False
-            # 22.62: сохранить не удалось — снимаем свой анти-дубль клейм,
-            # чтобы этот же файл из чата не потерялся из-за нас
-            if _dup_mine:
-                _dup_release(uid, name, size)
+            # 22.63: анти-дубль клеймы убраны — при неудаче просто
+            # возвращаем сессию клиенту (досыл/повтор complete)
 
 
 # --- ВОЛНА 22.23: «МОЁ ОБЛАКО» В МИНИ-АППЕ (хранилище пользователя) ---
@@ -25722,9 +24665,9 @@ def mount_miniapp_routes(app):
     app.router.add_post("/api/upload/abort", miniapp_upload_abort)
     # ВОЛНА 22.48: «мини апп закрыли посреди загрузки» (fetch keepalive)
     app.router.add_post("/api/upload/closed", miniapp_upload_closed)
-    # ВОЛНА 22.62: пометка «файлы передаются через Telegram» (автопередача
-    # из мини-аппа: системная панель «поделиться» → чат бота)
-    app.router.add_post("/api/upload/tg_mark", miniapp_upload_tg_mark)
+    # ВОЛНА 22.63: маршрут /api/upload/tg_mark (автопередача 22.62) убран —
+    # старым кэшированным копиям мини-аппа вернётся 404, их вызов тихо
+    # гасится клиентским .catch(() => {})
     # ВОЛНА 22.50: статус сессии загрузки — честный успех вместо фантомных ошибок
     app.router.add_get("/api/upload/status", miniapp_upload_status)
     # ВОЛНА 22.54: имя «догоняет» уже летящую загрузку (предохранка)
@@ -26117,11 +25060,8 @@ async def _cdb_ingest_post(context, post, doc, fname, chat_id):
     проверяет _meta.json и применяет базу. ВОЛНА 16: файл в канал вставляет
     ЧЕЛОВЕК (свои собственные снапшоты бот не видит — зацикливание
     невозможно), значит ЭТОТ файл и есть актуальная база:
-    • применяем базу ВСЕГДА и ЗАКРЕПЛЯЕМ пост (pin) — при старте бот
-      прочитает именно этот закреп;
-    • ВОЛНА 22.56 (подтверждено 22.63): СТАРЫЕ СНАПШОТЫ ИЗ КАНАЛА
-      НЕ УДАЛЯЮТСЯ НИКОГДА — канал хранит ПОЛНУЮ историю версий,
-      закреп служит только указателем на актуальный снапшот;
+    • применяем базу ВСЕГДА, ЗАКРЕПЛЯЕМ пост (pin) и стираем старые
+      снапшоты этого канала — при старте бот прочитает именно этот закреп;
     • если штамп старше локального cdb_last_flush — всё равно применяем
       (ручное восстановление БЕЗ отказов «не новее»), честно помечая это
       в отчёте; защита latest-wins осталась только на автоматических
@@ -29665,239 +28605,58 @@ async def web_pw_change_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return WEB_PW_ENTER_OLD
 
 
-def _web_pw_delete_perform(user) -> None:
-    """ВОЛНА 22.64: само удаление веб-пароля (общее для путей «старый пароль»
-    и «секретные вопросы»). Веб-вход по паролю выключается, все веб-сессии
-    убиваются. Раньше логика сидела прямо в web_pw_delete_cb и удаляла пароль
-    ОДНИМ нажатием кнопки без всякой проверки — по требованию пользователя
-    закрыто: «при удалении пароля бот должен спрашивать старый пароль или
-    вопросы если забыл»."""
+async def web_pw_delete_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """«🗑 Удалить пароль» — веб-вход по паролю выключается."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    user = get_user(str(query.from_user.id))
+    if not user:
+        return MAIN_MENU
     user.web_password_hash = None
     user.web_password_set_at = None
     user.web_login_attempts = 0
     user.web_login_locked_until = None
-    # Веб-пароль удалён — все веб-сессии недействительны (22.49).
+    # ВОЛНА 22.49: веб-пароль удалён — все веб-сессии недействительны.
     _web_invalidate_sessions(getattr(user, "user_id", ""))
     save_user(user)
     logger.info(f"web_password: пользователь {user.user_id} удалил веб-пароль")
-
-
-def _web_pw_delete_done_kb():
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("⬅️ Назад", callback_data="cloud_menu")]])
-
-
-def _web_pw_questions_available(user) -> bool:
-    """ВОЛНА 22.64: True — удаление веб-пароля можно подтвердить по 3
-    секретным вопросам Сейфа: связка настроена (пароль запечатан ответами),
-    тексты вопросов читаются и библиотека шифрования на месте."""
-    if not _vault_kdf_available():
-        return False
-    auth = getattr(user, "vault_auth", None)
-    if not isinstance(auth, dict) or not auth.get("rec"):
-        return False
-    try:
-        questions = _vault_auth_open(auth).get("questions") or []
-    except Exception:
-        return False
-    return len(questions) >= VAULT_QUESTIONS_N
-
-
-def _web_pw_forgot_kb():
-    """Кнопка «Забыл пароль» — показывается только когда вопросы доступны."""
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("🤔 Забыл пароль — подтвердить по вопросам",
-                             callback_data="web_pw_delete_rec")]])
-
-
-async def web_pw_delete_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """«🗑 Удалить пароль» — ВОЛНА 22.64: удаление требует ПОДТВЕРЖДЕНИЯ.
-    Шаг 1: бот просит ТЕКУЩИЙ (старый) пароль. Если пользователь его забыл —
-    кнопка «🤔 Забыл пароль — подтвердить по вопросам»: бот задаёт его
-    3 секретных вопроса Сейфа (проверка распечаткой запечатанного пароля,
-    как в восстановлении доступа). Пароль НЕ удаляется, пока личность не
-    подтверждена одним из двух способов."""
-    query = update.callback_query
-    try:
-        await query.answer()
-    except Exception:
-        pass
-    user = get_user(str(query.from_user.id))
-    if not user:
-        return MAIN_MENU
-    if not isinstance(getattr(user, "web_password_hash", None), dict):
-        # Пароля нет — удалять нечего (раньше кнопка была видна всегда,
-        # теперь честно объясняем).
-        try:
-            await query.edit_message_text(
-                "❌ Веб-пароль не задан — удалять нечего.",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("⬅️ Назад",
-                                         callback_data="web_password_menu")]]),
-            )
-        except Exception:
-            pass
-        return MAIN_MENU
-    context.user_data["web_pw_mode"] = "delete"
-    context.user_data.pop("web_pw_rec_answers", None)
-    context.user_data.pop("web_pw_rec_fails", None)
     try:
         await query.edit_message_text(
-            "🗑 Удаление веб-пароля.\n\n"
-            "Шаг 1: пришлите ТЕКУЩИЙ (старый) пароль одним сообщением.\n"
-            "Сообщение я удалю из чата после проверки.\n\n"
-            "«отмена» — выйти без изменений.",
-            reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("⬅️ Назад",
-                                       callback_data="web_password_menu")]]
-                + ([_web_pw_forgot_kb().inline_keyboard[0]]
-                   if _web_pw_questions_available(user) else [])),
-        )
-    except Exception:
-        pass
-    return WEB_PW_ENTER_OLD
-
-
-async def web_pw_delete_rec_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """ВОЛНА 22.64: «🤔 Забыл пароль» при удалении веб-пароля — подтверждение
-    по 3 секретным вопросам Сейфа. Ответы проверяются распечаткой запечатанного
-    пароля Сейфа (AES-GCM): сошлось — личность подтверждена, веб-пароль
-    удаляется; нет — цикл ответов заново, максимум 3 попытки за сессию."""
-    query = update.callback_query
-    try:
-        await query.answer()
-    except Exception:
-        pass
-    user = get_user(str(query.from_user.id))
-    if not user:
-        return MAIN_MENU
-    if not _web_pw_questions_available(user):
-        try:
-            await query.edit_message_text(
-                "❌ Секретные вопросы не настроены (они задаются при создании "
-                "пароля Сейфа) — подтвердить удаление по вопросам нельзя.\n\n"
-                "Пришлите текущий пароль сообщением, как раньше.",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("⬅️ Назад",
-                                         callback_data="web_pw_delete")]]),
-            )
-        except Exception:
-            pass
-        return WEB_PW_ENTER_OLD
-    auth = getattr(user, "vault_auth", None) or {}
-    questions = _vault_auth_open(auth).get("questions") or []
-    context.user_data["web_pw_mode"] = "delete_rec"
-    context.user_data["web_pw_rec_answers"] = []
-    context.user_data.pop("web_pw_rec_fails", None)
-    try:
-        await query.edit_message_text(
-            "🤔 Подтверждение по секретным вопросам Сейфа.\n\n"
-            f"Вопрос 1 из {VAULT_QUESTIONS_N}:\n{questions[0]}\n\n"
-            "Ответьте одним сообщением. «отмена» — выйти без изменений.")
-    except Exception:
-        pass
-    return WEB_PW_ENTER_OLD
-
-
-async def _web_pw_rec_answer(update, context, user, text):
-    """ВОЛНА 22.64: приём ответа на секретный вопрос при удалении веб-пароля
-    (состояние WEB_PW_ENTER_OLD, режим web_pw_mode="delete_rec")."""
-    answers = context.user_data.get("web_pw_rec_answers")
-    if not isinstance(answers, list):
-        context.user_data["web_pw_rec_answers"] = answers = []
-    auth = getattr(user, "vault_auth", None) or {}
-    questions = _vault_auth_open(auth).get("questions") or []
-    if len(questions) < VAULT_QUESTIONS_N:
-        context.user_data.pop("web_pw_mode", None)
-        context.user_data.pop("web_pw_rec_answers", None)
-        await update.message.reply_text(
-            "❌ Не смог прочитать секретные вопросы (например, сменился "
-            "BOT_TOKEN). Удаление отменено — веб-пароль остался на месте.")
-        return MAIN_MENU
-    answers.append(text)
-    if len(answers) < VAULT_QUESTIONS_N:
-        await update.message.reply_text(
-            f"Вопрос {len(answers) + 1} из {VAULT_QUESTIONS_N}:\n"
-            f"{questions[len(answers)]}")
-        return WEB_PW_ENTER_OLD
-    # Все ответы собраны — проверяем распечаткой запечатанного пароля Сейфа.
-    # Верные ответы распечатывают блоб (GCM-тег сходится); неверные — None.
-    context.user_data.pop("web_pw_rec_answers", None)
-    unsealed = _vault_unseal_password(auth.get("rec"), answers)
-    if unsealed is not None:
-        context.user_data.pop("web_pw_mode", None)
-        context.user_data.pop("web_pw_rec_fails", None)
-        _web_pw_delete_perform(user)
-        await update.message.reply_text(
-            "✅ Ответы верные — личность подтверждена.\n\n"
             "🗑 Веб-пароль удалён. Вход в веб-облако по паролю больше "
             "не работает (в Telegram облако открывается как раньше).",
-            reply_markup=_web_pw_delete_done_kb(),
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ Назад", callback_data="cloud_menu")]]),
         )
-        return MAIN_MENU
-    fails = int(context.user_data.get("web_pw_rec_fails") or 0) + 1
-    if fails >= 3:
-        context.user_data.pop("web_pw_mode", None)
-        context.user_data.pop("web_pw_rec_fails", None)
-        await update.message.reply_text(
-            "🚫 Ответы неверные 3 раза — удаление отменено, веб-пароль "
-            "остался на месте. Вспомните ответы и попробуйте позже: "
-            "☁️ Облако → 🔑 Веб-пароль → 🗑 Удалить пароль.")
-        return MAIN_MENU
-    context.user_data["web_pw_rec_fails"] = fails
-    context.user_data["web_pw_rec_answers"] = []
-    await update.message.reply_text(
-        f"❌ Ответы неверные (попытка {fails} из 3). Неверно хотя бы одно — "
-        "придётся ответить на все вопросы заново.\n\n"
-        f"Вопрос 1 из {VAULT_QUESTIONS_N}:\n{questions[0]}")
-    return WEB_PW_ENTER_OLD
+    except Exception:
+        pass
+    return MAIN_MENU
 
 
 async def web_pw_old_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Шаг 1 смены / УДАЛЕНИЯ веб-пароля (состояние WEB_PW_ENTER_OLD).
-    Режимы web_pw_mode: «change» — старый пароль → ввод нового; «delete» —
-    старый пароль → удалить веб-пароль (22.64); «delete_rec» — приём ответов
-    на секретные вопросы (22.64)."""
+    """Шаг 1 смены пароля: проверяем СТАРЫЙ пароль (состояние WEB_PW_ENTER_OLD)."""
     user = get_user(str(update.effective_user.id))
     if not user:
         return MAIN_MENU
     text = (update.message.text or "").strip()
     if text.lower() in ("отмена", "cancel"):
         context.user_data.pop("web_pw_mode", None)
-        context.user_data.pop("web_pw_rec_answers", None)
-        context.user_data.pop("web_pw_rec_fails", None)
-        await update.message.reply_text("Готово: без изменений.")
+        await update.message.reply_text("Смена веб-пароля отменена.")
         return await global_cancel_handler(update, context)
-    # Сообщение со старым паролем/ответом сразу стираем — секретам нечего
-    # делать в чате.
+    # Сообщение со старым паролем сразу стираем — паролям нечего делать в чате.
     try:
         await context.bot.delete_message(
             chat_id=update.effective_chat.id,
             message_id=update.message.message_id)
     except Exception:
         pass
-    # === 22.64: путь «подтверждение по секретным вопросам» ===
-    if context.user_data.get("web_pw_mode") == "delete_rec":
-        return await _web_pw_rec_answer(update, context, user, text)
     if not _web_check_password(user, text):
-        # 22.64: забыл пароль — предлагаем вопросы (если они настроены).
-        _kb = _web_pw_forgot_kb() if _web_pw_questions_available(user) else None
         await update.message.reply_text(
             "❌ Старый пароль не подошёл. Попробуйте ещё раз — пришлите "
-            "текущий пароль одним сообщением, или напишите «отмена».",
-            reply_markup=_kb)
+            "текущий пароль одним сообщением, или напишите «отмена».")
         return WEB_PW_ENTER_OLD
-    _mode = context.user_data.get("web_pw_mode")
-    if _mode == "delete":
-        # Пароль подтверждён — выполняем удаление веб-пароля (22.64).
-        context.user_data.pop("web_pw_mode", None)
-        _web_pw_delete_perform(user)
-        await update.message.reply_text(
-            "🗑 Веб-пароль удалён. Вход в веб-облако по паролю больше "
-            "не работает (в Telegram облако открывается как раньше).",
-            reply_markup=_web_pw_delete_done_kb(),
-        )
-        return MAIN_MENU
     context.user_data["web_pw_mode"] = "change"
     await update.message.reply_text(
         "✅ Старый пароль верный.\n\nШаг 2 из 2: пришлите НОВЫЙ пароль "
@@ -38371,12 +37130,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user = get_user(user_id)
 
-    # ВОЛНА 22.67: /start перезапускает диалог — ожидание названия класса
-    # (персистентный флаг после «➕ Создать класс») больше не актуально.
-    if user is not None and getattr(user, "cls_pending", None):
-        user.cls_pending = None
-        save_user(user)
-
     # ПУНКТ 1: Инструкция показывается СРАЗУ при /start (для всех — новых и старых).
     # После нажатия "Я прочитал(а) инструкцию" — продолжается регистрация как раньше.
     is_new_user = user is None
@@ -38405,13 +37158,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return AGE_BLOCKED
 
     # Если инструкция уже прочитана — продолжаем как раньше.
-    # ВОЛНА 22.28: ДР обязателен при регистрации.
-    # ВОЛНА 22.64: ПОВТОРНЫЙ запрос ДР у ЗАРЕГИСТРИРОВАННЫХ пользователей
-    # УБРАН — жалоба: «иногда, когда пользователь уже зарегистрирован,
-    # бот просит опять день рождения». Дата спрашивается ТОЛЬКО пока
-    # регистрация не завершена (setup_completed=False). Возрастной гейт 13+
-    # полностью сохранён: у кого ДР указан и по нему <13 — блок (_age_gate).
-    if not user.birthday and not user.setup_completed:
+    # ВОЛНА 22.28: ДР ОБЯЗАТЕЛЕН («дату рождения нельзя пропустить») —
+    # просим у ВСЕХ без даты, включая тех, кто раньше нажимал «Пропустить».
+    if not user.birthday:
         await update.message.reply_text(
             "🎂 Пожалуйста, введите вашу реальную дату рождения в формате ГГГГ-ММ-ДД (например, 2005-04-15):\n\n"
             "Дата рождения обязательна: по ней проверяется возраст 13+.\n"
@@ -39183,10 +37932,8 @@ async def instructions_read_handler(update: Update, context: ContextTypes.DEFAUL
     save_user(user)
 
     # Дальше — регистрация как раньше.
-    # ВОЛНА 22.64: ДР спрашиваем ТОЛЬКО у незавершённой регистрации —
-    # старые зарегистрированные пользователи без даты больше не получают
-    # повторный запрос при каждом входе.
-    if not user.birthday and not getattr(user, "setup_completed", False):
+    # ВОЛНА 22.28: ДР обязателен — просим у всех без даты рождения.
+    if not user.birthday:
         await query.edit_message_text(
             "👋 Добро пожаловать в DEVORKS+! Давайте настроим ваш профиль.\n\n"
             "🎂 Введите вашу реальную дату рождения в формате ГГГГ-ММ-ДД (например, 2005-04-15):\n\n"
@@ -39572,8 +38319,6 @@ async def _global_cancel_cleanup(update: Update, context: ContextTypes.DEFAULT_T
                 user.ct_pending = None
             if getattr(user, "bells_pending", None):
                 user.bells_pending = None
-            if getattr(user, "cls_pending", None):
-                user.cls_pending = None   # 22.67: и ожидание названия класса
             save_user(user)
     except Exception:
         pass
@@ -39720,11 +38465,10 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _age_gate_violation(user):
         await _send_age_block(update, context)
         return AGE_BLOCKED
-    # ВОЛНА 22.64: повторный запрос ДР у зарегистрированных пользователей
-    # убран — меню открывается сразу. Дата обязательна ТОЛЬКО в ходе
-    # регистрации (setup_completed=False), как и на /start.
-    if not getattr(user, "birthday", None) \
-            and not getattr(user, "setup_completed", False):
+    # ВОЛНА 22.28: «дату рождения нельзя пропустить» — у пользователей
+    # без ДР (в т.ч. нажимавших «⏭ Пропустить» раньше) меню не открывается,
+    # пока дата не введена. Ровно та же проверка, что и на /start.
+    if not getattr(user, "birthday", None):
         await update.message.reply_text(
             "🎂 Введите вашу реальную дату рождения в формате ГГГГ-ММ-ДД "
             "(например, 2005-04-15):\n\n"
@@ -39734,16 +38478,6 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ВОЛНА 22.13: отметка дневной активности (для DAU/WAU/MAU статистики).
     _touch_activity(user_id)
     message_text = update.message.text
-
-    # ВОЛНА 22.67: пользователь в главном меню — ожидание названия класса
-    # («➕ Создать класс») прервано: снимаем персистентный флаг, чтобы
-    # случайный текст позже не создал класс.
-    try:
-        if getattr(user, "cls_pending", None):
-            user.cls_pending = None
-            save_user(user)
-    except Exception:
-        pass
 
     # ПУНКТ 4: если пользователь переименовал кнопку, отображаемое имя нужно
     # сопоставить с оригинальным, чтобы внутренняя логика осталась рабочей.
@@ -40129,38 +38863,6 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 image_days.append((day, payload))
             else:
                 parts.append(f"\n📌 {day}:\n{payload}")
-
-        # ВОЛНА 22.67: «🌐 Расписание с сайтов» — последнее расписание,
-        # полученное монитором админ-панели («🌐 Расписание с сайтов») или
-        # выбранное админом. Ученики видят его прямо в «📅 Расписание»,
-        # а не только отдельным сообщением в чате.
-        # ВОЛНА 22.68: ФАЙЛОВЫЕ расписания (картинка/PDF со школы) тоже
-        # приходят В КНОПКУ: бот переигрывает файл по file_id первой
-        # отправки (без перекачки с сайта), а не только текст.
-        _web = getattr(class_obj, "schedule_web", None)
-        _web_file = None
-        if isinstance(_web, dict):
-            _wtext = str(_web.get("text") or "").strip()
-            if _wtext:
-                _when = str(_web.get("ts") or "").strip()
-                _host = str(_web.get("host") or "").strip()
-                _head = "\n🌐 Расписание с сайтов"
-                if _host:
-                    _head += f" ({_host})"
-                if _when:
-                    _head += f" — обновлено {_when}"
-                parts.append(_head + ":\n" + _wtext)
-            _wname = str(_web.get("name") or "").strip()
-            _wfid = str(_web.get("file_id") or "").strip()
-            if _wfid:
-                _web_file = _web          # файл можно переиграть по file_id
-            elif str(_web.get("kind")) == "file" and _wname:
-                _when = str(_web.get("ts") or "").strip()
-                parts.append(
-                    "\n🌐 Расписание с сайтов — 📄 " + _wname +
-                    (f" (файл прислан в чат класса {_when})" if _when
-                     else " (файл прислан в чат класса)"))
-
         full_text = "\n".join(parts)
 
         # У Telegram есть лимит ~4096 символов на сообщение. Если расписание
@@ -40192,27 +38894,6 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(
                     f"🖼 Картинка расписания на {_day} не открылась — админ может "
                     "перезалить её через «📅 Редактировать расписание».")
-
-        # ВОЛНА 22.68: и САМ файл «Расписания с сайтов» — картинкой или
-        # документом (file_id первой отправки; перекачки с сайта нет).
-        if _web_file is not None:
-            _wcap = "🌐 Расписание с сайтов"
-            if str(_web_file.get("host") or "").strip():
-                _wcap += f" ({_web_file['host']})"
-            if str(_web_file.get("ts") or "").strip():
-                _wcap += f" — обновлено {_web_file['ts']}"
-            try:
-                if str(_web_file.get("file_kind") or "") == "photo":
-                    await update.message.reply_photo(
-                        _web_file["file_id"], caption=_wcap[:1024])
-                else:
-                    await update.message.reply_document(
-                        _web_file["file_id"], caption=_wcap[:1024])
-            except Exception as e:
-                logger.warning(f"schedule_web file re-send: {e}")
-                await update.message.reply_text(
-                    "🌐 Файл расписания с сайтов не открылся — админ может "
-                    "прислать его заново через «🌐 Расписание с сайтов».")
         return MAIN_MENU
 
     elif message_text == "📝 Домашнее задание":
@@ -43170,1746 +41851,20 @@ async def handle_week_schedule(update: Update, context: ContextTypes.DEFAULT_TYP
     return WEEK_SCHEDULE
 
 # ==================================
-# === ВОЛНА 22.66: «РАСПИСАНИЕ С САЙТОВ» (админ-панель) ===
-# ==================================
-# Админ-панель класса → «🌐 Расписание с сайтов»: админ присылает боту ссылку
-# на страницу школы со расписанием, бот показывает, ЧТО нашёл (файлы PDF/Word/
-# Excel, картинки-расписания, текст), админ выбирает кнопками, что присылать
-# ПОСТОЯННО — и дальше бот САМ следит за страницей и при изменении присылает
-# классу обновление: 🖼 фото (если расписание картинкой), 📄 файл (PDF/Word/
-# Excel) или 📅 текст. Не чаще ОДНОГО сообщения в день на ссылку, дубли не
-# шлём. Для сложных сайтов подключается ИИ DeepSeek (ключ опционален).
-#
-# Движок парсинга перенесён из отдельного бота «Расписание» (проверенная
-# логика): правила -> таблицы -> строки с временем -> ИИ. Все сетевые
-# операции синхронные (requests) и крутятся в отдельном потоке
-# (asyncio.to_thread) — цикл событий бота не блокируется.
-
-# Модули для движка: имя urllib до этого места модуля НЕ связано
-# (там только _urllib_parse), html не импортирован вовсе.
-import html as html_mod
-import urllib.parse
-# requests — для «Расписания с сайтов» (опциональна: без неё бот работает
-# как раньше, а раздел честно попросит доустановить библиотеку).
-try:
-    import requests as _sch_requests
-except Exception:  # pragma: no cover
-    _sch_requests = None
-
-SCHEDMON_FILE = _data_file("schedule_monitor.json")
-# Проверка ссылок каждые 5 минут; авторассылка — не чаще 1 сообщения в день.
-SCHEDMON_CHECK_INTERVAL = 300
-SCHEDMON_MAX_AUTO_PER_DAY = 1
-SCHEDMON_MAX_TRACK_PER_CLASS = 15   # сколько ссылок может следить один класс
-SCHEDMON_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-               "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-SCHEDMON_MAX_SCHEDULE_CHARS = 3500
-SCHEDMON_MIN_SCHEDULE_LEN = 60
-SCHEDMON_FILE_EXTS = ("pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx",
-                      "rtf", "odt", "ods")
-SCHEDMON_IMAGE_EXTS = ("jpg", "jpeg", "png", "webp", "gif", "bmp")
-SCHEDMON_MAX_FILE_MB = 49           # лимит Bot API на файл (с запасом)
-SCHEDMON_MAX_PHOTO_MB = 10          # лимит Telegram sendPhoto
-SCHEDMON_MIN_IMAGE_BYTES = 12 * 1024  # отсекаем иконки и мелкие картинки
-SCHEDMON_MAX_FILES_PER_NOTIFY = 5
-SCHEDMON_DEEPSEEK_MODEL = "deepseek-chat"
-SCHEDMON_DEEPSEEK_MAX_CHARS = 30000
-SCHEDMON_DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
-SCHEDMON_DEEPSEEK_PROMPT = (
-    "Найди в тексте веб-страницы расписание (занятия, звонки, мероприятия — "
-    "по дням и времени). Верни только само расписание простым текстом: "
-    "дни, время, события. Без пояснений и без markdown-разметки. "
-    "Если расписания на странице нет — верни ровно одно слово: NO_SCHEDULE")
-
-# Ключи записи ссылки в состоянии (нормализация при загрузке).
-SCHEDMON_INFO_KEYS = ("chat", "h", "ch", "title", "errors", "files", "sig",
-                      "sch", "sent", "cand", "sel", "day", "nday",
-                      "next_check", "added_by", "added_ts")
-
-_SCHMON_TLS = threading.local()
-
-
-def _schmon_session():
-    """requests.Session на поток (синхронные вызовы крутятся в to_thread)."""
-    if _sch_requests is None:
-        raise RuntimeError("Библиотека requests не установлена")
-    s = getattr(_SCHMON_TLS, "session", None)
-    if s is None:
-        s = _sch_requests.Session()
-        s.headers.update({"User-Agent": SCHEDMON_UA, "Accept-Language": "ru,en;q=0.8"})
-        _SCHMON_TLS.session = s
-    return s
-
-
-# ------------------------------ состояние -----------------------------------
-def schmon_load():
-    data = load_data(SCHEDMON_FILE, {})
-    return data if isinstance(data, dict) else {}
-
-
-def schmon_save(state):
-    try:
-        return save_data(SCHEDMON_FILE, state)
-    except Exception as e:
-        logger.error(f"schmon_save: {e}")
-        return False
-
-
-def schmon_normalize(state):
-    """Чистим состояние от мусора и заполняем значения по умолчанию
-    (аналог load_state отдельного бота «Расписание»)."""
-    clean = {}
-    for class_code, entry in (state or {}).items():
-        if not isinstance(entry, dict):
-            continue
-        urls = entry.get("urls") if isinstance(entry.get("urls"), dict) else {}
-        clean_urls = {}
-        for url, info in urls.items():
-            if not isinstance(url, str) or not isinstance(info, dict):
-                continue
-            ni = {k: info[k] for k in SCHEDMON_INFO_KEYS if k in info}
-            ni.setdefault("chat", None)
-            ni.setdefault("h", None)
-            ni.setdefault("ch", None)
-            ni.setdefault("title", "")
-            ni.setdefault("errors", 0)
-            ni.setdefault("files", {})
-            ni.setdefault("sig", None)
-            ni.setdefault("sch", "")
-            ni.setdefault("sent", {})
-            ni.setdefault("cand", [])
-            ni.setdefault("sel", [])
-            ni.setdefault("day", "")     # дата последней авторассылки
-            ni.setdefault("nday", 0)     # сколько уже прислано сегодня
-            ni.setdefault("next_check", 0)
-            ni.setdefault("added_by", "")
-            ni.setdefault("added_ts", 0)
-            clean_urls[url] = ni
-        entry["urls"] = clean_urls
-        clean[str(class_code)] = entry
-    return clean
-
-
-def schmon_class_urls(state, class_code):
-    """Словарь ссылок класса (создаёт запись при необходимости)."""
-    entry = state.get(str(class_code))
-    if not isinstance(entry, dict):
-        entry = {}
-    urls = entry.get("urls")
-    if not isinstance(urls, dict):
-        urls = {}
-    entry["urls"] = urls
-    state[str(class_code)] = entry
-    return urls
-
-
-def schmon_new_info():
-    return {"chat": None, "h": None, "ch": None, "title": "", "errors": 0,
-            "files": {}, "sig": None, "sch": "", "sent": {}, "cand": [],
-            "sel": [], "day": "", "nday": 0, "next_check": 0,
-            "added_by": "", "added_ts": 0}
-
-
-def schmon_merge_info(class_code, url, info):
-    """Сохранить ОДНУ ссылку, не затирая изменения админов: читаем свежее
-    состояние, подменяем только эту ссылку (если её не удалили) и пишем."""
-    try:
-        state = schmon_load()
-        urls = schmon_class_urls(state, class_code)
-        if url not in urls:
-            return False   # админ уже удалил ссылку — не возвращаем её
-        urls[url] = {k: info.get(k, urls[url].get(k)) for k in SCHEDMON_INFO_KEYS}
-        return schmon_save(state)
-    except Exception as e:
-        logger.error(f"schmon_merge_info: {e}")
-        return False
-
-
-def schmon_find_by_key(key):
-    """Найти ссылку по короткому md5-ключу: (state, class_code, url, info)."""
-    state = schmon_normalize(schmon_load())
-    for class_code, entry in state.items():
-        for url, info in (entry.get("urls") or {}).items():
-            if schmon_md5key(url) == key:
-                return state, str(class_code), url, info
-    return state, None, None, None
-
-
-# ------------------------------ ссылки --------------------------------------
-_SCHMON_URL_TAIL = re.compile(r"[)\]}>.,;:!?'\"«»]+$")
-_SCHMON_TLD = (r"(?:ru|su|рф|by|ua|kz|com|net|org|info|io|me|edu|gov|online"
-               r"|site|shop|club)")
-_SCHMON_BARE = re.compile(
-    r"([a-z0-9а-яё][a-z0-9а-яё\-]*(?:\.[a-z0-9а-яё\-]+)*\." + _SCHMON_TLD
-    + r")(/[^\s]*)?$", re.I)
-
-
-def schmon_extract_url(text):
-    if not text:
-        return None
-    t = str(text).strip()
-    m = re.search(r"https?://\S+", t, re.I)
-    if m:
-        return _SCHMON_URL_TAIL.sub("", m.group(0))
-    m = re.match(r"www\.\S+", t, re.I)
-    if m:
-        return "https://" + _SCHMON_URL_TAIL.sub("", m.group(0))
-    m = _SCHMON_BARE.match(t)
-    if m:
-        return "https://" + m.group(1) + (m.group(2) or "")
-    return None
-
-
-def schmon_md5key(url):
-    return hashlib.md5(url.encode("utf-8")).hexdigest()[:12]
-
-
-def schmon_host_of(url):
-    try:
-        return urllib.parse.urlparse(url).netloc or url
-    except Exception:
-        return url
-
-
-# --------------------------- чтение страниц ---------------------------------
-def schmon_fetch_page(url):
-    s = _schmon_session()
-    r = s.get(url, timeout=30)
-    if r.encoding in (None, "ISO-8859-1") and r.apparent_encoding:
-        r.encoding = r.apparent_encoding
-    r.raise_for_status()
-    return r.text
-
-
-def schmon_norm_html(text):
-    text = re.sub(r"(?is)<(script|style|noscript|template)[^>]*>.*?</\1\s*>",
-                  "", text or "")
-    text = re.sub(r"(?s)<!--.*?-->", "", text)
-    return re.sub(r"\s+", " ", text).strip()
-
-
-_SCHMON_TAG_RE = re.compile(r"<[^>]+>")
-
-
-def schmon_page_hashes(html_text):
-    norm = schmon_norm_html(html_text)
-    h1 = hashlib.sha256(norm.encode("utf-8", "ignore")).hexdigest()[:16]
-    h2 = hashlib.sha256(_SCHMON_TAG_RE.sub(" ", norm)
-                        .encode("utf-8", "ignore")).hexdigest()[:16]
-    return h1, h2
-
-
-def schmon_page_title(html_text):
-    m = re.search(r"(?is)<title[^>]*>(.*?)</title>", html_text or "")
-    if not m:
-        return ""
-    return html_mod.unescape(re.sub(r"\s+", " ", m.group(1))).strip()[:100]
-
-
-def schmon_visible_text(html_text, limit=3000):
-    t = _SCHMON_TAG_RE.sub(" ", schmon_norm_html(html_text))
-    return html_mod.unescape(re.sub(r"\s+", " ", t)).strip()[:limit]
-
-
-# ---------------------- извлечение расписания -------------------------------
-_SCHMON_SCHED_WORDS = re.compile(
-    r"(расписан|заняти|звонк|урок|консультац|\bпара\b|\bпар[ыу]\b|смен[аы]"
-    r"|понедельник|вторник|сред[ауе]|четверг|пятниц|суббот|воскресень"
-    r"|monday|tuesday|wednesday|thursday|friday|saturday|sunday"
-    r"|timetable|schedule)", re.I)
-_SCHMON_TIME_RE = re.compile(r"(?<!\d)\d{1,2}[:.]\d{2}(?!\d)")
-_SCHMON_TABLE_OPEN = re.compile(r"<table\b", re.I)
-_SCHMON_TABLE_TAG = re.compile(r"(?i)<(/?)table\b")
-_SCHMON_TR_RE = re.compile(r"(?is)<tr\b.*?</tr>")
-_SCHMON_CELL_RE = re.compile(r"(?is)<t[dh]\b.*?</t[dh]>")
-
-
-def schmon_text_hash(text):
-    return hashlib.md5((text or "").encode("utf-8", "ignore")).hexdigest()[:16]
-
-
-def schmon_looks_like_schedule(text):
-    return (len(_SCHMON_TIME_RE.findall(text)) >= 2
-            and len(_SCHMON_SCHED_WORDS.findall(text)) >= 1)
-
-
-def _schmon_page_tables(html_text):
-    text, out, end_prev = html_text or "", [], -1
-    for m in _SCHMON_TABLE_OPEN.finditer(text):
-        if m.start() < end_prev:
-            continue
-        depth = 0
-        for t in _SCHMON_TABLE_TAG.finditer(text, m.start()):
-            depth += -1 if t.group(1) else 1
-            if depth == 0:
-                out.append(text[m.start():t.end()])
-                end_prev = t.end()
-                break
-        else:
-            out.append(text[m.start():])
-            end_prev = len(text)
-    return out
-
-
-def _schmon_table_to_text(tbl):
-    rows = []
-    for tr in _SCHMON_TR_RE.finditer(tbl):
-        cells = [re.sub(r"\s+", " ",
-                        html_mod.unescape(_SCHMON_TAG_RE.sub(" ", c.group(0)))).strip()
-                 for c in _SCHMON_CELL_RE.finditer(tr.group(0))]
-        cells = [c for c in cells if c]
-        if cells:
-            rows.append(" | ".join(cells))
-    return "\n".join(rows)
-
-
-def schmon_extract_schedule(html_text):
-    tables = []
-    for tbl in _schmon_page_tables(html_text):
-        txt = _schmon_table_to_text(tbl)
-        if txt and schmon_looks_like_schedule(txt):
-            tables.append(txt)
-    if tables:
-        res, total = [], 0
-        for txt in tables:
-            if total >= SCHEDMON_MAX_SCHEDULE_CHARS:
-                break
-            res.append(txt[:SCHEDMON_MAX_SCHEDULE_CHARS - total])
-            total += len(res[-1])
-        out = "\n".join(res).strip()
-        if len(out) >= SCHEDMON_MIN_SCHEDULE_LEN:
-            return out
-
-    lines = []
-    for ln in html_mod.unescape(
-            _SCHMON_TAG_RE.sub("\n", schmon_norm_html(html_text or ""))).split("\n"):
-        ln = re.sub(r"\s+", " ", ln).strip()
-        if ln and (_SCHMON_TIME_RE.search(ln) or _SCHMON_SCHED_WORDS.search(ln)):
-            lines.append(ln)
-        if sum(len(x) for x in lines) > SCHEDMON_MAX_SCHEDULE_CHARS:
-            break
-    out = "\n".join(lines).strip()
-    if (len(lines) >= 3 and len(out) >= SCHEDMON_MIN_SCHEDULE_LEN
-            and schmon_looks_like_schedule(out)):
-        return out
-    return None
-
-
-# ------------------------------ DeepSeek (ИИ) -------------------------------
-def schmon_load_deepseek_key():
-    k = (os.environ.get("DEEPSEEK_API_KEY") or "").strip()
-    if k:
-        return k
-    try:
-        p = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                         "deepseek_key.txt")
-        with open(p, encoding="utf-8") as f:
-            k = f.read().strip()
-            if k:
-                return k
-    except OSError:
-        pass
-    return ""
-
-
-def schmon_deepseek_extract(page_text):
-    key = schmon_load_deepseek_key()
-    if not key or not page_text or _sch_requests is None:
-        return None
-    try:
-        r = _schmon_session().post(
-            SCHEDMON_DEEPSEEK_URL, timeout=90,
-            headers={"Authorization": "Bearer " + key},
-            json={"model": SCHEDMON_DEEPSEEK_MODEL, "temperature": 0.1,
-                  "max_tokens": 2000,
-                  "messages": [{"role": "system",
-                                "content": SCHEDMON_DEEPSEEK_PROMPT},
-                               {"role": "user",
-                                "content": page_text[:SCHEDMON_DEEPSEEK_MAX_CHARS]}]})
-        txt = (((r.json().get("choices") or [{}])[0].get("message")
-                or {}).get("content") or "").strip()
-        txt = re.sub(r"\*\*", "", txt)
-        txt = re.sub(r"^#{1,6} ", "", txt, flags=re.M).strip()
-        if not txt or "NO_SCHEDULE" in txt.upper():
-            return None
-        if len(txt) < SCHEDMON_MIN_SCHEDULE_LEN:
-            return None
-        if not (_SCHMON_TIME_RE.search(txt)
-                or len(_SCHMON_SCHED_WORDS.findall(txt)) >= 2):
-            return None
-        return txt[:SCHEDMON_MAX_SCHEDULE_CHARS]
-    except Exception:
-        return None
-
-
-def schmon_get_schedule(html_text, deep=True):
-    if not html_text:
-        return None
-    try:
-        s = schmon_extract_schedule(html_text)
-    except Exception:
-        s = None
-    if s:
-        return s
-    if deep and schmon_load_deepseek_key():
-        return schmon_deepseek_extract(
-            schmon_visible_text(html_text, SCHEDMON_DEEPSEEK_MAX_CHARS))
-    return None
-
-
-# ------------------ файлы-документы (PDF, Word, Excel...) -------------------
-_SCHMON_CLOUD_RE = re.compile(
-    r"(drive\.google\.com|docs\.google\.com|dropbox\.com|yadi\.sk"
-    r"|disk\.yandex\.ru)", re.I)
-_SCHMON_SRC_RE = re.compile(
-    r"""(?:<a\b[^>]*?\bhref|<iframe\b[^>]*?\bsrc|<embed\b[^>]*?\bsrc|<object\b[^>]*?\bdata)\s*=\s*["']([^"']+)["']""",
-    re.I)
-_SCHMON_A_RE = re.compile(
-    r"""(?is)<a\b[^>]*?\bhref\s*=\s*["']([^"']+)["'][^>]*>(.*?)</a>""")
-_SCHMON_IMG_RE = re.compile(r"(?is)<img\b[^>]*>")
-_SCHMON_ATTR_RE = re.compile(r"""(\w+)\s*=\s*["']([^"']*)["']""")
-_SCHMON_CT_EXT = {
-    "application/pdf": ".pdf", "application/msword": ".doc",
-    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
-    "application/vnd.ms-excel": ".xls",
-    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
-    "image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}
-
-# Признаки «это именно расписание» в имени файла/картинки, alt или тексте ссылки
-_SCHMON_NAME_RE = re.compile(
-    r"(расписан|raspisan|\brasp[_\-.]|schedul|timetable|звонк|zvonk"
-    r"|график|grafik|заняти|zanyat|урок|urok|\bсмен[аы]?\b|smen|consult"
-    r"|консультац)", re.I)
-
-
-def _schmon_is_schedule_named(*texts):
-    for t in texts:
-        if not t:
-            continue
-        try:
-            t = urllib.parse.unquote(t)
-        except Exception:
-            pass
-        if _SCHMON_NAME_RE.search(t):
-            return True
-    return False
-
-
-def _schmon_site_key(url):
-    """Ключ сайта: последние 2 части домена (school.ru и www.school.ru —
-    один сайт)."""
-    try:
-        host = (urllib.parse.urlparse(url).netloc or "").lower().split(":")[0]
-    except Exception:
-        return ""
-    parts = host.split(".")
-    return ".".join(parts[-2:]) if len(parts) >= 2 else host
-
-
-def _schmon_same_site(page_url, u):
-    return (_schmon_site_key(page_url)
-            and _schmon_site_key(page_url) == _schmon_site_key(u))
-
-
-def _schmon_norm_src(u):
-    """Нормализация для дедупликации URL: один файл с разными ?v=1 —
-    одно и то же."""
-    try:
-        p = urllib.parse.urlparse(u)
-        return (p.netloc.lower().split(":")[0], p.path)
-    except Exception:
-        return ("", u)
-
-
-# --------- память отправленного (чтобы не слать одинаковое повторно) --------
-def _schmon_sent_map(info):
-    s = info.get("sent")
-    if not isinstance(s, dict):
-        s = {}
-        info["sent"] = s
-    return s
-
-
-def schmon_was_sent(info, digest):
-    return digest in _schmon_sent_map(info)
-
-
-def schmon_mark_sent(info, digest):
-    s = _schmon_sent_map(info)
-    s[digest] = int(time.time())
-    if len(s) > 40:  # храним последние 40 отправок
-        for k in sorted(s, key=s.get)[:len(s) - 40]:
-            s.pop(k, None)
-
-
-# ----------------- дневной лимит авторассылки (раз в день) ------------------
-def _schmon_today():
-    return time.strftime("%Y-%m-%d", time.localtime())
-
-
-def _schmon_next_midnight_ts():
-    lt = time.localtime()
-    secs_today = lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec
-    return time.time() + (86400 - secs_today) + 60  # минута запаса
-
-
-def schmon_daily_quota_left(info):
-    if info.get("day") != _schmon_today():
-        return SCHEDMON_MAX_AUTO_PER_DAY
-    return max(0, SCHEDMON_MAX_AUTO_PER_DAY - int(info.get("nday") or 0))
-
-
-def schmon_use_daily_quota(info):
-    today = _schmon_today()
-    if info.get("day") != today:
-        info["day"], info["nday"] = today, 1
-    else:
-        info["nday"] = int(info.get("nday") or 0) + 1
-
-
-def _schmon_ext_of(url):
-    try:
-        path = urllib.parse.urlparse(url or "").path.lower()
-    except Exception:
-        return ""
-    return path.rsplit(".", 1)[-1] if "." in path else ""
-
-
-def schmon_file_kind(url):
-    ext = _schmon_ext_of(url)
-    return ext if ext in SCHEDMON_FILE_EXTS else ""
-
-
-def schmon_image_kind(url):
-    ext = _schmon_ext_of(url)
-    return ext if ext in SCHEDMON_IMAGE_EXTS else ""
-
-
-def schmon_is_cloud(url):
-    return bool(_SCHMON_CLOUD_RE.search(url or ""))
-
-
-def _schmon_cloud_download_url(url):
-    u = url or ""
-    if "dropbox.com" in u:
-        if "dl=" in u:
-            return re.sub(r"([?&])dl=0", r"\1dl=1", u)
-        return u + ("&dl=1" if "?" in u else "?dl=1")
-    if "drive.google.com" in u or "docs.google.com" in u:
-        m = (re.search(r"/d/([a-zA-Z0-9_-]{10,})", u)
-             or re.search(r"[?&]id=([a-zA-Z0-9_-]{10,})", u))
-        if m:
-            return "https://drive.google.com/uc?export=download&id=" + m.group(1)
-        return u
-    return u
-
-
-def _schmon_file_candidate(page_url, src):
-    if not src:
-        return None
-    src = html_mod.unescape(str(src).strip())
-    if not src or src.startswith(("data:", "#", "mailto:", "tel:", "javascript:")):
-        return None
-    full = urllib.parse.urljoin(page_url, src).split("#")[0]
-    return full if full.startswith(("http://", "https://")) else None
-
-
-def _schmon_anchor_texts(page_url, html_text):
-    """Карта: ссылка -> видимый текст ссылки (для оценки «это расписание?»)."""
-    out = {}
-    for m in _SCHMON_A_RE.finditer(html_text or ""):
-        full = _schmon_file_candidate(page_url, m.group(1))
-        if not full:
-            continue
-        txt = re.sub(r"\s+", " ",
-                     html_mod.unescape(_SCHMON_TAG_RE.sub(" ", m.group(2)))).strip()
-        if txt and full not in out:
-            out[full] = txt[:200]
-    return out
-
-
-def schmon_find_file_links(page_url, html_text, limit=8):
-    urls = []
-    for m in _SCHMON_SRC_RE.finditer(html_text or ""):
-        if len(urls) >= limit:
-            break
-        full = _schmon_file_candidate(page_url, m.group(1))
-        if not full:
-            continue
-        if "docs.google.com/viewer" in full:
-            m2 = re.search(r"[?&]url=([^&]+)", full)
-            if m2:
-                target = urllib.parse.unquote(m2.group(1))
-                if schmon_file_kind(target) and target not in urls:
-                    urls.append(target)
-            continue
-        if schmon_file_kind(full) or schmon_is_cloud(full):
-            if full not in urls:
-                urls.append(full)
-    return urls
-
-
-def schmon_find_image_links(page_url, html_text, limit=8, anchors=None):
-    """Картинки-расписания: <img> и ссылки на JPG/PNG с «расписательными»
-    признаками."""
-    anchors = anchors if isinstance(anchors, dict) else _schmon_anchor_texts(
-        page_url, html_text)
-    urls = []
-    # <img src=... alt=...>  — только картинки С ЭТОГО ЖЕ сайта
-    for m in _SCHMON_IMG_RE.finditer(html_text or ""):
-        if len(urls) >= limit:
-            break
-        attrs = dict((k.lower(), v)
-                     for k, v in _SCHMON_ATTR_RE.findall(m.group(0)))
-        full = _schmon_file_candidate(
-            page_url, attrs.get("src") or attrs.get("data-src") or "")
-        if not full or not schmon_image_kind(full) or full in urls:
-            continue
-        if not _schmon_same_site(page_url, full):
-            continue
-        if _schmon_is_schedule_named(full, attrs.get("alt"), attrs.get("title")):
-            urls.append(full)
-    # <a href="....jpg">Расписание</a>
-    for full, txt in anchors.items():
-        if len(urls) >= limit:
-            break
-        if not schmon_image_kind(full) or full in urls:
-            continue
-        if not _schmon_same_site(page_url, full):
-            continue
-        if _schmon_is_schedule_named(full, txt):
-            urls.append(full)
-    return urls
-
-
-def schmon_find_schedule_sources(page_url, html_text, limit=8):
-    """ТОЛЬКО источники расписания: документы (с приоритетом
-    «расписательных») и картинки-расписания."""
-    anchors = _schmon_anchor_texts(page_url, html_text)
-    docs = schmon_find_file_links(page_url, html_text, limit)
-    relevant = [f for f in docs
-                if _schmon_is_schedule_named(f, anchors.get(f, ""))]
-    if relevant:
-        docs = relevant  # есть явные файлы расписания — шлём только их
-    imgs = schmon_find_image_links(page_url, html_text, limit, anchors)
-    # Дедупликация: один файл с разными ?v=123 не считаем разными
-    out, seen = [], set()
-    for u in docs + imgs:
-        key = _schmon_norm_src(u)
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(u)
-    return out[:limit]
-
-
-def schmon_file_meta_signature(url):
-    try:
-        r = _schmon_session().head(url, timeout=15, allow_redirects=True)
-        if r.status_code == 200:
-            parts = [str(r.headers.get(k) or "")
-                     for k in ("ETag", "Last-Modified", "Content-Length")]
-            if any(p.strip() for p in parts):
-                return "|".join(parts)
-    except Exception:
-        pass
-    return ""
-
-
-def schmon_file_deep_signature(url):
-    try:
-        r = _schmon_session().get(url, timeout=60, stream=True)
-        if r.status_code != 200:
-            return ""
-        data = b""
-        for chunk in r.iter_content(65536):
-            data += chunk
-            if len(data) > 8 * 1024 * 1024:
-                break
-        return "sha:" + hashlib.md5(data).hexdigest()
-    except Exception:
-        return ""
-
-
-def _schmon_filename_from_response(r, url):
-    cd = r.headers.get("Content-Disposition") or ""
-    m = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', cd, re.I)
-    name = html_mod.unescape(m.group(1)).strip() if m else ""
-    if not name:
-        path = urllib.parse.urlparse(url).path
-        name = urllib.parse.unquote(path.rsplit("/", 1)[-1])
-    ct = (r.headers.get("Content-Type") or "").lower()
-    if "." not in name:
-        for k, ext in _SCHMON_CT_EXT.items():
-            if ct.startswith(k):
-                name += ext
-                break
-    return re.sub(r'[\\/:*?"<>|]+', "_", name).strip()[:80] or "file.pdf"
-
-
-def schmon_download_file(url, referer=None):
-    """Скачать файл: (bytes, filename) или None."""
-    if _sch_requests is None:
-        return None
-    try:
-        real = _schmon_cloud_download_url(url)
-        headers = {"Referer": referer} if referer else {}
-        if "yadi.sk" in (url or "") or "disk.yandex.ru" in (url or ""):
-            r0 = _schmon_session().get(
-                "https://cloud-api.yandex.net/v1/disk/public/resources/download",
-                params={"public_key": url}, timeout=25)
-            real = (r0.json() or {}).get("href") or real
-            headers = {}
-        s = _schmon_session()
-        r = s.get(real, timeout=120, stream=True, headers=headers)
-        if r.status_code != 200:
-            return None
-        if "text/html" in (r.headers.get("Content-Type") or "").lower():
-            return None
-        name = _schmon_filename_from_response(r, url)
-        cap = SCHEDMON_MAX_FILE_MB * 1024 * 1024
-        data = b""
-        for chunk in r.iter_content(65536):
-            data += chunk
-            if len(data) > cap:
-                return None
-        return data, name
-    except Exception:
-        return None
-
-
-def _schmon_collect_file_sigs(page_url, html_text, old_files=None, deep_all=False):
-    old = old_files if isinstance(old_files, dict) else {}
-    out = {}
-    for f in schmon_find_schedule_sources(page_url, html_text):
-        if schmon_is_cloud(f):
-            out[f] = {"m": "", "d": ""}
-            continue
-        m = schmon_file_meta_signature(f)
-        prev = old.get(f) if isinstance(old.get(f), dict) else None
-        if not m and prev and prev.get("m"):
-            out[f] = {"m": prev["m"], "d": prev.get("d", "")}
-            continue
-        if m:
-            d = ""
-        elif deep_all or prev is None:
-            d = schmon_file_deep_signature(f)
-        else:
-            d = prev.get("d", "")
-        out[f] = {"m": m, "d": d}
-    return out
-
-
-def _schmon_file_changed(old, now):
-    if not isinstance(old, dict):
-        return True
-    if (old.get("m") or "") != (now.get("m") or ""):
-        return True
-    nd = now.get("d") or ""
-    return bool(nd) and nd != (old.get("d") or "")
-
-
-def schmon_short_name(u, maxlen=35):
-    """Короткое читаемое имя файла для кнопки."""
-    try:
-        path = urllib.parse.urlparse(u).path
-        name = urllib.parse.unquote(path.rsplit("/", 1)[-1]) or schmon_host_of(u)
-    except Exception:
-        name = u
-    return name[:maxlen] + ("…" if len(name) > maxlen else "")
-
-
-# ---------------------------- отправка (async) ------------------------------
-def _schmon_chunk_text(text, size=4000):
-    text = (text or "").strip()
-    if not text:
-        return []
-    if len(text) <= size:
-        return [text]
-    parts = []
-    while text:
-        parts.append(text[:size])
-        text = text[size:]
-    return parts
-
-
-async def schmon_send_text(bot, chat_id, text):
-    ok = False
-    for part in _schmon_chunk_text(text):
-        try:
-            await bot.send_message(chat_id=chat_id, text=part)
-            ok = True
-        except Exception as e:
-            logger.warning(f"schmon_send_text {chat_id}: {e}")
-    return ok
-
-
-class _SchmonResult:
-    """ВОЛНА 22.68: результат schmon_send_item — truthy как раньше (bool-
-    совместимость всех старых `if await schmon_send_item(…)`), но ещё несёт
-    file_id последней успешной отправки и её тип ("photo"/"document") —
-    чтобы запомнить расписание В КЛАССЕ и переигрывать его из кнопки
-    «📅 Расписание» без перекачки с сайта."""
-    __slots__ = ("ok", "file_id", "kind")
-
-    def __init__(self, ok, file_id="", kind=""):
-        self.ok = bool(ok)
-        self.file_id = str(file_id or "")
-        self.kind = str(kind or "")
-
-    def __bool__(self):
-        return self.ok
-
-
-async def schmon_send_item(bot, chat_id, src_url, data, name, host):
-    """Отправить один источник расписания: картинку — фото, документ — файлом.
-    ВОЛНА 22.68: возвращает _SchmonResult (truthy как раньше) с file_id."""
-    try:
-        if (schmon_image_kind(src_url) or schmon_image_kind(name)):
-            if len(data) < SCHEDMON_MIN_IMAGE_BYTES:
-                return _SchmonResult(False)  # иконка/мусор — не шлём
-            if len(data) <= SCHEDMON_MAX_PHOTO_MB * 1024 * 1024:
-                try:
-                    m = await bot.send_photo(
-                        chat_id=chat_id,
-                        photo=InputFile(data, filename=name or "photo.jpg"),
-                        caption=("🖼 Расписание\n%s" % host)[:1024])
-                    _fid = ""
-                    try:
-                        _fid = (m.photo[-1].file_id if getattr(m, "photo", None)
-                                else "") or ""
-                    except Exception:
-                        _fid = ""
-                    return _SchmonResult(True, _fid, "photo")
-                except Exception as e:
-                    logger.warning(f"schmon_send_item photo→doc {chat_id}: {e}")
-            m = await bot.send_document(
-                chat_id=chat_id,
-                document=InputFile(data, filename=name or "image.jpg"),
-                caption=("🖼 Расписание\n%s" % host)[:1024])
-            _fid = ""
-            try:
-                _fid = getattr(getattr(m, "document", None), "file_id", "") or ""
-            except Exception:
-                _fid = ""
-            return _SchmonResult(True, _fid, "document")
-        m = await bot.send_document(
-            chat_id=chat_id,
-            document=InputFile(data, filename=name or "file.pdf"),
-            caption=("📄 %s\n%s" % (name, host))[:1024])
-        _fid = ""
-        try:
-            _fid = getattr(getattr(m, "document", None), "file_id", "") or ""
-        except Exception:
-            _fid = ""
-        return _SchmonResult(True, _fid, "document")
-    except Exception as e:
-        logger.warning(f"schmon_send_item {chat_id}: {e}")
-        return False
-
-
-def schmon_recipients(class_obj):
-    """Кому присылать обновления: все участники класса (админы + ученики),
-    кроме заблокированных. Идентификаторы — только числовые Telegram ID."""
-    if class_obj is None:
-        return []
-    blocked = {str(b) for b in (getattr(class_obj, "blocked_users", []) or [])}
-    ids = []
-    for uid in (list(getattr(class_obj, "students", []) or [])
-                + list(getattr(class_obj, "admins", []) or [])):
-        s = str(uid or "").strip()
-        if not s or not s.isdigit() or s in blocked or s in ids:
-            continue
-        ids.append(s)
-    return ids
-
-
-def _schmon_store_web(class_obj, url, info, text="", kind="text", name="",
-                      file_id="", file_kind=""):
-    """ВОЛНА 22.67: запомнить в КЛАССЕ последнее «Расписание с сайтов».
-
-    Просьба: «оно должно приходить В РАСПИСАНИЯ классу» — теперь выбранное
-    или обновлённое расписание пишется в class_obj.schedule_web и видно
-    ученикам в «📅 Расписание» секцией «🌐 Расписание с сайтов», а не только
-    разлетается сообщениями (которые легко потерять в чате).
-    ВОЛНА 22.68: для файловых расписаний запоминается ещё file_id первой
-    успешной отправки (+file_kind "photo"/"document") — кнопка «📅 Расписание»
-    переигрывает САМ ФАЙЛ по file_id, без перекачки с сайта."""
-    try:
-        if class_obj is None:
-            return
-        class_obj.schedule_web = {
-            "text": str(text or "")[:4000],
-            "kind": str(kind or "text"),
-            "name": str(name or "")[:120],
-            "url": str(url or "")[:500],
-            "host": schmon_host_of(url)[:120],
-            "title": str((info or {}).get("title") or "")[:200],
-            "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
-            "file_id": str(file_id or "")[:200],
-            "file_kind": str(file_kind or "")[:16],
-        }
-        save_class(class_obj)
-    except Exception as e:
-        logger.warning(f"schmon_store_web: {e}")
-
-
-async def schmon_notify(app, class_code, url, info, new_files=(),
-                        schedule_text=None):
-    """Авторассылка классу: прислать ТОЛЬКО изменившееся расписание — ОДИН
-    файл/фото или текст, и НЕ ЧАЩЕ раза в день. Дубли не шлём.
-    ВАЖНО: мутируем ТУ ЖЕ запись info, что у вызывающего (check_url/цикл), —
-    иначе финальный merge перезатрёт память отправленного и дневной лимит.
-    Сохранение делает вызывающий (schmon_merge_info)."""
-    if not isinstance(info, dict):
-        return False
-    class_obj = get_class_by_code(class_code)
-    recipients = schmon_recipients(class_obj)
-    if not recipients:
-        return False
-    bot = app.bot
-
-    files = list(new_files or [])
-    handled = False
-
-    # 1) Фото-расписания и файлы — присылаем ОДНО новое, не больше
-    for f in files[:SCHEDMON_MAX_FILES_PER_NOTIFY]:
-        dl = await asyncio.to_thread(schmon_download_file, f, url)
-        if not dl:
-            continue
-        data, name = dl
-        digest = hashlib.md5(data).hexdigest()
-        if schmon_was_sent(info, digest):
-            handled = True  # это уже присылали — повторно НЕ шлём
-            continue
-        if schmon_daily_quota_left(info) <= 0:
-            # дневной лимит исчерпан — отложим проверку до завтра
-            info["next_check"] = _schmon_next_midnight_ts()
-            return False
-        host = schmon_host_of(url)
-        sent_any = False
-        # ВОЛНА 22.68: file_id первой успешной отправки — для кнопки «📅
-        # Расписание» (переигрывает файл классу без перекачки).
-        _first_res = None
-        for chat_id in recipients:
-            _res = await schmon_send_item(bot, chat_id, f, data, name, host)
-            if _res:
-                sent_any = True
-                # getattr: у файла может не быть file_id (старые заглушки),
-                # и monkeypatch-подмены в тестах возвращают просто True
-                if _first_res is None or not getattr(_first_res, "file_id", ""):
-                    _first_res = _res
-        if sent_any:
-            schmon_mark_sent(info, digest)
-            schmon_use_daily_quota(info)
-            # ВОЛНА 22.67: расписание-файл запоминаем и В КЛАССЕ — его видно
-            # в «📅 Расписание» секцией «🌐 Расписание с сайтов».
-            # ВОЛНА 22.68: с file_id — кнопка присылает сам файл.
-            _schmon_store_web(class_obj, url, info, kind="file", name=name,
-                              file_id=(getattr(_first_res, "file_id", "") if _first_res else ""),
-                              file_kind=(getattr(_first_res, "kind", "") if _first_res else ""))
-            return True  # ровно ОДИН файл/фото за день!
-
-    if handled:
-        return True  # всё уже присылалось — просто обновляем состояние
-
-    # 2) Расписание текстом
-    if schedule_text:
-        if schmon_daily_quota_left(info) <= 0:
-            info["next_check"] = _schmon_next_midnight_ts()
-            return False
-        head = "📅 Расписание обновилось\n%s\n\n" % schmon_host_of(url)
-        sent_any = False
-        for chat_id in recipients:
-            if await schmon_send_text(bot, chat_id, head + schedule_text):
-                sent_any = True
-        if sent_any:
-            schmon_use_daily_quota(info)
-            # ВОЛНА 22.67: текст запоминаем в КЛАССЕ (секция «📅 Расписание»).
-            _schmon_store_web(class_obj, url, info,
-                              text=schedule_text, kind="text")
-            return True
-
-    # Если ни фото, ни файлов, ни текста расписания не нашли — молчим
-    return False
-
-
-# ---------------------------- проверка ссылок -------------------------------
-async def _schmon_check_file_url(app, class_code, url, info):
-    """Прямая ссылка на файл/картинку: следим за ETag/Last-Modified/длиной,
-    при их отсутствии — за md5 содержимого."""
-    old = info.get("sig") if isinstance(info.get("sig"), dict) else None
-    m = await asyncio.to_thread(schmon_file_meta_signature, url)
-    if m:
-        d = (old or {}).get("d", "")
-    else:
-        d = await asyncio.to_thread(schmon_file_deep_signature, url)
-    if old is None:
-        info["sig"] = {"m": m, "d": d}
-        schmon_merge_info(class_code, url, info)
-        return False
-    changed = ((bool(old.get("m")) and old.get("m") != m)
-               or (bool(d) and d != (old.get("d") or "")))
-    if not changed:
-        info["sig"] = {"m": m, "d": d}
-        schmon_merge_info(class_code, url, info)
-        return False
-    if await schmon_notify(app, class_code, url, info, [url]):
-        info["sig"] = {"m": m, "d": d}
-        schmon_merge_info(class_code, url, info)
-        return True
-    return False
-
-
-async def schmon_check_url(app, class_code, url, info):
-    """Проверить одну ссылку класса. True — было обновление (отправлено)."""
-    if not isinstance(info, dict):
-        return False
-    if schmon_file_kind(url) or schmon_image_kind(url):
-        return await _schmon_check_file_url(app, class_code, url, info)
-    try:
-        html_text = await asyncio.to_thread(schmon_fetch_page, url)
-    except Exception:
-        info["errors"] = int(info.get("errors") or 0) + 1
-        schmon_merge_info(class_code, url, info)
-        return False
-    info["errors"] = 0
-    h, ch = schmon_page_hashes(html_text)
-    first = info.get("h") is None
-    page_changed = (not first) and (h, ch) != (info.get("h"), info.get("ch"))
-    old_files = info.get("files") if isinstance(info.get("files"), dict) else {}
-    files_now = await asyncio.to_thread(
-        _schmon_collect_file_sigs, url, html_text, old_files,
-        bool(first or page_changed))
-    new_files = [f for f in files_now
-                 if _schmon_file_changed(old_files.get(f), files_now[f])]
-
-    if first:
-        info.update({"h": h, "ch": ch,
-                     "title": schmon_page_title(html_text),
-                     "files": files_now})
-        schmon_merge_info(class_code, url, info)
-        return False
-
-    # --- следим ТОЛЬКО за тем, что выбрал админ ---
-    sel = info.get("sel") or []
-    has_cand = bool(info.get("cand"))
-    if sel:
-        sel_norm = {_schmon_norm_src(s) for s in sel if s != "TEXT"}
-        new_files = [f for f in new_files if _schmon_norm_src(f) in sel_norm]
-        allow_text = "TEXT" in sel
-    elif has_cand:
-        new_files, allow_text = [], False  # админ ещё не выбрал — молчим
-    else:
-        allow_text = True  # состояние без меню выбора — как раньше
-
-    if page_changed or new_files:
-        sch_text, sch_hash = None, ""
-        if not new_files and allow_text:
-            sch_text = await asyncio.to_thread(schmon_get_schedule, html_text)
-            if sch_text:
-                sch_hash = schmon_text_hash(sch_text)
-                if sch_hash == info.get("sch"):
-                    info.update({"h": h, "ch": ch,
-                                 "title": schmon_page_title(html_text),
-                                 "files": files_now})
-                    schmon_merge_info(class_code, url, info)
-                    return False
-
-        if not new_files and not sch_text:
-            # Выбранное не изменилось — просто обновляем состояние
-            info.update({"h": h, "ch": ch,
-                         "title": schmon_page_title(html_text),
-                         "files": files_now})
-            schmon_merge_info(class_code, url, info)
-            return False
-
-        if await schmon_notify(app, class_code, url, info, new_files, sch_text):
-            upd = {"h": h, "ch": ch,
-                   "title": schmon_page_title(html_text), "files": files_now}
-            if not new_files:
-                upd["sch"] = sch_hash
-            info.update(upd)
-            schmon_merge_info(class_code, url, info)
-            return True
-        return False
-
-    info["files"] = files_now
-    schmon_merge_info(class_code, url, info)
-    return False
-
-
-async def schmon_monitor_loop(app):
-    """Фоновый цикл: раз в 30с собирает «созревшие» ссылки всех классов и
-    проверяет их (до 3 параллельно, сеть — в отдельных потоках)."""
-    logger.info("Мониторинг «Расписание с сайтов» запущен: тик 30с, "
-                "интервал проверки %dс.", SCHEDMON_CHECK_INTERVAL)
-    await asyncio.sleep(20)  # дать боту спокойно подняться
-    while True:
-        try:
-            state = schmon_normalize(schmon_load())
-            now = time.time()
-            jobs = []
-            for class_code, entry in state.items():
-                for url, info in (entry.get("urls") or {}).items():
-                    if (isinstance(info, dict)
-                            and now >= float(info.get("next_check") or 0)):
-                        jobs.append((str(class_code), url, info))
-            if jobs:
-                sem = asyncio.Semaphore(3)
-
-                async def _schmon_run_one(cc, u, inf):
-                    async with sem:
-                        try:
-                            await schmon_check_url(app, cc, u, inf)
-                        except asyncio.CancelledError:
-                            raise
-                        except Exception:
-                            logger.exception("schmon check failed: %s", u)
-                        finally:
-                            # не затираем отложенную проверку (дневной лимит)
-                            inf["next_check"] = max(
-                                float(inf.get("next_check") or 0),
-                                time.time() + SCHEDMON_CHECK_INTERVAL)
-                            schmon_merge_info(cc, u, inf)
-
-                await asyncio.gather(
-                    *[_schmon_run_one(cc, u, inf) for cc, u, inf in jobs])
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("schmon_monitor_loop tick")
-        await asyncio.sleep(30)
-
-
-async def schmon_force_check(app, class_code, chat_id):
-    """«🔍 Проверить сейчас»: немедленная проверка всех ссылок класса
-    с отчётом админу."""
-    state = schmon_normalize(schmon_load())
-    urls = schmon_class_urls(state, class_code)
-    if not urls:
-        if chat_id:
-            await schmon_send_text(
-                app.bot, chat_id,
-                "📭 За классом пока не следит ни одна ссылка. Добавьте её "
-                "через «🌐 Расписание с сайтов» → «➕ Добавить ссылку».")
-        return
-    if chat_id:
-        await schmon_send_text(app.bot, chat_id,
-                               "🔍 Проверяю ссылок: %d…" % len(urls))
-    checked = changed = 0
-    for url, info in urls.items():
-        try:
-            if await schmon_check_url(app, class_code, url, info):
-                changed += 1
-            checked += 1
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("schmon force check: %s", url)
-        info["next_check"] = max(float(info.get("next_check") or 0),
-                                 time.time() + SCHEDMON_CHECK_INTERVAL)
-        schmon_merge_info(class_code, url, info)
-    if chat_id:
-        await schmon_send_text(
-            app.bot, chat_id,
-            "✔ Проверил ссылок: %d, обновлений: %d." % (checked, changed))
-
-
-# ------------------------- UI админ-панели ----------------------------------
-def _schmon_admin_class(context, uid):
-    """Класс для schmon-колбэков: рабочий класс админ-панели (или свой класс
-    админа) с проверкой прав."""
-    cls = None
-    cur = context.user_data.get('current_admin_class')
-    if cur:
-        cls = get_class_by_code(cur) if isinstance(cur, str) else cur
-    if cls is None:
-        cls = get_class_by_user(uid)
-    if cls is None or not getattr(cls, 'is_active', True):
-        return None
-    if uid not in (cls.admins or []) and uid != str(cls.creator_id or ''):
-        return None
-    return cls
-
-
-def _schmon_menu_text(class_obj):
-    state = schmon_normalize(schmon_load())
-    urls = schmon_class_urls(state, class_obj.class_code)
-    # Панель рисуется в ParseMode.HTML — все данные со страниц (title,
-    # url) экранируем, иначе «<» в <title> сломает рендер сообщения.
-    esc = html_mod.escape
-    lines = [
-        "🌐 <b>Расписание с сайтов</b> — класс «%s»" % esc(class_obj.class_name),
-        "",
-        "Слежу за страницами со расписанием и присылаю классу обновления "
-        "автоматически: 🖼 фото, 📄 файл (PDF/Word/Excel) или 📅 текст — "
-        "не чаще <b>1 раза в день</b> на ссылку, без дублей.",
-        "",
-    ]
-    if not urls:
-        lines.append("Ссылок пока нет. Нажмите «➕ Добавить ссылку» и пришлите "
-                     "адрес страницы школы с расписанием.")
-    else:
-        lines.append("Отслеживаю ссылок: %d" % len(urls))
-        for url, info in list(urls.items())[:30]:
-            sel = info.get("sel") or []
-            if sel and sel != ["TEXT"]:
-                status = "выбрано файлов: %d" % len(
-                    [s for s in sel if s != "TEXT"])
-                if "TEXT" in sel:
-                    status += " + текст"
-            elif sel == ["TEXT"]:
-                status = "текст расписания"
-            else:
-                status = "источники не выбраны"
-            title = str(info.get("title") or "").strip()
-            host = esc(schmon_host_of(url))
-            name = esc(schmon_short_name(url, 40))
-            lines.append("• 🌐 %s — %s (%s)" % (host, name, esc(status))
-                         if not title else
-                         "• 🌐 %s — %s (%s)" % (host, esc(title[:40]),
-                                                esc(status)))
-        lines.append("")
-        lines.append("«❌ …» — перестать следить за ссылкой.")
-    return "\n".join(lines)
-
-
-def _schmon_menu_kb(class_code):
-    state = schmon_normalize(schmon_load())
-    urls = schmon_class_urls(state, class_code)
-    rows = [[InlineKeyboardButton("➕ Добавить ссылку", callback_data="schmon_add")]]
-    for url in list(urls.keys())[:30]:
-        label = "❌ " + (schmon_host_of(url) + " · "
-                        + schmon_short_name(url))[:60]
-        rows.append([InlineKeyboardButton(label,
-                                          callback_data="schdel:"
-                                          + schmon_md5key(url))])
-    rows.append([InlineKeyboardButton("🔍 Проверить сейчас",
-                                      callback_data="schmon_check")])
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_to_admin")])
-    return InlineKeyboardMarkup(rows)
-
-
-async def schmon_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Меню «🌐 Расписание с сайтов» (из админ-панели)."""
-    query = update.callback_query
-    try:
-        await query.answer()
-    except Exception:
-        pass
-    uid = str(query.from_user.id)
-    class_obj = _schmon_admin_class(context, uid)
-    if not class_obj:
-        try:
-            await query.answer("Только для админов класса.", show_alert=True)
-        except Exception:
-            pass
-        return MAIN_MENU
-    context.user_data['current_admin_class'] = class_obj.class_code
-    context.user_data.pop('schmon_wait_url', None)
-    try:
-        if _sch_requests is None:
-            await query.edit_message_text(
-                "⚙️ На сервере не установлена библиотека requests.\n"
-                "Попросите администратора сервера выполнить:\n"
-                "<code>pip install requests</code>",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("⬅️ Назад", callback_data="back_to_admin")]]),
-                parse_mode=ParseMode.HTML)
-            return ADMIN_PANEL
-        await query.edit_message_text(
-            _schmon_menu_text(class_obj),
-            reply_markup=_schmon_menu_kb(class_obj.class_code),
-            parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-    except Exception:
-        pass
-    return ADMIN_PANEL
-
-
-async def schmon_add_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """«➕ Добавить ссылку» — ждём URL от админа (состояние SCHEDMON_URL)."""
-    query = update.callback_query
-    try:
-        await query.answer()
-    except Exception:
-        pass
-    uid = str(query.from_user.id)
-    class_obj = _schmon_admin_class(context, uid)
-    if not class_obj:
-        try:
-            await query.answer("Только для админов класса.", show_alert=True)
-        except Exception:
-            pass
-        return MAIN_MENU
-    context.user_data['current_admin_class'] = class_obj.class_code
-    context.user_data['schmon_wait_url'] = True
-    try:
-        await query.edit_message_text(
-            "🌐 Пришлите ссылку на страницу с расписанием.\n\n"
-            "Например: https://school1.ru/schedule\n\n"
-            "Я покажу, что нашёл (🖼 картинки, 📄 файлы, 📅 текст), "
-            "а вы выберете кнопками, что присылать классу ПОСТОЯННО.",
-            reply_markup=get_cancel_keyboard(), disable_web_page_preview=True)
-    except Exception:
-        pass
-    return SCHEDMON_URL
-
-
-@timeout(CONVERSATION_TIMEOUT)
-async def schmon_url_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Админ прислал ссылку: показываем источники и выбор «что присылать»."""
-    uid = str(update.effective_user.id)
-    class_obj = _schmon_admin_class(context, uid)
-    if not class_obj:
-        await update.message.reply_text("❌ Только для админов класса.")
-        return MAIN_MENU
-    class_code = class_obj.class_code
-    context.user_data['current_admin_class'] = class_code
-
-    text = (update.message.text or "").strip()
-    if not context.user_data.get('schmon_wait_url'):
-        # Текст без запроса ссылки — показываем меню как вежливый ответ
-        await update.message.reply_text(
-            _schmon_menu_text(class_obj),
-            reply_markup=_schmon_menu_kb(class_code),
-            parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-        return ADMIN_PANEL
-
-    url = schmon_extract_url(text)
-    if not url:
-        await update.message.reply_text(
-            "Не похоже на ссылку. Пришлите адрес страницы (начинается с http "
-            "или www), либо нажмите «❌ Отмена».")
-        return SCHEDMON_URL
-
-    context.user_data['schmon_wait_url'] = False
-
-    if _sch_requests is None:
-        await update.message.reply_text(
-            "⚙️ На сервере не установлена библиотека requests.\n"
-            "Попросите администратора сервера выполнить:\n"
-            "<code>pip install requests</code>", parse_mode=ParseMode.HTML)
-        return ADMIN_PANEL
-
-    wait_msg = await update.message.reply_text("🔎 Открываю страницу и ищу расписание…")
-
-    state = schmon_normalize(schmon_load())
-    urls = schmon_class_urls(state, class_code)
-
-    if url in urls:
-        info = urls[url]
-        cands = info.get("cand") or []
-        if cands:
-            key = schmon_md5key(url)
-            buttons = []
-            for i, (u2, k) in enumerate(cands):
-                label = ("🖼 " if k == "img" else "📄 ") + schmon_short_name(u2)
-                buttons.append([InlineKeyboardButton(
-                    label, callback_data="schsnd:%s:%d" % (key, i))])
-            buttons.append([InlineKeyboardButton(
-                "📅 Текст расписания", callback_data="schtxt:" + key)])
-            buttons.append([InlineKeyboardButton("⬅️ В меню",
-                                                 callback_data="schmon_menu")])
-            await wait_msg.edit_text(
-                "🔗 Эта ссылка уже под наблюдением — выберите источники заново "
-                "(можно дополнить):",
-                reply_markup=InlineKeyboardMarkup(buttons),
-                disable_web_page_preview=True)
-        else:
-            await wait_msg.edit_text("🔗 Эта ссылка уже под наблюдением.")
-        return ADMIN_PANEL
-
-    if len(urls) >= SCHEDMON_MAX_TRACK_PER_CLASS:
-        await wait_msg.edit_text(
-            "⚠ Лимит: не больше %d ссылок на класс. Удалите лишние (❌ в меню) "
-            "и попробуйте снова." % SCHEDMON_MAX_TRACK_PER_CLASS)
-        return ADMIN_PANEL
-
-    info = schmon_new_info()
-    info["chat"] = uid        # куда сразу слать выбранные источники
-    info["added_by"] = uid
-    info["added_ts"] = int(time.time())
-
-    try:
-        if schmon_file_kind(url) or schmon_image_kind(url):
-            # Прямая ссылка на файл/картинку — выбирать нечего, следим сразу
-            m = await asyncio.to_thread(schmon_file_meta_signature, url)
-            d = "" if m else await asyncio.to_thread(
-                schmon_file_deep_signature, url)
-            info["sig"] = {"m": m, "d": d}
-            info["sel"] = [url]
-            urls[url] = info
-            schmon_save(state)
-            await wait_msg.edit_text(
-                "✅ Следю за файлом %s.\nПри изменении пришлю классу "
-                "(не чаще 1 раза в день)." % schmon_short_name(url))
-            return ADMIN_PANEL
-        html_text = await asyncio.to_thread(schmon_fetch_page, url)
-    except Exception:
-        await wait_msg.edit_text(
-            "⚠ Не удалось открыть страницу. Проверьте ссылку и попробуйте "
-            "ещё раз. Ссылка НЕ добавлена.")
-        return ADMIN_PANEL
-
-    h, ch = schmon_page_hashes(html_text)
-    info.update({"h": h, "ch": ch, "title": schmon_page_title(html_text)})
-    sources = await asyncio.to_thread(schmon_find_schedule_sources, url, html_text)
-    has_text = bool(await asyncio.to_thread(
-        lambda: schmon_get_schedule(html_text, deep=False)))  # без ИИ, быстро
-
-    if not sources and not has_text:
-        sch_text = await asyncio.to_thread(schmon_get_schedule, html_text)
-        if sch_text:
-            head = "📅 Расписание\n%s\n\n" % schmon_host_of(url)
-            await schmon_send_text(context.bot, uid, head + sch_text)
-            info["sch"] = schmon_text_hash(sch_text)
-            info["sel"] = ["TEXT"]
-            urls[url] = info
-            schmon_save(state)
-            await update.message.reply_text(
-                "✅ Следю за страницей: буду присылать классу текст расписания "
-                "при изменении (не чаще 1 раза в день).")
-            return ADMIN_PANEL
-        await wait_msg.edit_text(
-            "На странице не нашёл ни файлов, ни текста расписания. Ссылка НЕ "
-            "добавлена. Попробуйте другую страницу.")
-        return ADMIN_PANEL
-
-    cands = [[u2, ("img" if schmon_image_kind(u2) else "doc")]
-             for u2 in sources[:8]]
-    info["cand"] = cands
-    urls[url] = info
-    schmon_save(state)
-
-    key = schmon_md5key(url)
-    buttons = []
-    for i, (u2, k) in enumerate(cands):
-        label = ("🖼 " if k == "img" else "📄 ") + schmon_short_name(u2)
-        buttons.append([InlineKeyboardButton(
-            label, callback_data="schsnd:%s:%d" % (key, i))])
-    if has_text:
-        buttons.append([InlineKeyboardButton(
-            "📅 Текст расписания", callback_data="schtxt:" + key)])
-    if len(cands) > 1:
-        buttons.append([InlineKeyboardButton(
-            "📦 Прислать всё", callback_data="schall:" + key)])
-    buttons.append([InlineKeyboardButton("⬅️ В меню",
-                                         callback_data="schmon_menu")])
-    await wait_msg.edit_text(
-        "Вот что я нашёл на %s.\nВыберите кнопками, что присылать классу "
-        "ПОСТОЯННО (можно несколько).\nВыбранное пришлю сразу вам, дальше — "
-        "классу только при изменении, не чаще 1 раза в день."
-        % schmon_host_of(url),
-        reply_markup=InlineKeyboardMarkup(buttons),
-        disable_web_page_preview=True)
-    return ADMIN_PANEL
-
-
-async def _schmon_send_candidate_admin(bot, url, info, u, admin_chat_id,
-                                       skip_dup=False, also_chats=None):
-    """Скачать и отправить один выбранный источник админу; запомнить выбор.
-    skip_dup=True — не слать, если такое же содержимое уже отправлялось.
-    ВОЛНА 22.67: also_chats — список chat_id, кому продублировать ТО ЖЕ
-    содержимое (класс: выбранное админом сразу уходит всем ученикам)."""
-    dl = await asyncio.to_thread(schmon_download_file, u, url)
-    if not dl:
-        return False
-    data, name = dl
-    digest = hashlib.md5(data).hexdigest()
-    sel = info.get("sel") or []
-    if skip_dup and schmon_was_sent(info, digest):
-        if u not in sel:
-            sel.append(u)
-        info["sel"] = sel
-        return True  # уже присылали такое же — выбор запомнили, дубль не шлём
-    ok = await schmon_send_item(bot, admin_chat_id, u, data, name,
-                                schmon_host_of(url))
-    if ok:
-        schmon_mark_sent(info, digest)
-        if u not in sel:
-            sel.append(u)
-        info["sel"] = sel
-        # ВОЛНА 22.67: выбранное админом расписание сразу уходит и классу.
-        for _chat in (also_chats or []):
-            try:
-                await schmon_send_item(bot, _chat, u, data, name,
-                                       schmon_host_of(url))
-            except Exception as _e:
-                logger.warning(f"schmon also_chats {_chat}: {_e}")
-    # ВОЛНА 22.68: возвращаем _SchmonResult (truthy) — вызывающий заберёт
-    # file_id для запоминания в классе; для старых сравнений с False всё
-    # совместимо (__bool__).
-    return ok
-
-
-async def schmon_pick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """schsnd:<key>:<idx> — скачать и сразу отправить источник админу."""
-    query = update.callback_query
-    parts = (query.data or "").split(":")
-    uid = str(query.from_user.id)
-    if len(parts) != 3:
-        try:
-            await query.answer()
-        except Exception:
-            pass
-        return ADMIN_PANEL
-    key, idx = parts[1], -1
-    try:
-        idx = int(parts[2])
-    except ValueError:
-        pass
-    state, class_code, url, info = schmon_find_by_key(key)
-    class_obj = get_class_by_code(class_code) if class_code else None
-    if (not url or not isinstance(info, dict) or class_obj is None
-            or (uid not in (class_obj.admins or [])
-                and uid != str(class_obj.creator_id or ''))):
-        try:
-            await query.answer("Ссылка не найдена", show_alert=True)
-        except Exception:
-            pass
-        return ADMIN_PANEL
-    cands = info.get("cand") or []
-    if not (0 <= idx < len(cands)):
-        try:
-            await query.answer("Источник не найден", show_alert=True)
-        except Exception:
-            pass
-        return ADMIN_PANEL
-    try:
-        await query.answer("Отправляю…")
-    except Exception:
-        pass
-    # ВОЛНА 22.67: выбранное админом сразу уходит и ВСЕМУ классу
-    # (ученики + админы, без заблокированных, без самого выбравшего —
-    # ему уже пришло). Дневная квота НЕ тратится: это явное действие админа.
-    _also = [c for c in schmon_recipients(class_obj)
-             if str(c) != str(uid)]
-    ok = await _schmon_send_candidate_admin(context.bot, url, info,
-                                            cands[idx][0], uid,
-                                            also_chats=_also)
-    if ok:
-        # ВОЛНА 22.68: с file_id — кнопка «📅 Расписание» переигрывает файл
-        _schmon_store_web(class_obj, url, info, kind="file",
-                          name=(cands[idx][0] or "").rsplit("/", 1)[-1],
-                          file_id=getattr(ok, "file_id", ""),
-                          file_kind=getattr(ok, "kind", ""))
-    schmon_merge_info(class_code, url, info)
-    if not ok:
-        try:
-            await query.answer("Не удалось скачать", show_alert=True)
-        except Exception:
-            pass
-    return ADMIN_PANEL
-
-
-async def schmon_text_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """schtxt:<key> — выслать админу текст расписания и следить за ним."""
-    query = update.callback_query
-    uid = str(query.from_user.id)
-    key = (query.data or "")[len("schtxt:"):]
-    state, class_code, url, info = schmon_find_by_key(key)
-    class_obj = get_class_by_code(class_code) if class_code else None
-    if (not url or not isinstance(info, dict) or class_obj is None
-            or (uid not in (class_obj.admins or [])
-                and uid != str(class_obj.creator_id or ''))):
-        try:
-            await query.answer("Ссылка не найдена", show_alert=True)
-        except Exception:
-            pass
-        return ADMIN_PANEL
-    try:
-        await query.answer("Ищу текст…")
-    except Exception:
-        pass
-    ok = False
-    try:
-        html_text = await asyncio.to_thread(schmon_fetch_page, url)
-    except Exception:
-        html_text = ""
-    sch_text = await asyncio.to_thread(schmon_get_schedule, html_text)
-    if sch_text and await schmon_send_text(
-            context.bot, uid,
-            "📅 Расписание\n%s\n\n%s" % (schmon_host_of(url), sch_text)):
-        ok = True
-        info["sch"] = schmon_text_hash(sch_text)
-        sel = info.get("sel") or []
-        if "TEXT" not in sel:
-            sel.append("TEXT")
-        info["sel"] = sel
-        # ВОЛНА 22.67: выбранное расписание сразу уходит и ВСЕМУ классу
-        # (без выбравшего админа — ему уже пришло), и запоминается в классе:
-        # секция «🌐 Расписание с сайтов» в «📅 Расписание».
-        _also = [c for c in schmon_recipients(class_obj)
-                 if str(c) != str(uid)]
-        for _chat in _also:
-            try:
-                await schmon_send_text(
-                    context.bot, _chat,
-                    "📅 Расписание\n%s\n\n%s" % (schmon_host_of(url), sch_text))
-            except Exception as _e:
-                logger.warning(f"schmon text also {_chat}: {_e}")
-        _schmon_store_web(class_obj, url, info,
-                          text=sch_text, kind="text")
-    schmon_merge_info(class_code, url, info)
-    if not ok:
-        await schmon_send_text(context.bot, uid,
-                               "⚠ Не удалось извлечь текст расписания.")
-    return ADMIN_PANEL
-
-
-async def schmon_all_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """schall:<key> — прислать админу все найденные источники и следить за
-    всеми."""
-    query = update.callback_query
-    uid = str(query.from_user.id)
-    key = (query.data or "")[len("schall:"):]
-    state, class_code, url, info = schmon_find_by_key(key)
-    class_obj = get_class_by_code(class_code) if class_code else None
-    if (not url or not isinstance(info, dict) or class_obj is None
-            or (uid not in (class_obj.admins or [])
-                and uid != str(class_obj.creator_id or ''))):
-        try:
-            await query.answer("Ссылка не найдена", show_alert=True)
-        except Exception:
-            pass
-        return ADMIN_PANEL
-    try:
-        await query.answer("Отправляю всё…")
-    except Exception:
-        pass
-    sent_any = False
-    # ВОЛНА 22.67: класс получает копии того же содержимого (без админа).
-    _also = [c for c in schmon_recipients(class_obj)
-             if str(c) != str(uid)]
-    _last_name = ""
-    _last_fid = ""
-    _last_fkind = ""
-    for u, _k in (info.get("cand") or [])[:SCHEDMON_MAX_FILES_PER_NOTIFY]:
-        _res = await _schmon_send_candidate_admin(context.bot, url, info, u, uid,
-                                                  skip_dup=True,
-                                                  also_chats=_also)
-        if _res:
-            sent_any = True
-            _last_name = str(u or "").rsplit("/", 1)[-1]
-            # getattr: совместимость с заглушками, возвращающими True
-            if getattr(_res, "file_id", ""):
-                _last_fid = _res.file_id
-                _last_fkind = _res.kind
-    if sent_any:
-        _schmon_store_web(class_obj, url, info, kind="file", name=_last_name,
-                          file_id=_last_fid, file_kind=_last_fkind)
-    schmon_merge_info(class_code, url, info)
-    if not sent_any:
-        await schmon_send_text(context.bot, uid,
-                               "⚠ Не удалось скачать файлы со страницы.")
-    return ADMIN_PANEL
-
-
-async def schmon_del_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """schdel:<key> — перестать следить за ссылкой."""
-    query = update.callback_query
-    uid = str(query.from_user.id)
-    key = (query.data or "")[len("schdel:"):]
-    state, class_code, url, info = schmon_find_by_key(key)
-    class_obj = get_class_by_code(class_code) if class_code else None
-    if url and class_obj is not None:
-        if (uid not in (class_obj.admins or [])
-                and uid != str(class_obj.creator_id or '')):
-            try:
-                await query.answer("Только для админов класса.",
-                                   show_alert=True)
-            except Exception:
-                pass
-            return ADMIN_PANEL
-        urls = schmon_class_urls(state, class_code)
-        urls.pop(url, None)
-        schmon_save(state)
-        _log_admin_action(uid, class_code,
-                          "Расписание с сайтов: ссылка удалена", url[:200])
-        try:
-            await query.answer("Удалено")
-        except Exception:
-            pass
-    else:
-        try:
-            await query.answer("Не найдено")
-        except Exception:
-            pass
-    show_obj = class_obj or _schmon_admin_class(context, uid)
-    if show_obj is not None:
-        try:
-            await query.edit_message_text(
-                _schmon_menu_text(show_obj),
-                reply_markup=_schmon_menu_kb(show_obj.class_code),
-                parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-        except Exception:
-            pass
-    return ADMIN_PANEL
-
-
-async def schmon_check_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """«🔍 Проверить сейчас» — фоновая проверка всех ссылок класса + отчёт."""
-    query = update.callback_query
-    try:
-        await query.answer()
-    except Exception:
-        pass
-    uid = str(query.from_user.id)
-    class_obj = _schmon_admin_class(context, uid)
-    if not class_obj:
-        try:
-            await query.answer("Только для админов класса.", show_alert=True)
-        except Exception:
-            pass
-        return MAIN_MENU
-    class_code = class_obj.class_code
-    context.user_data['current_admin_class'] = class_code
-    state = schmon_normalize(schmon_load())
-    urls = schmon_class_urls(state, class_code)
-    if not urls:
-        try:
-            await query.answer("Сначала добавьте ссылку", show_alert=True)
-        except Exception:
-            pass
-        return ADMIN_PANEL
-    try:
-        await query.answer("Проверяю %d ссылок…" % len(urls))
-    except Exception:
-        pass
-    _task = asyncio.create_task(
-        schmon_force_check(context.application, class_code, uid))
-    try:
-        context.application.bot_data.setdefault("_bg_tasks", []).append(_task)
-    except Exception:
-        pass
-    return ADMIN_PANEL
-
-
-# ==================================
 # === АДМИНСКАЯ ПАНЕЛЬ ===
 # ==================================
 
 @timeout(CONVERSATION_TIMEOUT)
-async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE,
-                      _trusted: bool = False):
+async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     user = get_user(user_id)
     if not user:
         user = User(user_id)
 
-    # ВОЛНА 22.67: _trusted=True — вызов СРАЗУ после создания класса:
-    # создатель только что сохранён админом (проверено форс-перечитыванием),
-    # повторная проверка может дать ложный «нет прав» на устаревшем кэше.
-    if not _trusted and not is_user_class_admin(user_id):
-        # ВОЛНА 22.67: прежде чем отказать — перечитываем классы С ДИСКА/ИЗ
-        # БД минуя кэш (TTL-кэш мог отстать от только что сохранённых данных
-        # или от другой копии базы). Ложные «❌ нет прав» больше не показываем.
-        _classes_force_reload()
-        if not is_user_class_admin(user_id):
-            error_text = "❌ У вас нет прав доступа к админке."
-            await update.message.reply_text(error_text)
-            return MAIN_MENU
+    if not is_user_class_admin(user_id):
+        error_text = "❌ У вас нет прав доступа к админке."
+        await update.message.reply_text(error_text)
+        return MAIN_MENU
 
     user_classes = []
     classes = load_classes()
@@ -44918,15 +41873,9 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE,
             user_classes.append(class_obj)
 
     if not user_classes:
-        if not _trusted:
-            _classes_force_reload()
-            for class_obj in _classes_force_reload().values():
-                if class_obj.is_active and user_id in class_obj.admins:
-                    user_classes.append(class_obj)
-        if not user_classes:
-            error_text = "❌ У вас нет прав доступа."
-            await update.message.reply_text(error_text)
-            return MAIN_MENU
+        error_text = "❌ У вас нет прав доступа."
+        await update.message.reply_text(error_text)
+        return MAIN_MENU
 
     if len(user_classes) == 1:
         class_obj = user_classes[0]
@@ -46165,82 +43114,37 @@ async def create_class_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = update.callback_query
     await query.answer()
 
-    # ВОЛНА 22.67: запоминаем «ждём название класса» В БАЗЕ (TTL 2 ч).
-    # Если бот перезапустится/задеплоится, пока пользователь печатает название,
-    # FSM-состояние CREATE_CLASS_NAME потеряется, и текст молча пропадал
-    # («класс не создаётся») — теперь глобальный приёмник доведёт название.
-    try:
-        _uid = str(update.effective_user.id)
-        _user = get_user(_uid)
-        if _user is not None:
-            _user.cls_pending = {"ts": time.time()}
-            save_user(_user)
-    except Exception as e:
-        logger.warning(f"create_class_start: не пометил cls_pending: {e}")
-
     text = "➕ Введите название класса (например, '10А' или 'Информатика 2024'):"
 
     await query.edit_message_text(text, reply_markup=get_cancel_keyboard())
     return CREATE_CLASS_NAME
 
-
-async def _cls_pending_finalize(update: Update, context: ContextTypes.DEFAULT_TYPE,
-                                user, class_name: str):
-    """ВОЛНА 22.67: общая часть создания класса (используется и FSM-хендлером,
-    и глобальным приёмником после потери состояния). Здесь:
-      • защита от крашей ДО сохранения (created_classes=None у старых записей);
-      • проверка, что класс ДЕЙСТВИТЕЛЬНО записан (форс-перечитывание) — при
-        неудаче одна повторная попытка, затем честная ошибка пользователю;
-      • мгновенный слив снапшота в канал (_cdb_flush_soon) — класс не должен
-        «создаться и сразу удалиться» при рестарте/деплое бота;
-      • админ-панель сразу после создания с trust-флагом (без повторной
-        проверки прав — создатель не может «не иметь прав» на только что
-        созданный им класс)."""
+@timeout(CONVERSATION_TIMEOUT)
+async def create_class_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
+    user = get_user(user_id)
+    if not user:
+        user = User(user_id)
+    class_name = update.message.text.strip()
 
-    # 1) Починка полей, которые могли быть мусором у старых записей.
-    if not isinstance(getattr(user, 'created_classes', None), list):
-        user.created_classes = []
+    if not class_name:
+        await update.message.reply_text("Введите название класса:")
+        return CREATE_CLASS_NAME
 
-    # 2) Создание + сохранение с ОДНОЙ повторной попыткой.
-    saved = False
-    last_err = None
-    for attempt in range(2):
-        try:
-            class_code = generate_class_code()
-            class_obj = Class(class_code, class_name, user_id)
+    rejected = await reject_if_forbidden_chars(update, class_name, CREATE_CLASS_NAME)
+    if rejected is not None:
+        return rejected
 
-            classes = load_classes()
-            classes[class_code] = class_obj
-            save_classes(classes)
+    class_code = generate_class_code()
+    class_obj = Class(class_code, class_name, user_id)
 
-            user.class_code = class_code
-            if class_code not in user.created_classes:
-                user.created_classes.append(class_code)
-            user.cls_pending = None
-            save_user(user)
+    classes = load_classes()
+    classes[class_code] = class_obj
+    save_classes(classes)
 
-            # 3) Проверяем, что класс действительно сохранён (минуя кэш).
-            check = _classes_force_reload().get(class_code)
-            if check is not None and user_id in (check.admins or []):
-                saved = True
-                break
-            last_err = RuntimeError("класс не найден после записи")
-        except Exception as e:
-            last_err = e
-            logger.error(f"create class attempt {attempt + 1}: {e}")
-    if not saved:
-        try:
-            user.cls_pending = None
-            save_user(user)
-        except Exception:
-            pass
-        await update.message.reply_text(
-            "⚠️ Не удалось сохранить класс (ошибка базы). Попробуйте ещё "
-            "раз через минуту — если повторится, нажмите «❌ Отмена» и "
-            "начните заново.")
-        logger.error(f"create class FAILED: {last_err}")
-        return MAIN_MENU
+    user.class_code = class_code
+    user.created_classes.append(class_code)
+    save_user(user)
 
     await update.message.reply_text(
         f"✅ Класс '{class_name}' создан!\n\n"
@@ -46259,38 +43163,12 @@ async def _cls_pending_finalize(update: Update, context: ContextTypes.DEFAULT_TY
     except Exception:
         pass
 
-    # 4) Мгновенный слив снапшота в канал — класс переживает рестарт/деплой.
-    _cdb_flush_soon(context, reason="создан класс")
-
-    # 5) Сразу показываем создателю админ-панель (trust: права только что
-    #    проверены сохранением — admins=[создатель]).
+    # Сразу показываем создателю класса админ-панель — без лишнего шага через
+    # «Управление классами». Создатель автоматически становится админом класса
+    # (см. Class.__init__: self.admins = [str(creator_id)]), поэтому admin_panel
+    # успешно пройдёт проверку прав.
     context.user_data['current_admin_class'] = class_code
-    return await admin_panel(update, context, _trusted=True)
-
-
-@timeout(CONVERSATION_TIMEOUT)
-async def create_class_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
-    user = get_user(user_id)
-    if not user:
-        user = User(user_id)
-    class_name = update.message.text.strip()
-
-    if not class_name:
-        await update.message.reply_text("Введите название класса:")
-        return CREATE_CLASS_NAME
-
-    rejected = await reject_if_forbidden_chars(update, class_name, CREATE_CLASS_NAME)
-    if rejected is not None:
-        return rejected
-
-    # ВОЛНА 22.67: FSM-путь отработал — персистентный флаг больше не нужен.
-    try:
-        user.cls_pending = None
-    except Exception:
-        pass
-
-    return await _cls_pending_finalize(update, context, user, class_name)
+    return await admin_panel(update, context)
 
 @timeout(CONVERSATION_TIMEOUT)
 async def join_class_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -46310,16 +43188,6 @@ async def join_class_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         user = User(user_id)
     class_code = update.message.text.strip().upper()
 
-    # ВОЛНА 22.68: кнопки меню/быстрые команды — НЕ код класса. Раньше такой
-    # текст честно отвечал «класс не найден» и держал пользователя в ожидании
-    # кода («во всех кнопках ошибки»). Отдаём текст штатному меню.
-    if update.message.text.strip() in QUICK_COMMANDS or \
-            update.message.text.strip() in ALL_MAIN_MENU_BUTTONS:
-        try:
-            return await handle_main_menu(update, context)
-        except Exception:
-            return MAIN_MENU
-
     class_obj = get_class_by_code(class_code)
 
     if not class_obj:
@@ -46329,27 +43197,6 @@ async def join_class_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if str(user_id) in class_obj.students:
         await update.message.reply_text("✅ Вы уже состоите в этом классе!")
         return await class_management(update, context)
-
-    # ВОЛНА 22.68: админ класса, повторно введший код, раньше становился
-    # ЕЩЁ И УЧЕНИКОМ своего класса (дубли в уведомлениях и рассылках).
-    if str(user_id) in class_obj.admins or \
-            str(class_obj.creator_id or "") == str(user_id):
-        await update.message.reply_text(
-            f"✅ Вы админ класса '{class_obj.class_name}' — отдельно "
-            "присоединяться не нужно.")
-        return await class_management(update, context)
-
-    # ВОЛНА 22.68: состоя в ДРУГОМ классе — в новый не пускаем. Раньше
-    # пользователь попадал в ДВА класса сразу (students обоих), а
-    # user.class_code показывал только один: расписание/дежурства/уведомления
-    # шли от «первого попавшегося» класса — отсюда «во всех кнопках ошибки».
-    _mine = get_class_by_user(user_id)
-    if _mine is not None and str(_mine.class_code) != str(class_code):
-        await update.message.reply_text(
-            f"⚠️ Вы уже состоите в классе «{_mine.class_name}».\n"
-            "Сначала выйдите из него («🚪 Выйти из класса»), затем "
-            "присоединяйтесь к новому.")
-        return JOIN_CLASS
 
     if not check_class_limit(class_code):
         await update.message.reply_text("В классе максимум участников (40).")
@@ -46373,11 +43220,6 @@ async def join_class_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             logger.error(f"Ошибка при уведомлении админа {admin_id}: {e}")
 
     await update.message.reply_text(f"✅ Вы присоединились к классу '{class_obj.class_name}'!")
-
-    # ВОЛНА 22.67: мгновенный слив снапшота — состав класса должен пережить
-    # рестарт/деплой бота даже в первые 30 секунд после входа.
-    _cdb_flush_soon(context, reason="вход в класс")
-
     return await class_management(update, context)
 
 @timeout(CONVERSATION_TIMEOUT)
@@ -54212,125 +51054,6 @@ class _BellsBulkFilter(filters.MessageFilter):
 _BELLS_BULK_FILTER = _BellsBulkFilter()
 
 
-# ==================================
-# === ВОЛНА 22.67: СОЗДАНИЕ КЛАССА ВНЕ FSM ===
-# ==================================
-# Жалоба: «создаю класс — пишет "нет прав доступа к админке", класс не
-# создаётся». Корень: «➕ Создать класс» ставит FSM в CREATE_CLASS_NAME, но
-# рестарт/деплой бота (разработчик обновляет бота на ходу) СТИРАЕТ FSM —
-# присланное название молча пропадало, класс не создавался, и «Админская
-# панель» честно отвечала «нет прав» (класса-то нет). Лечится как
-# duty/ct/bells: персистентный флаг user.cls_pending (TTL 2 ч) + глобальный
-# приёмник текста ниже — доводит название до создания класса даже после
-# потери состояния.
-
-_CLS_CANCEL_RE = None  # заполняется лениво (word-фильтры отмены)
-
-
-class _ClsPendingFilter(filters.MessageFilter):
-    """Текст можно считать НАЗВАНИЕМ КЛАССА, только если пользователь ранее
-    нажал «➕ Создать класс» (флаг user.cls_pending жив, TTL 2 ч)."""
-    def filter(self, message):
-        try:
-            if not message.from_user:
-                return False
-            u = get_user(str(message.from_user.id))
-            return bool(u and isinstance(getattr(u, "cls_pending", None), dict))
-        except Exception:
-            return False
-
-
-_CLS_PENDING_FILTER = _ClsPendingFilter()
-
-
-async def _cls_pending_text_handler(update: Update,
-                                    context: ContextTypes.DEFAULT_TYPE):
-    """Глобальный приёмник НАЗВАНИЯ КЛАССА вне ConversationHandler.
-
-    Срабатывает, только если пользователь ранее нажал «➕ Создать класс»
-    (флаг user.cls_pending), а FSM-состояние было потеряно (рестарт/деплой
-    бота). Когда FSM жив, апдейт первым забирает ConversationHandler —
-    двойной обработки нет."""
-    if not update.message or not update.effective_user:
-        return
-    uid = str(update.effective_user.id)
-    user = get_user(uid)
-    if user is None:
-        return
-    pend = getattr(user, "cls_pending", None)
-    if not isinstance(pend, dict):
-        return
-    try:
-        if (time.time() - float(pend.get("ts") or 0)) > 2 * 3600:
-            user.cls_pending = None
-            save_user(user)
-            return
-    except Exception:
-        user.cls_pending = None
-        save_user(user)
-        return
-
-    raw = (update.message.text or "").strip()
-
-    # Отмена — снимаем ожидание (в т.ч. кнопки главного меню: пользователь
-    # ушёл в другое меню, название он вводить не собирается).
-    global _CLS_CANCEL_RE
-    if _CLS_CANCEL_RE is None:
-        try:
-            _CLS_CANCEL_RE = re.compile(
-                "^(❌ ?(отмена|отменить)|отмена|cancel|/cancel|/start)$",
-                re.IGNORECASE)
-        except Exception:
-            _CLS_CANCEL_RE = None
-    if not raw or (_CLS_CANCEL_RE and _CLS_CANCEL_RE.match(raw)):
-        user.cls_pending = None
-        save_user(user)
-        await update.message.reply_text(
-            "Создание класса отменено.",
-            reply_markup=get_main_menu_keyboard(user))
-        return
-
-    # Кнопки главного меню/быстрых команд — НЕ название класса: снимаем
-    # ожидание и отдаём текст штатному меню (иначе после потери FSM кнопка
-    # «📅 Расписание» создала бы класс с таким названием).
-    if raw in QUICK_COMMANDS or raw in ALL_MAIN_MENU_BUTTONS:
-        user.cls_pending = None
-        save_user(user)
-        try:
-            await handle_main_menu(update, context)
-        except Exception:
-            pass
-        return
-
-    # Пользователь уже в классе — создавать второй не будем.
-    if get_class_by_user(uid) is not None:
-        user.cls_pending = None
-        save_user(user)
-        await update.message.reply_text(
-            "Вы уже состоите в классе. Сначала выйдите из него "
-            "(«🚪 Выйти из класса»), затем создайте новый.")
-        return
-
-    # Запрещённые символы — честная ошибка (как в FSM-потоке).
-    err = forbidden_chars_message(raw)
-    if err:
-        user.cls_pending = None
-        save_user(user)
-        await update.message.reply_text(err)
-        return
-
-    if len(raw) > 64:
-        await update.message.reply_text(
-            "Название слишком длинное (максимум 64 символа). Пришлите "
-            "название ещё раз, либо напишите «отмена»:")
-        user.cls_pending = {"ts": time.time()}
-        save_user(user)
-        return
-
-    # Название получили — доводим до конца тем же кодом, что и в FSM.
-    await _cls_pending_finalize(update, context, user, raw)
-
-
 # === ВОЛНА 22.27/22.28: возрастной гейт 13+ ===
 # 22.28: ДР ОБЯЗАТЕЛЕН — экрана «можно продолжить без даты» (_AGE_ASK_*)
 # больше нет; все без ДР направляются на ввод даты. Экран отказа получил
@@ -55174,10 +51897,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await web_pw_change_cb(update, context)
     elif data == "web_pw_delete":
         return await web_pw_delete_cb(update, context)
-    elif data == "web_pw_delete_rec":
-        # ВОЛНА 22.64: «🤔 Забыл пароль» — подтверждение удаления веб-пароля
-        # по 3 секретным вопросам Сейфа.
-        return await web_pw_delete_rec_cb(update, context)
     elif data == "dnd_menu":
         # ВОЛНА 22.29: «🌙 Не беспокоить» — окно тишины и типы уведомлений.
         return await dnd_menu_cb(update, context)
@@ -55383,21 +52102,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await duty_custom_test_cb(update, context)
     elif data == "duty_custom_off":
         return await duty_custom_off_cb(update, context)
-    # ВОЛНА 22.66: «Расписание с сайтов» (админ-панель → 🌐)
-    elif data == "schmon_menu":
-        return await schmon_menu_cb(update, context)
-    elif data == "schmon_add":
-        return await schmon_add_cb(update, context)
-    elif data == "schmon_check":
-        return await schmon_check_cb(update, context)
-    elif data.startswith("schsnd:"):
-        return await schmon_pick_cb(update, context)
-    elif data.startswith("schtxt:"):
-        return await schmon_text_cb(update, context)
-    elif data.startswith("schall:"):
-        return await schmon_all_cb(update, context)
-    elif data.startswith("schdel:"):
-        return await schmon_del_cb(update, context)
     elif data == "edit_schedule":
         return await edit_schedule_start(update, context)
     elif data == "edit_teachers":
@@ -60976,17 +57680,6 @@ async def _post_init(application):
     except Exception as e2:
         logger.error(f"Не удалось восстановить сессии загрузки: {e2}")
 
-    # === ВОЛНА 22.68: карта завершённых загрузок — с диска. ===
-    # Повторный complete после рестарта отдаёт СОХРАНЁННЫЙ результат вместо
-    # создания второй записи («файлы дублируются»).
-    try:
-        _comp_n = _miniapp_completed_restore()
-        if _comp_n:
-            logger.info(f"ВОЛНА 22.68: завершённых загрузок восстановлено: "
-                        f"{_comp_n}")
-    except Exception as e2:
-        logger.error(f"Не удалось восстановить карту завершённых загрузок: {e2}")
-
     # === ВОЛНА 22.55: восстановление очередей скачивания «через бота» ===
     # Пользователь закрыл Telegram посреди пачки — очередь жила на сервере;
     # даже рестарт бота её не убьёт: поднимаем воркеры и продолжаем отправку.
@@ -60999,20 +57692,6 @@ async def _post_init(application):
                         f"{len(_dlq_uids)}")
     except Exception as e2:
         logger.error(f"Не удалось восстановить очереди скачивания: {e2}")
-
-    # === ВОЛНА 22.66: мониторинг «Расписание с сайтов». ===
-    # Админ-панель → «🌐 Расписание с сайтов»: бот сам проверяет страницы
-    # школы каждые 5 минут и присылает классу обновления расписания
-    # (фото/файл/текст), не чаще 1 раза в день на ссылку.
-    try:
-        _schmon_task = asyncio.create_task(schmon_monitor_loop(application))
-        try:
-            application.bot_data.setdefault("_bg_tasks", []).append(_schmon_task)
-        except Exception:
-            pass
-        logger.info("Мониторинг «Расписание с сайтов» запущен (тик 30с).")
-    except Exception as e2:
-        logger.error(f"Не удалось запустить schmon_monitor_loop: {e2}")
 
     # === ШАГ 4: диагностика уведомлений по каждому пользователю. ===
     try:
@@ -61797,11 +58476,6 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, save_bell_end_handler),
                 CallbackQueryHandler(handle_callback),
             ],
-            # ВОЛНА 22.66: «Расписание с сайтов» — админ присылает ссылку.
-            SCHEDMON_URL: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, schmon_url_handler),
-                CallbackQueryHandler(handle_callback),
-            ],
             SET_HOLIDAYS: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, save_holidays_handler),
                 CallbackQueryHandler(handle_callback),
@@ -62418,14 +59092,6 @@ def main():
         filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND
         & _BELLS_BULK_FILTER,
         _bells_bulk_text_handler))
-
-    # ВОЛНА 22.67: название класса («➕ Создать класс») вне FSM — переживает
-    # потерю состояния после рестарта/деплоя бота. Тот же персистентный
-    # паттерн, что у duty/ct/bells: флаг user.cls_pending в базе.
-    application.add_handler(MessageHandler(
-        filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND
-        & _CLS_PENDING_FILTER,
-        _cls_pending_text_handler))
 
     # 📤 ВОЛНА 22.57: ГЛОБАЛЬНЫЙ РОУТЕР «ФАЙЛ В ЧАТЕ = ФАЙЛ В ОБЛАКЕ».
     # Стоит ПОСЛЕ ConversationHandler: медиа забирают FSM-состояния
