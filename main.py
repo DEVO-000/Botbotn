@@ -3641,7 +3641,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.63"
+BOT_BUILD = "22.59"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -8147,103 +8147,6 @@ async def _bg_upload_big_mtproto(update, context, user, item, chat_msg, live=Non
         _shutil.rmtree(job_dir, ignore_errors=True)
 
 
-# ═══ ВОЛНА 22.62: АНТИ-ДУБЛИ «АВТОПЕРЕДАЧА + ПРЯМОЙ СТРИМ» ═══
-# Пользователь выбрал файлы — они летят боту ДВУМЯ путями одновременно:
-#   1) прямой стрим из мини-аппа (22.59/22.61 — байты идут, пока жив
-#      WebView);
-#   2) автопередача в Telegram (22.62 — системная панель «поделиться»
-#      через navigator.share → чат бота → нативная очередь Telegram,
-#      настоящий фон).
-# Кто первый довёз — тот и сохранил. Второй путь — дубликат: один и
-# тот же файл НЕ должен появляться в облаке дважды. Реестр ниже держит
-# «клеймы» имя+размер на окно 10 минут для обоих путей: чат-роутер
-# (_bg_upload_items) и финализация стрима (_miniapp_upload_finalize)
-# сверяются перед сохранением.
-_DUP_RECENT = {}        # uid -> {"имя|размер": [ts_claim, ts_saved?]
-_DUP_WINDOW = 600.0     # секунд
-
-
-def _dup_key(name, size):
-    return f"{str(name or '')[:200]}|{int(size or 0)}"
-
-
-def _dup_prune(uid):
-    ent = _DUP_RECENT.get(uid)
-    if not ent:
-        return
-    now = time.time()
-    for k in [k for k, v in ent.items() if now - max(v) > _DUP_WINDOW]:
-        ent.pop(k, None)
-    if not ent:
-        _DUP_RECENT.pop(uid, None)
-
-
-def _dup_claim(uid, name, size):
-    """True — такой файл УЖЕ сохраняют/сохраняли в окне 10 минут.
-    False — свободно, и мы сами поставили клейм (не забудьте
-    _dup_release при неудаче или _dup_saved при успехе)."""
-    _dup_prune(uid)
-    ent = _DUP_RECENT.setdefault(uid, {})
-    v = ent.get(_dup_key(name, size))
-    if v and time.time() - max(v) < _DUP_WINDOW:
-        return True
-    ent[_dup_key(name, size)] = [time.time()]
-    return False
-
-
-def _dup_held(uid, name, size):
-    """Клейм занят (кем-то) — без захвата, только проверка."""
-    ent = _DUP_RECENT.get(uid)
-    if not ent:
-        return False
-    v = ent.get(_dup_key(name, size))
-    return bool(v and time.time() - max(v) < _DUP_WINDOW)
-
-
-def _dup_release(uid, name, size):
-    """Наш клейм не понадобился (сохранение не удалось) — снимаем,
-    чтобы другой путь мог сохранить файл без потерь."""
-    ent = _DUP_RECENT.get(uid)
-    if ent:
-        ent.pop(_dup_key(name, size), None)
-        if not ent:
-            _DUP_RECENT.pop(uid, None)
-
-
-def _dup_saved(uid, name, size):
-    """Файл реально сохранён — клейм живёт от момента СОХРАНЕНИЯ."""
-    ent = _DUP_RECENT.setdefault(uid, {})
-    ent[_dup_key(name, size)] = [time.time(), time.time()]
-
-
-def _cloud_recent_dup(user, name, size):
-    """ВОЛНА 22.62: свежая (≤15 мин) запись в облаке с тем же именем и
-    размером — автопередача уже сохранила этот файл из чата."""
-    try:
-        cut = time.time() - 900.0
-        for f in reversed(getattr(user, "cloud_files", []) or []):
-            if not isinstance(f, dict):
-                continue
-            if str(f.get("name") or "")[:200] == str(name or "")[:200] and \
-                    int(f.get("size") or 0) == int(size or 0):
-                try:
-                    if float(f.get("ts") or 0) >= cut:
-                        return f
-                except Exception:
-                    return f
-    except Exception:
-        pass
-    return None
-
-
-# ВОЛНА 22.62: пометка «файлы сейчас передаются боту через Telegram»
-# (мини-апп ставит её перед автопередачей, POST /api/upload/tg_mark).
-# Пока пометка свежая — итоги сохранения из чата отправляются
-# БЕЗЗВУЧНО (disable_notification): «как в обычном чате, но БЕЗ
-# оповещений», прогресс виден только в панели передач мини-аппа.
-_TG_AUTOSHARE_MARK = {}
-
-
 async def _bg_upload_items(update, context, items):
     """Сохраняет пачку файлов из чата в облако и пишет ОДИН компактный итог.
     Вызывается из bg_chat_upload_receive (глобальный роутер 22.57)."""
@@ -8252,15 +8155,11 @@ async def _bg_upload_items(update, context, items):
     user = get_user(user_id)
     if not user:
         return
-    # ВОЛНА 22.62: автопередача из мини-аппа — работаем максимально тихо:
-    # итог в чат БЕЗ звука и пуша (пользователь просил «без оповещений»,
-    # прогресс он видит в панели передач мини-аппа)
-    _tg_silent = time.time() - _TG_AUTOSHARE_MARK.get(user_id, 0.0) < 900.0
     if not get_cloud_channel_ids() and not _user_vault_channel(user):
         await msg.reply_text(
             "❌ Хранилище не настроено — файл не сохранён. Попросите "
             "разработчика подключить канал, либо подключите СВОЙ: "
-            "🔐 Сейф → 🔗 Моё облако.", disable_notification=_tg_silent)
+            "🔐 Сейф → 🔗 Моё облако.")
         return
 
     files = [f for f in (getattr(user, "cloud_files", []) or []) if isinstance(f, dict)]
@@ -8273,7 +8172,6 @@ async def _bg_upload_items(update, context, items):
         pass
 
     saved, skipped_big, failed, limit_hit = [], [], [], False
-    deduped = []            # 22.62: имена, сведённые с прямым стримом
     warned_quality = False
 
     _msg_mid = int(getattr(msg, "message_id", 0) or 0)
@@ -8285,12 +8183,6 @@ async def _bg_upload_items(update, context, items):
             continue
         size = int(item.get("size") or 0)
         name = str(item.get("name") or "файл")
-        # ВОЛНА 22.62: дубль прямого стрима — автопередача и стрим грузили
-        # ОДНИ И ТЕ ЖЕ файлы одновременно. Файл уже в облаке (или стрим
-        # сохраняет его прямо сейчас) — второго не создаём, тихо пропускаем
-        if _dup_claim(user_id, name, size):
-            deduped.append(name)
-            continue
         # ВОЛНА 22.58: живой статус файла для панели передач мини-аппа.
         _lk = f"{_msg_mid}-{_li}"
         _bg_live_add(user_id, _lk, name, size)
@@ -8300,16 +8192,13 @@ async def _bg_upload_items(update, context, items):
             channel_id = _bg_upload_target(user)
             if channel_id is None:
                 _bg_live_del(user_id, _lk)
-                _dup_release(user_id, name, size)
                 await msg.reply_text(
-                    "❌ Хранилище не настроено — файл не сохранён.",
-                    disable_notification=_tg_silent)
+                    "❌ Хранилище не настроено — файл не сохранён.")
                 return
             _bg_live_set(user_id, _lk, "save")
             sent = await _bg_send_media(context, channel_id, item)
             if sent is None:
                 _bg_live_del(user_id, _lk)
-                _dup_release(user_id, name, size)
                 failed.append(f"{name[:40]}: Telegram не принял")
                 continue
             rec = {
@@ -8331,13 +8220,11 @@ async def _bg_upload_items(update, context, items):
                 update, context, user, item, msg, live=(user_id, _lk))
             if rec is None:
                 _bg_live_del(user_id, _lk)
-                _dup_release(user_id, name, size)
                 why = item.get("_why")
                 if why == "big_hard_limit":
                     await msg.reply_text(
                         f"🚫 «{name[:40]}» больше 2 ГБ — потолок Telegram "
-                        "для ботов. Разделите файл на части по ~1,5 ГБ.",
-                        disable_notification=_tg_silent)
+                        "для ботов. Разделите файл на части по ~1,5 ГБ.")
                 elif why == "mt_failed":
                     failed.append(f"{name[:40]}: не докачался — "
                                   "попробуйте ещё раз")
@@ -8347,20 +8234,7 @@ async def _bg_upload_items(update, context, items):
                 else:
                     skipped_big.append(item)
                 continue
-            # ВОЛНА 22.62: большая загрузка шла минутами — за это время
-            # прямой стрим мог сохранить ЭТОТ ЖЕ файл. Проверяем свежий
-            # список облака: дубль не добавляем (файл уже там).
-            try:
-                _fc = [f for f in (getattr(get_user(user_id), "cloud_files", [])
-                                   or []) if isinstance(f, dict)]
-                if any(str(f.get("name") or "")[:200] == name[:200] and
-                       int(f.get("size") or 0) == size for f in _fc):
-                    deduped.append(name)
-                    continue
-            except Exception:
-                pass
         _bg_live_del(user_id, _lk)
-        _dup_saved(user_id, name, size)   # 22.62: анти-дубль: файл сохранён
         files.append(rec)
         saved.append(rec)
         # Подсказка про качество — ОДНА строка и один раз за пачку.
@@ -8397,10 +8271,6 @@ async def _bg_upload_items(update, context, items):
             lines.append(f"🚫 «{item['name'][:40]}» тоже больше 49 МБ.")
     if failed:
         lines.append("⚠️ Не удалось: " + "; ".join(failed[:5]))
-    if deduped:
-        # 22.62: файлы, которые уже доехали прямым стримом — дублей нет
-        lines.append(f"♻️ {len(deduped)} файл(ов) уже загружен(ы) напрямую — "
-                     "дубли не созданы.")
     if lines:
         kb = None
         if MINIAPP_URL:
@@ -8410,11 +8280,9 @@ async def _bg_upload_items(update, context, items):
         try:
             if skipped_big:
                 await msg.reply_text("\n".join(lines),
-                                     reply_markup=get_big_file_keyboard(),
-                                     disable_notification=_tg_silent)
+                                     reply_markup=get_big_file_keyboard())
             else:
-                await msg.reply_text("\n".join(lines), reply_markup=kb,
-                                     disable_notification=_tg_silent)
+                await msg.reply_text("\n".join(lines), reply_markup=kb)
         except Exception:
             pass
 
@@ -8642,19 +8510,12 @@ async def cloud_del_yes_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 _MINIAPP_PTB_APP = None        # ссылка на Application (ставится в _post_init)
 _MINIAPP_UPLOADS = {}          # uploadId → {path, name, mime, size, uid, received, ts}
 _MINIAPP_UPLOADS_TTL = 6 * 3600
-# ВОЛНА 22.61: якорные сообщения «файлы ждут продолжения» (uid → ts).
-# Анти-спам: не чаще раза в _CLOSED_ANCHOR_COOLDOWN секунд на пользователя.
-_CLOSED_ANCHOR_TS = {}
-_CLOSED_ANCHOR_COOLDOWN = 180.0
 # ВОЛНА 22.49: успешно завершённые загрузки (uploadId → ответ complete) —
 # идемпотентность: повторный complete после потери ответа отдаёт ТОТ ЖЕ
 # результат, вместо дубля файла в Сейфе.
 _MINIAPP_COMPLETED = {}
 _MINIAPP_COMPLETED_TTL = 3600
-_MINIAPP_AUTH_TTL = 604800     # 7 суток — ВОЛНА 22.63: длинные сессии мини-аппа
-                               # больше не отваливаются от бота (раньше было 24 ч:
-                               # подпись initData «старела», /api/* начинал отвечать
-                               # 401, и облако «переставало синхронизироваться»)
+_MINIAPP_AUTH_TTL = 86400      # 24 часа — как рекомендует Telegram
 _MINIAPP_CHUNK = 4 * 1024 * 1024  # клиент шлёт кусками по 4 МБ (документация)
 
 
@@ -9465,79 +9326,6 @@ html.low-end .file-card {
   contain-intrinsic-size: auto;
 }
 
-/* ═══ ВОЛНА 22.56: ПЛАВНОЕ ПОЯВЛЕНИЕ / ИСЧЕЗНОВЕНИЕ КАРТОЧЕК ═══
-   Раньше список перерисовывался «скачком» (innerHTML без анимации) —
-   смена фильтра, сортировки, загрузка и удаление выглядели резко.
-   Теперь карточки въезжают лёгкой волной (только transform+opacity —
-   композитор, без reflow), а удаляемые — мягко сжимаются и тают.
-   Стаггер ограничен (--i ≤ 12), на слабых телефонах и при системном
-   «меньше движений» анимация отключается — там важнее отсутствие лагов. */
-@keyframes cardIn {
-  from { opacity: 0; transform: translateY(14px) scale(0.985); }
-  to   { opacity: 1; transform: translateY(0) scale(1); }
-}
-
-@keyframes cardOut {
-  to { opacity: 0; transform: scale(0.94); }
-}
-
-@keyframes softFadeIn {
-  from { opacity: 0; transform: translateY(6px); }
-  to   { opacity: 1; transform: translateY(0); }
-}
-
-/* ВОЛНА 22.59: мягкое появление блоков — список в окне загрузки,
-   кнопки статуса хранилища, точки плеера (только transform+opacity).
-   Раньше эти элементы «выскакивали» рывком из display:none */
-@keyframes softReveal {
-  from { opacity: 0; transform: translateY(6px); }
-  to   { opacity: 1; transform: translateY(0); }
-}
-
-.soft-reveal {
-  animation: softReveal 0.32s var(--ease-smooth) both;
-}
-
-/* Слабые устройства / «меньше движений» — без анимации */
-html.low-end .soft-reveal {
-  animation: none;
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .soft-reveal {
-    animation: none;
-  }
-}
-
-.file-card.card-enter {
-  animation: cardIn 0.38s var(--ease-smooth) both;
-  /* --i приходит из JS и уже ограничен 12 — старые WebView не знают CSS min() */
-  animation-delay: calc(var(--i, 0) * 24ms);
-}
-
-.file-card.card-out {
-  animation: cardOut 0.2s var(--ease-smooth) both;
-  pointer-events: none;
-}
-
-.fade-soft-in {
-  animation: softFadeIn 0.45s var(--ease-smooth) both;
-}
-
-html.low-end .file-card.card-enter,
-html.low-end .file-card.card-out,
-html.low-end .fade-soft-in {
-  animation: none;
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .file-card.card-enter,
-  .file-card.card-out,
-  .fade-soft-in {
-    animation: none;
-  }
-}
-
 .icon-wrap {
   width: 46px;
   height: 46px;
@@ -9564,31 +9352,9 @@ html.low-end .fade-soft-in {
   touch-action: manipulation;
 }
 
-/* ВОЛНА 22.59: крестик поиска — плавное появление/исчезание
-   (раньше display:none↔flex давал резкий «скачок») */
-#clearSearch {
-  transform: translateY(-50%) scale(0.55);
-  opacity: 0;
-  pointer-events: none;
-  transition:
-    opacity 0.22s var(--ease-smooth),
-    transform 0.28s var(--ease-snap);
-}
-
-#clearSearch.shown {
-  transform: translateY(-50%) scale(1);
-  opacity: 1;
-  pointer-events: auto;
-}
-
 .action-btn:active {
   transform: scale(0.88);
   opacity: 0.85;
-}
-
-/* 22.59: у крестика поиска :active сохраняет вертикальное центрирование */
-#clearSearch:active {
-  transform: translateY(-50%) scale(0.88);
 }
 
 .chip {
@@ -9600,11 +9366,7 @@ html.low-end .fade-soft-in {
   font-size: 14px;
   border: 1px solid var(--border-color);
   cursor: pointer;
-  /* 22.56: + плавная смена цветов активного чипа (paint-only, дёшево) */
-  transition: transform 0.15s var(--ease-spring),
-    background 0.25s var(--ease-smooth),
-    color 0.25s var(--ease-smooth),
-    border-color 0.25s var(--ease-smooth);
+  transition: transform 0.15s var(--ease-spring);
   white-space: nowrap;
   display: inline-flex;
   align-items: center;
@@ -9711,15 +9473,13 @@ html.low-end .fade-soft-in {
   align-items: center;
   justify-content: center;
   gap: 8px;
+  opacity: 0;
+  transition: opacity 0.5s var(--ease-smooth);
 }
 
-/* ВОЛНА 22.56: раньше тут был transition: opacity — он НЕ проигрывался:
-   display:none → flex в одном кадре даёт «выскакивание» без плавности.
-   Keyframes-анимация стартует сразу при первом рендере элемента —
-   кольцо прогресса мягко проявляется. */
 .download-progress-wrap.active {
   display: flex;
-  animation: softFadeIn 0.5s var(--ease-smooth) both;
+  opacity: 1;
 }
 
 .drop-loader {
@@ -10194,9 +9954,7 @@ html.low-end .fade-soft-in {
   max-height: 0;
   opacity: 0;
   transition: max-height 0.4s var(--ease-ultra), opacity 0.35s var(--ease-smooth);
-  /* ВОЛНА 22.55 (плавность): will-change на max-height (layout-свойство)
-     не помогает и лишь держит слой в памяти — убрано; opacity оставлена */
-  will-change: opacity;
+  will-change: max-height, opacity;
 }
 
 .settings-submenu.open {
@@ -10912,15 +10670,12 @@ html.low-end #musicPlayer .mp-circle {
   height: 100%;
   object-fit: cover;
   z-index: 1;
-  /* ВОЛНА 22.59: обложка проявляется ПОСЛЕ загрузки картинки (класс .shown
-     вешается из onload). Раньше анимация стартовала на display:block —
-     пустой квадрат «выскакивал» сразу, а сама карточка догружалась позже */
-  opacity: 0;
-  transition: opacity 0.45s var(--ease-smooth);
+  animation: mpFadeCover 0.5s ease;
 }
 
-#musicPlayer .art-cover.shown {
-  opacity: 1;
+@keyframes mpFadeCover {
+  from { opacity: 0; }
+  to { opacity: 1; }
 }
 
 #musicPlayer .art-container.playing .art-fallback {
@@ -11178,11 +10933,7 @@ html.low-end #musicPlayer .art-container.mp-switch {
   height: 8px;
   border-radius: 9999px;
   background: rgba(255, 255, 255, 0.25);
-  /* ВОЛНА 22.55 (плавность): «transition: all» заставлял движок проверять
-     ВСЕ свойства на каждый кадр — на слабых телефонах точки плеера
-     подрагивали. Перечисляем только реально анимируемые свойства. */
-  transition: background 0.3s cubic-bezier(0.4, 0, 0.2, 1),
-              width 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
   cursor: pointer;
   flex-shrink: 0;
 }
@@ -11844,11 +11595,6 @@ body.vp-lock {
     </p>
 
     <div style="display:flex;flex-direction:column;gap:8px">
-      <!-- ВОЛНА 22.63: кнопки «Загрузить через Telegram» и «Автопередача
-           в Telegram» УДАЛЕНЫ по просьбе пользователя. Файлы всегда (по
-           умолчанию) летят боту напрямую стримом с момента выбора —
-           никаких переключателей и лишних кнопок. -->
-
       <button class="sound-item-btn" id="uploadAddBtn" onclick="pickUploadFiles()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
         <span>Добавить файл</span>
         <i data-lucide="plus" style="width:18px;height:18px"></i>
@@ -12296,7 +12042,7 @@ body.vp-lock {
   <div class="search-box" style="margin-bottom:12px">
     <i data-lucide="search" style="position:absolute;left:14px;top:50%;transform:translateY(-50%);width:18px;height:18px;color:var(--text-color);opacity:.5"></i>
     <input type="text" id="searchInput" placeholder="Поиск файлов..." oninput="onSearch()">
-    <button id="clearSearch" class="action-btn" style="position:absolute;right:6px;top:50%;width:26px;height:26px" onclick="clearSearch()">
+    <button id="clearSearch" class="action-btn" style="position:absolute;right:6px;top:50%;transform:translateY(-50%);width:26px;height:26px;display:none" onclick="clearSearch()">
       <i data-lucide="x" style="width:14px;height:14px"></i>
     </button>
   </div>
@@ -13058,34 +12804,11 @@ async function apiJson(url, options) {
          подпись initData может не пройти проверку — пользователь должен
          иметь возможность войти по ID и веб-паролю (путь Bearer в
          _api_get_user_any работает и внутри Telegram). */
-      /* ВОЛНА 22.63: ВНУТРИ TELEGRAM — сначала тихая перезагрузка ОДИН
-         раз: Telegram вносит в WebView СВЕЖИЙ initData при каждом старте
-         мини-аппа. Долгая сессия (или рестарт сервера с подвисшей
-         подписью) больше НЕ выкидывает пользователя на окно входа «ID +
-         пароль», которого у него может не быть, — синхронизация
-         восстанавливается сама. Флаг в sessionStorage страхует от
-         циклической перезагрузки; на любом УСПЕШНОМ ответе снимается. */
-      if (IS_TELEGRAM && tg && tg.initData) {
-        let reloaded = false;
-        try {
-          reloaded = sessionStorage.getItem('dv_relogin') === '1';
-        } catch (e) {}
-        if (!reloaded) {
-          try { sessionStorage.setItem('dv_relogin', '1'); } catch (e) {}
-          location.reload();
-        } else {
-          openLoginModal();
-        }
-      } else {
-        openLoginModal();
-      }
+      openLoginModal();
     }
 
     throw err;
   }
-
-  /* успех — снимаем страховку от циклической перезагрузки */
-  try { sessionStorage.removeItem('dv_relogin'); } catch (e) {}
 
   return data;
 }
@@ -13277,7 +13000,7 @@ async function zipSelected() {
         vault: !!data.file.vault
       });
 
-      renderAll({ animate: true });
+      renderAll();
 
       showToast('📦 Архив готов, скачиваю…');
       downloadFileById(data.file.id, data.file.name, +data.file.size || 0);
@@ -13321,7 +13044,7 @@ async function unzipSelected() {
       });
     });
 
-    renderAll({ animate: true });
+    renderAll();
 
     showToast(
       '✅ Файлов получено: ' + (data.files || []).length +
@@ -13330,25 +13053,6 @@ async function unzipSelected() {
   } catch (e) {
     showToast(cloudErrText(e));
   }
-}
-
-/* ВОЛНА 22.56: мягкое исчезновение карточек перед удалением — файлы
-   больше не «вырываются» из списка рывком, а плавно сжимаются и тают.
-   Возвращает true, если анимация реально запущена (иначе ждать нечего). */
-function animateCardsOut(ids) {
-  if (LOW_END || REDUCED_MOTION) return false;
-
-  const set = new Set(ids);
-  let found = false;
-
-  document.querySelectorAll('#filesList .file-card').forEach((c) => {
-    if (set.has(c.dataset.id)) {
-      c.classList.add('card-out');
-      found = true;
-    }
-  });
-
-  return found;
 }
 
 async function deleteSelected() {
@@ -13360,11 +13064,6 @@ async function deleteSelected() {
   const ids = [...selectedIds];
 
   showToast('🗑 Удаляю ' + ids.length + '…');
-
-  /* 22.56: карточки выбранных файлов мягко «улетают» ДО перерисовки */
-  const animated = animateCardsOut(ids);
-
-  if (animated) await new Promise((r) => setTimeout(r, 210));
 
   let ok = 0;
 
@@ -13394,12 +13093,8 @@ const CONN = {
 let LAST_ERR = null;
 const NETERR_RE = /failed to fetch|networkerror|load failed|timed? ?out/i;
 let LAST_SYNC = 0;
-/* ВОЛНА 22.58: сигнатура списка файлов — если данные не изменились,
-   опрос (каждые 2.5с живой карточки) не перерисовывает и не мигает
-   карточками списка: DOM не трогаем вообще */
-let LAST_FILES_SIG = '';
 
-async function loadFiles(silent, quiet) {
+async function loadFiles(silent) {
   if (listLoading) return false;
 
   listLoading = true;
@@ -13417,47 +13112,15 @@ async function loadFiles(silent, quiet) {
       /* ВОЛНА 22.50: признаки Сейфа — «Достать из Сейфа» для файлов режима
          «без шифра» (plain) идёт БЕЗ пароля (сервер 22.50 это умеет) */
       safe: !!f.safe,
-      plain: !!f.plain,
-      /* ВОЛНА 22.57: откуда файл — «через бота» (из чата) или из веба;
-         нужно для тоста «Пока вас не было» после фоновых загрузок */
-      src: String(f.src || '')
+      plain: !!f.plain
     }));
 
     CONN.bot = String(data.bot || CONN.bot || '');
     CONN.build = String(data.build || CONN.build || '');
 
-    /* ВОЛНА 22.57: файлы, приехавшие «ЧЕРЕЗ БОТА» (из чата), пока мини-апп
-       был закрыт — короткий тост, чтобы пользователь точно знал: ничего
-       не потерялось. База — самый свежий ts из ПРОШЛОЙ синхронизации
-       (localStorage); при первом запуске базы нет — тоста нет, только
-       запоминаем. Старые записи со строковым ts (до 22.36) не считаются. */
-    try {
-      var _bgPrev = localStorage.getItem('dv_cloud_last_ts');
-      var _bgMax = 0;
-
-      for (var _i = 0; _i < ALL_FILES.length; _i++) {
-        var _t = +ALL_FILES[_i].ts;
-        if (_t > _bgMax) _bgMax = _t;
-      }
-
-      if (_bgPrev !== null && _bgMax) {
-        var _bgPrevNum = +_bgPrev || 0;
-        var _bgFresh = ALL_FILES.filter(function (f) {
-          return f.src === 'chat' && +f.ts > _bgPrevNum;
-        });
-
-        if (_bgFresh.length && !bgUploadTracking()) {
-          showToast('📨 Через бота загрузилось: ' + _bgFresh.length +
-            ' файл(ов) — уже в облаке');
-        }
-      }
-
-      if (_bgMax) localStorage.setItem('dv_cloud_last_ts', String(_bgMax));
-    } catch (e) {}
-
     if (typeof data.plain === 'boolean') STORAGE_ENCRYPTED = !data.plain;
     /* ВОЛНА 22.52: зашифрованными считаем только НЕ-plain файлы Сейфа.
-       Раньше существование ЛЮБОГО vault-файла (включая «без шифра») включало
+       Раньше existence ЛЮБОГО vault-файла (включая «без шифра») включало
        «шифрование» для всего интерфейса — пароль спрашивался даже там,
        где файл лежит в канале открыто. */
     else if (ALL_FILES.some((f) => f.vault && !f.plain)) STORAGE_ENCRYPTED = true;
@@ -13465,23 +13128,7 @@ async function loadFiles(silent, quiet) {
     LAST_ERR = null;
     LAST_SYNC = Date.now();
 
-    /* ВОЛНА 22.58: список не изменился — не перерисовываем его вовсе
-       (живой опрос каждые 2.5с не должен дёргать DOM и мигать карточками).
-       Тихий опрос (quiet) рендерит без волны появления — новые файлы
-       просто появляются на местах, плавно и без рывков */
-    const _sig = ALL_FILES.length + '|'
-      + ALL_FILES.map(function (f) {
-          return f.id + ':' + f.ts + ':' + f.name + ':' + f.size;
-        }).join('|');
-
-    if (_sig !== LAST_FILES_SIG) {
-      LAST_FILES_SIG = _sig;
-      renderAll({ animate: !quiet });
-    }
-
-    /* ВОЛНА 22.58: живая карточка «Загрузка через Telegram» — считаем
-       приехавшие из чата файлы и серверные статусы bg_live */
-    bgUploadApply(data.bg_live);
+    renderAll();
 
     return true;
   } catch (e) {
@@ -13657,20 +13304,6 @@ function flashScreen() {
   flash.classList.add('active');
 }
 
-/* ВОЛНА 22.59: универсальное МЯГКОЕ появление блока (только transform+opacity
-   — композитор, без reflow). Раньше список файлов в окне загрузки, кнопки
-   статуса хранилища, обложка плеера и крестик поиска «выскакивали» рывком.
-   На слабых устройствах и при «меньше движений» — без анимации. */
-function softReveal(el) {
-  if (!el || LOW_END || REDUCED_MOTION) return;
-
-  try {
-    el.classList.remove('soft-reveal');
-    void el.offsetWidth;
-    el.classList.add('soft-reveal');
-  } catch (e) {}
-}
-
 function fmtSize(n) {
   n = +n || 0;
 
@@ -13800,11 +13433,11 @@ function applyFilters() {
   return list;
 }
 
-function renderAll(opts) {
+function renderAll() {
   /* Один проход фильтрации на рендер вместо двух */
   const list = applyFilters();
 
-  renderFiles(list, opts);
+  renderFiles(list);
   renderStats(list);
 }
 
@@ -13822,35 +13455,19 @@ function renderStats(list) {
       : `${shown} из ${ALL_FILES.length}`;
 }
 
-function renderFiles(files, opts) {
+function renderFiles(files) {
   const list = document.getElementById('filesList');
   const empty = document.getElementById('emptyState');
 
-  /* ВОЛНА 22.56: анимация появления — только по явному запросу (загрузка
-     списка, смена фильтра/сортировки, новые файлы). Поиск и выделение
-     перерисовываются мгновенно — анимация на каждый символ/тап мешает.
-     На слабых устройствах и при «меньше движений» — выключена (плавность
-     важнее декораций, там каждый кадр на счету). */
-  const animate = !!(opts && opts.animate) && !LOW_END && !REDUCED_MOTION;
-
   if (!files.length) {
     list.innerHTML = '';
-
-    /* ВОЛНА 22.56: пустое состояние больше не «выскакивает» — мягко проявляется */
     empty.style.display = 'block';
-
-    if (animate) {
-      empty.classList.remove('fade-soft-in');
-      void empty.offsetWidth;
-      empty.classList.add('fade-soft-in');
-    }
-
     return;
   }
 
   empty.style.display = 'none';
 
-  list.innerHTML = files.map((f, idx) => {
+  list.innerHTML = files.map((f) => {
     const sel = selectMode && selectedIds.has(f.id);
 
     /* 22.49: id экранируется — раньше подставлялся в inline-атрибут raw:
@@ -13860,11 +13477,6 @@ function renderFiles(files, opts) {
     const cardAction = selectMode
       ? `toggleFileSelection(event,'${fid}')`
       : `openEditModal('${fid}')`;
-
-    /* ВОЛНА 22.56: индекс стаггера (кап 12) для волны появления карточек */
-    const enterAttrs = animate
-      ? ` card-enter" data-id="${fid}" style="--i:${Math.min(idx, 12)};`
-      : `" data-id="${fid}" style="`;
 
     const checkHtml = selectMode ? `
       <div onclick="toggleFileSelection(event,'${fid}')" style="flex-shrink:0;width:24px;height:24px;border-radius:8px;display:flex;align-items:center;justify-content:center;border:2px solid ${sel ? 'var(--btn-text)' : 'var(--border-color)'};background:${sel ? 'var(--btn-text)' : 'transparent'};transition:transform .15s var(--ease-spring)">
@@ -13881,7 +13493,7 @@ function renderFiles(files, opts) {
     `;
 
     return `
-      <article class="file-card${enterAttrs}display:flex;align-items:center;gap:12px;${sel ? 'outline:2px solid var(--btn-text);outline-offset:-2px' : ''}" onclick="${cardAction}">
+      <article class="file-card" style="display:flex;align-items:center;gap:12px;${sel ? 'outline:2px solid var(--btn-text);outline-offset:-2px' : ''}" onclick="${cardAction}">
         ${checkHtml}
 
         <div class="icon-wrap" style="flex-shrink:0">
@@ -14218,11 +13830,6 @@ async function unlockSafe() {
       const df = ALL_FILES.find((x) => x.id === pending.id);
 
       if (df) setTimeout(() => downloadFileById(df.id, df.name, df.size), 350);
-    } else if (pending && pending.type === 'dlq') {
-      /* ВОЛНА 22.55: продолжаем постановку очереди «через бота» —
-         пароль теперь известен, сервер примет файлы Сейфа */
-      showToast('📨 Ставлю файлы в очередь бота…');
-      setTimeout(() => enqueueBotDownload(pending.ids || []), 350);
     }
   } catch (e) {
     showToast(cloudErrText(e));
@@ -14656,24 +14263,6 @@ async function downloadFileById(id, name, size) {
       }
     }
 
-    /* ВОЛНА 22.55: прямой путь сорвался (WebView-ограничения, обрыв сети,
-         выход из Telegram) — НЕ теряем файл: ставим его в серверную очередь
-     «через бота», он приедет в чат и сохранится оттуда. Файл зашифрован
-     Сейфом и пароля нет — тогда честно про пароль, без тихих провалов. */
-    try {
-      const fInfo = ALL_FILES.find((x) => x.id === id);
-      const isEncSafe = fInfo && fInfo.vault && !fInfo.plain;
-
-      if (!isEncSafe || VAULT_PW || VAULT_SERVER_UNLOCKED) {
-        const okBot = await enqueueBotDownload([id]);
-
-        if (okBot) {
-          showToast('📨 Отправлю файл в чат бота — сохраните его из чата (можно закрывать мини-апп)');
-          return;
-        }
-      }
-    } catch (e2) {}
-
     openExternalLink(abs);
     showToast('Открыл ссылку в браузере — если файл не скачался, нажмите на неё там');
   } catch (e) {
@@ -14749,356 +14338,6 @@ async function sendCurrentFileToChat() {
   }
 }
 
-/* ═══ ВОЛНА 22.55: ОЧЕРЕДЬ СКАЧИВАНИЯ «ЧЕРЕЗ БОТА» ═══
-   Пользователь выбрал несколько файлов и жмёт «Скачать» — файлы НЕ качаются
-   клиентом (WebView умирает при выходе из Telegram и всё «исчезало»), а
-   ставятся в очередь НА СЕРВЕРЕ: бот сам, один за другим, отправляет их в
-   личный чат. Мини-апп можно закрывать, Telegram — сворачивать: файлы
-   приедут в чат, а из чата Telegram надёжно сохраняет в галерею.
-   Прогресс — в угловой панели передач; после переоткрытия мини-аппа
-   очередь «находится» опросом статуса. */
-let botQueueTimer = null;
-let botQueueActive = false;
-let botQueueFinalNotified = false;
-
-function botQueueEnsureTransfer(total) {
-  if (!TRANSFERS.has('botqueue')) {
-    transferStart({
-      id: 'botqueue',
-      type: 'botqueue',
-      name: 'Файлы в чат (через бота)',
-      total: Math.max(1, total),
-      cancel: () => {
-        fetch('/api/download/queue/cancel', {
-          method: 'POST',
-          keepalive: true,
-          headers: vaultHeaders({ 'Content-Type': 'application/json' }),
-          body: '{}'
-        }).catch(function () {});
-      }
-    });
-  } else {
-    const t = TRANSFERS.get('botqueue');
-
-    if (!t.done && total) t.total = total;
-  }
-}
-
-function botQueueApplyState(data) {
-  if (!data) return;
-
-  const active = !!(data.running) || (+data.pending || 0) > 0;
-  const total = +data.total || 0;
-  const sent = +data.sent || 0;
-  const failed = +data.failed || 0;
-
-  if (total && (active || TRANSFERS.has('botqueue'))) {
-    botQueueEnsureTransfer(total);
-
-    const t = TRANSFERS.get('botqueue');
-
-    if (t && !t.done) {
-      /* прогресс считаем по ЗАКРЫТЫМ пунктам: sent + failed */
-      t.loaded = Math.min(total, sent + failed);
-      t.note = failed
-        ? 'Отправлено ' + sent + ' из ' + total + ' · не вышло: ' + failed
-        : 'Отправлено ' + sent + ' из ' + total;
-      ctSync();
-    }
-  }
-
-  if (!active && botQueueTimer) {
-    clearTimeout(botQueueTimer);
-    botQueueTimer = null;
-  }
-
-  botQueueActive = active;
-
-  /* очередь ещё работает — продолжаем опрос (сам таймер сбрасывается
-     в начале botQueuePoll, так что здесь просто перевзводим при пустоте) */
-  if (active && !botQueueTimer) {
-    botQueueTimer = setTimeout(botQueuePoll, 2500);
-  }
-
-  /* финал: панель закрываем, тост-итог */
-  if (!active && total) {
-    if (TRANSFERS.has('botqueue')) {
-      const t = TRANSFERS.get('botqueue');
-
-      if (t && !t.done) {
-        transferFinish('botqueue', true,
-          failed ? 'Готово · отправлено ' + sent + ' из ' + total
-                 : 'Готово · ' + total + ' файлов в чате');
-        showToast(failed
-          ? '📨 Готово: ' + sent + ' из ' + total + ' в чате бота (детали в панели)'
-          : '📨 Все ' + total + ' файлов приехали в чат бота — сохраните их из чата');
-        botQueueFinalNotified = true;
-      }
-    } else if (!botQueueFinalNotified && (sent || failed)) {
-      /* ВОЛНА 22.55: переоткрыли мини-апп уже ПОСЛЕ того, как бот всё
-         отправил (пока мы были вне Telegram) — короткий тост-итог,
-         чтобы пользователь знал: файлы в чате, ничего не потерялось */
-      botQueueFinalNotified = true;
-
-      showToast(failed
-        ? '📨 Пока вас не было: ' + sent + ' из ' + total + ' файлов в чате бота'
-        : '📨 Пока вас не было: все ' + total + ' файлов приехали в чат бота');
-    }
-  }
-
-  /* новая пачка поехала — итоговое уведомление сбрасываем */
-  if (active) botQueueFinalNotified = false;
-}
-
-async function botQueuePoll() {
-  /* таймер сработал — обнуляем, чтобы botQueueApplyState мог перевзвести */
-  botQueueTimer = null;
-
-  try {
-    const data = await apiJson('/api/download/queue', {
-      headers: vaultHeaders()
-    });
-
-    botQueueApplyState(data);
-  } catch (e) {
-    /* сеть моргнула — попробуем позже, пока очередь активна */
-    if (botQueueActive && !botQueueTimer) {
-      botQueueTimer = setTimeout(botQueuePoll, 4000);
-    }
-  }
-}
-
-function botQueueTrack() {
-  /* стартуем цикл опроса сразу; статус применится первым же ответом */
-  botQueueFinalNotified = false;
-
-  if (botQueueTimer) clearTimeout(botQueueTimer);
-  botQueueTimer = setTimeout(botQueuePoll, 300);
-}
-
-/* ═══ ВОЛНА 22.58: ЖИВАЯ КАРТОЧКА «ЗАГРУЗКА ЧЕРЕЗ БОТА» ═══
-   Физика WebView: мини-апп не может сам «отдать» выбранные файлы в чат
-   бота — байты уходят только пока он жив. Поэтому главный путь (22.57) —
-   файлы прикладываются В ЧАТЕ бота, Telegram доносит их сам (настоящий
-   фон, 100%), а бот сохраняет всё в облако на сервере. Здесь этот путь
-   становится ПРОЗРАЧНЫМ: карточка в панели передач включается в момент
-   нажатия кнопки «📤 Загрузить через Telegram» и живёт, пока файлы
-   едут: считает приехавшие из чата файлы (src='chat' свежее пометки
-   dv_bg_wait_ts) и показывает серверные статусы bg_live — в том числе
-   живые проценты больших файлов («Качаю с Telegram: 45%»). */
-let bgUploadTimer = null;
-let bgUploadLastGrow = 0;
-let bgUploadCount = 0;
-
-function bgUploadMarker() {
-  try {
-    return +localStorage.getItem('dv_bg_wait_ts') || 0;
-  } catch (e) {
-    return 0;
-  }
-}
-
-function bgUploadTracking() {
-  /* Активно ли живое отслеживание прямо сейчас (пометка свежая,
-     не старше 30 минут): свежие бот-загрузки показываются карточкой,
-     а не дублирующим тостом «Пока вас не было» */
-  const m = bgUploadMarker();
-
-  return !!(m && Date.now() / 1000 - m < 1800);
-}
-
-function bgUploadClearMarker() {
-  try { localStorage.removeItem('dv_bg_wait_ts'); } catch (e) {}
-}
-
-function bgUploadEnsureCard() {
-  if (!TRANSFERS.has('bgupload')) {
-    transferStart({
-      id: 'bgupload',
-      type: 'bgupload',
-      name: 'Загрузка через Telegram',
-      total: 1,
-      cancel: () => {
-        /* ручное снятие карточки — загрузкам в чате это не мешает,
-           просто перестаём подсвечивать прогресс */
-        bgUploadFinish(true, 0, 'Отслеживание остановлено');
-      }
-    });
-    bgUploadCount = 0;
-    bgUploadLastGrow = Date.now();
-  }
-}
-
-function bgUploadCard() {
-  return TRANSFERS.get('bgupload') || null;
-}
-
-function bgUploadSchedule(ms) {
-  if (bgUploadTimer) clearTimeout(bgUploadTimer);
-  bgUploadTimer = setTimeout(bgUploadTick, ms || 2500);
-}
-
-async function bgUploadTick() {
-  bgUploadTimer = null;
-
-  const t = bgUploadCard();
-
-  /* карточки нет (сняли/финишировали) и пометки нет — цикл не нужен */
-  if (!t) return;
-  if (t.done) return;
-
-  /* мини-апп скрыт (пользователь в чате бота) — сеть в WebView обычно
-     заморожена; при возврате всё подхватит visibilitychange + этот цикл */
-  if (document.hidden) {
-    bgUploadSchedule(5000);
-    return;
-  }
-
-  await loadFiles(true, true);
-
-  /* карточку могли финишировать прямо в loadFiles → bgUploadApply */
-  if (bgUploadCard() && !bgUploadCard().done) bgUploadSchedule(2500);
-}
-
-function bgUploadApply(live) {
-  /* Вызывается из loadFiles ПОСЛЕ обновления ALL_FILES: обновляет живую
-     карточку «через бота» (счётчик приехавших + серверные статусы) */
-  const markerRaw = bgUploadMarker();
-
-  /* пометка старше 30 минут — считаем отслеживание завершённым: такие
-     arrivals покажет обычный тост «Пока вас не было», а не карточка */
-  const marker = (markerRaw && Date.now() / 1000 - markerRaw < 1800)
-    ? markerRaw : 0;
-
-  if (markerRaw && !marker) bgUploadClearMarker();
-
-  let t = bgUploadCard();
-
-  if (!t && !marker) return;
-  if (t && t.done) return;
-
-  const liveArr = (live || []).filter(function (x) { return x && x.name; });
-  const fresh = marker
-    ? ALL_FILES.filter(function (f) { return f.src === 'chat' && +f.ts > marker; })
-    : [];
-
-  if (!t && marker && (fresh.length || liveArr.length)) {
-    bgUploadEnsureCard();
-    t = bgUploadCard();
-  }
-
-  if (!t) return;
-
-  if (fresh.length > bgUploadCount) {
-    /* первый приехавший — короткое подтверждение, что всё работает */
-    if (!bgUploadCount) showToast('📨 Файлы поехали — сохраняю в облако, можете вернуться в чат');
-    bgUploadCount = fresh.length;
-    bgUploadLastGrow = Date.now();
-  }
-
-  if (liveArr.length) bgUploadLastGrow = Date.now();
-
-  t.total = Math.max(1, fresh.length + liveArr.length);
-  t.loaded = fresh.length;
-
-  if (liveArr.length) {
-    const top = liveArr[0];
-    const stageText = top.stage === 'mt_dl'
-      ? 'Качаю с Telegram: ' + (+top.pct || 0) + '%'
-      : top.stage === 'mt_up'
-        ? 'Загружаю в облако: ' + (+top.pct || 0) + '%'
-        : 'Сохраняю в облако…';
-    t.note = '«' + top.name + '» — ' + stageText
-      + (liveArr.length > 1 ? ' · ещё ' + (liveArr.length - 1) : '')
-      + (fresh.length ? ' · готово: ' + fresh.length : '');
-  } else if (fresh.length) {
-    t.note = 'Сохранено в облако: ' + fresh.length + ' файл(ов)';
-  } else {
-    t.note = 'Ждём файлы из чата бота — отправьте их в чате (скрепка)';
-  }
-
-  ctSync();
-
-  /* финал: всё приехало и сохранилось, 6с тишины после последнего события */
-  if (!liveArr.length && fresh.length && Date.now() - bgUploadLastGrow > 6000) {
-    bgUploadFinish(true, fresh.length);
-    return;
-  }
-
-  /* таймаут ожидания: 12 минут карточка живёт без единого события —
-     снимаем её честным текстом (загрузкам в чате это не мешает) */
-  if (!liveArr.length && !fresh.length && Date.now() - t.t0 > 720000) {
-    bgUploadFinish(false, 0, 'Файлы не пришли — можно отправить их в чат бота позже');
-  }
-}
-
-function bgUploadFinish(ok, count, noteOverride) {
-  const t = bgUploadCard();
-
-  bgUploadClearMarker();
-  bgUploadCount = 0;
-
-  if (bgUploadTimer) {
-    clearTimeout(bgUploadTimer);
-    bgUploadTimer = null;
-  }
-
-  if (t && !t.done) {
-    transferFinish('bgupload', ok, noteOverride
-      || (ok && count ? 'Готово · ' + count + ' файл(ов) в облаке' : 'Завершено'));
-
-    if (ok && count) showToast('📨 Через бота: ' + count + ' файл(ов) — уже в облаке');
-  }
-}
-
-function bgUploadRestore() {
-  /* Переоткрытие мини-аппа: если недавно уходили «через бота» (WebView
-     мог быть убит, пока пользователь был в чате) — оживляем карточку
-     и цикл опроса: приехавшие файлы посчитаются и покажут итог */
-  const marker = bgUploadMarker();
-
-  if (!marker) return;
-  if (Date.now() / 1000 - marker > 1800) {
-    bgUploadClearMarker();
-    return;
-  }
-
-  bgUploadEnsureCard();
-  bgUploadSchedule(800);
-}
-
-async function enqueueBotDownload(ids) {
-  /* ВОЛНА 22.55: ставим файлы в серверную очередь «через бота».
-  Возвращает true при успехе; при safe_locked открывает окно пароля
-  и повторит постановку после разблокировки. */
-  try {
-    const data = await apiJson('/api/download/queue', {
-      method: 'POST',
-      headers: vaultHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify({ ids: ids })
-    });
-
-    botQueueTrack();
-
-    return true;
-  } catch (e) {
-    if (e.code === 'safe_locked') {
-      VAULT_PW = '';
-      VAULT_SERVER_UNLOCKED = false;
-      PENDING_FILE_ACTION = { type: 'dlq', ids: ids.slice() };
-
-      showToast('🔒 Введите пароль Сейфа — среди файлов есть зашифрованные');
-      openSafeModal();
-
-      return false;
-    }
-
-    showToast('Не получилось: ' + cloudErrText(e));
-
-    return false;
-  }
-}
-
 async function downloadSelected() {
   if (!selectedIds.size) {
     showToast('Сначала выберите файлы');
@@ -15124,35 +14363,32 @@ async function downloadSelected() {
     return;
   }
 
-  /* ВОЛНА 22.55: НЕСКОЛЬКО файлов — очередь «через бота». Раньше собирался
-     ZIP и качался клиентом: выход из Telegram убивал WebView — скачивание
-     пропадало. Теперь сервер сам отправляет каждый файл в чат бота: можно
-     закрывать мини-апп и выходить из Telegram — ничего не исчезнет.
-     Нужен именно архив одним файлом — рядом есть кнопка «В ZIP». */
-  const ids = [...selectedIds];
+  showToast('📦 Собираю архив…');
 
-  const hasEncrypted = ids.some((id) => {
-    const f = ALL_FILES.find((x) => x.id === id);
-    return f && f.vault && !f.plain;
-  });
+  try {
+    const data = await apiJson('/api/files/zip_selected', {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ ids: [...selectedIds] })
+    });
 
-  if (hasEncrypted && !VAULT_PW && !VAULT_SERVER_UNLOCKED) {
-    PENDING_FILE_ACTION = { type: 'dlq', ids: ids };
+    if (data.file) {
+      ALL_FILES.unshift({
+        id: data.file.id,
+        name: data.file.name,
+        kind: data.file.kind,
+        size: +data.file.size || 0,
+        ts: data.file.ts || '',
+        vault: !!data.file.vault
+      });
 
-    showToast('🔒 Введите пароль Сейфа — среди файлов есть зашифрованные');
-    openSafeModal();
+      renderAll();
 
-    return;
-  }
-
-  showToast('📨 Ставлю ' + ids.length + ' файлов в очередь бота…');
-
-  const ok = await enqueueBotDownload(ids);
-
-  if (ok) {
-    toggleSelectMode();
-
-    showToast('📨 ' + ids.length + ' файлов полетят в чат бота — можно закрывать мини-апп, ничего не пропадёт');
+      showToast('📦 Архив готов: ' + data.file.name);
+      downloadFileById(data.file.id, data.file.name, +data.file.size || 0);
+    }
+  } catch (e) {
+    showToast(cloudErrText(e));
   }
 }
 
@@ -15278,14 +14514,6 @@ async function deleteCurrentFile() {
 
   const id = activeEditingFileId;
 
-  /* 22.56: карточка мягко «улетает» до перерисовки списка */
-  const animated = animateCardsOut([id]);
-
-  if (animated) {
-    closeEditModal();
-    await new Promise((r) => setTimeout(r, 210));
-  }
-
   try {
     await apiJson('/api/files/' + encodeURIComponent(id), { method: 'DELETE' });
 
@@ -15303,7 +14531,7 @@ async function deleteCurrentFile() {
 function onSearch() {
   SEARCH = document.getElementById('searchInput').value;
 
-  document.getElementById('clearSearch').classList.toggle('shown', !!SEARCH);
+  document.getElementById('clearSearch').style.display = SEARCH ? 'flex' : 'none';
 
   /* Перерисовка не чаще одного раза на кадр — плавный ввод даже на 120 Гц */
   if (onSearch._raf) return;
@@ -15318,9 +14546,9 @@ function clearSearch() {
   document.getElementById('searchInput').value = '';
   SEARCH = '';
 
-  document.getElementById('clearSearch').classList.remove('shown');
+  document.getElementById('clearSearch').style.display = 'none';
 
-  renderAll({ animate: true });
+  renderAll();
 }
 
 function setFilter(f) {
@@ -15330,8 +14558,7 @@ function setFilter(f) {
     b.classList.toggle('active', b.dataset.filter === f);
   });
 
-  /* 22.56: смена фильтра — как смена экрана: список мягко «подъезжает» */
-  renderAll({ animate: true });
+  renderAll();
 }
 
 function toggleSortMenu(e) {
@@ -15359,8 +14586,7 @@ function setSort(s) {
   document.getElementById('sortLabel').textContent = labels[s] || 'По дате';
   document.getElementById('sortMenu').classList.remove('open');
 
-  /* 22.56: пересортировка — карточки мягко перестраиваются волной */
-  renderAll({ animate: true });
+  renderAll();
 }
 
 document.addEventListener('pointerdown', (e) => {
@@ -15736,13 +14962,7 @@ async function loadStorageStatus() {
         : 'Канал не подключён — файлы хранятся в облаке бота';
     }
 
-    if (offBtn) {
-      offBtn.style.display = connected ? '' : 'none';
-
-      /* 22.59: кнопка появляется мягко (статус хранилища грузится позже
-         открытия окна — раньше «выскакивала» поверх готовой модалки) */
-      if (connected) softReveal(offBtn);
-    }
+    if (offBtn) offBtn.style.display = connected ? '' : 'none';
     if (input && channel && !input.value) input.value = channel;
 
     if (typeof d.plain === 'boolean') {
@@ -15755,7 +14975,6 @@ async function loadStorageStatus() {
 
     if (plainBtn && STORAGE_PLAIN !== null) {
       plainBtn.style.display = '';
-      softReveal(plainBtn);   /* 22.59: мягкое появление */
 
       if (plainLabel) {
         plainLabel.textContent = STORAGE_PLAIN
@@ -15938,51 +15157,32 @@ window.addEventListener('pageshow', () => {
 
 /* ВОЛНА 22.48: ЗАКРЫЛИ МИНИ АПП ПОСРЕДИ ЗАГРУЗКИ. Последним дыханием
    (fetch keepalive — доходит даже при выгрузке страницы) сообщаем серверу,
-   что пользователь ушёл, пока файлы не догрузились. ВОЛНА 22.60: бот
-   БОЛЬШЕ НЕ присылает в чат «⏸ Загрузка на паузе» — загрузки из
-   мини-аппа идут вообще без оповещений. Смысл closed_hint остался:
-   сервер помечает сессию остановившейся и, как только все байты
-   доедут, финализирует файл сам уже через 6 секунд (а не 20).
-   Файлы не теряются в любом случае: при переоткрытии очередь
-   подхватывается из IndexedDB (22.39/22.47) и догружается сама. */
-function notifyUploadClosed(release) {
+   что пользователь ушёл, пока файлы не догрузились. Бот пришлёт в чат
+   «⏸ Загрузка на паузе» с кнопкой «▶️ Продолжить загрузку» — НО только
+   если куски и правда перестали идти (если мини апп просто свернули и
+   загрузка продолжает идти в фоне, сервер метку снимет — ложных
+   сообщений нет). Файлы не теряются в любом случае: при переоткрытии
+   очередь подхватывается из IndexedDB (22.39/22.47) и догружается сама. */
+function notifyUploadClosed() {
   try {
     /* 22.49: считаем ТОЛЬКО ещё не догруженные (загруженные файлы остаются
        в uploadQueue до конца пачки — раньше N было завышено) */
-    const seen = new Set();
-    const list = [];
-
-    const addF = function (f) {
-      if (f && !seen.has(f) && !f._doneFlag) {
-        seen.add(f);
-        list.push(f);
-      }
-    };
-
-    if (isUploading && uploadQueue && uploadQueue.length) {
-      uploadQueue.forEach(addF);
-    }
+    let pending = (isUploading && uploadQueue && uploadQueue.length)
+      ? uploadQueue.filter(function (f) { return !f._doneFlag; })
+      : [];
 
     /* ВОЛНА 22.54: плюс файлы ПРЕДОХРАНКИ — они летят в бота параллельно
        с окнами имени (движок ещё не запущен). closed_hint придёт сразу:
-       сервер пометит сессию остановившейся уже через ~6 с тишины (22.60 —
-       молча, без сообщений в чат) и быстрее финализирует догруженное.
-       ВОЛНА 22.59: окно загрузки могли уже ЗАКРЫТЬ (файлы продолжают
-       лететь сами) — их тоже честно учитываем через PRE_ACTIVE. */
-    (pendingFiles || []).forEach(function (f) {
-      if (f && f._preId && f._preState !== 'done' && !f._preStop) addF(f);
+       сторож сообщит о паузе через ~6 с тишины, а не через 30. */
+    const preRun = (pendingFiles || []).filter(function (f) {
+      return f && f._preId && f._preState === 'run' && !f._preStop;
     });
 
-    PRE_ACTIVE.forEach(addF);
+    pending = pending.concat(preRun);
 
-    /* 22.59: приложение реально закрывается (pagehide) и есть
-       «недорешённые» сессии — пароль больше не введут, разрешаем
-       серверу закончить файлы самому (в облако, без шифра) */
-    const rel = !!release && PRE_HELD.size > 0;
+    if (!pending.length) return;
 
-    if (!list.length && !rel) return;
-
-    const names = list.slice(0, 3).map(function (f) {
+    const names = pending.slice(0, 3).map(function (f) {
       return String(f.uploadName || f.name || 'файл').slice(0, 40);
     });
 
@@ -15990,22 +15190,16 @@ function notifyUploadClosed(release) {
       method: 'POST',
       keepalive: true,
       headers: vaultHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify({
-        n: list.length,
-        names: names,
-        release: rel
-      })
+      body: JSON.stringify({ n: pending.length, names: names })
     }).catch(function () {});
   } catch (e) {}
 }
 
 document.addEventListener('visibilitychange', function () {
-  if (document.hidden) notifyUploadClosed(false);
+  if (document.hidden) notifyUploadClosed();
 });
 
-window.addEventListener('pagehide', function () {
-  notifyUploadClosed(true);
-});
+window.addEventListener('pagehide', notifyUploadClosed);
 
 setInterval(ensureScrollUnlocked, 4000);
 
@@ -16023,16 +15217,10 @@ function refreshUploadModal() {
 
   if (info) {
     info.textContent = !has
-      /* ВОЛНА 22.59: файлы летят боту С МОМЕНТА ВЫБОРА — окно теперь
-         настройки (пароль/имена), а не «шлюз». ВОЛНА 22.61: текст честный:
-         что успело дойти — сохранится само; недокачанное продолжится при
-         следующем открытии, бот молча подскажет в чате.
-         ВОЛНА 22.63: упоминание кнопки «через Telegram» убрано — кнопки
-         больше нет, загрузка идёт напрямую всегда. */
-      ? 'Файлы, выбранные ниже, сразу летят боту. Что успеет дойти — сохранится само; недокачанное продолжится при следующем открытии (бот подскажет в чате).'
+      ? 'Файлы ещё не выбраны — нажмите «Добавить файл» или перетащите их в облако'
       : pendingFiles.length === 1
-        ? (pendingFiles[0].name || 'файл') + ' — уже летит боту. Пароль (в Сейф) и имя — по кнопке «Отправить», можно и просто закрыть окно.'
-        : 'Выбрано файлов: ' + pendingFiles.length + ' — все уже летят боту. Пароль (в Сейф) и имена — по кнопке «Отправить», окно можно закрыть.';
+        ? (pendingFiles[0].name || 'файл')
+        : 'Выбрано файлов: ' + pendingFiles.length;
   }
 
   if (list) {
@@ -16052,19 +15240,12 @@ function refreshUploadModal() {
 
       list.innerHTML = rows + more;
       list.style.display = 'block';
-
-      /* ВОЛНА 22.59: список появляется мягко — без «выскакивания» */
-      softReveal(list);
     }
   }
 
   if (addBtn) addBtn.classList.toggle('hidden', has);
   if (sendBtn) sendBtn.classList.toggle('hidden', !has);
   if (moreBtn) moreBtn.classList.toggle('hidden', !has);
-
-  /* ВОЛНА 22.63: тумблер автопередачи и подзаголовок кнопки «через
-     Telegram» удалены вместе с самими кнопками — окно загрузки снова
-     простое: пароль, список файлов, «Отправить» / «Добавить ещё». */
 
   /* ВОЛНА 22.40: пароль ОБЯЗАТЕЛЕН только когда хранилище шифруется
      (STORAGE_ENCRYPTED === true). Раньше поле становилось обязательным,
@@ -16104,25 +15285,12 @@ function openUploadModal() {
 function closeUploadModal(e) {
   if (e) e.stopPropagation();
 
-  /* ВОЛНА 22.59: закрытие окна БОЛЬШЕ НЕ отменяет загрузку — файлы уже
-     летят боту с момента выбора («сразу в бота», как при отправке в чат).
-     Отменить осознанно можно крестиком строки в панели передач (справа
-     внизу). Из очереди докачки убираем только файлы, которые ещё НЕ
-     летят (нет сессии — например, ждут пароль), — как раньше. */
-  let flying = 0;
-
+  /* ВОЛНА 22.54: крестик ДО подтверждения — как раньше, «отмена»: файлы,
+     которые ещё не начали лететь в бота (нет сессии), убираем из очереди
+     докачки, чтобы при следующем открытии не всплывала фантомная докачка.
+     Файлы предохранки (сессия уже создана) НЕ трогаем — они уже у бота. */
   for (const f of pendingFiles) {
-    if (f && !f._doneFlag &&
-        (f._preId || (f._preQueued && f._preState !== 'fail'))) {
-      flying++;
-      continue;
-    }
-
     if (f && f._entryKey && !f._preId) upqDel(f._entryKey);
-  }
-
-  if (flying) {
-    showToast('📨 Файлы продолжают грузиться боту — прогресс в панели справа внизу');
   }
 
   pendingFiles = [];
@@ -16168,16 +15336,8 @@ function confirmUploadFiles() {
      шифрованный режим — VAULT_PW уйдёт заголовком, «без шифрования» —
      пароль Сейфа (если ввёл) телом init. Закрытие мини аппа посреди
      окна имени больше НЕ теряет файлы: байты у бота, бот договорит сам. */
-  /* ВОЛНА 22.59: пароль перезаписываем, если ввели НОВЫЙ. Раньше поле
-     фиксировалось только при «undefined» — повторный ввод пароля после
-     wrong_password уходил на complete со СТАРЫМ пустым значением, и
-     перенацеливание в Сейф не срабатывало. Пустой пароль по-прежнему
-     НЕ наследуется (защита 22.50 на месте). */
   for (const f of pendingFiles) {
-    if (!f) continue;
-
-    if (UPLOAD_PLAIN_PW) f._uploadPw = UPLOAD_PLAIN_PW;
-    else if (typeof f._uploadPw === 'undefined') f._uploadPw = '';
+    if (f && typeof f._uploadPw === 'undefined') f._uploadPw = UPLOAD_PLAIN_PW || '';
   }
   prestreamStart(pendingFiles.slice());
 
@@ -16203,15 +15363,6 @@ function addMoreUploadFiles() {
   document.getElementById('fileInput').click();
 }
 
-/* ═══ ВОЛНА 22.63: ЕДИНЫЙ ПУТЬ ЗАГРУЗКИ — ПРЯМО БОТУ, ВСЕГДА ═══
-   Кнопки «Загрузить через Telegram» и «Автопередача в Telegram»
-   (волны 22.57/22.62) удалены по решению пользователя: они путали
-   поток и ломали привычную синхронизацию. Теперь всё включено по
-   умолчанию и работает само: файлы летят боту НАПРЯМУЮ стримом с
-   момента выбора (22.59/22.61), недокачанное бот доносит сам при
-   следующем открытии облака, прогресс — в панели передач. Никаких
-   переключателей, панелей «поделиться» и переходов в чат. */
-
 function uploadFiles(fileList) {
   let files = Array.from(fileList);
 
@@ -16236,10 +15387,6 @@ function uploadFiles(fileList) {
   files = files.filter((f) => +f.size);
 
   if (!files.length) return;
-
-  /* ВОЛНА 22.63: автопередача (панель «поделиться») удалена — выбор
-     файлов сразу запускает ПРЯМОЙ стрим боту ниже: очередь IndexedDB,
-     prestreamInitAll, prestreamStart. Всё включено по умолчанию. */
 
   const modalOpen = !!(document.getElementById('uploadModal') || {}).classList &&
     document.getElementById('uploadModal').classList.contains('open');
@@ -16275,43 +15422,6 @@ function uploadFiles(fileList) {
     openUploadModal();
   }
 
-  /* ═══ ВОЛНА 22.59: СРАЗУ В БОТА ═══
-     Байты каждого файла летят боту С МОМЕНТА ВЫБОРА — как при отправке
-     в чат бота: не дожидаясь кнопки «Отправить» и окон имени. Пользователь
-     может закрыть окно и вообще выйти — всё, что доехало до сервера,
-     бот закончит сам (финализация по последнему куску, 22.52 + hold 22.59).
-     Окно загрузки остаётся НАСТРОЙКОЙ поверх уже идущей передачи: пароль
-     (в Сейф), имена (догонят через rename), докидывание файлов.
-     В режиме шифрования без известного пароля init честно ответит 423 —
-     предохранка тихо отступит, движок спросит пароль как раньше. */
-  if (IS_TELEGRAM || WEB_TOKEN) {
-    let preStarted = 0;
-
-    for (const f of files) {
-      if (f && f._preState !== 'run' && f._preState !== 'done' && !f._preStop &&
-          +f.size > 0) {
-        f._preHold = true;   /* 22.59: сессия «недорешённая» — сервер ждёт пароль/имя */
-        f._preQueued = true;
-        PRE_QUEUE.push(f);
-        preStarted++;
-      }
-    }
-
-    if (preStarted) {
-      /* 22.61: чем больше пачка, тем больше файлов в полёте + сессии
-         ВСЕЙ пачке сразу — выход из приложения больше не оставляет
-         файлы «не тронутыми» (см. prestreamInitAll) */
-      prestreamTuneConcurrency(files.length);
-      prestreamInitAll(files);
-
-      prestreamKick();
-
-      if (STORAGE_ENCRYPTED !== true || VAULT_PW) {
-        showToast('📨 Файлы сразу пошли боту — грузятся в фоне, можно закрыть приложение');
-      }
-    }
-  }
-
   pickerAppend = false;
 }
 
@@ -16337,7 +15447,6 @@ function showDropLoader(files) {
   }
 
   filenameEl.style.display = 'block';
-  softReveal(filenameEl);   /* 22.59: имя файла появляется мягко */
 
   initial.style.display = 'none';
   wrap.classList.add('active');
@@ -16460,43 +15569,30 @@ async function resumePendingUploads() {
   /* ВОЛНА 22.47: счётчик попыток на запись очереди. Каждая докачка
      увеличивает tries; ЛЮБОЙ успешный кусок перезаписывает запись БЕЗ
      tries (сброс) — файл, у которого есть прогресс, никогда не бросается.
-     ВОЛНА 22.61: порог 5 → 12 — пользователь, быстро открывающий/закрывающий
-     облако, раньше исчерпывал 5 попыток раньше, чем файлы успевали хотя бы
-     получить сессию («все файлы теряются»). Теперь запас вдвое больше. */
+     Бросаем только совсем безнадёжные (5 докачек без единого байта) —
+     иначе очередь вечно висит и дёргает тостами на каждом открытии */
   let dropped = 0;
-  let lostBlob = 0;
   const files = [];
 
   for (const e of entries) {
     e.tries = (+e.tries || 0) + 1;
 
-    if (e.tries > 12) { upqDel(e.k); dropped++; continue; }
+    if (e.tries > 5) { upqDel(e.k); dropped++; continue; }
 
     upqPut(e);
 
     try {
       const f = new File([e.blob], e.name || 'file.bin', { type: e.mime || '' });
 
-      /* 22.61: blob НЕ пережил закрытие WebView (размер не совпал/0) —
-         молча терять нельзя: честно говорим, что файл надо загрузить заново */
-      if (+f.size !== +e.size || !+f.size) throw new Error('blob_lost');
-
       f.uploadName = e.uploadName || e.name;
       f._entryKey = e.k;
       f._resumeId = e.uploadId || '';
       files.push(f);
-    } catch (err) { upqDel(e.k); lostBlob++; }
+    } catch (err) { upqDel(e.k); }
   }
 
   if (dropped) {
-    showToast('🧹 ' + dropped + ' файл(ов) не удалось загрузить после 12 попыток — убран(ы) из очереди');
-  }
-
-  /* 22.61: телефон не сохранил байты между запусками (редко, но бывает
-     на iOS) — пользователь ДОЛЖЕН знать, что файлы нужно загрузить заново,
-     иначе «тихая потеря» выглядит как баг */
-  if (lostBlob) {
-    showToast('⚠️ ' + lostBlob + ' файл(ов) не сохранились на телефоне для докачки — загрузите их заново');
+    showToast('🧹 ' + dropped + ' файл(ов) не удалось загрузить после 5 попыток — убран(ы) из очереди');
   }
 
   if (files.length) {
@@ -16522,17 +15618,6 @@ function proceedUpload(files, opts) {
   isPaused = false;
   uploadAbortFlag = false;
   uploadQueue = files.slice();
-
-  /* ВОЛНА 22.59: строки предохранки гасим — визуализацию пачки берёт
-     на себя кольцо прогресса (движок перехватывает те же сессии) */
-  for (const f of uploadQueue) {
-    if (f && f._preTid && TRANSFERS.has(f._preTid)) {
-      TRANSFERS.delete(f._preTid);
-      f._preTid = '';
-    }
-  }
-
-  ctSync();
 
   /* ВОЛНА 22.54: движок вступает — очередь предохранки гасим (файлы из неё
      движок загрузит сам, двойной отправки не будет). Уже ЛЕТЯЩИЕ предохранки
@@ -16600,14 +15685,6 @@ function resetUploadUI(bar, checkmark, squareStop) {
   wrap.classList.remove('active');
   filenameEl.style.display = 'none';
   initial.style.display = 'flex';
-
-  /* ВОЛНА 22.56: зона загрузки мягко возвращается после завершения пачки —
-     раньше «выскакивала» рывком */
-  if (!LOW_END && !REDUCED_MOTION) {
-    initial.classList.remove('fade-soft-in');
-    void initial.offsetWidth;
-    initial.classList.add('fade-soft-in');
-  }
 
   if (bar) {
     bar.classList.remove('success');
@@ -16738,126 +15815,20 @@ function sendChunk(uploadId, index, blobPart, offset, onLoaded) {
      добегает до конца.
    Дизайн и порядок окон НЕ изменились. */
 
-/* ВОЛНА 22.56: 3 файла одновременно (было 2) — пока пользователь отвечает
-   на окна имени/пароля, в полёте больше файлов: закрыл мини апп в этот
-   момент — у большего числа файлов байты уже на сервере */
-let PRE_CONCURRENCY = 3;        /* сколько файлов грузим «впрок» одновременно */
+let PRE_CONCURRENCY = 2;        /* сколько файлов грузим «впрок» одновременно */
 let PRE_RUNNING = 0;
 const PRE_QUEUE = [];
-
-/* ВОЛНА 22.61: параллельность предохранки — по размеру пачки (3..5).
-   Раньше «в полёте» жили только 3 файла: пользователь, закрывший
-   приложение на большой пачке, оставлял байты на сервере максимум у
-   трёх — остальные не успевали получить НИ БАЙТА («остаются только
-   два»). Теперь чем больше пачка, тем больше файлов в полёте. */
-function prestreamTuneConcurrency(batchN) {
-  PRE_CONCURRENCY = Math.max(3, Math.min(5,
-    Math.max(PRE_CONCURRENCY, +batchN || 0)));
-}
-
-/* ═══ ВОЛНА 22.61: СЕССИИ ВСЕЙ ПАЧКЕ СРАЗУ ═══
-   Раньше /api/upload/init (и запись докачки с uploadId) выполнялись
-   ТОЛЬКО когда файл доходивал до слота предохранки (3 одновременно) —
-   при раннем выходе из приложения остальные файлы пачки не имели на
-   сервере НИ БАЙТА и не были привязаны к сессии докачки. Теперь init
-   улетает КАЖДОМУ выбранному файлу в первые же секунды (параллельно,
-   пачками по 8): у каждого файла есть серверная сессия и запись в
-   IndexedDB с uploadId — выход из приложения в ЛЮБОЙ момент оставляет
-   ВСЕ файлы докачиваемыми с точного байта, а не «выживают только два». */
-async function prestreamInitAll(files) {
-  const list = [];
-
-  for (const f of files || []) {
-    if (f && !f._preId && !f._preInitPromise && f._preState !== 'done' &&
-        !f._preStop && +f.size > 0) {
-      list.push(f);
-    }
-  }
-
-  if (!list.length) return;
-
-  let cursor = 0;
-
-  const worker = async () => {
-    while (cursor < list.length) {
-      const f = list[cursor++];
-
-      /* файл уже взял другой воркер или стрим — не трогаем */
-      if (f._preId || f._preInitPromise || f._preState === 'done' ||
-          f._preStop) continue;
-
-      f._preInitPromise = (async () => {
-        try {
-          const initData = await apiJson('/api/upload/init', {
-            method: 'POST',
-            headers: vaultHeaders({ 'Content-Type': 'application/json' }),
-            body: JSON.stringify({
-              name: String(f.uploadName || f.name || 'file.bin').slice(0, 120),
-              size: +f.size || 0,
-              mime: f.type || '',
-              password: f._uploadPw || '',
-              hold: !!f._preHold
-            })
-          });
-
-          const uploadId = initData && initData.uploadId;
-
-          if (!uploadId) return;
-
-          f._preId = uploadId;
-          f._preHeld = !!(f._preHold && initData.encrypt === false);
-
-          if (f._preHeld) PRE_HELD.add(uploadId);
-
-          if (Array.isArray(initData.parts) && initData.parts.length) {
-            f._preParts = new Set(initData.parts);
-          }
-
-          /* запись докачки — СРАЗУ с uploadId: файл переживает выход */
-          if (f._entryKey) {
-            upqPut({
-              k: f._entryKey, blob: f, name: f.name,
-              uploadName: String(f.uploadName || f.name || 'file.bin').slice(0, 120),
-              size: +f.size || 0, mime: f.type || '',
-              uploadId: uploadId, added: Date.now()
-            });
-          }
-        } catch (e) {
-          /* лимит/сеть/пароль — молча: стрим повторит init, движок спросит */
-        } finally {
-          f._preInitPromise = null;
-        }
-      })();
-
-      await f._preInitPromise;
-    }
-  };
-
-  await Promise.all(
-    Array.from({ length: Math.min(8, Math.max(1, list.length)) }, worker));
-}
-/* ВОЛНА 22.59: PRE стал ГЛАВНЫМ путём («сразу в бота») — ведём учёт:
-   • PRE_ACTIVE — файлы в полёте (для честного closed-уведомления,
-     включая те, чьё окно уже закрыли);
-   • PRE_HELD — uploadId «недорешённых» сессий (hold: пароль/имя ещё
-     могут прийти) — при закрытии приложения сообщаем серверу release. */
-const PRE_ACTIVE = new Set();
-const PRE_HELD = new Set();
 
 function prestreamKick() {
   while (PRE_RUNNING < PRE_CONCURRENCY && PRE_QUEUE.length) {
     const f = PRE_QUEUE.shift();
 
-    /* 22.61: _preId больше НЕ значит «уже летит» (init-all 22.61 ставит
-       его всей пачке заранее) — смотрим на СОСТОЯНИЕ файла */
-    if (!f || f._preStop || f._preState === 'run' || f._preState === 'done') continue;
+    if (!f || f._preStop || f._preId || f._preState === 'done') continue;
 
     PRE_RUNNING++;
-    PRE_ACTIVE.add(f);
 
     _preStreamFile(f).catch(() => {}).finally(() => {
       PRE_RUNNING--;
-      PRE_ACTIVE.delete(f);
       prestreamKick();
     });
   }
@@ -16869,84 +15840,12 @@ function prestreamStart(files) {
   if (!IS_TELEGRAM && !WEB_TOKEN) return;
 
   for (const f of files) {
-    if (f && f._preState !== 'run' && f._preState !== 'done' && !f._preStop &&
-        +f.size > 0) {
-      f._preQueued = true;
+    if (f && !f._preId && f._preState !== 'done' && !f._preStop && +f.size > 0) {
       PRE_QUEUE.push(f);
     }
   }
 
-  /* 22.61: сессии — ВСЕЙ пачке сразу (см. prestreamInitAll) */
-  prestreamTuneConcurrency(files.length);
-  prestreamInitAll(files);
-
   prestreamKick();
-}
-
-/* 22.59: отмена конкретного файла из панели передач (предохранка —
-   теперь главный путь, у каждой строки есть крестик) */
-function prestreamCancelFile(file) {
-  if (!file) return;
-
-  file._preStop = true;
-  file._preQueued = false;
-
-  if (file._preTid) transferFinish(file._preTid, false, 'Отменено');
-
-  if (file._preId) {
-    PRE_HELD.delete(file._preId);
-
-    apiJson('/api/upload/abort', {
-      method: 'POST',
-      headers: authHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify({ uploadId: file._preId })
-    }).catch(() => {});
-  }
-
-  if (file._entryKey) upqDel(file._entryKey);
-
-  /* из окна загрузки файл тоже убираем (если окно открыто) */
-  if (pendingFiles && pendingFiles.includes(file)) {
-    pendingFiles = pendingFiles.filter((x) => x !== file);
-
-    try { refreshUploadModal(); } catch (e) {}
-  }
-}
-
-/* 22.59: файл доехал до бота БЕЗ движка (пользователь закрыл окно или
-   ничего не нажимал) — сразу показываем его в списке + итоговый тост */
-let _preDoneT = null;
-let _preDoneN = 0;
-
-function prestreamReportDone(rec) {
-  if (rec && rec.id) {
-    ALL_FILES.unshift({
-      id: rec.id, name: rec.name, kind: rec.kind,
-      size: +rec.size || 0, ts: rec.ts || '', vault: !!rec.vault
-    });
-
-    renderAll({ animate: true });
-  }
-
-  _preDoneN++;
-  clearTimeout(_preDoneT);
-  _preDoneT = setTimeout(() => {
-    showToast('✅ Загрузилось без вас: ' + _preDoneN +
-      ' файл(ов) — уже в облаке');
-    _preDoneN = 0;
-  }, 900);
-}
-
-/* 22.59: тост-предупреждение «нужен пароль» — не чаще раза на пачку */
-let _prePwToastTs = 0;
-
-function prePwToastAllowed() {
-  const now = Date.now();
-
-  if (now - _prePwToastTs < 5000) return false;
-
-  _prePwToastTs = now;
-  return true;
 }
 
 /* Ожидание окончания предохранки файла (ограниченно по времени). */
@@ -16964,45 +15863,20 @@ async function _preSettle(file, timeoutSec) {
 
 async function _preStreamFile(file) {
   const upName = String(file.uploadName || file.name || 'file.bin').slice(0, 120);
-  /* ВОЛНА 22.61: сессию могла уже создать prestreamInitAll (вся пачка
-     получает сессии в первые секунды) — переиспользуем её; куски,
-     уже принятые сервером, — в _preParts */
-  let uploadId = file._preId || '';
-  let serverParts = file._preParts || null;
-  let initData = null;
+  let uploadId = '';
+  let serverParts = null;
 
   file._preState = 'run';
 
-  /* 22.59: строка в панели передач — предохранка теперь ГЛАВНЫЙ путь
-     («сразу в бота»), прогресс и отмена обязаны быть видимыми */
-  const tid = 'pre_' + Date.now().toString(36) +
-    Math.random().toString(36).slice(2, 6);
-
-  file._preTid = tid;
-
-  /* 22.61: init-all создаёт сессию этому файлу ПРЯМО СЕЙЧАС — ждём её
-     результат, чтобы не получить две сессии на один файл */
-  if (!uploadId && file._preInitPromise) {
-    try { await file._preInitPromise; } catch (e) {}
-
-    uploadId = file._preId || '';
-    serverParts = file._preParts || null;
-  }
-
-  if (uploadId) {
-    /* сессия уже есть (init-all) — собственный init не нужен */
-    file._preParts = null;
-  } else try {
-    initData = await apiJson('/api/upload/init', {
+  try {
+    const initData = await apiJson('/api/upload/init', {
       method: 'POST',
       headers: vaultHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({
         name: upName,
         size: +file.size || 0,
         mime: file.type || '',
-        password: file._uploadPw || '',
-        /* 22.59: «недорешённая» сессия — сервер ждёт пароль/имя из окна */
-        hold: !!file._preHold
+        password: file._uploadPw || ''
       })
     });
 
@@ -17016,32 +15890,12 @@ async function _preStreamFile(file) {
     }
   } catch (e) {
     /* предохранка не удалась (лимит/сеть/пароль) — НЕ страшно: движок после
-     окон имени сделает всё как раньше, с честной ошибкой при необходимости */
+       окон имени сделает всё как раньше, с честной ошибкой при необходимости */
     file._preState = 'fail';
-
-    /* 22.59: байты НЕ летят — честно говорим про пароль (один тост на пачку) */
-    if (e && e.code === 'safe_locked' && prePwToastAllowed()) {
-      showToast('🔒 Файлы ждут пароль Сейфа — введите его в окне и нажмите «Отправить»');
-    }
-
     return;
   }
 
   file._preId = uploadId;
-
-  /* 22.61: блок ниже — только при СОБСТВЕННОМ init (initData заполнен);
-     при сессии от init-all значение уже вычислено и лежит в file._preHeld */
-  if (initData) {
-    /* 22.59: сервер держит «окно решения» ТОЛЬКО на plain-сессиях
-       (encrypt:false) — шифрованные уже решены паролем при init, их можно
-       финализировать сразу. Ответ init говорит правду независимо от режима. */
-    const heldSession = !!(file._preHold && initData.encrypt === false);
-
-    file._preHeld = heldSession;
-
-    /* 22.59: «недорешённые» сессии — на учёт (release при закрытии аппа) */
-    if (heldSession) PRE_HELD.add(uploadId);
-  }
 
   /* uploadId — в очередь докачки сразу: закрыл мини апп на окне имени —
      при следующем открытии докачка подхватит ИМЕННО эту сессию */
@@ -17053,41 +15907,10 @@ async function _preStreamFile(file) {
     });
   }
 
-  /* 22.59: файл официально летит боту — строка в панели передач */
-  transferStart({
-    id: tid,
-    type: 'upload',
-    name: upName,
-    total: +file.size || 0,
-    cancel: () => prestreamCancelFile(file)
-  });
-
   file._prePromise = new Promise((resolvePre) => {
     const totalChunks = Math.ceil((+file.size || 0) / CHUNK_SIZE);
     let nextIndex = 0;
     let alive = true;
-
-    /* 22.59: прогресс по принятым кускам — как у движка */
-    const chunkGot = new Map();
-
-    const reportPre = () => {
-      let sum = 0;
-
-      for (const v of chunkGot.values()) sum += v;
-
-      transferProgress(tid, Math.min(sum, +file.size || sum));
-    };
-
-    if (serverParts) {
-      for (const pi of serverParts) {
-        const po = pi * CHUNK_SIZE;
-        const pe = Math.min(po + CHUNK_SIZE, +file.size || 0);
-
-        if (po < pe) chunkGot.set(pi, pe - po);
-      }
-
-      reportPre();
-    }
 
     const worker = async () => {
       while (alive) {
@@ -17112,8 +15935,6 @@ async function _preStreamFile(file) {
 
           try {
             await sendChunk(uploadId, idx, file.slice(off, end), off);
-            chunkGot.set(idx, end - off);
-            reportPre();
             break;
           } catch (e) {
             if (e && e.message === 'aborted') return;
@@ -17134,41 +15955,19 @@ async function _preStreamFile(file) {
 
   await file._prePromise;
 
-  /* 22.59: финал строки передачи */
-  if (file._preStop || uploadAbortFlag) {
-    transferFinish(tid, false, 'Отменено');
-    return;
-  }
-
-  if (file._preState !== 'done') {
-    transferFinish(tid, false, 'Сбой сети — движок повторит');
-    return;
-  }
-
-  /* Все байты у бота. «Недорешённую» (hold на сервере) сессию НЕ
-     финализируем сами — её завершит complete от движка (пароль/имя из
-     окна) или сторож сервера после окна решения. Решённую — сразу. */
-  if (!file._preHeld) {
+  /* Все байты у бота — зовём complete ПРЯМО ИЗ ПРЕДОХРАНКИ: файл уходит в
+     канал/Сейф сразу (2.5-секундная авто-финализация сервера сделала бы то
+     же самое). Неудача не фатальна: движок после окон имени добьёт через
+     status/complete. Пароль у complete — как у движка (заголовок/сессия). */
+  if (file._preState === 'done' && !file._preStop && !uploadAbortFlag) {
     try {
-      const resp = await apiJson('/api/upload/complete', {
+      await apiJson('/api/upload/complete', {
         method: 'POST',
         headers: vaultHeaders({ 'Content-Type': 'application/json' }),
-        body: JSON.stringify({ uploadId, password: file._uploadPw || '' })
+        body: JSON.stringify({ uploadId })
       });
-
-      PRE_HELD.delete(uploadId);
-      transferFinish(tid, true, 'Готово — у бота');
-      prestreamReportDone((resp && resp.file) || resp);
-      return;
-    } catch (e) {
-      /* бот догрузит сам / добьёт движок — байты в безопасности */
-    }
-
-    transferFinish(tid, true, 'У бота — бот сохраняет в облако');
-    return;
+    } catch (e) { /* бот догрузит сам / добьёт движок */ }
   }
-
-  transferFinish(tid, true, 'Байты у бота — ждёт пароль/имя из окна');
 }
 
 /* Имя из окна имени — догоняет уже летящую/готовую загрузку. */
@@ -17410,9 +16209,7 @@ async function _uploadOneSession(file, reportBytes) {
       done = await apiJson('/api/upload/complete', {
         method: 'POST',
         headers: vaultHeaders({ 'Content-Type': 'application/json' }),
-        /* 22.59: пароль ИМЕННО этой загрузки — в теле: им сервер
-           перенацеливает plain-сессию в Сейф (файл уже у бота) */
-        body: JSON.stringify({ uploadId, password: file._uploadPw || '' })
+        body: JSON.stringify({ uploadId })
       });
 
       cErr = null;
@@ -17449,14 +16246,8 @@ async function _uploadOneSession(file, reportBytes) {
   if (key) upqDel(key);
 
   /* ВОЛНА 22.50: pollUploadStatus отдаёт запись файла напрямую, обычный
-     complete — объектом {file: …}; приводим к одному виду.
-     ВОЛНА 22.62: сервер свёл дубль (тот же файл уже приехал из чата):
-     помечаем файл, чтобы движок не добавлял вторую карточку и не
-     хвастался «загружено» дважды. */
-  if (done && done.file) {
-    if (done.dedup) file._dupFlag = true;
-    return done.file;
-  }
+     complete — объектом {file: …}; приводим к одному виду. */
+  if (done && done.file) return done.file;
 
   return done;
 }
@@ -17493,10 +16284,7 @@ async function pollUploadStatus(uploadId, file) {
         const d2 = await apiJson('/api/upload/complete', {
           method: 'POST',
           headers: vaultHeaders({ 'Content-Type': 'application/json' }),
-          body: JSON.stringify({
-            uploadId,
-            password: (file && file._uploadPw) || ''
-          })
+          body: JSON.stringify({ uploadId })
         });
 
         return d2.file;
@@ -17527,12 +16315,6 @@ async function uploadOneFile(file, reportBytes) {
      честный успех без перекачки) или ready+parts (дошлём только остаток). */
   file._preStop = true;
 
-  /* 22.61: если prestreamInitAll прямо сейчас создаёт сессию этому файлу —
-     дождёмся её, чтобы движок продолжил ИМЕННО её (а не открывал вторую) */
-  if (file._preInitPromise) {
-    try { await file._preInitPromise; } catch (e) {}
-  }
-
   try { await _preSettle(file, 120); } catch (e) {}
 
   /* имя из окна имени должно успеть «догнать» сессию до complete */
@@ -17557,133 +16339,67 @@ async function uploadOneFile(file, reportBytes) {
   throw new Error('Загрузка не удалась — попробуйте ещё раз');
 }
 
-/* ═══ ВОЛНА 22.56: ПАРАЛЛЕЛЬНАЯ ЗАГРУЗКА ВСЕХ ФАЙЛОВ ПАЧКИ ═══
-   Раньше файлы грузились СТРОГО ПО ОДНОМУ: пока летел первый, остальные
-   просто ЖДАЛИ в очереди — и если пользователь закрывал мини апп (или
-   вообще выходил из Telegram), до поздних файлов не успевал доехать НИ
-   ОДИН байт: они целиком оставались на телефоне. Теперь ВСЕ файлы пачки
-   летят ОДНОВРЕМЕННО (пул из UPLOAD_FILES_PARALLEL задач, каждая со
-   своими кусочными воркерами): пока мини апп жив, КАЖДЫЙ файл очереди
-   непрерывно грузится, а не только «текущий». Закрыли апп — байты,
-   которые успели доехать, уже на сервере (переживают даже рестарт
-   бота), и при возвращении докачка продолжится С ТОГО ЖЕ места для
-   КАЖДОГО файла. Ошибки и повторы — как раньше (22.39): сбой одного
-   файла не роняет остальных, итог честно показываем в конце. */
-const UPLOAD_FILES_PARALLEL = 2;
-
 async function uploadEngine(bar) {
   const checkmark = document.getElementById('checkmark');
   const squareStop = document.getElementById('squareStop');
   const dlText = document.getElementById('downloadText');
 
-  const queue = uploadQueue.slice();
-  const totalBytes = queue.reduce((s, f) => s + (+f.size || 0), 0) || 1;
+  const totalBytes = uploadQueue.reduce((s, f) => s + (+f.size || 0), 0) || 1;
 
+  let doneBytes = 0;
   const added = [];
   const failedFiles = [];
 
-  /* Прогресс считается по КАЖДОМУ файлу отдельно и суммируется живьём —
-     файлы грузятся параллельно, поэтому «doneBytes» одного файла из
-     старого движка больше не подходит */
-  const fileBytes = new Map();
-  let reportedTotal = 0;
-  let dedupedCount = 0;   /* 22.62: сколько файлов свёл сервер (уже из чата) */
+  /* 22.39: ошибка ОДНОГО файла больше не роняет всю пачку — грузим дальше,
+     итог честно показываем в конце */
+  for (const file of uploadQueue.slice()) {
+    if (uploadAbortFlag) break;
 
-  const reportTotal = () => {
-    setUploadPct((reportedTotal / totalBytes) * 100, bar);
-  };
+    file._cancelFlag = false;
 
-  const topUpFile = (file) => {
-    /* файл прошёл через движок (успех или ошибка) — добираем его полные
-       байты в общий прогресс, чтобы кольцо не «зависало» на 97% */
-    const prev = fileBytes.get(file) || 0;
-    const full = +file.size || 0;
+    try {
+      const rec = await uploadOneFile(file, (cur) => {
+        setUploadPct(((doneBytes + cur) / totalBytes) * 100, bar);
+      });
 
-    if (full > prev) {
-      reportedTotal += full - prev;
-      fileBytes.set(file, full);
-      reportTotal();
-    }
-  };
+      if (rec) added.push(rec);
 
-  let nextFileIdx = 0;
-
-  const engineWorker = async () => {
-    for (;;) {
-      if (uploadAbortFlag) return;
-
-      const file = queue[nextFileIdx++];
-
-      if (!file) return;
-
-      file._cancelFlag = false;
-      fileBytes.set(file, 0);
-
-      try {
-        const rec = await uploadOneFile(file, (cur) => {
-          const prev = fileBytes.get(file) || 0;
-
-          if (cur > prev) {
-            reportedTotal += cur - prev;
-            fileBytes.set(file, cur);
-            reportTotal();
-          }
-        });
-
-        /* 22.62: дубль сведён сервером (файл уже приехал через
-           Telegram) — карточку и похвалу не дублируем */
-        if (rec && file._dupFlag) {
-          dedupedCount++;
-        } else if (rec) {
-          added.push(rec);
-        }
-
-        /* ВОЛНА 22.54: страховка имени. Файл уходил в бота под оригинальным
-           именем (предохранка), пользователь назвал его в окне имени — если
-           сервер всё же записал старое имя (финализация обогнала ренейм),
-           тихо переименовываем запись и подпись в канале (как ✏️). */
-        if (rec && rec.id && file.uploadName && rec.name &&
-            String(rec.name) !== String(file.uploadName)) {
-          apiJson('/api/files/' + encodeURIComponent(rec.id), {
-            method: 'PATCH',
-            headers: authHeaders({ 'Content-Type': 'application/json' }),
-            body: JSON.stringify({ name: file.uploadName })
-          }).catch(() => {});
-        }
-
-        /* 22.49: помечаем ДОСТИГНУТЫМ — notifyUploadClosed считает
-           только недогруженные, «⏸ пауза» больше не преувеличивает.
-           22.59: сессия решена — из реестра «недорешённых» убираем */
-        file._doneFlag = true;
-
-        if (file._preId) PRE_HELD.delete(file._preId);
-      } catch (e) {
-        if (e.message === 'aborted' || uploadAbortFlag) {
-          topUpFile(file);
-          return;
-        }
-
-        /* 22.49: НЕобратимые ошибки сервера (4xx, кроме 429/423 — это
-           «слишком часто»/«нет пароля») — убираем файл из очереди докачки,
-           чтобы он не бесконечно повторял тост «⏳ Продолжаю прерванную
-           загрузку» на каждом открытии приложения */
-        const _code = String((e && e.code) || '');
-        if (/^4\d\d$/.test(_code) && _code !== '429' && _code !== '423'
-          && file._entryKey) {
-          upqDel(file._entryKey);
-        }
-
-        failedFiles.push({ file: file, e: e });
+      /* ВОЛНА 22.54: страховка имени. Файл уходил в бота под оригинальным
+         именем (предохранка), пользователь назвал его в окне имени — если
+         сервер всё же записал старое имя (финализация обогнала ренейм),
+         тихо переименовываем запись и подпись в канале (как ✏️). */
+      if (rec && rec.id && file.uploadName && rec.name &&
+          String(rec.name) !== String(file.uploadName)) {
+        apiJson('/api/files/' + encodeURIComponent(rec.id), {
+          method: 'PATCH',
+          headers: authHeaders({ 'Content-Type': 'application/json' }),
+          body: JSON.stringify({ name: file.uploadName })
+        }).catch(() => {});
       }
 
-      topUpFile(file);
-    }
-  };
+      /* 22.49: помечаем ДОСТИГНУТЫМ — notifyUploadClosed считает
+         только недогруженные, «⏸ пауза» больше не преувеличивает */
+      file._doneFlag = true;
+    } catch (e) {
+      if (e.message === 'aborted' || uploadAbortFlag) break;
 
-  /* Пул: не больше задач, чем файлов; минимум одна (пустых пачек не бывает) */
-  await Promise.all(Array.from(
-    { length: Math.max(1, Math.min(UPLOAD_FILES_PARALLEL, queue.length)) },
-    engineWorker));
+      /* 22.49: НЕобратимые ошибки сервера (4xx, кроме 429/423 — это
+         «слишком часто»/«нет пароля») — убираем файл из очереди докачки,
+         чтобы он не бесконечно повторял тост «⏳ Продолжаю прерванную
+         загрузку» на каждом открытии приложения */
+      const _code = String((e && e.code) || '');
+      if (/^4\d\d$/.test(_code) && _code !== '429' && _code !== '423'
+        && file._entryKey) {
+        upqDel(file._entryKey);
+      }
+
+      failedFiles.push({ file: file, e: e });
+    }
+
+    doneBytes += (+file.size || 0);
+
+    setUploadPct((doneBytes / totalBytes) * 100, bar);
+  }
 
   if (uploadAbortFlag) {
     /* отмена — стираем очередь докачки (пользователь сам отменил) */
@@ -17744,7 +16460,6 @@ async function uploadEngine(bar) {
 
   showToast(
     (anySafe ? '✅ Успешно! 🔒 Зашифровано и в Сейфе' : '✅ Загружено') +
-    (dedupedCount ? ' · ♻️ дублей не создано: ' + dedupedCount : '') +
     (maxQueuePos > 1 ? ' · ⏳ публикация в канале, перед вами: ' + (maxQueuePos - 1) : ''));
 
   added.forEach((rec) => {
@@ -17758,7 +16473,7 @@ async function uploadEngine(bar) {
     });
   });
 
-  renderAll({ animate: true });
+  renderAll();
 
   setTimeout(() => {
     resetUploadUI(bar, checkmark, squareStop);
@@ -17798,7 +16513,7 @@ startBlobAnimation();
 renderSoundMenu();
 updateSoundLabel();
 setSort('date-desc');
-renderAll({ animate: true });
+renderAll();
 detectStorageMode();
 updateDevRecBanner(false);
 pullSettingsApply(); /* 22.39: подтянуть настройки из базы */
@@ -18025,9 +16740,6 @@ function ctSubText(t) {
       /* для Сейфа байты не считаются — честное «Готово» */
       if (t.type === 'safe' || t.type === 'safe_out') return 'Готово';
 
-      /* 22.59: загрузка в бота — свой честный итог («Готово — у бота») */
-      if (t.type === 'upload' && t.note) return t.note;
-
       return 'Завершено · ' + fmtSize(t.total || t.loaded || 0);
     }
 
@@ -18039,23 +16751,6 @@ function ctSubText(t) {
   if (t.type === 'safe') return 'Шифрую и переношу в Сейф…';
 
   if (t.type === 'safe_out') return 'Расшифровываю и возвращаю…';
-
-  /* ВОЛНА 22.55: очередь «через бота» — прогресс в файлах, не в байтах.
-     Текст готовит botQueueApplyState (note), здесь только отрисовка */
-  if (t.type === 'botqueue') {
-    if (t.done) return t.note || 'Готово';
-
-    return t.note || 'Бот отправляет в чат — можно закрывать мини-апп';
-  }
-
-  /* ВОЛНА 22.58: загрузка «через бота» — статус текстом (готовит
-     bgUploadApply: счётчик «Сохранено: N» и проценты больших файлов);
-     байты не считаются — файлов может быть сколько угодно */
-  if (t.type === 'bgupload') {
-    if (t.done) return t.note || 'Готово';
-
-    return t.note || 'Ждём файлы из чата бота…';
-  }
 
   const sec = (Date.now() - t.t0) / 1000;
   const speed = (sec > 0.8 && t.loaded) ? fmtSize(t.loaded / sec) + '/с · ' : '';
@@ -18082,11 +16777,7 @@ function ctRow(t) {
         ? '<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/>'
         : t.type === 'safe_out'
           ? '<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 7.5-2"/><path d="m3 3 18 18"/>'
-          : t.type === 'botqueue'
-            ? '<path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/>'
-            : t.type === 'bgupload'
-              ? '<path d="M4 14.899A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.5 8.242"/><path d="M12 12v9"/><path d="m8 17 4-4 4 4"/>'
-              : '<path d="M12 5v14"/><path d="m19 12-7 7-7-7"/>')
+          : '<path d="M12 5v14"/><path d="m19 12-7 7-7-7"/>')
     + '</svg>';
 
   const main = document.createElement('div');
@@ -18126,10 +16817,7 @@ function ctRow(t) {
       ? '<svg viewBox="0 0 24 24" stroke="#34c759"><path d="M20 6 9 17l-5-5"/></svg>'
       : '<svg viewBox="0 0 24 24" stroke="#ef4444"><path d="M18 6 6 18M6 6l12 12"/></svg>';
     row.appendChild(doneEl);
-  } else if (t.cancel) {
-    /* ВОЛНА 22.58: кнопка отмены — только у передач, которые реально
-       отменяются; карточка bgupload лишь наблюдает за бот-загрузками
-       (крестик снимает отслеживание, не трогая сами загрузки) */
+  } else {
     const btn = document.createElement('button');
     btn.className = 'ct-item-cancel';
     btn.setAttribute('aria-label', 'Отменить');
@@ -18530,7 +17218,6 @@ function mpResetCover() {
   }
 
   mpEl.mpArtCover.removeAttribute('src');
-  mpEl.mpArtCover.classList.remove('shown');   /* 22.59: мягкое скрытие */
   mpEl.mpArtCover.style.display = 'none';
   mpEl.mpArtFallback.style.opacity = '1';
 
@@ -18538,26 +17225,8 @@ function mpResetCover() {
 }
 
 function mpShowCover(src) {
-  const img = mpEl.mpArtCover;
-
-  /* 22.59: обложка проявляется, когда КАРТИНКА реально загрузилась —
-     раньше пустой квадрат «выскакивал» сразу (display:block), а сама
-     картинка дорисовывалась позже */
-  img.classList.remove('shown');
-  img.style.display = 'block';
-
-  const reveal = () => {
-    try { requestAnimationFrame(() => img.classList.add('shown')); } catch (e) {}
-  };
-
-  if (img.complete && img.naturalWidth) {
-    img.src = src;
-    reveal();
-  } else {
-    img.onload = reveal;
-    img.src = src;
-  }
-
+  mpEl.mpArtCover.src = src;
+  mpEl.mpArtCover.style.display = 'block';
   mpEl.mpArtFallback.style.opacity = '0';
 }
 
@@ -18735,8 +17404,6 @@ function mpRenderDots() {
 
   dots.style.display = 'flex';
   dots.innerHTML = '';
-
-  softReveal(dots);   /* 22.59: точки появляются мягко */
 
   mpList.forEach((_, i) => {
     const d = document.createElement('div');
@@ -20245,82 +18912,38 @@ setTimeout(() => {
   requestAnimationFrame(() => requestAnimationFrame(() => w.remove()));
 }, 150);
 
-/* ═══ ВОЛНА 22.60: ТИХИЙ СТАРТ ═══
-   Пользователь: «убери начальные уведомления — не удалось подключиться
-   к облаку и HTTP 500». Причина: сервер бота просыпается (бесплатный
-   хостинг) или только что перезапустился — первые запросы падают, а
-   стартовый loadFiles() кричал тостом с ошибкой. Теперь старт ПОЛНОСТЬЮ
-   ТИХИЙ: подключаемся без единого тоста, с мягкой лестницей повторов
-   (3с → 7с → 15с → 30с → 60с), дальше подхватывает авто-синхронизация
-   раз в 45с (она всегда тихая). Ошибки показываются ТОЛЬКО при явном
-   действии пользователя (кнопка обновления списка). Окно входа
-   открывается только при честном 401 (из apiJson). */
-const START_RETRY_STEPS = [3000, 7000, 15000, 30000, 60000];
-let startRetryN = 0;
-
-function startAfterConnect() {
-  setTimeout(botQueuePoll, 1200);        /* 22.55: живая очередь «через бота» */
-  setTimeout(bgUploadRestore, 900);      /* 22.58: живая карточка бот-загрузок */
-  setTimeout(resumePendingUploads, 800); /* 22.39: докачка прерванных */
-}
-
-function quietStartRetry() {
-  const delay = startRetryN < START_RETRY_STEPS.length
-    ? START_RETRY_STEPS[startRetryN] : 60000;
-
-  startRetryN++;
-
-  setTimeout(quietStart, delay);
-}
-
-async function quietStart() {
-  /* ТИХО: без тостов — «HTTP 500» и «нет связи» при старте убраны */
-  const ok = await loadFiles(true);
-
-  if (ok) {
-    startAfterConnect();
-    return;
-  }
-
-  /* 401 уже открыл окно входа из apiJson — лестницу повторов не крутим */
-  if (LAST_ERR && (LAST_ERR.code === 'unauthorized'
-      || LAST_ERR.code === 'not_registered')) return;
-
-  /* сервер просыпается / перезапускается — пробуем ещё раз, молча */
-  quietStartRetry();
-}
-
 if (!IS_TELEGRAM) {
   if (WEB_TOKEN) {
-    /* 22.60: тихая проверка токена — сетевой сбой больше НЕ открывает
-       окно входа (сервер мог просто просыпаться); войти заново просим
-       только при честном 401/403 от самого сервера */
-    (function webStart() {
-      fetch('/api/web_me', { headers: authHeaders() })
-        .then(function (r) {
-          if (r.ok) {
-            quietStart();
-          } else if (r.status === 401 || r.status === 403) {
-            localStorage.removeItem('devo_web_token');
-            WEB_TOKEN = '';
-            setTimeout(openLoginModal, 500);
-          } else {
-            /* 5xx / сервер спит — тихий повтор по лестнице */
-            quietStartRetry();
-          }
-        })
-        .catch(function () {
-          /* сеть моргнула — тихий повтор, без окна входа */
-          quietStartRetry();
-        });
-    })();
+    fetch('/api/web_me', { headers: authHeaders() })
+      .then(function (r) {
+        if (r.ok) {
+          loadFiles();
+          resumePendingUploads(); /* 22.39: докачка после закрытия мини-аппа */
+        } else {
+          localStorage.removeItem('devo_web_token');
+          WEB_TOKEN = '';
+          setTimeout(openLoginModal, 500);
+        }
+      })
+      .catch(function () {
+        setTimeout(openLoginModal, 500);
+      });
   } else {
     /* Окно входа открываем чуть позже старта: прогрев размытия успевает
        отработать, первый рендер и иконки — устаканиться, без рывка */
     setTimeout(openLoginModal, 650);
   }
 } else {
-  quietStart();
+  loadFiles().then(function (ok) {
+    if (!ok) {
+      setTimeout(function () {
+        loadFiles(true);
+      }, 4000);
+    }
+
+    /* 22.39: докачка прерванных загрузок после открытия мини-аппа */
+    setTimeout(resumePendingUploads, 800);
+  });
 }
 
 safeIcons();
@@ -23026,16 +21649,13 @@ async def miniapp_upload_init(request):
         })
     # ВОЛНА 22.49: капа одновременных сессий на пользователя — иначе спам
     # init создаёт неограниченное число пустых .part-файлов на диске.
-    # ВОЛНА 22.61: 5 → 64 — клиент теперь создаёт сессию КАЖДОМУ файлу
-    # пачки в момент выбора (prestreamInitAll): капа 5 резала пачки
-    # больше пяти, и «шестой» файл оставался без сессии вообще.
     _my_sessions = sum(
         1 for _s in _MINIAPP_UPLOADS.values()
         if str(_s.get("uid") or "") == str(uid))
-    if _my_sessions >= 64:
+    if _my_sessions >= 5:
         return _miniapp_err(
             429, "too_many_uploads",
-            "Слишком много одновременных загрузок — дождитесь завершения.")
+            "У вас уже 5 активных загрузок — дождитесь их завершения.")
     upload_id = ''.join(random.choices(string.ascii_lowercase + string.digits, k=16))
     path = os.path.join(_miniapp_tmpdir(), upload_id + ".part")
     open(path, "wb").close()
@@ -23184,12 +21804,12 @@ async def miniapp_upload_closed(request):
 
     Клиент последним дыханием (fetch keepalive — доходит даже при выгрузке
     страницы) сообщает, что пользователь ушёл, пока файлы НЕ догрузились.
-    Мы помечаем незавершённые сессии closed_hint. ВОЛНА 22.60: никаких
-    сообщений в чат больше нет — сторож (_upload_pause_check_once) молча
-    помечает сессию остановившейся (~6 секунд тишины), и автодогрузка
-    финализирует файл через 6 секунд после того, как все байты доедут.
-    Если куски продолжают приходить (мини апп просто свернули) — метка
-    снимается. Файлы не теряются: при переоткрытии мини-аппа очередь
+    Мы помечаем незавершённые сессии closed_hint: сторож (_upload_pause_
+    check_once) через ~6 секунд пришлёт в чат «⏸ Загрузка на паузе» с
+    кнопкой «▶️ Продолжить загрузку» — но ТОЛЬКО если куски и правда
+    перестали приходить (мини апп могли просто свернуть, а загрузка
+    продолжает идти в фоне — тогда метка снимается, ложных сообщений нет).
+    Файлы при этом не теряются: при переоткрытии мини-аппа очередь
     подхватывается из IndexedDB и грузится дальше."""
     user, uid, err = await _api_get_user_any(request)
     if err is not None:
@@ -23216,33 +21836,6 @@ async def miniapp_upload_closed(request):
         if size > 0 and received < size:
             s["closed_hint"] = now
             marked += 1
-
-    # ВОЛНА 22.61: ЯКОРНОЕ СООБЩЕНИЕ «файлы ждут продолжения».
-    # Пользователь вышел из мини-аппа, пока не все файлы доехали (эти байты
-    # физически могут прийти ТОЛЬКО с телефона — мёртвый WebView байтов не
-    # шлёт). Молчать здесь = тихая потеря: человек видит в облаке 2 файла
-    # из 10 и решает, что «всё теряется». Одно БЕЗЗВУЧНОЕ сообщение в чат
-    # (disable_notification — без popup и звука, не оповещение, а заметка
-    # в переписке) с кнопкой открытия облака возвращает файлы: открыл —
-    # докачка сама продолжила с того же байта. Анти-спам: только при
-    # реальном закрытии (release) и не чаще раза в 3 минуты.
-    if release and marked > 0 and MINIAPP_URL:
-        if time.time() - _CLOSED_ANCHOR_TS.get(uid, 0.0) > _CLOSED_ANCHOR_COOLDOWN:
-            _CLOSED_ANCHOR_TS[uid] = time.time()
-            _bot = getattr(_MINIAPP_PTB_APP, "bot", None) if _MINIAPP_PTB_APP else None
-            if _bot is not None:
-                try:
-                    await _bot.send_message(
-                        chat_id=int(uid),
-                        disable_notification=True,
-                        text=("⏳ Не догрузилось файлов: " + str(marked) +
-                              " — телефон закрылся раньше байтов.\n"
-                              "Откройте Облако: продолжу сам, с того же места."),
-                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
-                            "🌐 Открыть облако",
-                            web_app=WebAppInfo(url=MINIAPP_URL))]]))
-                except Exception as e:
-                    logger.warning(f"upload closed anchor {uid}: {e}")
     return web.json_response({"ok": True, "marked": marked})
 
 
@@ -23378,28 +21971,33 @@ async def miniapp_upload_rename(request):
     return web.json_response({"renamed": "none"})
 
 
-# ВОЛНА 22.60: сообщения «⏸ Загрузка на паузе» больше не отправляются
-# (тихий режим) — переменные кулдаунов сохранены для отката/совместимости
+# uid → ts последнего отправленного сообщения «⏸ Загрузка на паузе»
 _UPLOAD_PAUSE_LAST = {}
+# не чаще одного сообщения в 2 минуты на пользователя (TTL-циклы, двойные биконы)
 _UPLOAD_PAUSE_COOLDOWN = 120.0
 # сколько секунд тишины (без закрытия) считаем «загрузка умерла молча»
 _UPLOAD_PAUSE_SILENCE = 30.0
 
 
 async def _upload_pause_check_once(app, now=None):
-    """ВОЛНА 22.60: ТИХИЙ проход сторожа паузы загрузок.
+    """Один проход сторожа паузы загрузок (22.48).
 
-    Раньше (22.48) за каждую остановившуюся загрузку бот писал в чат
-    «⏸ Загрузка на паузе». Пользователь попросил: загрузки из мини-аппа —
-    БЕЗ оповещений вообще. Теперь сторож только ПОМЕЧАЕТ остановившиеся
-    сессии (pause_notified) — это важно: помеченные сессии автодогрузка
-    финализирует уже через 6 секунд (а не через 20), как только байты
-    дойдут. Никаких сообщений в чат не отправляется.
+    Находит НЕЗАВЕРШЁННЫЕ сессии загрузки, по которым перестали приходить
+    куски, и отправляет каждому затронутому пользователю ОДНО сообщение со
+    списком файлов и кнопкой «▶️ Продолжить загрузку» (Mini App).
 
-    Возвращает число помеченных сессий (для совместимости/логов)."""
+    Триггеры тишины:
+      • closed_hint (клиент сам сообщил о закрытии) — ждём ~6 с: если куски
+        снова пошли (ts > hint) — ложная тревога, метка снимается;
+      • без hint — сессия молчит > 30 с (крестик без событий, обрыв сети).
+
+    Один раз на сессию (pause_notified) + кулдаун 2 мин на пользователя.
+    Возвращает, скольким пользователям отправили сообщение."""
     now = time.time() if now is None else float(now)
+    bot = getattr(app, "bot", None)
 
-    marked = 0
+    # 1) снимаем метки у живых загрузок и собираем затухшие по пользователям
+    stale = {}                     # uid → [(uploadId, имя, размер, догружено)]
     for upid, s in list(_MINIAPP_UPLOADS.items()):
         size = int(s.get("size") or 0)
         received = int(s.get("received") or 0)
@@ -23415,19 +22013,64 @@ async def _upload_pause_check_once(app, now=None):
         elif now - float(s.get("ts", now)) <= _UPLOAD_PAUSE_SILENCE:
             continue                         # молчит недолго — может, оживёт
         if s.get("pause_notified"):
-            continue                         # уже помечена
+            continue                         # по этой сессии уже сообщали
         uid = str(s.get("uid") or "")
         if not uid:
             continue
-        # помечаем молча: автодогрузка увидит pause_notified и, когда все
-        # байты будут на сервере, финализирует файл через 6 секунд
-        s["pause_notified"] = True
-        s.pop("closed_hint", None)
-        marked += 1
-    if marked:
-        logger.info(f"upload pause watchdog: помечено остановившихся "
-                    f"сессий (тихо, без сообщений): {marked}")
-    return marked
+        stale.setdefault(uid, []).append(
+            (upid, str(s.get("name") or "файл")[:60], size, received))
+
+    if not stale:
+        return 0
+
+    sent = 0
+    for uid, items in list(stale.items()):
+        # недавно уже писали об остановке? — сессии НЕ помечаем: если
+        # тишина продолжится, сообщение уйдёт после кулдауна (а не «никогда»)
+        last = _UPLOAD_PAUSE_LAST.get(uid, 0)
+        if now - last < _UPLOAD_PAUSE_COOLDOWN:
+            continue
+        if bot is None:
+            continue
+        # помечаем ДО отправки (отправка может упасть — спамить не нужно)
+        for upid, _nm, _sz, _rc in items:
+            _s = _MINIAPP_UPLOADS.get(upid)
+            if _s is not None:
+                _s["pause_notified"] = True
+                _s.pop("closed_hint", None)
+        _UPLOAD_PAUSE_LAST[uid] = now
+        lines = ""
+        for _upid, nm, sz, rc in items[:3]:
+            lines += f"• «{nm}» — догружено {_fmt_bytes(rc)} из {_fmt_bytes(sz)}\n"
+        extra = len(items) - 3
+        if extra > 0:
+            lines += f"• и ещё {extra} файл(ов)\n"
+        kb = None
+        if MINIAPP_URL:
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("▶️ Продолжить загрузку",
+                                     web_app=WebAppInfo(url=MINIAPP_URL))]])
+        try:
+            await bot.send_message(
+                chat_id=int(uid),
+                text=("⏸ Загрузка на паузе\n\n" + lines +
+                      "\nМини апп закрыли посреди загрузки, и файлы "
+                      "перестали лететь на сервер.\n\n"
+                      "Файлы НЕ потеряны: откройте мини апп — загрузка "
+                      "продолжится сама с того же места.\n\n"
+                      "💡 А чтобы грузилось В ФОНЕ даже с закрытым "
+                      "приложением — отправьте файлы прямо в ЭТОТ чат "
+                      "(в мини-аппе для этого есть кнопка «📤 Загрузить "
+                      "через Telegram»): Telegram сам доносит их боту, "
+                      "а я сохраню всё в облако. Прогресс виден в мини-"
+                      "аппе — карточка «Загрузка через Telegram» в панели "
+                      "передач."),
+                reply_markup=kb,
+            )
+            sent += 1
+        except Exception:
+            pass
+    return sent
 
 
 async def _upload_pause_watchdog(app):
@@ -23539,38 +22182,28 @@ async def _upload_auto_complete_task(app, upid):
                 pass
 
 
-async def miniapp_upload_tg_mark(request):
-    """ВОЛНА 22.62: пометка «файлы передаются боту через Telegram».
-
-    Мини-апп ставит её ПЕРЕД автопередачей (navigator.share → панель
-    «поделиться» → чат бота). Пока пометка свежая (15 минут), итоги
-    сохранения файлов ИЗ ЧАТА бот отправляет БЕЗЗВУЧНО
-    (disable_notification) — «как в обычном чате, но БЕЗ оповещений».
-    Прогресс пользователь видит в панели передач мини-аппа (bg_live),
-    а дубли с прямым стримом сводятся отдельно (_dup_*)."""
-    user, uid, err = await _api_get_user_any(request)
-    if err is not None:
-        return err
-    _TG_AUTOSHARE_MARK[uid] = time.time()
-    if len(_TG_AUTOSHARE_MARK) > 512:
-        cut = time.time() - 900.0
-        for k in [k for k, v in _TG_AUTOSHARE_MARK.items() if v < cut]:
-            _TG_AUTOSHARE_MARK.pop(k, None)
-    return web.json_response({"ok": True})
-
-
 def _notify_auto_complete(uid, s, payload, ok=True):
-    """ВОЛНА 22.60: ПОЛНОСТЬЮ БЕСШУМНО.
-
-    Пользователь: «файлы из мини-аппа уходят боту как в обычном чате, но
-    БЕЗ оповещения пользователя». Файл просто появляется в облаке и в
-    панели передач мини-аппа («Загрузилось без вас: N»), чат бота больше
-    не получает сообщений о догрузках. Пишем только в серверный лог."""
-    _ = (uid, s, payload, ok)
+    """Одно честное сообщение «бот сам догрузил ваш файл» (с кулдауном)."""
+    now = time.time()
+    if now - float(_UPLOAD_AUTO_LAST.get(uid, 0)) < _UPLOAD_AUTO_COOLDOWN:
+        return
+    _UPLOAD_AUTO_LAST[uid] = now
+    app = _MINIAPP_PTB_APP
+    bot = getattr(app, "bot", None) if app is not None else None
+    if bot is None:
+        return
     f = (payload or {}).get("file") or {}
     nm = str(f.get("name") or f.get("label") or (s or {}).get("name") or "Файл")[:60]
-    logger.info(f"upload auto-complete: «{nm}» сохранён без уведомления "
-                f"пользователя {uid} (тихий режим 22.60)")
+    to_safe = bool((payload or {}).get("safe"))
+    where = "Сейф" if to_safe else "облако"
+    try:
+        asyncio.ensure_future(bot.send_message(
+            chat_id=int(uid),
+            text=("🤖 Догрузил без вас: «" + nm + "» — файл уже в " + where +
+                  ".\nМини апп был закрыт после передачи файла, поэтому "
+                  "загрузку закончил сам бот.")))
+    except Exception:
+        pass
 
 
 async def _upload_autocomplete_pass(app, now=None):
@@ -23761,27 +22394,41 @@ def _upload_pw_wait_expired_session(s):
 
 
 async def _upload_ask_vault_pw(bot, uid, upid):
-    """ВОЛНА 22.60: ТИХИЙ РЕЖИМ — больше НЕ спрашивает пароль в чате.
-
-    Раньше бот писал «🔐 пришлите пароль Сейфа следующим сообщением» и
-    регистрировал ожидание пароля (_UPLOAD_PW_WAIT). Пользователь просил:
-    загрузки из мини-аппа — вообще без оповещений. Пароль для ждущих
-    зашифрованных сессий спросит САМ МИНИ-АПП при следующем открытии
-    (флоу ensureSafeUnlocked / PENDING_FILE_ACTION уже умеет это, файлы
-    при этом не перекачиваются — байты уже на сервере)."""
-    _ = (bot, uid, upid)
-    logger.info(f"upload: зашифрованная сессия {upid} пользователя {uid} "
-                "ждёт пароль — молча (спросит мини-апп, 22.60)")
-    return False
+    """Один проактивный запрос «пришлите пароль Сейфа — догружу сам».
+    Кулдауны: 10 минут на пользователя, 30 минут на сессию."""
+    s = _MINIAPP_UPLOADS.get(upid)
+    if s is None or s.get("plain") is not False or s.get("vault_pw"):
+        return False
+    now = time.time()
+    if now - float(_UPLOAD_PW_LAST.get(uid, 0)) < _UPLOAD_PW_COOLDOWN:
+        return False
+    if _upload_pw_wait_expired_session(s):
+        return False
+    if bot is None:
+        return False
+    _UPLOAD_PW_LAST[uid] = now
+    if not _upload_pw_register(uid, upid):
+        return False
+    nm = str(s.get("name") or "файл")[:60]
+    try:
+        await bot.send_message(
+            chat_id=int(uid),
+            text=("🔐 Файл «" + nm + "» уже полностью на сервере, но он "
+                  "зашифрован паролем Сейфа.\n\n"
+                  "Пришлите пароль Сейфа следующим сообщением — я расшифрую "
+                  "и загружу файл в хранилище прямо здесь, мини апп "
+                  "открывать не нужно.\n"
+                  "(Не хотите присылать пароль в чат — просто откройте мини "
+                  "апп: загрузка продолжится там.)"))
+        return True
+    except Exception:
+        return False
 
 
 async def _upload_pw_attempt(bot, uid, text):
     """Пользователь прислал ТЕКСТ, пока бот ждёт пароль Сейфа для его файла.
     Возвращает True, если текст обработан как пароль (напоминание не шлём).
-    Пароль в логи/базу/диск не попадает НИКОГДА.
-    ВОЛНА 22.60: тихий режим — бот больше НЕ регистрирует ожидание пароля
-    (_upload_ask_vault_pw стал тихим), поэтому сюда прийти неоткуда: тело
-    сохранено как есть на случай возврата чат-флоу пароля в будущем."""
+    Пароль в логи/базу/диск не попадает НИКОГДА."""
     w = _UPLOAD_PW_WAIT.get(uid)
     if w is None:
         return False
@@ -23873,15 +22520,15 @@ _UPLOAD_REMIND_COOLDOWN = 1800.0
 
 
 async def _upload_resume_reminder(update, context):
-    """ВОЛНА 22.60: ТИХИЙ РЕЖИМ — напоминание больше НЕ отправляется.
-
-    Раньше (22.50/22.53) при любом сообщении боту бот присылал «⏸ Файлы
-    ещё не догружены» со списком и кнопкой, а заодно регистрировал
-    ожидание пароля Сейфа. Пользователь попросил: загрузки из мини-аппа —
-    вообще БЕЗ оповещений в чате. Прогресс и докачка живут в мини-аппе:
-    очередь IndexedDB подхватывается при открытии, пароль спрашивает
-    окно Сейфа. Здесь остаётся только очистка протухших ожиданий пароля
-    (на случай перехода со старой версии) — и больше ничего."""
+    """Группа 1: бежит ПАРАЛЛЕЛЬНО основному потоку, ничего не глушит и ни на
+    что не отвечает вместо бота. Если у написавшего в личку пользователя есть
+    НЕдогруженные сессии загрузки из мини-аппа — одно короткое сообщение со
+    списком и кнопкой «▶️ Продолжить загрузку» (web_app → мини апп, где очередь
+    из IndexedDB подхватывается сама). Антиспам: скипаем активные загрузки
+    (куски идут прямо сейчас), 1 раз на сессию (remind_done) + 30 мин на юзера.
+    ВОЛНА 22.53: (а) если бот ждёт пароль Сейфа для догрузки через чат —
+    текст пользователя ЭТО ПАРОЛЬ; (б) в напоминание добавляется строка
+    про зашифрованные файлы, у которых все байты на сервере, но нет пароля."""
     try:
         u = getattr(update, "effective_user", None)
         ch = getattr(update, "effective_chat", None)
@@ -23889,9 +22536,94 @@ async def _upload_resume_reminder(update, context):
             return
         uid = str(u.id)
         now = time.time()
+        # ВОЛНА 22.53 (а): пользователь отвечает текстом на запрос пароля —
+        # этот текст и есть пароль (просроченное ожидание снимаем). ДО
+        # кулдауна напоминания: попытки пароля не должны глотаться им.
         _w = _UPLOAD_PW_WAIT.get(uid)
         if _w is not None and _upload_pw_wait_expired(_w, now):
             _UPLOAD_PW_WAIT.pop(uid, None)
+            _w = None
+        _msg = getattr(update, "effective_message", None)
+        _txt = str(getattr(_msg, "text", "") or "").strip() \
+            if _msg is not None else ""
+        if _w is not None and _txt and not _txt.startswith("/"):
+            if await _upload_pw_attempt(getattr(context, "bot", None),
+                                        uid, _txt):
+                return
+        if now - float(_UPLOAD_REMIND_LAST.get(uid, 0)) < _UPLOAD_REMIND_COOLDOWN:
+            return
+        stale = []
+        for upid, s in list(_MINIAPP_UPLOADS.items()):
+            if str(s.get("uid") or "") != uid or s.get("remind_done"):
+                continue
+            size = int(s.get("size") or 0)
+            received = int(s.get("received") or 0)
+            if size <= 0 or received >= size:
+                continue                      # завершено/пусто — не интересует
+            if now - float(s.get("ts", 0)) < 15.0:
+                continue                      # куски идут СЕЙЧАС — загрузка жива
+            stale.append((upid, str(s.get("name") or "файл")[:60], size, received))
+        # ВОЛНА 22.53 (б): зашифрованные сессии, где ВСЕ байты на сервере,
+        # а пароля нет (рестарт бота) — предложим догрузить прямо в чате.
+        pw_need = []
+        for upid2, s2 in list(_MINIAPP_UPLOADS.items()):
+            if str(s2.get("uid") or "") != uid:
+                continue
+            if s2.get("plain") is not False or s2.get("vault_pw") \
+                    or s2.get("completing") or s2.get("auto_done"):
+                continue
+            _sz2 = int(s2.get("size") or 0)
+            _rc2 = int(s2.get("received") or 0)
+            if _sz2 <= 0 or _rc2 < _sz2:
+                continue                      # байтов не хватает — это не про пароль
+            if now - float(s2.get("ts", 0)) < 15.0:
+                continue                      # куски идут сейчас — загрузка жива
+            if _upload_pw_wait_expired_session(s2):
+                continue                      # недавно уже спрашивали
+            pw_need.append((upid2, str(s2.get("name") or "файл")[:60]))
+        if not stale and not pw_need:
+            return
+        bot = getattr(context, "bot", None)
+        if bot is None:
+            return
+        if not stale:
+            # только «парольные» сессии — отдельный запрос пароля
+            await _upload_ask_vault_pw(bot, uid, pw_need[0][0])
+            return
+        _UPLOAD_REMIND_LAST[uid] = now
+        for upid, _nm, _sz, _rc in stale:
+            _s = _MINIAPP_UPLOADS.get(upid)
+            if _s is not None:
+                _s["remind_done"] = True
+        lines = ""
+        for _upid, nm, sz, rc in stale[:3]:
+            lines += f"• «{nm}» — догружено {_fmt_bytes(rc)} из {_fmt_bytes(sz)}\n"
+        extra = len(stale) - 3
+        if extra > 0:
+            lines += f"• и ещё {extra} файл(ов)\n"
+        if pw_need:
+            # регистрируем ожидание пароля — следующий текст пользователя
+            # будет принят как пароль Сейфа (догрузка прямо в чате)
+            if _upload_pw_register(uid, pw_need[0][0]):
+                lines += ("• 🔐 «" + pw_need[0][1] + "» — файл уже на сервере, "
+                          "но зашифрован: пришлите пароль Сейфа следующим "
+                          "сообщением, и я загружу его прямо в чат\n")
+        kb = None
+        if MINIAPP_URL:
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("▶️ Продолжить загрузку",
+                                     web_app=WebAppInfo(url=MINIAPP_URL))]])
+        try:
+            await bot.send_message(
+                chat_id=int(uid),
+                text=("⏸ Файлы ещё не догружены\n\n" + lines +
+                      "\nМини апп закрыли посреди загрузки, но файлы НЕ "
+                      "потеряны. Откройте мини апп — загрузка продолжится "
+                      "сама с того же места."),
+                reply_markup=kb,
+            )
+        except Exception:
+            pass
     except Exception:
         pass
 
@@ -23979,10 +22711,6 @@ async def _miniapp_upload_finalize(user, uid, upid, s, pw_raw="",
     # ВАЖНО: _mt_upload_container может ПЕРЕИМЕНОВАТЬ временный файл — чистим оба пути.
     mt_renamed = os.path.join(os.path.dirname(s["path"]), s["name"] or "file.bin")
     _finished = False   # сессия закрыта (успех или неисправимая порча)
-    # ВОЛНА 22.62: анти-дубль — переменные доступны в finally (ранние
-    # return'ы до присваивания name/size больше не роняют обработчик)
-    name, size = "", 0
-    _dup_mine = False   # клейм анти-дубля держим мы — при неудаче снимем
     try:
         if s["size"] <= 0:
             # ВОЛНА 22.38: 0-байтовые файлы невозможны (init их отвергает;
@@ -24096,34 +22824,6 @@ async def _miniapp_upload_finalize(user, uid, upid, s, pw_raw="",
             _miniapp_prune_completed()
             return True, _resp
         # === режим «БЕЗ ШИФРА» (личный канал) — прежний путь, облако ===
-        # ВОЛНА 22.62: СВЕДЕНИЕ ДУБЛЕЙ (автопередача + прямой стрим).
-        # Пользователь выбрал файлы — они полетели ДВУМЯ путями: эта
-        # сессия (прямой стрим) и автопередача в Telegram (панель
-        # «поделиться» → чат бота). Кто первый довёз — тот и сохранил.
-        # Файл уже сохранён из чата — второй раз не заливаем, отдаём
-        # клиенту УЖЕ СОХРАНЁННУЮ запись (dedup: true — без второй
-        # карточки в списке). Если файл из чата сохраняют прямо сейчас —
-        # коротко ждём (фаст-путь чата — секунды) и сверяемся ещё раз.
-        _dd = _cloud_recent_dup(user, name, size)
-        if _dd is None and (_dup_held(uid, name, size) or
-                            _dup_claim(uid, name, size)):
-            for _ in range(10):
-                await asyncio.sleep(2.0)
-                _dd = _cloud_recent_dup(user, name, size)
-                if _dd is not None or not _dup_held(uid, name, size):
-                    break
-        if _dd is not None:
-            _dup_saved(uid, name, size)
-            _finished = True
-            _resp = {"file": _miniapp_rec_out(_dd), "dedup": True}
-            _MINIAPP_COMPLETED[upid] = {"ts": time.time(), "uid": uid,
-                                        "resp": _resp}
-            _miniapp_prune_completed()
-            logger.info(f"upload {upid}: дубль сведён — «{name[:40]}» "
-                        "уже в облаке (автопередача 22.62)")
-            return True, _resp
-        _dup_claim(uid, name, size)
-        _dup_mine = True
         app = _MINIAPP_PTB_APP
         sent = None
         if size <= STORAGE_MAX_FILE_BYTES:
@@ -24174,8 +22874,6 @@ async def _miniapp_upload_finalize(user, uid, upid, s, pw_raw="",
                             if isinstance(f, dict)]
         user.cloud_files.append(rec)
         save_user(user)
-        _dup_saved(uid, name, size)   # 22.62: анти-дубль — файл сохранён
-        _dup_mine = False
         # ВОЛНА 22.38: «Скрыть» в канале больше не отправляем (см. выше).
         # ВОЛНА 22.35: позиция в очереди публикаций канала (1 = печатали сразу)
         out = _miniapp_rec_out(rec)
@@ -24204,10 +22902,6 @@ async def _miniapp_upload_finalize(user, uid, upid, s, pw_raw="",
                     pass
         else:
             s["completing"] = False
-            # 22.62: сохранить не удалось — снимаем свой анти-дубль клейм,
-            # чтобы этот же файл из чата не потерялся из-за нас
-            if _dup_mine:
-                _dup_release(uid, name, size)
 
 
 # --- ВОЛНА 22.23: «МОЁ ОБЛАКО» В МИНИ-АППЕ (хранилище пользователя) ---
@@ -24854,9 +23548,6 @@ def mount_miniapp_routes(app):
     app.router.add_post("/api/upload/abort", miniapp_upload_abort)
     # ВОЛНА 22.48: «мини апп закрыли посреди загрузки» (fetch keepalive)
     app.router.add_post("/api/upload/closed", miniapp_upload_closed)
-    # ВОЛНА 22.62: пометка «файлы передаются через Telegram» (автопередача
-    # из мини-аппа: системная панель «поделиться» → чат бота)
-    app.router.add_post("/api/upload/tg_mark", miniapp_upload_tg_mark)
     # ВОЛНА 22.50: статус сессии загрузки — честный успех вместо фантомных ошибок
     app.router.add_get("/api/upload/status", miniapp_upload_status)
     # ВОЛНА 22.54: имя «догоняет» уже летящую загрузку (предохранка)
@@ -25249,11 +23940,8 @@ async def _cdb_ingest_post(context, post, doc, fname, chat_id):
     проверяет _meta.json и применяет базу. ВОЛНА 16: файл в канал вставляет
     ЧЕЛОВЕК (свои собственные снапшоты бот не видит — зацикливание
     невозможно), значит ЭТОТ файл и есть актуальная база:
-    • применяем базу ВСЕГДА и ЗАКРЕПЛЯЕМ пост (pin) — при старте бот
-      прочитает именно этот закреп;
-    • ВОЛНА 22.56 (подтверждено 22.63): СТАРЫЕ СНАПШОТЫ ИЗ КАНАЛА
-      НЕ УДАЛЯЮТСЯ НИКОГДА — канал хранит ПОЛНУЮ историю версий,
-      закреп служит только указателем на актуальный снапшот;
+    • применяем базу ВСЕГДА, ЗАКРЕПЛЯЕМ пост (pin) и стираем старые
+      снапшоты этого канала — при старте бот прочитает именно этот закреп;
     • если штамп старше локального cdb_last_flush — всё равно применяем
       (ручное восстановление БЕЗ отказов «не новее»), честно помечая это
       в отчёте; защита latest-wins осталась только на автоматических
