@@ -3693,7 +3693,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.64"
+BOT_BUILD = "22.65"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -10699,6 +10699,17 @@ html.low-end #cornerTransfers.panel-open .ct-panel {
   animation: ctItemIn 0.35s var(--ease-snap);
 }
 
+/* ВОЛНА 22.65: строка «ждёт пароль Сейфа» нажимается целиком */
+.ct-item.ct-clickable {
+  cursor: pointer;
+  -webkit-tap-highlight-color: rgba(10, 132, 255, 0.15);
+}
+
+.ct-item.ct-clickable:active {
+  transform: scale(0.98);
+  border-color: rgba(10, 132, 255, 0.55);
+}
+
 @keyframes ctItemIn {
   from { opacity: 0; transform: translateY(8px) scale(0.97); }
   to   { opacity: 1; transform: none; }
@@ -13609,6 +13620,11 @@ async function loadFiles(silent, quiet) {
        приехавшие из чата файлы и серверные статусы bg_live */
     bgUploadApply(data.bg_live);
 
+    /* ВОЛНА 22.65: недогруженное с сервера — восстановление строк панели
+       передач после обновления страницы («файлы сбрасываются и ничего
+       не остаётся» — больше не должно) */
+    srvPendingApply(data.pending);
+
     return true;
   } catch (e) {
     LAST_ERR = e;
@@ -14186,8 +14202,11 @@ function openSafeModal(mode, fileId) {
   const m = document.getElementById('safeModal');
   if (!m) return;
 
-  /* ВОЛНА 22.40: контекстное окно Сейфа — подпись кнопки зависит от действия */
-  SAFE_MODAL_MODE = (mode === 'to_safe' || mode === 'from_safe') ? mode : 'unlock';
+  /* ВОЛНА 22.40: контекстное окно Сейфа — подпись кнопки зависит от действия.
+     ВОЛНА 22.65: режим 'complete_upload' — файл уже у бота целиком и ждёт
+     пароль: верный пароль сохранит его в облако БЕЗ перекачки. */
+  SAFE_MODAL_MODE = (mode === 'to_safe' || mode === 'from_safe' ||
+                     mode === 'complete_upload') ? mode : 'unlock';
   SAFE_MODAL_FILE_ID = fileId || null;
 
   const lbl = document.getElementById('safeActionLabel');
@@ -14195,7 +14214,9 @@ function openSafeModal(mode, fileId) {
   if (lbl) {
     lbl.textContent = SAFE_MODAL_MODE === 'to_safe'
       ? 'Переместить в сейф'
-      : 'Разблокировать';
+      : SAFE_MODAL_MODE === 'complete_upload'
+        ? 'Сохранить файл в облако'
+        : 'Разблокировать';
   }
 
   const input = document.getElementById('safePassword');
@@ -14219,12 +14240,15 @@ function closeSafeModal(e) {
   closeModalEl('safeModal');
 }
 
-/* Кнопка действия в окне Сейфа: разблокировать / переместить в сейф */
+/* Кнопка действия в окне Сейфа: разблокировать / переместить в сейф /
+   сохранить ждущий файл (22.65) */
 function onSafeAction() {
   if (SAFE_MODAL_MODE === 'to_safe') {
     safeDoTransfer('to_safe');
   } else if (SAFE_MODAL_MODE === 'from_safe') {
     safeDoTransfer('from_safe');
+  } else if (SAFE_MODAL_MODE === 'complete_upload') {
+    completePendingUpload();
   } else {
     unlockSafe();
   }
@@ -15198,6 +15222,179 @@ function bgUploadRestore() {
 
   bgUploadEnsureCard();
   bgUploadSchedule(800);
+}
+
+/* ═══ ВОЛНА 22.65: НЕДОГРУЖЕННОЕ ПОСЛЕ ОБНОВЛЕНИЯ СТРАНИЦЫ ═══
+   Жалоба: «после обновления страницы в мини апп файлы все сбрасываются
+   и в мини апп ничего не остаётся». Список файлов всегда жил на сервере
+   и возвращался, а вот строки передач — нет: они были только в памяти
+   вкладки, обновление их стирало, и недоконченная загрузка становилась
+   невидимой. Теперь сервер присылает недоконченные сессии в /api/files
+   (pending), панель передач восстанавливает строки:
+     • байты ещё едут или прервались — видно процент; выбрать файл заново
+       можно в любой момент: сервер узнаёт «свою» сессию по отпечатку и
+       продолжит с того же байта;
+     • все байты уже у бота, файл ждёт пароль Сейфа — строка НАЖИМАЕТСЯ:
+       ввод пароля сохраняет файл БЕЗ перекачки (байты уже на сервере). */
+const SRV_PEND_PREFIX = 'srvp_';
+
+function srvPendingId(upid) {
+  return SRV_PEND_PREFIX + String(upid || '');
+}
+
+function srvPendingApply(list) {
+  const arr = Array.isArray(list) ? list : [];
+  const seen = new Set();
+
+  for (const p of arr) {
+    if (!p || !p.uploadId) continue;
+
+    const upid = String(p.uploadId);
+    const id = srvPendingId(upid);
+
+    seen.add(id);
+
+    /* сессию прямо сейчас ведёт этот клиент (предохранка/движок) —
+       строка уже есть, серверную не дублируем */
+    if (LOCALLY_DRIVEN.has(upid)) continue;
+
+    const size = +p.size || 0;
+    const received = Math.max(0, Math.min(+p.received || 0, size));
+    const complete = size > 0 && received >= size;
+    const waitPw = complete && !!p.wait_pw;
+    const pct = size ? Math.floor((received / size) * 100) : 0;
+
+    let t = TRANSFERS.get(id);
+
+    if (!t) {
+      transferStart({
+        id: id,
+        type: 'srvpend',
+        name: String(p.name || 'файл'),
+        total: size,
+        cancel: () => srvPendingCancel(upid)
+      });
+
+      t = TRANSFERS.get(id);
+
+      if (!t) continue;
+    }
+
+    if (t.done) continue;
+
+    t.loaded = received;
+    t.waitPw = waitPw;
+    t.note = waitPw
+      ? 'Целиком у бота — ждёт пароль Сейфа · нажмите, чтобы ввести'
+      : complete
+        ? 'Целиком у бота — сохраняю в облако…'
+        : (pct > 0
+          ? 'В пути: ' + pct + '% — можно закрыть приложение, докачаю'
+          : 'Готовлю загрузку…');
+
+    ctSync();
+  }
+
+  /* сессии, которых больше нет на сервере, — файл сохранён (или отменён):
+     строку честно закрываем, панель сама её уберёт */
+  TRANSFERS.forEach((t, id) => {
+    if (t.type === 'srvpend' && !t.done && !seen.has(id)) {
+      transferFinish(id, true, 'Сохранено в облаке');
+    }
+  });
+}
+
+function srvPendingCancel(upid) {
+  /* отмена недогруженного: сервер стирает сессию и временные байты
+     (идемпотентно, владение проверяет сервер) */
+  apiJson('/api/upload/abort', {
+    method: 'POST',
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ uploadId: upid })
+  }).catch(() => {});
+
+  LOCALLY_DRIVEN.delete(upid);
+
+  transferFinish(srvPendingId(upid), false, 'Отменено — байты стёрты');
+}
+
+function srvPendingPwPrompt(upid) {
+  const t = TRANSFERS.get(srvPendingId(upid));
+
+  if (!t || t.done || !t.waitPw) return;
+
+  /* окно Сейфа в режиме «сохранить файл»: верный пароль завершит загрузку
+     прямо с сервера — перекачивать ничего не нужно */
+  openSafeModal('complete_upload', upid);
+}
+
+async function completePendingUpload() {
+  const input = document.getElementById('safePassword');
+  const pw = (input && input.value) || '';
+  const upid = SAFE_MODAL_FILE_ID || '';
+
+  if (!upid) {
+    closeSafeModal();
+    return;
+  }
+
+  if (!pw) {
+    showToast('Введите пароль Сейфа');
+    return;
+  }
+
+  /* пароль проверяем сразу: неверный — окно остаётся открытым */
+  try {
+    await apiJson('/api/safe/unlock', {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ password: pw })
+    });
+  } catch (e) {
+    showToast(cloudErrText(e));
+    return;
+  }
+
+  VAULT_PW = pw;
+  VAULT_SERVER_UNLOCKED = true;
+
+  if (input) input.value = '';
+
+  closeSafeModal();
+
+  const tid = srvPendingId(upid);
+  const t = TRANSFERS.get(tid);
+
+  if (t && !t.done) {
+    t.note = 'Шифрую и сохраняю в облако…';
+
+    ctSync();
+  }
+
+  try {
+    await apiJson('/api/upload/complete', {
+      method: 'POST',
+      headers: vaultHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ uploadId: upid, password: pw })
+    });
+
+    LOCALLY_DRIVEN.add(upid);   /* строку закроет следующий тик loadFiles */
+
+    transferFinish(tid, true, 'Готово — в облаке');
+    showToast('✅ Файл сохранён — уже в облаке');
+    loadFiles(true);
+  } catch (e) {
+    /* сессия на сервере жива: строка остаётся, пароль можно ввести снова */
+    if (t && !t.done) {
+      t.note = (e && e.code === 'wrong_password')
+        ? 'Пароль не подошёл — нажмите и введите снова'
+        : 'Не получилось: ' + cloudErrText(e).slice(0, 60);
+
+      ctSync();
+    }
+
+    showToast(cloudErrText(e));
+  }
 }
 
 async function enqueueBotDownload(ids) {
@@ -16439,9 +16636,10 @@ function uploadFiles(fileList) {
 
       prestreamKick();
 
-      if (STORAGE_ENCRYPTED !== true || VAULT_PW) {
-        showToast('📨 Файлы сразу пошли боту — грузятся в фоне, можно закрыть приложение');
-      }
+      /* ВОЛНА 22.65: тост ВСЕГДА — байты летят боту с момента выбора
+         и в шифрованном режиме (сервер 22.65 создаёт сессию без пароля,
+         pw_pending): пароль догонит из окна, файл уже в пути */
+      showToast('📨 Файлы сразу пошли боту — грузятся в фоне, можно закрыть приложение');
     }
   }
 
@@ -16938,6 +17136,7 @@ async function prestreamInitAll(files) {
           if (!uploadId) return;
 
           f._preId = uploadId;
+          LOCALLY_DRIVEN.add(uploadId);   /* 22.65: сессию ведёт этот клиент */
           f._preHeld = !!(f._preHold && initData.encrypt === false);
 
           if (f._preHeld) PRE_HELD.add(uploadId);
@@ -16976,6 +17175,11 @@ async function prestreamInitAll(files) {
      могут прийти) — при закрытии приложения сообщаем серверу release. */
 const PRE_ACTIVE = new Set();
 const PRE_HELD = new Set();
+/* ВОЛНА 22.65: сессии, которые ПРЯМО СЕЙЧАС ведёт ЭТОТ клиент (предохранка/
+   движок/докачка). Панель недогруженного (srvp_, строки с сервера) такие
+   сессии не дублирует: своя строка уже есть. После обновления страницы
+   набор пуст — и серверные строки честно восстанавливаются. */
+const LOCALLY_DRIVEN = new Set();
 
 function prestreamKick() {
   while (PRE_RUNNING < PRE_CONCURRENCY && PRE_QUEUE.length) {
@@ -17161,6 +17365,7 @@ async function _preStreamFile(file) {
   }
 
   file._preId = uploadId;
+  LOCALLY_DRIVEN.add(uploadId);   /* 22.65: сессию ведёт этот клиент */
 
   /* 22.61: блок ниже — только при СОБСТВЕННОМ init (initData заполнен);
      при сессии от init-all значение уже вычислено и лежит в file._preHeld */
@@ -17410,6 +17615,7 @@ async function _uploadOneSession(file, reportBytes) {
   }
 
   file._lastUploadId = uploadId;
+  LOCALLY_DRIVEN.add(uploadId);   /* 22.65: сессию ведёт этот клиент */
 
   if (key) {
     upqPut({
@@ -18190,6 +18396,14 @@ function ctSubText(t) {
     return t.note || 'Ждём файлы из чата бота…';
   }
 
+  /* ВОЛНА 22.65: недогруженное с сервера — статус текстом (готовит
+     srvPendingApply): «в пути N%», «ждёт пароль Сейфа», «сохраняю…» */
+  if (t.type === 'srvpend') {
+    if (t.done) return t.note || 'Готово';
+
+    return t.note || 'В пути…';
+  }
+
   const sec = (Date.now() - t.t0) / 1000;
   const speed = (sec > 0.8 && t.loaded) ? fmtSize(t.loaded / sec) + '/с · ' : '';
 
@@ -18217,7 +18431,7 @@ function ctRow(t) {
           ? '<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 7.5-2"/><path d="m3 3 18 18"/>'
           : t.type === 'botqueue'
             ? '<path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/>'
-            : t.type === 'bgupload'
+            : t.type === 'bgupload' || t.type === 'srvpend'
               ? '<path d="M4 14.899A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.5 8.242"/><path d="M12 12v9"/><path d="m8 17 4-4 4 4"/>'
               : '<path d="M12 5v14"/><path d="m19 12-7 7-7-7"/>')
     + '</svg>';
@@ -18269,6 +18483,16 @@ function ctRow(t) {
     btn.innerHTML = '<svg viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg>';
     btn.addEventListener('click', (ev) => ctCancelTransfer(t.id, ev));
     row.appendChild(btn);
+  }
+
+  /* ВОЛНА 22.65: строка «ждёт пароль Сейфа» нажимается целиком — ввод
+     пароля сохраняет файл без перекачки (байты уже у бота) */
+  if (t.type === 'srvpend' && t.waitPw && !t.done) {
+    row.classList.add('ct-clickable');
+    row.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      srvPendingPwPrompt(String(t.id).slice(SRV_PEND_PREFIX.length));
+    });
   }
 
   return row;
@@ -20704,6 +20928,34 @@ async def miniapp_files_get(request):
     # спрашивать ли пароль Сейфа в окне загрузки (без лишнего 423).
     plain_mode = (_user_vault_channel(user) is not None
                   and _vault_channel_plain(user))
+    # ВОЛНА 22.65: НЕДОГРУЖЕННЫЕ/ЖДУЩИЕ сессии этого пользователя — мини-апп
+    # показывает их в панели передач ПОСЛЕ обновления страницы (раньше строки
+    # передач жили только в памяти вкладки: обновление стирало их, и выгля-
+    # дела это как «всё сбросилось и ничего не осталось»). Показываем:
+    #   • байты ещё едут/прервались — процент, файл можно докачать повторным
+    #     выбором (сервер узнаёт сессию по отпечатку и продолжит);
+    #   • все байты у бота, ждёт пароль Сейфа — в мини-аппе строка нажимается:
+    #     ввод пароля сохраняет файл БЕЗ перекачки (байты уже на сервере).
+    _now_ts = time.time()
+    _pend = []
+    for _upid, _s in _MINIAPP_UPLOADS.items():
+        if str(_s.get("uid") or "") != str(_uid):
+            continue
+        if _s.get("completing") or _s.get("auto_done"):
+            continue              # финализируется/готово — покажет список файлов
+        _sz = int(_s.get("size") or 0)
+        if _sz <= 0:
+            continue
+        _rc = int(_s.get("received") or 0)
+        _pend.append({
+            "uploadId": _upid,
+            "name": str(_s.get("name") or "файл"),
+            "size": _sz,
+            "received": _rc,
+            "wait_pw": bool(not _s.get("plain") and not _s.get("vault_pw")),
+            "ts": float(_s.get("ts") or _now_ts),
+        })
+    _pend.sort(key=lambda x: x["ts"])
     return web.json_response({
         "files": out,
         "stats": {"count": len(out), "size": total + safe_total},
@@ -20715,7 +20967,12 @@ async def miniapp_files_get(request):
         "bot": _miniapp_bot_username(),
         # ВОЛНА 22.58: живые бот-загрузки — панель передач мини-аппа рисует
         # «Качаю с Telegram: 45%» / «Сохраняю в облако…» для файлов из чата.
-        "bg_live": _bg_live_out(uid),
+        # 22.65: ФИКС NameError — здесь был неопределённый uid (вместо _uid):
+        # /api/files падал 500-й с волны 22.58 — мини-апп не получал список
+        # файлов ВООБЩЕ («не синхронизируется», «после обновления пусто»).
+        "bg_live": _bg_live_out(_uid),
+        # ВОЛНА 22.65: недогруженное — восстановление панели после обновления
+        "pending": _pend,
     })
 
 
@@ -23044,6 +23301,7 @@ async def miniapp_upload_init(request):
     plain_mode = (_user_vault_channel(user) is not None
                   and _vault_channel_plain(user))
     vault_pw = None
+    pw_pending = False
     if not plain_mode:
         vault_pw_raw = _miniapp_vault_pw_from(request, body)
         # ВОЛНА 22.35: не-Latin1 пароль из заголовка URL-кодирован клиентом —
@@ -23053,14 +23311,26 @@ async def miniapp_upload_init(request):
         vault_pw = await asyncio.to_thread(
             _miniapp_vault_pw_pick, user, _vault_pw_candidates(vault_pw_raw)) \
             if vault_pw_raw else None
-        guard = await asyncio.to_thread(_miniapp_vault_pw_guard, user, vault_pw)
-        if guard is None:
-            return _miniapp_err(
-                423, "safe_locked",
-                "🔒 Файлы шифруются паролем Сейфа (как в чате). Введите пароль "
-                "Сейфа — и загрузка продолжится уже зашифрованной.")
-        if guard is not True:
-            return guard
+        if vault_pw:
+            guard = await asyncio.to_thread(
+                _miniapp_vault_pw_guard, user, vault_pw)
+            if guard is None:
+                # страховка (пароль стёрся между pick и guard) — ниже
+                # сессия станет pw_pending и честно дождётся пароля
+                vault_pw = None
+            elif guard is not True:
+                return guard
+        if not vault_pw:
+            # ВОЛНА 22.65: пароля НЕТ — сессия ВСЁ РАВНО создаётся, байты
+            # летят боту СРАЗУ с момента выбора (жалоба: «после обновления
+            # страницы файлы сбрасываются, файл должен сразу лететь в бота,
+            # чтобы грузился даже при закрытии мини аппа»). Раньше init
+            # отвечал 423 и ни байта не ехало до ввода пароля: обновление
+            # страницы теряло выбор целиком. Теперь pw_pending-сессия
+            # ДЕРЖИТСЯ на сервере: пароль догонит из окна загрузки
+            # (complete) или из панели недогруженного; без пароля
+            # финализация честно ответит safe_locked и сессия будет ждать.
+            pw_pending = True
     else:
         # ВОЛНА 22.40: «загружаю в мини-апп и шифрую» — ДОЛЖНО попадать в Сейф
         # бота. В режиме «без шифрования» пароль теперь ОПЦИОНАЛЕН: ввёл пароль
@@ -23138,6 +23408,12 @@ async def miniapp_upload_init(request):
             sess = _miniapp_session_of(request)
             if sess is not None:
                 sess["vault_pw"] = vault_pw
+        # ВОЛНА 22.65: повторный init принёс пароль pw_pending-сессии —
+        # «недорешённость» снята: держать окно больше не нужно, авто-догрузка
+        # закончит файл сама, даже если клиент исчезнет
+        if not plain_mode and vault_pw and _s.get("pw_pending"):
+            _s["pw_pending"] = False
+            _s["hold_until"] = 0.0
         _upload_session_persist(_s)
         # все байты уже были, клиента может снова не стать — страховка:
         # отложенная серверная финализация (клиент обычно успеет сам)
@@ -23153,6 +23429,7 @@ async def miniapp_upload_init(request):
             "uploadId": _upid,
             "chunkSize": int(_s.get("chunk") or _MINIAPP_CHUNK),
             "encrypt": not bool(_s.get("plain")),
+            "pw_pending": bool(_s.get("pw_pending")),
             "resumed": True,
             "received": _rc,
             "parts": _parts_out,
@@ -23179,10 +23456,16 @@ async def miniapp_upload_init(request):
         # загрузки (до complete), в базу не пишем никогда.
         "vault_pw": vault_pw or "",
         "plain": plain_mode,
+        # ВОЛНА 22.65: зашифрованная сессия БЕЗ пароля — ждёт его (окно
+        # загрузки / панель недогруженного / повторный выбор файла), байты
+        # при этом уже летят боту
+        "pw_pending": bool(pw_pending),
         # ВОЛНА 22.59: окно решения для plain-сессии (пароль могут ввести
-        # задним числом — complete перенацелит файл в Сейф)
+        # задним числом — complete перенацелит файл в Сейф).
+        # ВОЛНА 22.65: то же окно — и для pw_pending (пароль может приехать
+        # с опозданием, финализировать раньше нельзя)
         "hold_until": (time.time() + 120.0)
-        if (want_hold_flag and plain_mode) else 0.0,
+        if (want_hold_flag and (plain_mode or pw_pending)) else 0.0,
         # ВОЛНА 22.49: согласованный размер куска — фолбэк index→offset
         # работает даже если клиент шлёт куски нестандартного размера.
         "chunk": _MINIAPP_CHUNK,
@@ -23196,7 +23479,8 @@ async def miniapp_upload_init(request):
         if sess is not None:
             sess["vault_pw"] = vault_pw
     return web.json_response({"uploadId": upload_id, "chunkSize": _MINIAPP_CHUNK,
-                              "encrypt": not plain_mode})
+                              "encrypt": not plain_mode,
+                              "pw_pending": bool(pw_pending)})
 
 
 async def miniapp_upload_chunk(request):
@@ -23791,6 +24075,7 @@ def _upload_session_persist(s):
             "received": int(s.get("received") or 0),
             "chunk": int(s.get("chunk") or _MINIAPP_CHUNK),
             "plain": bool(s.get("plain")),
+            "pw_pending": bool(s.get("pw_pending")),
             "hold_until": float(s.get("hold_until") or 0),
             "parts": sorted(int(i) for i in (s.get("parts") or ())),
             "ts": float(s.get("ts") or time.time()),
@@ -23856,6 +24141,7 @@ def _miniapp_restore_upload_sessions():
                     "ts": float(meta.get("ts") or now),
                     "vault_pw": "",          # на диск не пишем и не читаем
                     "plain": bool(meta.get("plain")),
+                    "pw_pending": bool(meta.get("pw_pending")),
                     "hold_until": float(meta.get("hold_until") or 0),
                     "chunk": int(meta.get("chunk") or _MINIAPP_CHUNK),
                     "parts": set(int(i) for i in (_parts or [])
