@@ -7717,7 +7717,41 @@ async function upqAll() {
 
 let RESUMING = false;
 
-async function resumePendingUploads() {
+/* ═══ ВОЛНА 22.67: АВТО-РЕТРАЙ ДОКАЧКИ, ПОКА АПП ОТКРЫТ ═══
+   Жалоба: «пользователь загружает большой файл, разработчик обновляет бота
+   — всё сбрасывается». Раньше после сбоя (редеплой бота = сеть отвалилась
+   на минуты) файл оставался в очереди IndexedDB, но ДОКАЧКА ЖДАЛА,
+   ПОКА пользователь не свернёт/не переоткроет апп (resume дёргался только
+   на visibilitychange/boot). Теперь движок сам переподнимает очередь
+   через растущие паузы (20с → 5мин), пока апп открыт. Soft-режим НЕ сжигает
+   бюджет tries (12) и молчит без тостов. */
+let _upRetryTimer = null;
+let _upRetryPlan = 0;   /* индекс текущей паузы */
+let _upSoftTries = 0;   /* мягких запусков за сессию (анти-зацикливание) */
+const UP_RETRY_DELAYS = [20000, 40000, 60000, 120000, 180000, 300000];
+
+function scheduleUploadRetry() {
+  if (!IS_TELEGRAM && !WEB_TOKEN) return;
+  if (_upSoftTries >= 120) return; /* ~несколько часов попыток — хватит */
+  const delay = UP_RETRY_DELAYS[Math.min(_upRetryPlan, UP_RETRY_DELAYS.length - 1)];
+  _upRetryPlan++;
+  clearTimeout(_upRetryTimer);
+  _upRetryTimer = setTimeout(() => {
+    if (isUploading || RESUMING || document.hidden) return;
+    _upSoftTries++;
+    resumePendingUploads({ soft: true });
+  }, delay);
+}
+
+function resetUploadRetry() {
+  /* успех — схема пауз начинается заново */
+  _upRetryPlan = 0;
+  clearTimeout(_upRetryTimer);
+}
+
+async function resumePendingUploads(opts) {
+  const soft = !!(opts && opts.soft);
+
   if (isUploading || RESUMING) return;
 
   /* ВОЛНА 22.47: без входа — тихий выход (раньше этот вызов при каждом
@@ -7729,7 +7763,7 @@ async function resumePendingUploads() {
 
   try { entries = await upqAll(); } catch (e) {}
 
-  if (!entries.length) return;
+  if (!entries.length) { resetUploadRetry(); return; }
 
   RESUMING = true;
 
@@ -7744,11 +7778,16 @@ async function resumePendingUploads() {
   const files = [];
 
   for (const e of entries) {
-    e.tries = (+e.tries || 0) + 1;
+    /* 22.67: soft-режим (авто-ретрай в открытом аппе) НЕ тратит бюджет
+       tries — он только для явных открытий аппа; иначе фоновые тики
+       выкинули бы файл из очереди через 12 тиков */
+    if (!soft) {
+      e.tries = (+e.tries || 0) + 1;
 
-    if (e.tries > 12) { upqDel(e.k); dropped++; continue; }
+      if (e.tries > 12) { upqDel(e.k); dropped++; continue; }
 
-    upqPut(e);
+      upqPut(e);
+    }
 
     try {
       const f = new File([e.blob], e.name || 'file.bin', { type: e.mime || '' });
@@ -7764,19 +7803,22 @@ async function resumePendingUploads() {
     } catch (err) { upqDel(e.k); lostBlob++; }
   }
 
-  if (dropped) {
+  if (dropped && !soft) {
     showToast('🧹 ' + dropped + ' файл(ов) не удалось загрузить после 12 попыток — убран(ы) из очереди');
   }
 
   /* 22.61: телефон не сохранил байты между запусками (редко, но бывает
      на iOS) — пользователь ДОЛЖЕН знать, что файлы нужно загрузить заново,
      иначе «тихая потеря» выглядит как баг */
-  if (lostBlob) {
+  if (lostBlob && !soft) {
     showToast('⚠️ ' + lostBlob + ' файл(ов) не сохранились на телефоне для докачки — загрузите их заново');
   }
 
   if (files.length) {
-    showToast('⏳ Продолжаю прерванную загрузку: ' + files.length + ' файл(ов)');
+    /* 22.67: в soft-режиме молча — тосты только на явных открытиях */
+    if (!soft) {
+      showToast('⏳ Продолжаю прерванную загрузку: ' + files.length + ' файл(ов)');
+    }
 
     proceedUpload(files, { resume: true });
   }
@@ -8940,6 +8982,9 @@ async function uploadEngine(bar) {
            22.59: сессия решена — из реестра «недорешённых» убираем */
         file._doneFlag = true;
 
+        /* 22.67: файл загрузился — паузы авто-ретрая начинаются заново */
+        resetUploadRetry();
+
         if (file._preId) PRE_HELD.delete(file._preId);
       } catch (e) {
         if (e.message === 'aborted' || uploadAbortFlag) {
@@ -8958,6 +9003,12 @@ async function uploadEngine(bar) {
         }
 
         failedFiles.push({ file: file, e: e });
+
+        /* 22.67: НЕ сдаваться, пока апп открыт — бот мог просто
+           обновляться (деплой). Переподнимем очередь из IndexedDB
+           через растущие паузы; файл остаётся в очереди и докачается
+           сам, когда бот проснётся. */
+        scheduleUploadRetry();
       }
 
       topUpFile(file);
