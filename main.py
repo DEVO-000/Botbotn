@@ -2281,8 +2281,14 @@ class User:
         # (TTL 3 ч) — переживает рестарт сервера, как duty_pending.
         self.ct_pending = None
         # ВОЛНА 22.41: бот ждёт от админа СПИСОК ЗВОНКОВ целиком («весь
-        # список вручную»). {"ts": epoch} или None, TTL 3 ч.
+        # список вручную"). {"ts": epoch} или None, TTL 3 ч.
         self.bells_pending = None
+        # ВОЛНА 22.67: бот ждёт НАЗВАНИЕ КЛАССА («➕ Создать класс»). ПЕРСИСТЕНТЕН
+        # (TTL 2 ч): после рестарта/деплоя бота FSM-состояние CREATE_CLASS_NAME
+        # терялось, присланное название молча пропадало («класс не создаётся, а
+        # потом пишет, что нет прав к админке»). Теперь название доведёт
+        # глобальный приёмник _cls_pending_text_handler.
+        self.cls_pending = None
         self.birthday = None
         # ВОЛНА 22.28: пропустить ввод ДР больше нельзя — дата обязательна.
         # Флаг остался только для совместимости старых JSON-записей; при
@@ -2514,6 +2520,8 @@ class User:
             'ct_pending': getattr(self, 'ct_pending', None),
             # ВОЛНА 22.41: ожидаемый список звонков целиком (переживает рестарт)
             'bells_pending': getattr(self, 'bells_pending', None),
+            # ВОЛНА 22.67: ожидаемое название класса (переживает рестарт)
+            'cls_pending': getattr(self, 'cls_pending', None),
             'birthday': self.birthday,
             'birthday_skipped': getattr(self, 'birthday_skipped', False),
             'show_birthday_countdown': self.show_birthday_countdown,
@@ -2660,6 +2668,20 @@ class User:
                     user.bells_pending = None
             except Exception:
                 user.bells_pending = None
+        # ВОЛНА 22.67: флаг «ждём название класса» (TTL 2 ч).
+        if not hasattr(user, 'cls_pending') or not isinstance(user.cls_pending, dict):
+            user.cls_pending = None
+        else:
+            try:
+                if (time.time() - float(user.cls_pending.get('ts') or 0)) > 2 * 3600:
+                    user.cls_pending = None
+            except Exception:
+                user.cls_pending = None
+        # ВОЛНА 22.67: старые записи могли сохранить created_classes=None —
+        # create_class_handler падал на .append ДО сохранения класса
+        # («класс не создаётся»), молча для пользователя.
+        if not isinstance(user.created_classes, list):
+            user.created_classes = []
         if not hasattr(user, 'birthday_eve_notify') or user.birthday_eve_notify is None:
             user.birthday_eve_notify = True
         if not hasattr(user, 'dnd_enabled') or user.dnd_enabled is None:
@@ -2896,6 +2918,12 @@ class Class:
         # Утром бот просто присылает имена из плана («сегодня дежурит тот или
         # такоже»); план строит ИИ по списку, либо админ присылает даты сам.
         self.duty_custom = None
+        # ВОЛНА 22.67: «Расписание с сайтов» — последний расписание/файл,
+        # присланные классу монитором или выбранные админом:
+        # {"text": str|"", "kind": "text"|"file", "name": str, "url": str,
+        #  "host": str, "title": str, "ts": "YYYY-MM-DD HH:MM"}
+        # Показывается ученикам в «📅 Расписание» секцией «🌐 Расписание с сайтов».
+        self.schedule_web = None
 
     def to_dict(self):
         return {
@@ -2928,6 +2956,8 @@ class Class:
             'duty_last_date': getattr(self, 'duty_last_date', None),
             # ВОЛНА 22.35: свой график (имена без ТГ-аккаунтов)
             'duty_custom': getattr(self, 'duty_custom', None),
+            # ВОЛНА 22.67: «Расписание с сайтов» (последнее присланное классу)
+            'schedule_web': getattr(self, 'schedule_web', None),
         }
 
     @classmethod
@@ -2959,6 +2989,22 @@ class Class:
             class_obj.duty_count = max(1, min(3, int(getattr(class_obj, 'duty_count', 1) or 1)))
         except (TypeError, ValueError):
             class_obj.duty_count = 1
+        # ВОЛНА 22.67: «Расписание с сайтов» — старые классы без поля не падают.
+        if not isinstance(getattr(class_obj, 'schedule_web', None), dict):
+            class_obj.schedule_web = None
+        else:
+            class_obj.schedule_web = {
+                'text': str(class_obj.schedule_web.get('text') or '')[:4000],
+                'kind': str(class_obj.schedule_web.get('kind') or 'text'),
+                'name': str(class_obj.schedule_web.get('name') or '')[:120],
+                'url': str(class_obj.schedule_web.get('url') or '')[:500],
+                'host': str(class_obj.schedule_web.get('host') or '')[:120],
+                'title': str(class_obj.schedule_web.get('title') or '')[:200],
+                'ts': str(class_obj.schedule_web.get('ts') or '')[:16],
+            }
+            if not (class_obj.schedule_web['text']
+                    or class_obj.schedule_web['name']):
+                class_obj.schedule_web = None
         return class_obj
 
 
@@ -3131,9 +3177,25 @@ def load_classes():
     _cache_last_update['classes'] = current_time
     return classes
 
+def _classes_force_reload():
+    """ВОЛНА 22.67: принудительное перечитывание классов С ДИСКА/ИЗ БД,
+    минуя TTL-кэш. Нужен там, где права критичны СЕЙЧАС: admin_panel не
+    должен врать «нет прав», если кэш отстал от сохранённых данных."""
+    try:
+        _cache_last_update.pop('classes', None)
+    except Exception:
+        pass
+    return load_classes()
+
+
 def save_classes(classes):
     global _classes_cache
     _classes_cache = classes
+    # ВОЛНА 22.67: кэш обязан считаться СВЕЖИМ после записи — раньше метка
+    # _cache_last_update['classes'] не обновлялась, и первое же load_classes()
+    # после истечения TTL перечитывало источник заново (Supabase/диск), хотя
+    # в памяти уже лежали только что сохранённые данные.
+    _cache_last_update['classes'] = time.time()
     data = {class_code: class_obj.to_dict() for class_code, class_obj in classes.items()}
     return save_data(CLASSES_FILE, data)
 
@@ -3696,7 +3758,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.66"
+BOT_BUILD = "22.67"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -7082,6 +7144,36 @@ def _vault_flush_soon(context, reason="сейф"):
         return task
     except Exception as e:
         logger.warning(f"vault flush soon: {e}")
+        return None
+
+
+# ВОЛНА 22.67: троттлинг «быстрых» сливов после критических сохранений
+# (создание/вход/выход из класса, регистрация). Полный force-слив — дорогая
+# операция (zip+загрузка+пин в каждый канал), поэтому чаще раза в 10 секунд
+# его не делаем: остальное довезёт тикер (30 с) или post_shutdown.
+_CDB_SOON_LAST_MONO = 0.0
+
+
+def _cdb_flush_soon(context, reason="критичные данные"):
+    """ВОЛНА 22.67: НЕМЕДЛЕННЫЙ слив базы в канал после критических событий —
+    жалоба: «пользователь создаёт класс, и он сразу удаляется» (рестарт/
+    деплой бота в первые 30 секунд после создания съедал класс: тикер не
+    успевал слить снапшот, а на Render диск при деплое стирается)."""
+    global _CDB_SOON_LAST_MONO
+    try:
+        import time as _time
+        now_mono = _time.monotonic()
+        if now_mono - _CDB_SOON_LAST_MONO < 10.0:
+            return None  # недавно сливали — довезёт тикер
+        _CDB_SOON_LAST_MONO = now_mono
+        task = asyncio.create_task(
+            _cdb_flush(context, force=True, reason=reason))
+        _bd = getattr(getattr(context, "application", None), "bot_data", None)
+        if isinstance(_bd, dict):
+            _bd.setdefault("_bg_tasks", []).append(task)
+        return task
+    except Exception as e:
+        logger.warning(f"cdb flush soon: {e}")
         return None
 
 
@@ -16899,7 +16991,41 @@ async function upqAll() {
 
 let RESUMING = false;
 
-async function resumePendingUploads() {
+/* ═══ ВОЛНА 22.67: АВТО-РЕТРАЙ ДОКАЧКИ, ПОКА АПП ОТКРЫТ ═══
+   Жалоба: «пользователь загружает большой файл, разработчик обновляет бота
+   — всё сбрасывается». Раньше после сбоя (редеплой бота = сеть отвалилась
+   на минуты) файл оставался в очереди IndexedDB, но ДОКАЧКА ЖДАЛА,
+   ПОКА пользователь не свернёт/не переоткроет апп (resume дёргался только
+   на visibilitychange/boot). Теперь движок сам переподнимает очередь
+   через растущие паузы (20с → 5мин), пока апп открыт. Soft-режим НЕ сжигает
+   бюджет tries (12) и молчит без тостов. */
+let _upRetryTimer = null;
+let _upRetryPlan = 0;   /* индекс текущей паузы */
+let _upSoftTries = 0;   /* мягких запусков за сессию (анти-зацикливание) */
+const UP_RETRY_DELAYS = [20000, 40000, 60000, 120000, 180000, 300000];
+
+function scheduleUploadRetry() {
+  if (!IS_TELEGRAM && !WEB_TOKEN) return;
+  if (_upSoftTries >= 120) return; /* ~несколько часов попыток — хватит */
+  const delay = UP_RETRY_DELAYS[Math.min(_upRetryPlan, UP_RETRY_DELAYS.length - 1)];
+  _upRetryPlan++;
+  clearTimeout(_upRetryTimer);
+  _upRetryTimer = setTimeout(() => {
+    if (isUploading || RESUMING || document.hidden) return;
+    _upSoftTries++;
+    resumePendingUploads({ soft: true });
+  }, delay);
+}
+
+function resetUploadRetry() {
+  /* успех — схема пауз начинается заново */
+  _upRetryPlan = 0;
+  clearTimeout(_upRetryTimer);
+}
+
+async function resumePendingUploads(opts) {
+  const soft = !!(opts && opts.soft);
+
   if (isUploading || RESUMING) return;
 
   /* ВОЛНА 22.47: без входа — тихий выход (раньше этот вызов при каждом
@@ -16911,7 +17037,7 @@ async function resumePendingUploads() {
 
   try { entries = await upqAll(); } catch (e) {}
 
-  if (!entries.length) return;
+  if (!entries.length) { resetUploadRetry(); return; }
 
   RESUMING = true;
 
@@ -16926,11 +17052,16 @@ async function resumePendingUploads() {
   const files = [];
 
   for (const e of entries) {
-    e.tries = (+e.tries || 0) + 1;
+    /* 22.67: soft-режим (авто-ретрай в открытом аппе) НЕ тратит бюджет
+       tries — он только для явных открытий аппа; иначе фоновые тики
+       выкинули бы файл из очереди через 12 тиков */
+    if (!soft) {
+      e.tries = (+e.tries || 0) + 1;
 
-    if (e.tries > 12) { upqDel(e.k); dropped++; continue; }
+      if (e.tries > 12) { upqDel(e.k); dropped++; continue; }
 
-    upqPut(e);
+      upqPut(e);
+    }
 
     try {
       const f = new File([e.blob], e.name || 'file.bin', { type: e.mime || '' });
@@ -16946,19 +17077,22 @@ async function resumePendingUploads() {
     } catch (err) { upqDel(e.k); lostBlob++; }
   }
 
-  if (dropped) {
+  if (dropped && !soft) {
     showToast('🧹 ' + dropped + ' файл(ов) не удалось загрузить после 12 попыток — убран(ы) из очереди');
   }
 
   /* 22.61: телефон не сохранил байты между запусками (редко, но бывает
      на iOS) — пользователь ДОЛЖЕН знать, что файлы нужно загрузить заново,
      иначе «тихая потеря» выглядит как баг */
-  if (lostBlob) {
+  if (lostBlob && !soft) {
     showToast('⚠️ ' + lostBlob + ' файл(ов) не сохранились на телефоне для докачки — загрузите их заново');
   }
 
   if (files.length) {
-    showToast('⏳ Продолжаю прерванную загрузку: ' + files.length + ' файл(ов)');
+    /* 22.67: в soft-режиме молча — тосты только на явных открытиях */
+    if (!soft) {
+      showToast('⏳ Продолжаю прерванную загрузку: ' + files.length + ' файл(ов)');
+    }
 
     proceedUpload(files, { resume: true });
   }
@@ -18122,6 +18256,9 @@ async function uploadEngine(bar) {
            22.59: сессия решена — из реестра «недорешённых» убираем */
         file._doneFlag = true;
 
+        /* 22.67: файл загрузился — паузы авто-ретрая начинаются заново */
+        resetUploadRetry();
+
         if (file._preId) PRE_HELD.delete(file._preId);
       } catch (e) {
         if (e.message === 'aborted' || uploadAbortFlag) {
@@ -18140,6 +18277,12 @@ async function uploadEngine(bar) {
         }
 
         failedFiles.push({ file: file, e: e });
+
+        /* 22.67: НЕ сдаваться, пока апп открыт — бот мог просто
+           обновляться (деплой). Переподнимем очередь из IndexedDB
+           через растущие паузы; файл остаётся в очереди и докачается
+           сам, когда бот проснётся. */
+        scheduleUploadRetry();
       }
 
       topUpFile(file);
@@ -38081,6 +38224,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user = get_user(user_id)
 
+    # ВОЛНА 22.67: /start перезапускает диалог — ожидание названия класса
+    # (персистентный флаг после «➕ Создать класс») больше не актуально.
+    if user is not None and getattr(user, "cls_pending", None):
+        user.cls_pending = None
+        save_user(user)
+
     # ПУНКТ 1: Инструкция показывается СРАЗУ при /start (для всех — новых и старых).
     # После нажатия "Я прочитал(а) инструкцию" — продолжается регистрация как раньше.
     is_new_user = user is None
@@ -39276,6 +39425,8 @@ async def _global_cancel_cleanup(update: Update, context: ContextTypes.DEFAULT_T
                 user.ct_pending = None
             if getattr(user, "bells_pending", None):
                 user.bells_pending = None
+            if getattr(user, "cls_pending", None):
+                user.cls_pending = None   # 22.67: и ожидание названия класса
             save_user(user)
     except Exception:
         pass
@@ -39436,6 +39587,16 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ВОЛНА 22.13: отметка дневной активности (для DAU/WAU/MAU статистики).
     _touch_activity(user_id)
     message_text = update.message.text
+
+    # ВОЛНА 22.67: пользователь в главном меню — ожидание названия класса
+    # («➕ Создать класс») прервано: снимаем персистентный флаг, чтобы
+    # случайный текст позже не создал класс.
+    try:
+        if getattr(user, "cls_pending", None):
+            user.cls_pending = None
+            save_user(user)
+    except Exception:
+        pass
 
     # ПУНКТ 4: если пользователь переименовал кнопку, отображаемое имя нужно
     # сопоставить с оригинальным, чтобы внутренняя логика осталась рабочей.
@@ -39821,6 +39982,22 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 image_days.append((day, payload))
             else:
                 parts.append(f"\n📌 {day}:\n{payload}")
+
+        # ВОЛНА 22.67: «🌐 Расписание с сайтов» — последнее расписание,
+        # полученное монитором админ-панели («🌐 Расписание с сайтов») или
+        # выбранное админом. Ученики видят его прямо в «📅 Расписание»,
+        # а не только отдельным сообщением в чате.
+        _web = getattr(class_obj, "schedule_web", None)
+        if isinstance(_web, dict) and str(_web.get("text") or "").strip():
+            _when = str(_web.get("ts") or "").strip()
+            _host = str(_web.get("host") or "").strip()
+            _head = "\n🌐 Расписание с сайтов"
+            if _host:
+                _head += f" ({_host})"
+            if _when:
+                _head += f" — обновлено {_when}"
+            parts.append(_head + ":\n" + str(_web.get("text") or "").strip())
+
         full_text = "\n".join(parts)
 
         # У Telegram есть лимит ~4096 символов на сообщение. Если расписание
@@ -43629,6 +43806,30 @@ def schmon_recipients(class_obj):
     return ids
 
 
+def _schmon_store_web(class_obj, url, info, text="", kind="text", name=""):
+    """ВОЛНА 22.67: запомнить в КЛАССЕ последнее «Расписание с сайтов».
+
+    Просьба: «оно должно приходить В РАСПИСАНИЯ классу» — теперь выбранное
+    или обновлённое расписание пишется в class_obj.schedule_web и видно
+    ученикам в «📅 Расписание» секцией «🌐 Расписание с сайтов», а не только
+    разлетается сообщениями (которые легко потерять в чате)."""
+    try:
+        if class_obj is None:
+            return
+        class_obj.schedule_web = {
+            "text": str(text or "")[:4000],
+            "kind": str(kind or "text"),
+            "name": str(name or "")[:120],
+            "url": str(url or "")[:500],
+            "host": schmon_host_of(url)[:120],
+            "title": str((info or {}).get("title") or "")[:200],
+            "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        }
+        save_class(class_obj)
+    except Exception as e:
+        logger.warning(f"schmon_store_web: {e}")
+
+
 async def schmon_notify(app, class_code, url, info, new_files=(),
                         schedule_text=None):
     """Авторассылка классу: прислать ТОЛЬКО изменившееся расписание — ОДИН
@@ -43669,6 +43870,9 @@ async def schmon_notify(app, class_code, url, info, new_files=(),
         if sent_any:
             schmon_mark_sent(info, digest)
             schmon_use_daily_quota(info)
+            # ВОЛНА 22.67: расписание-файл запоминаем и В КЛАССЕ — его видно
+            # в «📅 Расписание» секцией «🌐 Расписание с сайтов».
+            _schmon_store_web(class_obj, url, info, kind="file", name=name)
             return True  # ровно ОДИН файл/фото за день!
 
     if handled:
@@ -43686,6 +43890,9 @@ async def schmon_notify(app, class_code, url, info, new_files=(),
                 sent_any = True
         if sent_any:
             schmon_use_daily_quota(info)
+            # ВОЛНА 22.67: текст запоминаем в КЛАССЕ (секция «📅 Расписание»).
+            _schmon_store_web(class_obj, url, info,
+                              text=schedule_text, kind="text")
             return True
 
     # Если ни фото, ни файлов, ни текста расписания не нашли — молчим
@@ -44165,9 +44372,11 @@ async def schmon_url_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def _schmon_send_candidate_admin(bot, url, info, u, admin_chat_id,
-                                       skip_dup=False):
+                                       skip_dup=False, also_chats=None):
     """Скачать и отправить один выбранный источник админу; запомнить выбор.
-    skip_dup=True — не слать, если такое же содержимое уже отправлялось."""
+    skip_dup=True — не слать, если такое же содержимое уже отправлялось.
+    ВОЛНА 22.67: also_chats — список chat_id, кому продублировать ТО ЖЕ
+    содержимое (класс: выбранное админом сразу уходит всем ученикам)."""
     dl = await asyncio.to_thread(schmon_download_file, u, url)
     if not dl:
         return False
@@ -44186,6 +44395,13 @@ async def _schmon_send_candidate_admin(bot, url, info, u, admin_chat_id,
         if u not in sel:
             sel.append(u)
         info["sel"] = sel
+        # ВОЛНА 22.67: выбранное админом расписание сразу уходит и классу.
+        for _chat in (also_chats or []):
+            try:
+                await schmon_send_item(bot, _chat, u, data, name,
+                                       schmon_host_of(url))
+            except Exception as _e:
+                logger.warning(f"schmon also_chats {_chat}: {_e}")
     return ok
 
 
@@ -44226,8 +44442,17 @@ async def schmon_pick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("Отправляю…")
     except Exception:
         pass
+    # ВОЛНА 22.67: выбранное админом сразу уходит и ВСЕМУ классу
+    # (ученики + админы, без заблокированных, без самого выбравшего —
+    # ему уже пришло). Дневная квота НЕ тратится: это явное действие админа.
+    _also = [c for c in schmon_recipients(class_obj)
+             if str(c) != str(uid)]
     ok = await _schmon_send_candidate_admin(context.bot, url, info,
-                                            cands[idx][0], uid)
+                                            cands[idx][0], uid,
+                                            also_chats=_also)
+    if ok:
+        _schmon_store_web(class_obj, url, info, kind="file",
+                          name=(cands[idx][0] or "").rsplit("/", 1)[-1])
     schmon_merge_info(class_code, url, info)
     if not ok:
         try:
@@ -44271,6 +44496,20 @@ async def schmon_text_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if "TEXT" not in sel:
             sel.append("TEXT")
         info["sel"] = sel
+        # ВОЛНА 22.67: выбранное расписание сразу уходит и ВСЕМУ классу
+        # (без выбравшего админа — ему уже пришло), и запоминается в классе:
+        # секция «🌐 Расписание с сайтов» в «📅 Расписание».
+        _also = [c for c in schmon_recipients(class_obj)
+                 if str(c) != str(uid)]
+        for _chat in _also:
+            try:
+                await schmon_send_text(
+                    context.bot, _chat,
+                    "📅 Расписание\n%s\n\n%s" % (schmon_host_of(url), sch_text))
+            except Exception as _e:
+                logger.warning(f"schmon text also {_chat}: {_e}")
+        _schmon_store_web(class_obj, url, info,
+                          text=sch_text, kind="text")
     schmon_merge_info(class_code, url, info)
     if not ok:
         await schmon_send_text(context.bot, uid,
@@ -44299,10 +44538,18 @@ async def schmon_all_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
     sent_any = False
+    # ВОЛНА 22.67: класс получает копии того же содержимого (без админа).
+    _also = [c for c in schmon_recipients(class_obj)
+             if str(c) != str(uid)]
+    _last_name = ""
     for u, _k in (info.get("cand") or [])[:SCHEDMON_MAX_FILES_PER_NOTIFY]:
         if await _schmon_send_candidate_admin(context.bot, url, info, u, uid,
-                                              skip_dup=True):
+                                              skip_dup=True,
+                                              also_chats=_also):
             sent_any = True
+            _last_name = str(u or "").rsplit("/", 1)[-1]
+    if sent_any:
+        _schmon_store_web(class_obj, url, info, kind="file", name=_last_name)
     schmon_merge_info(class_code, url, info)
     if not sent_any:
         await schmon_send_text(context.bot, uid,
@@ -44395,16 +44642,25 @@ async def schmon_check_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==================================
 
 @timeout(CONVERSATION_TIMEOUT)
-async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                      _trusted: bool = False):
     user_id = str(update.effective_user.id)
     user = get_user(user_id)
     if not user:
         user = User(user_id)
 
-    if not is_user_class_admin(user_id):
-        error_text = "❌ У вас нет прав доступа к админке."
-        await update.message.reply_text(error_text)
-        return MAIN_MENU
+    # ВОЛНА 22.67: _trusted=True — вызов СРАЗУ после создания класса:
+    # создатель только что сохранён админом (проверено форс-перечитыванием),
+    # повторная проверка может дать ложный «нет прав» на устаревшем кэше.
+    if not _trusted and not is_user_class_admin(user_id):
+        # ВОЛНА 22.67: прежде чем отказать — перечитываем классы С ДИСКА/ИЗ
+        # БД минуя кэш (TTL-кэш мог отстать от только что сохранённых данных
+        # или от другой копии базы). Ложные «❌ нет прав» больше не показываем.
+        _classes_force_reload()
+        if not is_user_class_admin(user_id):
+            error_text = "❌ У вас нет прав доступа к админке."
+            await update.message.reply_text(error_text)
+            return MAIN_MENU
 
     user_classes = []
     classes = load_classes()
@@ -44413,9 +44669,15 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_classes.append(class_obj)
 
     if not user_classes:
-        error_text = "❌ У вас нет прав доступа."
-        await update.message.reply_text(error_text)
-        return MAIN_MENU
+        if not _trusted:
+            _classes_force_reload()
+            for class_obj in _classes_force_reload().values():
+                if class_obj.is_active and user_id in class_obj.admins:
+                    user_classes.append(class_obj)
+        if not user_classes:
+            error_text = "❌ У вас нет прав доступа."
+            await update.message.reply_text(error_text)
+            return MAIN_MENU
 
     if len(user_classes) == 1:
         class_obj = user_classes[0]
@@ -45654,37 +45916,82 @@ async def create_class_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = update.callback_query
     await query.answer()
 
+    # ВОЛНА 22.67: запоминаем «ждём название класса» В БАЗЕ (TTL 2 ч).
+    # Если бот перезапустится/задеплоится, пока пользователь печатает название,
+    # FSM-состояние CREATE_CLASS_NAME потеряется, и текст молча пропадал
+    # («класс не создаётся») — теперь глобальный приёмник доведёт название.
+    try:
+        _uid = str(update.effective_user.id)
+        _user = get_user(_uid)
+        if _user is not None:
+            _user.cls_pending = {"ts": time.time()}
+            save_user(_user)
+    except Exception as e:
+        logger.warning(f"create_class_start: не пометил cls_pending: {e}")
+
     text = "➕ Введите название класса (например, '10А' или 'Информатика 2024'):"
 
     await query.edit_message_text(text, reply_markup=get_cancel_keyboard())
     return CREATE_CLASS_NAME
 
-@timeout(CONVERSATION_TIMEOUT)
-async def create_class_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+async def _cls_pending_finalize(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                                user, class_name: str):
+    """ВОЛНА 22.67: общая часть создания класса (используется и FSM-хендлером,
+    и глобальным приёмником после потери состояния). Здесь:
+      • защита от крашей ДО сохранения (created_classes=None у старых записей);
+      • проверка, что класс ДЕЙСТВИТЕЛЬНО записан (форс-перечитывание) — при
+        неудаче одна повторная попытка, затем честная ошибка пользователю;
+      • мгновенный слив снапшота в канал (_cdb_flush_soon) — класс не должен
+        «создаться и сразу удалиться» при рестарте/деплое бота;
+      • админ-панель сразу после создания с trust-флагом (без повторной
+        проверки прав — создатель не может «не иметь прав» на только что
+        созданный им класс)."""
     user_id = str(update.effective_user.id)
-    user = get_user(user_id)
-    if not user:
-        user = User(user_id)
-    class_name = update.message.text.strip()
 
-    if not class_name:
-        await update.message.reply_text("Введите название класса:")
-        return CREATE_CLASS_NAME
+    # 1) Починка полей, которые могли быть мусором у старых записей.
+    if not isinstance(getattr(user, 'created_classes', None), list):
+        user.created_classes = []
 
-    rejected = await reject_if_forbidden_chars(update, class_name, CREATE_CLASS_NAME)
-    if rejected is not None:
-        return rejected
+    # 2) Создание + сохранение с ОДНОЙ повторной попыткой.
+    saved = False
+    last_err = None
+    for attempt in range(2):
+        try:
+            class_code = generate_class_code()
+            class_obj = Class(class_code, class_name, user_id)
 
-    class_code = generate_class_code()
-    class_obj = Class(class_code, class_name, user_id)
+            classes = load_classes()
+            classes[class_code] = class_obj
+            save_classes(classes)
 
-    classes = load_classes()
-    classes[class_code] = class_obj
-    save_classes(classes)
+            user.class_code = class_code
+            if class_code not in user.created_classes:
+                user.created_classes.append(class_code)
+            user.cls_pending = None
+            save_user(user)
 
-    user.class_code = class_code
-    user.created_classes.append(class_code)
-    save_user(user)
+            # 3) Проверяем, что класс действительно сохранён (минуя кэш).
+            check = _classes_force_reload().get(class_code)
+            if check is not None and user_id in (check.admins or []):
+                saved = True
+                break
+            last_err = RuntimeError("класс не найден после записи")
+        except Exception as e:
+            last_err = e
+            logger.error(f"create class attempt {attempt + 1}: {e}")
+    if not saved:
+        try:
+            user.cls_pending = None
+            save_user(user)
+        except Exception:
+            pass
+        await update.message.reply_text(
+            "⚠️ Не удалось сохранить класс (ошибка базы). Попробуйте ещё "
+            "раз через минуту — если повторится, нажмите «❌ Отмена» и "
+            "начните заново.")
+        logger.error(f"create class FAILED: {last_err}")
+        return MAIN_MENU
 
     await update.message.reply_text(
         f"✅ Класс '{class_name}' создан!\n\n"
@@ -45703,12 +46010,38 @@ async def create_class_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception:
         pass
 
-    # Сразу показываем создателю класса админ-панель — без лишнего шага через
-    # «Управление классами». Создатель автоматически становится админом класса
-    # (см. Class.__init__: self.admins = [str(creator_id)]), поэтому admin_panel
-    # успешно пройдёт проверку прав.
+    # 4) Мгновенный слив снапшота в канал — класс переживает рестарт/деплой.
+    _cdb_flush_soon(context, reason="создан класс")
+
+    # 5) Сразу показываем создателю админ-панель (trust: права только что
+    #    проверены сохранением — admins=[создатель]).
     context.user_data['current_admin_class'] = class_code
-    return await admin_panel(update, context)
+    return await admin_panel(update, context, _trusted=True)
+
+
+@timeout(CONVERSATION_TIMEOUT)
+async def create_class_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    user = get_user(user_id)
+    if not user:
+        user = User(user_id)
+    class_name = update.message.text.strip()
+
+    if not class_name:
+        await update.message.reply_text("Введите название класса:")
+        return CREATE_CLASS_NAME
+
+    rejected = await reject_if_forbidden_chars(update, class_name, CREATE_CLASS_NAME)
+    if rejected is not None:
+        return rejected
+
+    # ВОЛНА 22.67: FSM-путь отработал — персистентный флаг больше не нужен.
+    try:
+        user.cls_pending = None
+    except Exception:
+        pass
+
+    return await _cls_pending_finalize(update, context, user, class_name)
 
 @timeout(CONVERSATION_TIMEOUT)
 async def join_class_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -45760,6 +46093,11 @@ async def join_class_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             logger.error(f"Ошибка при уведомлении админа {admin_id}: {e}")
 
     await update.message.reply_text(f"✅ Вы присоединились к классу '{class_obj.class_name}'!")
+
+    # ВОЛНА 22.67: мгновенный слив снапшота — состав класса должен пережить
+    # рестарт/деплой бота даже в первые 30 секунд после входа.
+    _cdb_flush_soon(context, reason="вход в класс")
+
     return await class_management(update, context)
 
 @timeout(CONVERSATION_TIMEOUT)
@@ -53592,6 +53930,125 @@ class _BellsBulkFilter(filters.MessageFilter):
 
 
 _BELLS_BULK_FILTER = _BellsBulkFilter()
+
+
+# ==================================
+# === ВОЛНА 22.67: СОЗДАНИЕ КЛАССА ВНЕ FSM ===
+# ==================================
+# Жалоба: «создаю класс — пишет "нет прав доступа к админке", класс не
+# создаётся». Корень: «➕ Создать класс» ставит FSM в CREATE_CLASS_NAME, но
+# рестарт/деплой бота (разработчик обновляет бота на ходу) СТИРАЕТ FSM —
+# присланное название молча пропадало, класс не создавался, и «Админская
+# панель» честно отвечала «нет прав» (класса-то нет). Лечится как
+# duty/ct/bells: персистентный флаг user.cls_pending (TTL 2 ч) + глобальный
+# приёмник текста ниже — доводит название до создания класса даже после
+# потери состояния.
+
+_CLS_CANCEL_RE = None  # заполняется лениво (word-фильтры отмены)
+
+
+class _ClsPendingFilter(filters.MessageFilter):
+    """Текст можно считать НАЗВАНИЕМ КЛАССА, только если пользователь ранее
+    нажал «➕ Создать класс» (флаг user.cls_pending жив, TTL 2 ч)."""
+    def filter(self, message):
+        try:
+            if not message.from_user:
+                return False
+            u = get_user(str(message.from_user.id))
+            return bool(u and isinstance(getattr(u, "cls_pending", None), dict))
+        except Exception:
+            return False
+
+
+_CLS_PENDING_FILTER = _ClsPendingFilter()
+
+
+async def _cls_pending_text_handler(update: Update,
+                                    context: ContextTypes.DEFAULT_TYPE):
+    """Глобальный приёмник НАЗВАНИЯ КЛАССА вне ConversationHandler.
+
+    Срабатывает, только если пользователь ранее нажал «➕ Создать класс»
+    (флаг user.cls_pending), а FSM-состояние было потеряно (рестарт/деплой
+    бота). Когда FSM жив, апдейт первым забирает ConversationHandler —
+    двойной обработки нет."""
+    if not update.message or not update.effective_user:
+        return
+    uid = str(update.effective_user.id)
+    user = get_user(uid)
+    if user is None:
+        return
+    pend = getattr(user, "cls_pending", None)
+    if not isinstance(pend, dict):
+        return
+    try:
+        if (time.time() - float(pend.get("ts") or 0)) > 2 * 3600:
+            user.cls_pending = None
+            save_user(user)
+            return
+    except Exception:
+        user.cls_pending = None
+        save_user(user)
+        return
+
+    raw = (update.message.text or "").strip()
+
+    # Отмена — снимаем ожидание (в т.ч. кнопки главного меню: пользователь
+    # ушёл в другое меню, название он вводить не собирается).
+    global _CLS_CANCEL_RE
+    if _CLS_CANCEL_RE is None:
+        try:
+            _CLS_CANCEL_RE = re.compile(
+                "^(❌ ?(отмена|отменить)|отмена|cancel|/cancel|/start)$",
+                re.IGNORECASE)
+        except Exception:
+            _CLS_CANCEL_RE = None
+    if not raw or (_CLS_CANCEL_RE and _CLS_CANCEL_RE.match(raw)):
+        user.cls_pending = None
+        save_user(user)
+        await update.message.reply_text(
+            "Создание класса отменено.",
+            reply_markup=get_main_menu_keyboard(user))
+        return
+
+    # Кнопки главного меню/быстрых команд — НЕ название класса: снимаем
+    # ожидание и отдаём текст штатному меню (иначе после потери FSM кнопка
+    # «📅 Расписание» создала бы класс с таким названием).
+    if raw in QUICK_COMMANDS or raw in ALL_MAIN_MENU_BUTTONS:
+        user.cls_pending = None
+        save_user(user)
+        try:
+            await handle_main_menu(update, context)
+        except Exception:
+            pass
+        return
+
+    # Пользователь уже в классе — создавать второй не будем.
+    if get_class_by_user(uid) is not None:
+        user.cls_pending = None
+        save_user(user)
+        await update.message.reply_text(
+            "Вы уже состоите в классе. Сначала выйдите из него "
+            "(«🚪 Выйти из класса»), затем создайте новый.")
+        return
+
+    # Запрещённые символы — честная ошибка (как в FSM-потоке).
+    err = forbidden_chars_message(raw)
+    if err:
+        user.cls_pending = None
+        save_user(user)
+        await update.message.reply_text(err)
+        return
+
+    if len(raw) > 64:
+        await update.message.reply_text(
+            "Название слишком длинное (максимум 64 символа). Пришлите "
+            "название ещё раз, либо напишите «отмена»:")
+        user.cls_pending = {"ts": time.time()}
+        save_user(user)
+        return
+
+    # Название получили — доводим до конца тем же кодом, что и в FSM.
+    await _cls_pending_finalize(update, context, user, raw)
 
 
 # === ВОЛНА 22.27/22.28: возрастной гейт 13+ ===
@@ -61670,6 +62127,14 @@ def main():
         filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND
         & _BELLS_BULK_FILTER,
         _bells_bulk_text_handler))
+
+    # ВОЛНА 22.67: название класса («➕ Создать класс») вне FSM — переживает
+    # потерю состояния после рестарта/деплоя бота. Тот же персистентный
+    # паттерн, что у duty/ct/bells: флаг user.cls_pending в базе.
+    application.add_handler(MessageHandler(
+        filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND
+        & _CLS_PENDING_FILTER,
+        _cls_pending_text_handler))
 
     # 📤 ВОЛНА 22.57: ГЛОБАЛЬНЫЙ РОУТЕР «ФАЙЛ В ЧАТЕ = ФАЙЛ В ОБЛАКЕ».
     # Стоит ПОСЛЕ ConversationHandler: медиа забирают FSM-состояния
