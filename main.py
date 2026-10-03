@@ -1449,6 +1449,54 @@ def _ensure_parent_dir(path: str) -> None:
         os.makedirs(directory, exist_ok=True)
 
 
+# === ВОЛНА 22.64: СЧЁТЧИК ЗАПИСЕЙ ДАННЫХ (защита от отката базы) ===
+# Жалоба пользователя: «файлы исчезают при обновлении», «иногда бот опять
+# просит день рождения у уже зарегистрированного». Причина: при старте бот
+# применяет ЗАКРЕПЛЁННЫЙ снапшот канала БЕЗУСЛОВНО — если последний слив не
+# успел (рестарт/kill/неудачный пин), снапшот СТАРЕЕ локальных данных, и
+# свежие регистрации/файлы откатываются. Теперь каждое успешное save_data
+# увеличивает монотонный счётчик в служебном файле .data_epoch (рядом с
+# users.json), снапшот несёт ЗНАЧЕНИЕ счётчика на момент сборки (_meta.json
+# data_epoch), а восстановление на старте пропускает снапшот, если локальный
+# счётчик БОЛЬШЕ — локальные данные новее, откатывать их нельзя.
+def _data_epoch_path() -> str:
+    try:
+        return os.path.join(
+            os.path.dirname(os.path.abspath(str(USERS_FILE))) or ".",
+            ".data_epoch")
+    except Exception:
+        return os.path.join(".", ".data_epoch")
+
+
+def _data_epoch_bump() -> None:
+    """Инкремент счётчика записей данных (вызывается из save_data).
+    Служебный файл НЕ шифруется и НЕ входит в снапшот — это только
+    локальный маркер свежести. Любая ошибка гасится: счётчик не должен
+    ломать сохранение данных."""
+    try:
+        p = _data_epoch_path()
+        cur = 0.0
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                cur = float((f.read() or "0").strip() or 0)
+        except Exception:
+            cur = 0.0
+        tmp = p + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(repr(cur + 1.0))
+        os.replace(tmp, p)
+    except Exception:
+        pass
+
+
+def _data_epoch_read() -> float:
+    try:
+        with open(_data_epoch_path(), "r", encoding="utf-8") as f:
+            return float((f.read() or "0").strip() or 0)
+    except Exception:
+        return 0.0
+
+
 # ==================================
 # === ВОЛНА 22.18: ШИФРОВАНИЕ ХРАНИЛИЩА (DVF3, AES-256-GCM, DB_KEY) ===
 # ==================================
@@ -1572,14 +1620,17 @@ def save_data(filename, data):
     if _supabase_ready:
         if _supabase_save(filename, data):
             _cdb_mark_dirty(filename)
+            _data_epoch_bump()   # 22.64: маркер свежести для защиты от отката
             return True
     elif SUPABASE_URL and SUPABASE_KEY:
         if _supabase_try_late_init() and _supabase_save(filename, data):
             _cdb_mark_dirty(filename)
+            _data_epoch_bump()   # 22.64: маркер свежести для защиты от отката
             return True
     # 2) Mongo (legacy)
     if _mongo_kv is not None and _mongo_save(filename, data):
         _cdb_mark_dirty(filename)
+        _data_epoch_bump()       # 22.64: маркер свежести для защиты от отката
         return True
     # 3) Локальный файл — последний шанс. На Render Free данные пропадут
     # после рестарта, но это лучше, чем потерять прямо сейчас.
@@ -1592,6 +1643,7 @@ def save_data(filename, data):
             json.dump(data, f, ensure_ascii=False, indent=2)
         os.replace(_tmpf, filename)
         _cdb_mark_dirty(filename)
+        _data_epoch_bump()       # 22.64: маркер свежести для защиты от отката
         return True
     except Exception as e:
         logger.error(f"Ошибка при сохранении {filename}: {e}")
@@ -3641,7 +3693,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.63"
+BOT_BUILD = "22.64"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -6636,6 +6688,12 @@ def _storage_pack_payload():
         "users": users_n,
         "classes": classes_n,
         "bot": "DEVORKS+",
+        # ВОЛНА 22.64: значение счётчика записей данных НА МОМЕНТ СБОРКИ.
+        # Восстановление на старте сравнивает его с локальным счётчиком:
+        # локальный больше → на диске есть записи ПОЗЖЕ этого снапшота —
+        # применять снапшот нельзя (откат свежих данных). Если снапшот
+        # старого формата (поля нет) — фолбэк: created_utc против mtime.
+        "data_epoch": _data_epoch_read(),
     }
     buf = io.BytesIO()
     # ВОЛНА 9: LZMA (алгоритм 7-Zip) — снапшот базы в канале занимает заметно
@@ -7021,7 +7079,56 @@ def _vault_flush_soon(context, reason="сейф"):
         return None
 
 
-async def _cdb_recall(context, suppress_dirty: bool = True):
+def _cdb_freshness_skip(payload: bytes, fname: str) -> "tuple[bool, str]":
+    """ВОЛНА 22.64: (skip, причина) — НЕ откатывать ли локальную базу этим
+    снапшотом при старте. Жалоба пользователя: «файлы исчезают при
+    обновлении», «бот опять просит день рождения у зарегистрированного» —
+    так выглядел откат свежих данных старым закреплённым снапшотом (последний
+    слив не успел из-за рестарта/kill/неудачного пина). Если на диске есть
+    записи ПОЗЖЕ снапшота — снапшот применять НЕЛЬЗЯ."""
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(payload))
+        try:
+            meta = json.loads(zf.read("_meta.json").decode("utf-8"))
+        finally:
+            zf.close()
+        if not isinstance(meta, dict):
+            return False, ""
+    except Exception:
+        return False, ""
+    # 1) Точный путь (22.64+): счётчик записей в мете против локального.
+    try:
+        snap_epoch = float(meta.get("data_epoch") or 0)
+    except (TypeError, ValueError):
+        snap_epoch = 0.0
+    if snap_epoch > 0:
+        local_epoch = _data_epoch_read()
+        if local_epoch > snap_epoch + 0.5:
+            return True, (f"локальная база НОВЕЕ снапшота «{fname}» (записей: "
+                          f"локально {int(local_epoch)}, в снапшоте "
+                          f"{int(snap_epoch)}) — снапшот НЕ применён, данные "
+                          "остались на месте")
+        return False, ""
+    # 2) Фолбэк (снапшоты до 22.64, без data_epoch): created_utc против
+    #    времени последней записи users.json на диске.
+    try:
+        import calendar as _calendar
+        snap_ts = _calendar.timegm(time.strptime(
+            str(meta.get("created_utc") or ""), "%Y-%m-%d %H:%M:%S"))
+    except Exception:
+        return False, ""
+    try:
+        lm = os.path.getmtime(str(USERS_FILE))
+    except Exception:
+        return False, ""
+    if lm > snap_ts + 5:
+        return True, (f"локальная база НОВЕЕ снапшота «{fname}» (users.json "
+                      "записан позже снапшота) — снапшот НЕ применён")
+    return False, ""
+
+
+async def _cdb_recall(context, suppress_dirty: bool = True,
+                      freshness_guard: bool = False):
     """ВОЛНА 10: «ВСПОМНИТЬ ВСЁ» — вытянуть базу ИЗ КАНАЛА по требованию.
 
     Отличия от восстановления на старте (волна 8):
@@ -7034,6 +7141,12 @@ async def _cdb_recall(context, suppress_dirty: bool = True):
 
     suppress_dirty=True гасит «грязь» после применения (данные только что
     пришли из канала — заливать их обратно немедленно незачем).
+
+    freshness_guard=True (только АВТО-восстановление на старте, 22.64):
+    снапшот, СТАРЕЕ локальных данных, НЕ применяется — раньше это откатывало
+    свежие регистрации/файлы («файлы исчезают», «опять просит ДР»). Ручное
+    «📦 Вспомнить всё» работает БЕЗ этой проверки — человек нажал кнопку,
+    значит хочет применить снапшот именно этот.
 
     Возвращает (ok: bool, отчёт: str)."""
     # ВОЛНА 13: снапшот мог быть ВСТАВЛЕН пользователем и закреплён в любом
@@ -7098,6 +7211,13 @@ async def _cdb_recall(context, suppress_dirty: bool = True):
     # Сериализация со сливом: пока применяем снапшот, тикер не должен
     # параллельно заливать в канал «полустарую» базу.
     async with _get_cdb_flush_lock():
+        # ВОЛНА 22.64: защита от отката — снапшот старше локальных данных
+        # не применяется (только для авто-восстановления на старте).
+        if freshness_guard:
+            _skip, _why = _cdb_freshness_skip(payload, fname)
+            if _skip:
+                logger.info(f"cdb recall: {_why}")
+                return False, _why
         restored, problems = _storage_restore_apply(payload)
         if not restored:
             if problems:
@@ -7245,11 +7365,17 @@ async def _cdb_restore_on_boot(application):
             return
         class _CtxStub:
             bot = application.bot
-        ok, report = await _cdb_recall(_CtxStub(), suppress_dirty=True)
+        ok, report = await _cdb_recall(_CtxStub(), suppress_dirty=True,
+                                       freshness_guard=True)
         if ok:
             logger.info(f"cdb boot: ВСПОМНИЛИ ВСЁ ИЗ КАНАЛА:\n{report}")
             if empty_base:
                 await _boot_dev_restore_hint(application, ok=True, report=report)
+        elif report.startswith("локальная база НОВЕЕ"):
+            # ВОЛНА 22.64: это НЕ ошибка — просто на диске данные свежее
+            # закреплённого снапшота. Честно фиксируем в логе и продолжаем
+            # на локальной базе; слияние в канал выполнит тикер.
+            logger.info(f"cdb boot: восстановление из канала пропущено: {report}")
         else:
             logger.info(f"cdb boot: восстановление не состоялось: {report}")
             if empty_base:
@@ -13539,8 +13665,13 @@ async function syncNow() {
 let RESYNC_TIMER = null;
 
 function maybeAutoResync() {
-  if (!IS_TELEGRAM || listLoading || isUploading) return;
-  if (Date.now() - LAST_SYNC < 20000) return;
+  /* ВОЛНА 22.64: авто-синхронизация работает и в БРАУЗЕРЕ (WEB_TOKEN) —
+     раньше (!IS_TELEGRAM) молча отключала её вне Telegram: файлы, добавленные
+     через бота в чат, не появлялись в веб-облаке без ручной синхронизации
+     («файлы не синхронизируются»). */
+  if (listLoading || isUploading) return;
+  if (!IS_TELEGRAM && !WEB_TOKEN) return;
+  if (Date.now() - LAST_SYNC < 12000) return;
 
   loadFiles(true);
 }
@@ -13561,16 +13692,18 @@ try {
   if (tg && tg.onEvent) tg.onEvent('activated', maybeAutoResync);
 } catch (e) {}
 
-/* ВОЛНА 22.50: тихая авто-синхронизация каждые 45 секунд. Пользователь:
+/* ВОЛНА 22.50: тихая авто-синхронизация. Пользователь:
    «автоматическая синхронизация мини приложения должна быть каждые сколько-то
    секунд/минут, чтобы всё было синхронизировано, но не уведомлять об этом».
+   ВОЛНА 22.64: тик 45 с → 10 с (файлы, добавленные через бота, появляются
+   в облаке заметно быстрее; троттл LAST_SYNC 12 с не даёт лишнего спама).
    loadFiles(true) молчит (без тостов и спиннеров) и обновляет файлы, режим
    шифрования и статус канала. В фоне и без входа не тикает. */
 setInterval(function () {
   if (document.hidden) return;
   if (!IS_TELEGRAM && !WEB_TOKEN) return;   /* не вошли — нечего синхронизировать */
   maybeAutoResync();
-}, 45000);
+}, 10000);
 
 let FILTER = 'all';
 let SEARCH = '';
@@ -23537,6 +23670,32 @@ async def _upload_auto_complete_task(app, upid):
                                            uid, upid)
             except Exception:
                 pass
+        return
+    # ВОЛНА 22.64: ТРАНЗИТНЫЕ ошибки — бот обязан ДОЖАТЬ файл сам, без
+    # клиента («файлы должны грузиться в облако без пользователя»). Раньше
+    # после 3 неудач сессия бросалась НАВСЕГДА: байты лежали на сервере,
+    # файл не появлялся в облаке и «исчезал» из списка при обновлении.
+    # Теперь повтор с нарастающей паузой: 30с → 1м → 2м → 4м → … ≤ 10м,
+    # пока Telegram не примет файл (сбой канала/MTProto/старт бота —
+    # всё проходит само со временем). no_bot: бот ещё поднимается —
+    # первая же попытка через 30 с почти всегда успешна.
+    if code in ("upload_failed", "no_bot", "mt_unavailable"):
+        s = _MINIAPP_UPLOADS.get(upid)
+        if s is not None:
+            _fails = int(s.get("auto_fail_n") or 1)
+            _delay = min(600.0, 30.0 * (2 ** max(0, _fails - 1)))
+            try:
+                asyncio.create_task(_upload_auto_complete_delayed(upid, _delay))
+            except Exception:
+                s["auto_scheduled"] = False
+            logger.warning(
+                f"upload auto-complete {upid}: «{code}» — повтор через "
+                f"{int(_delay)} с (попытка {_fails})")
+        return
+    # Неизвестный код — как раньше: считаем попытки исчерпанными.
+    s = _MINIAPP_UPLOADS.get(upid)
+    if s is not None:
+        s["auto_giveup"] = True
 
 
 async def miniapp_upload_tg_mark(request):
@@ -28797,8 +28956,58 @@ async def web_pw_change_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return WEB_PW_ENTER_OLD
 
 
+def _web_pw_delete_perform(user) -> None:
+    """ВОЛНА 22.64: само удаление веб-пароля (общее для путей «старый пароль»
+    и «секретные вопросы»). Веб-вход по паролю выключается, все веб-сессии
+    убиваются. Раньше логика сидела прямо в web_pw_delete_cb и удаляла пароль
+    ОДНИМ нажатием кнопки без всякой проверки — по требованию пользователя
+    закрыто: «при удалении пароля бот должен спрашивать старый пароль или
+    вопросы если забыл»."""
+    user.web_password_hash = None
+    user.web_password_set_at = None
+    user.web_login_attempts = 0
+    user.web_login_locked_until = None
+    # Веб-пароль удалён — все веб-сессии недействительны (22.49).
+    _web_invalidate_sessions(getattr(user, "user_id", ""))
+    save_user(user)
+    logger.info(f"web_password: пользователь {user.user_id} удалил веб-пароль")
+
+
+def _web_pw_delete_done_kb():
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("⬅️ Назад", callback_data="cloud_menu")]])
+
+
+def _web_pw_questions_available(user) -> bool:
+    """ВОЛНА 22.64: True — удаление веб-пароля можно подтвердить по 3
+    секретным вопросам Сейфа: связка настроена (пароль запечатан ответами),
+    тексты вопросов читаются и библиотека шифрования на месте."""
+    if not _vault_kdf_available():
+        return False
+    auth = getattr(user, "vault_auth", None)
+    if not isinstance(auth, dict) or not auth.get("rec"):
+        return False
+    try:
+        questions = _vault_auth_open(auth).get("questions") or []
+    except Exception:
+        return False
+    return len(questions) >= VAULT_QUESTIONS_N
+
+
+def _web_pw_forgot_kb():
+    """Кнопка «Забыл пароль» — показывается только когда вопросы доступны."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🤔 Забыл пароль — подтвердить по вопросам",
+                             callback_data="web_pw_delete_rec")]])
+
+
 async def web_pw_delete_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """«🗑 Удалить пароль» — веб-вход по паролю выключается."""
+    """«🗑 Удалить пароль» — ВОЛНА 22.64: удаление требует ПОДТВЕРЖДЕНИЯ.
+    Шаг 1: бот просит ТЕКУЩИЙ (старый) пароль. Если пользователь его забыл —
+    кнопка «🤔 Забыл пароль — подтвердить по вопросам»: бот задаёт его
+    3 секретных вопроса Сейфа (проверка распечаткой запечатанного пароля,
+    как в восстановлении доступа). Пароль НЕ удаляется, пока личность не
+    подтверждена одним из двух способов."""
     query = update.callback_query
     try:
         await query.answer()
@@ -28807,48 +29016,179 @@ async def web_pw_delete_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(str(query.from_user.id))
     if not user:
         return MAIN_MENU
-    user.web_password_hash = None
-    user.web_password_set_at = None
-    user.web_login_attempts = 0
-    user.web_login_locked_until = None
-    # ВОЛНА 22.49: веб-пароль удалён — все веб-сессии недействительны.
-    _web_invalidate_sessions(getattr(user, "user_id", ""))
-    save_user(user)
-    logger.info(f"web_password: пользователь {user.user_id} удалил веб-пароль")
+    if not isinstance(getattr(user, "web_password_hash", None), dict):
+        # Пароля нет — удалять нечего (раньше кнопка была видна всегда,
+        # теперь честно объясняем).
+        try:
+            await query.edit_message_text(
+                "❌ Веб-пароль не задан — удалять нечего.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("⬅️ Назад",
+                                         callback_data="web_password_menu")]]),
+            )
+        except Exception:
+            pass
+        return MAIN_MENU
+    context.user_data["web_pw_mode"] = "delete"
+    context.user_data.pop("web_pw_rec_answers", None)
+    context.user_data.pop("web_pw_rec_fails", None)
     try:
         await query.edit_message_text(
-            "🗑 Веб-пароль удалён. Вход в веб-облако по паролю больше "
-            "не работает (в Telegram облако открывается как раньше).",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("⬅️ Назад", callback_data="cloud_menu")]]),
+            "🗑 Удаление веб-пароля.\n\n"
+            "Шаг 1: пришлите ТЕКУЩИЙ (старый) пароль одним сообщением.\n"
+            "Сообщение я удалю из чата после проверки.\n\n"
+            "«отмена» — выйти без изменений.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ Назад",
+                                       callback_data="web_password_menu")]]
+                + ([_web_pw_forgot_kb().inline_keyboard[0]]
+                   if _web_pw_questions_available(user) else [])),
         )
     except Exception:
         pass
-    return MAIN_MENU
+    return WEB_PW_ENTER_OLD
+
+
+async def web_pw_delete_rec_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.64: «🤔 Забыл пароль» при удалении веб-пароля — подтверждение
+    по 3 секретным вопросам Сейфа. Ответы проверяются распечаткой запечатанного
+    пароля Сейфа (AES-GCM): сошлось — личность подтверждена, веб-пароль
+    удаляется; нет — цикл ответов заново, максимум 3 попытки за сессию."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    user = get_user(str(query.from_user.id))
+    if not user:
+        return MAIN_MENU
+    if not _web_pw_questions_available(user):
+        try:
+            await query.edit_message_text(
+                "❌ Секретные вопросы не настроены (они задаются при создании "
+                "пароля Сейфа) — подтвердить удаление по вопросам нельзя.\n\n"
+                "Пришлите текущий пароль сообщением, как раньше.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("⬅️ Назад",
+                                         callback_data="web_pw_delete")]]),
+            )
+        except Exception:
+            pass
+        return WEB_PW_ENTER_OLD
+    auth = getattr(user, "vault_auth", None) or {}
+    questions = _vault_auth_open(auth).get("questions") or []
+    context.user_data["web_pw_mode"] = "delete_rec"
+    context.user_data["web_pw_rec_answers"] = []
+    context.user_data.pop("web_pw_rec_fails", None)
+    try:
+        await query.edit_message_text(
+            "🤔 Подтверждение по секретным вопросам Сейфа.\n\n"
+            f"Вопрос 1 из {VAULT_QUESTIONS_N}:\n{questions[0]}\n\n"
+            "Ответьте одним сообщением. «отмена» — выйти без изменений.")
+    except Exception:
+        pass
+    return WEB_PW_ENTER_OLD
+
+
+async def _web_pw_rec_answer(update, context, user, text):
+    """ВОЛНА 22.64: приём ответа на секретный вопрос при удалении веб-пароля
+    (состояние WEB_PW_ENTER_OLD, режим web_pw_mode="delete_rec")."""
+    answers = context.user_data.get("web_pw_rec_answers")
+    if not isinstance(answers, list):
+        context.user_data["web_pw_rec_answers"] = answers = []
+    auth = getattr(user, "vault_auth", None) or {}
+    questions = _vault_auth_open(auth).get("questions") or []
+    if len(questions) < VAULT_QUESTIONS_N:
+        context.user_data.pop("web_pw_mode", None)
+        context.user_data.pop("web_pw_rec_answers", None)
+        await update.message.reply_text(
+            "❌ Не смог прочитать секретные вопросы (например, сменился "
+            "BOT_TOKEN). Удаление отменено — веб-пароль остался на месте.")
+        return MAIN_MENU
+    answers.append(text)
+    if len(answers) < VAULT_QUESTIONS_N:
+        await update.message.reply_text(
+            f"Вопрос {len(answers) + 1} из {VAULT_QUESTIONS_N}:\n"
+            f"{questions[len(answers)]}")
+        return WEB_PW_ENTER_OLD
+    # Все ответы собраны — проверяем распечаткой запечатанного пароля Сейфа.
+    # Верные ответы распечатывают блоб (GCM-тег сходится); неверные — None.
+    context.user_data.pop("web_pw_rec_answers", None)
+    unsealed = _vault_unseal_password(auth.get("rec"), answers)
+    if unsealed is not None:
+        context.user_data.pop("web_pw_mode", None)
+        context.user_data.pop("web_pw_rec_fails", None)
+        _web_pw_delete_perform(user)
+        await update.message.reply_text(
+            "✅ Ответы верные — личность подтверждена.\n\n"
+            "🗑 Веб-пароль удалён. Вход в веб-облако по паролю больше "
+            "не работает (в Telegram облако открывается как раньше).",
+            reply_markup=_web_pw_delete_done_kb(),
+        )
+        return MAIN_MENU
+    fails = int(context.user_data.get("web_pw_rec_fails") or 0) + 1
+    if fails >= 3:
+        context.user_data.pop("web_pw_mode", None)
+        context.user_data.pop("web_pw_rec_fails", None)
+        await update.message.reply_text(
+            "🚫 Ответы неверные 3 раза — удаление отменено, веб-пароль "
+            "остался на месте. Вспомните ответы и попробуйте позже: "
+            "☁️ Облако → 🔑 Веб-пароль → 🗑 Удалить пароль.")
+        return MAIN_MENU
+    context.user_data["web_pw_rec_fails"] = fails
+    context.user_data["web_pw_rec_answers"] = []
+    await update.message.reply_text(
+        f"❌ Ответы неверные (попытка {fails} из 3). Неверно хотя бы одно — "
+        "придётся ответить на все вопросы заново.\n\n"
+        f"Вопрос 1 из {VAULT_QUESTIONS_N}:\n{questions[0]}")
+    return WEB_PW_ENTER_OLD
 
 
 async def web_pw_old_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Шаг 1 смены пароля: проверяем СТАРЫЙ пароль (состояние WEB_PW_ENTER_OLD)."""
+    """Шаг 1 смены / УДАЛЕНИЯ веб-пароля (состояние WEB_PW_ENTER_OLD).
+    Режимы web_pw_mode: «change» — старый пароль → ввод нового; «delete» —
+    старый пароль → удалить веб-пароль (22.64); «delete_rec» — приём ответов
+    на секретные вопросы (22.64)."""
     user = get_user(str(update.effective_user.id))
     if not user:
         return MAIN_MENU
     text = (update.message.text or "").strip()
     if text.lower() in ("отмена", "cancel"):
         context.user_data.pop("web_pw_mode", None)
-        await update.message.reply_text("Смена веб-пароля отменена.")
+        context.user_data.pop("web_pw_rec_answers", None)
+        context.user_data.pop("web_pw_rec_fails", None)
+        await update.message.reply_text("Готово: без изменений.")
         return await global_cancel_handler(update, context)
-    # Сообщение со старым паролем сразу стираем — паролям нечего делать в чате.
+    # Сообщение со старым паролем/ответом сразу стираем — секретам нечего
+    # делать в чате.
     try:
         await context.bot.delete_message(
             chat_id=update.effective_chat.id,
             message_id=update.message.message_id)
     except Exception:
         pass
+    # === 22.64: путь «подтверждение по секретным вопросам» ===
+    if context.user_data.get("web_pw_mode") == "delete_rec":
+        return await _web_pw_rec_answer(update, context, user, text)
     if not _web_check_password(user, text):
+        # 22.64: забыл пароль — предлагаем вопросы (если они настроены).
+        _kb = _web_pw_forgot_kb() if _web_pw_questions_available(user) else None
         await update.message.reply_text(
             "❌ Старый пароль не подошёл. Попробуйте ещё раз — пришлите "
-            "текущий пароль одним сообщением, или напишите «отмена».")
+            "текущий пароль одним сообщением, или напишите «отмена».",
+            reply_markup=_kb)
         return WEB_PW_ENTER_OLD
+    _mode = context.user_data.get("web_pw_mode")
+    if _mode == "delete":
+        # Пароль подтверждён — выполняем удаление веб-пароля (22.64).
+        context.user_data.pop("web_pw_mode", None)
+        _web_pw_delete_perform(user)
+        await update.message.reply_text(
+            "🗑 Веб-пароль удалён. Вход в веб-облако по паролю больше "
+            "не работает (в Telegram облако открывается как раньше).",
+            reply_markup=_web_pw_delete_done_kb(),
+        )
+        return MAIN_MENU
     context.user_data["web_pw_mode"] = "change"
     await update.message.reply_text(
         "✅ Старый пароль верный.\n\nШаг 2 из 2: пришлите НОВЫЙ пароль "
@@ -37350,9 +37690,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return AGE_BLOCKED
 
     # Если инструкция уже прочитана — продолжаем как раньше.
-    # ВОЛНА 22.28: ДР ОБЯЗАТЕЛЕН («дату рождения нельзя пропустить») —
-    # просим у ВСЕХ без даты, включая тех, кто раньше нажимал «Пропустить».
-    if not user.birthday:
+    # ВОЛНА 22.28: ДР обязателен при регистрации.
+    # ВОЛНА 22.64: ПОВТОРНЫЙ запрос ДР у ЗАРЕГИСТРИРОВАННЫХ пользователей
+    # УБРАН — жалоба: «иногда, когда пользователь уже зарегистрирован,
+    # бот просит опять день рождения». Дата спрашивается ТОЛЬКО пока
+    # регистрация не завершена (setup_completed=False). Возрастной гейт 13+
+    # полностью сохранён: у кого ДР указан и по нему <13 — блок (_age_gate).
+    if not user.birthday and not user.setup_completed:
         await update.message.reply_text(
             "🎂 Пожалуйста, введите вашу реальную дату рождения в формате ГГГГ-ММ-ДД (например, 2005-04-15):\n\n"
             "Дата рождения обязательна: по ней проверяется возраст 13+.\n"
@@ -38124,8 +38468,10 @@ async def instructions_read_handler(update: Update, context: ContextTypes.DEFAUL
     save_user(user)
 
     # Дальше — регистрация как раньше.
-    # ВОЛНА 22.28: ДР обязателен — просим у всех без даты рождения.
-    if not user.birthday:
+    # ВОЛНА 22.64: ДР спрашиваем ТОЛЬКО у незавершённой регистрации —
+    # старые зарегистрированные пользователи без даты больше не получают
+    # повторный запрос при каждом входе.
+    if not user.birthday and not getattr(user, "setup_completed", False):
         await query.edit_message_text(
             "👋 Добро пожаловать в DEVORKS+! Давайте настроим ваш профиль.\n\n"
             "🎂 Введите вашу реальную дату рождения в формате ГГГГ-ММ-ДД (например, 2005-04-15):\n\n"
@@ -38657,10 +39003,11 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _age_gate_violation(user):
         await _send_age_block(update, context)
         return AGE_BLOCKED
-    # ВОЛНА 22.28: «дату рождения нельзя пропустить» — у пользователей
-    # без ДР (в т.ч. нажимавших «⏭ Пропустить» раньше) меню не открывается,
-    # пока дата не введена. Ровно та же проверка, что и на /start.
-    if not getattr(user, "birthday", None):
+    # ВОЛНА 22.64: повторный запрос ДР у зарегистрированных пользователей
+    # убран — меню открывается сразу. Дата обязательна ТОЛЬКО в ходе
+    # регистрации (setup_completed=False), как и на /start.
+    if not getattr(user, "birthday", None) \
+            and not getattr(user, "setup_completed", False):
         await update.message.reply_text(
             "🎂 Введите вашу реальную дату рождения в формате ГГГГ-ММ-ДД "
             "(например, 2005-04-15):\n\n"
@@ -52089,6 +52436,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await web_pw_change_cb(update, context)
     elif data == "web_pw_delete":
         return await web_pw_delete_cb(update, context)
+    elif data == "web_pw_delete_rec":
+        # ВОЛНА 22.64: «🤔 Забыл пароль» — подтверждение удаления веб-пароля
+        # по 3 секретным вопросам Сейфа.
+        return await web_pw_delete_rec_cb(update, context)
     elif data == "dnd_menu":
         # ВОЛНА 22.29: «🌙 Не беспокоить» — окно тишины и типы уведомлений.
         return await dnd_menu_cb(update, context)
