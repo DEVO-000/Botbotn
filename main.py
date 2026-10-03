@@ -3641,7 +3641,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.60"
+BOT_BUILD = "22.62"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -8147,6 +8147,103 @@ async def _bg_upload_big_mtproto(update, context, user, item, chat_msg, live=Non
         _shutil.rmtree(job_dir, ignore_errors=True)
 
 
+# ═══ ВОЛНА 22.62: АНТИ-ДУБЛИ «АВТОПЕРЕДАЧА + ПРЯМОЙ СТРИМ» ═══
+# Пользователь выбрал файлы — они летят боту ДВУМЯ путями одновременно:
+#   1) прямой стрим из мини-аппа (22.59/22.61 — байты идут, пока жив
+#      WebView);
+#   2) автопередача в Telegram (22.62 — системная панель «поделиться»
+#      через navigator.share → чат бота → нативная очередь Telegram,
+#      настоящий фон).
+# Кто первый довёз — тот и сохранил. Второй путь — дубликат: один и
+# тот же файл НЕ должен появляться в облаке дважды. Реестр ниже держит
+# «клеймы» имя+размер на окно 10 минут для обоих путей: чат-роутер
+# (_bg_upload_items) и финализация стрима (_miniapp_upload_finalize)
+# сверяются перед сохранением.
+_DUP_RECENT = {}        # uid -> {"имя|размер": [ts_claim, ts_saved?]
+_DUP_WINDOW = 600.0     # секунд
+
+
+def _dup_key(name, size):
+    return f"{str(name or '')[:200]}|{int(size or 0)}"
+
+
+def _dup_prune(uid):
+    ent = _DUP_RECENT.get(uid)
+    if not ent:
+        return
+    now = time.time()
+    for k in [k for k, v in ent.items() if now - max(v) > _DUP_WINDOW]:
+        ent.pop(k, None)
+    if not ent:
+        _DUP_RECENT.pop(uid, None)
+
+
+def _dup_claim(uid, name, size):
+    """True — такой файл УЖЕ сохраняют/сохраняли в окне 10 минут.
+    False — свободно, и мы сами поставили клейм (не забудьте
+    _dup_release при неудаче или _dup_saved при успехе)."""
+    _dup_prune(uid)
+    ent = _DUP_RECENT.setdefault(uid, {})
+    v = ent.get(_dup_key(name, size))
+    if v and time.time() - max(v) < _DUP_WINDOW:
+        return True
+    ent[_dup_key(name, size)] = [time.time()]
+    return False
+
+
+def _dup_held(uid, name, size):
+    """Клейм занят (кем-то) — без захвата, только проверка."""
+    ent = _DUP_RECENT.get(uid)
+    if not ent:
+        return False
+    v = ent.get(_dup_key(name, size))
+    return bool(v and time.time() - max(v) < _DUP_WINDOW)
+
+
+def _dup_release(uid, name, size):
+    """Наш клейм не понадобился (сохранение не удалось) — снимаем,
+    чтобы другой путь мог сохранить файл без потерь."""
+    ent = _DUP_RECENT.get(uid)
+    if ent:
+        ent.pop(_dup_key(name, size), None)
+        if not ent:
+            _DUP_RECENT.pop(uid, None)
+
+
+def _dup_saved(uid, name, size):
+    """Файл реально сохранён — клейм живёт от момента СОХРАНЕНИЯ."""
+    ent = _DUP_RECENT.setdefault(uid, {})
+    ent[_dup_key(name, size)] = [time.time(), time.time()]
+
+
+def _cloud_recent_dup(user, name, size):
+    """ВОЛНА 22.62: свежая (≤15 мин) запись в облаке с тем же именем и
+    размером — автопередача уже сохранила этот файл из чата."""
+    try:
+        cut = time.time() - 900.0
+        for f in reversed(getattr(user, "cloud_files", []) or []):
+            if not isinstance(f, dict):
+                continue
+            if str(f.get("name") or "")[:200] == str(name or "")[:200] and \
+                    int(f.get("size") or 0) == int(size or 0):
+                try:
+                    if float(f.get("ts") or 0) >= cut:
+                        return f
+                except Exception:
+                    return f
+    except Exception:
+        pass
+    return None
+
+
+# ВОЛНА 22.62: пометка «файлы сейчас передаются боту через Telegram»
+# (мини-апп ставит её перед автопередачей, POST /api/upload/tg_mark).
+# Пока пометка свежая — итоги сохранения из чата отправляются
+# БЕЗЗВУЧНО (disable_notification): «как в обычном чате, но БЕЗ
+# оповещений», прогресс виден только в панели передач мини-аппа.
+_TG_AUTOSHARE_MARK = {}
+
+
 async def _bg_upload_items(update, context, items):
     """Сохраняет пачку файлов из чата в облако и пишет ОДИН компактный итог.
     Вызывается из bg_chat_upload_receive (глобальный роутер 22.57)."""
@@ -8155,11 +8252,15 @@ async def _bg_upload_items(update, context, items):
     user = get_user(user_id)
     if not user:
         return
+    # ВОЛНА 22.62: автопередача из мини-аппа — работаем максимально тихо:
+    # итог в чат БЕЗ звука и пуша (пользователь просил «без оповещений»,
+    # прогресс он видит в панели передач мини-аппа)
+    _tg_silent = time.time() - _TG_AUTOSHARE_MARK.get(user_id, 0.0) < 900.0
     if not get_cloud_channel_ids() and not _user_vault_channel(user):
         await msg.reply_text(
             "❌ Хранилище не настроено — файл не сохранён. Попросите "
             "разработчика подключить канал, либо подключите СВОЙ: "
-            "🔐 Сейф → 🔗 Моё облако.")
+            "🔐 Сейф → 🔗 Моё облако.", disable_notification=_tg_silent)
         return
 
     files = [f for f in (getattr(user, "cloud_files", []) or []) if isinstance(f, dict)]
@@ -8172,6 +8273,7 @@ async def _bg_upload_items(update, context, items):
         pass
 
     saved, skipped_big, failed, limit_hit = [], [], [], False
+    deduped = []            # 22.62: имена, сведённые с прямым стримом
     warned_quality = False
 
     _msg_mid = int(getattr(msg, "message_id", 0) or 0)
@@ -8183,6 +8285,12 @@ async def _bg_upload_items(update, context, items):
             continue
         size = int(item.get("size") or 0)
         name = str(item.get("name") or "файл")
+        # ВОЛНА 22.62: дубль прямого стрима — автопередача и стрим грузили
+        # ОДНИ И ТЕ ЖЕ файлы одновременно. Файл уже в облаке (или стрим
+        # сохраняет его прямо сейчас) — второго не создаём, тихо пропускаем
+        if _dup_claim(user_id, name, size):
+            deduped.append(name)
+            continue
         # ВОЛНА 22.58: живой статус файла для панели передач мини-аппа.
         _lk = f"{_msg_mid}-{_li}"
         _bg_live_add(user_id, _lk, name, size)
@@ -8192,13 +8300,16 @@ async def _bg_upload_items(update, context, items):
             channel_id = _bg_upload_target(user)
             if channel_id is None:
                 _bg_live_del(user_id, _lk)
+                _dup_release(user_id, name, size)
                 await msg.reply_text(
-                    "❌ Хранилище не настроено — файл не сохранён.")
+                    "❌ Хранилище не настроено — файл не сохранён.",
+                    disable_notification=_tg_silent)
                 return
             _bg_live_set(user_id, _lk, "save")
             sent = await _bg_send_media(context, channel_id, item)
             if sent is None:
                 _bg_live_del(user_id, _lk)
+                _dup_release(user_id, name, size)
                 failed.append(f"{name[:40]}: Telegram не принял")
                 continue
             rec = {
@@ -8220,11 +8331,13 @@ async def _bg_upload_items(update, context, items):
                 update, context, user, item, msg, live=(user_id, _lk))
             if rec is None:
                 _bg_live_del(user_id, _lk)
+                _dup_release(user_id, name, size)
                 why = item.get("_why")
                 if why == "big_hard_limit":
                     await msg.reply_text(
                         f"🚫 «{name[:40]}» больше 2 ГБ — потолок Telegram "
-                        "для ботов. Разделите файл на части по ~1,5 ГБ.")
+                        "для ботов. Разделите файл на части по ~1,5 ГБ.",
+                        disable_notification=_tg_silent)
                 elif why == "mt_failed":
                     failed.append(f"{name[:40]}: не докачался — "
                                   "попробуйте ещё раз")
@@ -8234,7 +8347,20 @@ async def _bg_upload_items(update, context, items):
                 else:
                     skipped_big.append(item)
                 continue
+            # ВОЛНА 22.62: большая загрузка шла минутами — за это время
+            # прямой стрим мог сохранить ЭТОТ ЖЕ файл. Проверяем свежий
+            # список облака: дубль не добавляем (файл уже там).
+            try:
+                _fc = [f for f in (getattr(get_user(user_id), "cloud_files", [])
+                                   or []) if isinstance(f, dict)]
+                if any(str(f.get("name") or "")[:200] == name[:200] and
+                       int(f.get("size") or 0) == size for f in _fc):
+                    deduped.append(name)
+                    continue
+            except Exception:
+                pass
         _bg_live_del(user_id, _lk)
+        _dup_saved(user_id, name, size)   # 22.62: анти-дубль: файл сохранён
         files.append(rec)
         saved.append(rec)
         # Подсказка про качество — ОДНА строка и один раз за пачку.
@@ -8271,6 +8397,10 @@ async def _bg_upload_items(update, context, items):
             lines.append(f"🚫 «{item['name'][:40]}» тоже больше 49 МБ.")
     if failed:
         lines.append("⚠️ Не удалось: " + "; ".join(failed[:5]))
+    if deduped:
+        # 22.62: файлы, которые уже доехали прямым стримом — дублей нет
+        lines.append(f"♻️ {len(deduped)} файл(ов) уже загружен(ы) напрямую — "
+                     "дубли не созданы.")
     if lines:
         kb = None
         if MINIAPP_URL:
@@ -8280,9 +8410,11 @@ async def _bg_upload_items(update, context, items):
         try:
             if skipped_big:
                 await msg.reply_text("\n".join(lines),
-                                     reply_markup=get_big_file_keyboard())
+                                     reply_markup=get_big_file_keyboard(),
+                                     disable_notification=_tg_silent)
             else:
-                await msg.reply_text("\n".join(lines), reply_markup=kb)
+                await msg.reply_text("\n".join(lines), reply_markup=kb,
+                                     disable_notification=_tg_silent)
         except Exception:
             pass
 
@@ -8510,6 +8642,10 @@ async def cloud_del_yes_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 _MINIAPP_PTB_APP = None        # ссылка на Application (ставится в _post_init)
 _MINIAPP_UPLOADS = {}          # uploadId → {path, name, mime, size, uid, received, ts}
 _MINIAPP_UPLOADS_TTL = 6 * 3600
+# ВОЛНА 22.61: якорные сообщения «файлы ждут продолжения» (uid → ts).
+# Анти-спам: не чаще раза в _CLOSED_ANCHOR_COOLDOWN секунд на пользователя.
+_CLOSED_ANCHOR_TS = {}
+_CLOSED_ANCHOR_COOLDOWN = 180.0
 # ВОЛНА 22.49: успешно завершённые загрузки (uploadId → ответ complete) —
 # идемпотентность: повторный complete после потери ответа отдаёт ТОТ ЖЕ
 # результат, вместо дубля файла в Сейфе.
@@ -11708,9 +11844,22 @@ body.vp-lock {
       <button class="sound-item-btn" id="uploadViaBotBtn" onclick="uploadViaBot()" style="background:#2481cc;color:#ffffff;border-color:#2481cc">
         <div style="text-align:left">
           <div style="font-weight:800">📤 Загрузить через Telegram</div>
-          <div style="font-size:11px;opacity:.85;margin-top:2px">Грузится в фоне на 100% — прогресс появится здесь</div>
+          <div style="font-size:11px;opacity:.85;margin-top:2px" id="uploadViaBotSub">Грузится в фоне на 100% — прогресс появится здесь</div>
         </div>
         <i data-lucide="send" style="width:18px;height:18px"></i>
+      </button>
+
+      <!-- ВОЛНА 22.62: тумблер АВТОПЕРЕДАЧИ — после выбора файлов мини-апп
+           сам открывает системную панель «поделиться» с УЖЕ выбранными
+           файлами (Telegram → чат бота → «Отправить»). Дальше файлы грузит
+           сам Telegram: нативная очередь, настоящий фон, переживает
+           закрытие мини-аппа. Показывается только там, где поддерживается. -->
+      <button class="sound-item-btn" id="tgAutoShareRow" onclick="tgAutoShareToggle()" style="display:none">
+        <div style="text-align:left">
+          <div style="font-weight:800">🤖 Автопередача в Telegram: <span id="tgAutoShareState">вкл</span></div>
+          <div style="font-size:11px;opacity:.7;margin-top:2px" id="tgAutoShareHint">Выбрали файлы — Telegram откроется сам, останется нажать «Отправить»</div>
+        </div>
+        <i data-lucide="zap" style="width:18px;height:18px"></i>
       </button>
 
       <button class="sound-item-btn" id="uploadAddBtn" onclick="pickUploadFiles()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
@@ -15811,7 +15960,7 @@ function notifyUploadClosed(release) {
        ВОЛНА 22.59: окно загрузки могли уже ЗАКРЫТЬ (файлы продолжают
        лететь сами) — их тоже честно учитываем через PRE_ACTIVE. */
     (pendingFiles || []).forEach(function (f) {
-      if (f && f._preId && f._preState === 'run' && !f._preStop) addF(f);
+      if (f && f._preId && f._preState !== 'done' && !f._preStop) addF(f);
     });
 
     PRE_ACTIVE.forEach(addF);
@@ -15865,11 +16014,13 @@ function refreshUploadModal() {
   if (info) {
     info.textContent = !has
       /* ВОЛНА 22.59: файлы летят боту С МОМЕНТА ВЫБОРА — окно теперь
-         настройки (пароль/имена), а не «шлюз». Подсказка про оба пути. */
-      ? 'Файлы, выбранные ниже, сразу летят боту и грузятся в фоне — приложение можно закрыть. Или отправьте их в чат бота: Telegram доносит сам.'
+         настройки (пароль/имена), а не «шлюз». ВОЛНА 22.61: текст честный:
+         что успело дойти — сохранится само; недокачанное продолжится при
+         следующем открытии облака, бот молча подскажет в чате. */
+      ? 'Файлы, выбранные ниже, сразу летят боту. Что успеет дойти — сохранится само; недокачанное продолжится при следующем открытии (бот подскажет в чате). Для 100% фона — кнопка «через Telegram» ниже.'
       : pendingFiles.length === 1
-        ? (pendingFiles[0].name || 'файл') + ' — уже грузится боту. Пароль (в Сейф) и имя — по кнопке «Отправить», можно и просто закрыть окно.'
-        : 'Выбрано файлов: ' + pendingFiles.length + ' — уже грузятся боту в фоне. Пароль (в Сейф) и имена — по кнопке «Отправить», окно можно закрыть.';
+        ? (pendingFiles[0].name || 'файл') + ' — уже летит боту. Пароль (в Сейф) и имя — по кнопке «Отправить», можно и просто закрыть окно.'
+        : 'Выбрано файлов: ' + pendingFiles.length + ' — все уже летят боту. Пароль (в Сейф) и имена — по кнопке «Отправить», окно можно закрыть.';
   }
 
   if (list) {
@@ -15898,6 +16049,31 @@ function refreshUploadModal() {
   if (addBtn) addBtn.classList.toggle('hidden', has);
   if (sendBtn) sendBtn.classList.toggle('hidden', !has);
   if (moreBtn) moreBtn.classList.toggle('hidden', !has);
+
+  /* ВОЛНА 22.62: тумблер автопередачи — видим только там, где она
+     реально работает (телефон + Web Share с файлами + нет шифрования);
+     подпись синей кнопки подстраивается под режим */
+  const tgRow = document.getElementById('tgAutoShareRow');
+
+  if (tgRow) {
+    const tgCapable = tgAutoShareCapable() && IS_MOBILE_UA &&
+      STORAGE_ENCRYPTED !== true;
+
+    tgRow.style.display = tgCapable ? '' : 'none';
+
+    const tgSt = document.getElementById('tgAutoShareState');
+
+    if (tgSt) tgSt.textContent = tgAutoShareEnabled() ? 'вкл' : 'выкл';
+  }
+
+  const vbb = document.getElementById('uploadViaBotSub');
+
+  if (vbb) {
+    vbb.textContent = (tgAutoShareCapable() && IS_MOBILE_UA &&
+      tgAutoShareEnabled() && STORAGE_ENCRYPTED !== true)
+      ? 'Уже включена: после выбора файлов Telegram откроется сам'
+      : 'Грузится в фоне на 100% — прогресс появится здесь';
+  }
 
   /* ВОЛНА 22.40: пароль ОБЯЗАТЕЛЕН только когда хранилище шифруется
      (STORAGE_ENCRYPTED === true). Раньше поле становилось обязательным,
@@ -16084,6 +16260,143 @@ function uploadViaBot() {
   window.open(url, '_blank');
 }
 
+/* ═══ ВОЛНА 22.62: АВТОПЕРЕДАЧА В TELEGRAM ПРИ ВЫБОРЕ ФАЙЛОВ ═══
+   Пользователь: «Файлы должны идти сразу в бот — как кнопка «через
+   Telegram», но АВТОМАТИЧЕСКИ, чтобы загрузка продолжалась при
+   закрытии». Физика WebView не изменилась: мини-апп не может сам
+   вложить файлы в чат бота. Но Web Share API (level 2) умеет почти
+   это: СРАЗУ после выбора файлов открываем СИСТЕМНУЮ панель
+   «поделиться» с УЖЕ выбранными файлами — пользователю остаётся
+   выбрать Telegram и нажать «Отправить». Дальше файлы грузит САМ
+   TELEGRAM (нативная очередь): настоящий фон, переживает закрытие
+   мини-аппа, гашение экрана и слабую сеть, очередь не теряется
+   никогда. Это максимум «автоматически», который допускают iOS и
+   Android (полный запрет делится без касания — защита ОС).
+   Параллельно продолжает работать прямой стрим боту (22.59/22.61):
+   кто первый довёз — тот и сохранил, дубли сводятся на сервере
+   тихо (волна 22.62, _dup_*), в облаке файл ОДИН. */
+const TG_AUTOSHARE_KEY = 'dv_tg_autoshare';
+
+const IS_MOBILE_UA = (function () {
+  try {
+    return navigator.maxTouchPoints > 0 ||
+      /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent || '');
+  } catch (e) {
+    return false;
+  }
+})();
+
+function tgAutoShareEnabled() {
+  try {
+    return localStorage.getItem(TG_AUTOSHARE_KEY) !== '0';
+  } catch (e) {
+    return true;
+  }
+}
+
+function tgAutoShareSet(on) {
+  try {
+    localStorage.setItem(TG_AUTOSHARE_KEY, on ? '1' : '0');
+  } catch (e) {}
+}
+
+function tgAutoShareToggle() {
+  const on = !tgAutoShareEnabled();
+
+  tgAutoShareSet(on);
+  refreshUploadModal();
+  showToast(on
+    ? '🤖 Автопередача вкл — после выбора файлов Telegram откроется сам'
+    : '🤖 Автопередача выкл — файлы грузятся напрямую (пока приложение открыто)');
+}
+
+function tgAutoShareCapable() {
+  /* Web Share level 2 (с файлами) доступен не везде: Android — да,
+     iOS/десктоп WebView — почти никогда. Проверяем честно. */
+  try {
+    return !!(navigator.share && navigator.canShare);
+  } catch (e) {
+    return false;
+  }
+}
+
+function tgAutoSharePick(files) {
+  /* какие файлы система реально примет в панель «поделиться» */
+  if (!files || !files.length) return [];
+  if (!tgAutoShareCapable() || !IS_MOBILE_UA) return [];
+
+  try {
+    const all = files.slice(0, 50);
+
+    if (navigator.canShare({ files: all })) return all;
+
+    const typed = all.filter((f) => f && f.type);
+
+    if (typed.length && navigator.canShare({ files: typed })) return typed;
+  } catch (e) {}
+
+  return [];
+}
+
+function tgAutoShareHandoff(files) {
+  /* Открывает панель «поделиться» СРАЗУ после выбора файлов.
+     ВАЖНО (физика браузеров): navigator.share требует ЖИВОГО касания —
+     вызов обязан случиться в той же цепочке событий, что и подтверждение
+     выбора файлов в пикере. Поэтому до самого вызова — НИ ОДНОГО await,
+     только синхронные операции, иначе ОС откажет (NotAllowedError). */
+  if (!tgAutoShareEnabled()) return Promise.resolve(false);
+
+  /* при включённом шифровании не предлагаем: файлы из чата попадают в
+     облако БЕЗ шифра — такое нельзя делать молча, пусть решает кнопка */
+  if (STORAGE_ENCRYPTED === true) return Promise.resolve(false);
+
+  const shareFiles = tgAutoSharePick(files);
+
+  if (!shareFiles.length) return Promise.resolve(false);
+
+  /* пометка «сейчас поедет через Telegram» + живая карточка (22.58):
+     как только бот сохранит файлы из чата, панель передач покажет
+     счётчик и проценты. Сервер по этой же пометке (/api/upload/tg_mark)
+     делает итоги в чате БЕЗЗВУЧНЫМИ — «как в обычном чате, но без
+     оповещений». */
+  try {
+    localStorage.setItem('dv_bg_wait_ts', String(Math.floor(Date.now() / 1000)));
+  } catch (e) {}
+
+  apiJson('/api/upload/tg_mark', {
+    method: 'POST',
+    headers: vaultHeaders({ 'Content-Type': 'application/json' }),
+    body: '{}'
+  }).catch(() => {});
+
+  bgUploadEnsureCard();
+  bgUploadSchedule(1500);
+
+  showToast('📤 Выберите Telegram и чат бота — отправится одним разом и продолжит грузиться В ФОНЕ, даже если закрыть приложение');
+
+  try {
+    return navigator.share({ files: shareFiles, title: 'Облако' })
+      .then(() => {
+        /* панель закрыта отправкой: файлы теперь грузит сам Telegram */
+        showToast('📨 Отдано Telegram — грузится в фоне, прогресс здесь');
+        return true;
+      })
+      .catch((e) => {
+        /* отменили / система не разрешила: НЕ страшно — прямой стрим
+           боту (22.59) продолжает грузить файлы, пока приложение открыто */
+        const why = (e && e.name === 'NotAllowedError')
+          ? 'Автопередача не открылась — файлы грузятся напрямую'
+          : 'Отправку отменили — файлы грузятся напрямую';
+
+        bgUploadFinish(false, 0, why);
+        return false;
+      });
+  } catch (e) {
+    bgUploadFinish(false, 0, 'Автопередача не открылась — файлы грузятся напрямую');
+    return Promise.resolve(false);
+  }
+}
+
 function uploadFiles(fileList) {
   let files = Array.from(fileList);
 
@@ -16108,6 +16421,15 @@ function uploadFiles(fileList) {
   files = files.filter((f) => +f.size);
 
   if (!files.length) return;
+
+  /* ═══ ВОЛНА 22.62: АВТОПЕРЕДАЧА В TELEGRAM ═══
+     Вызов ДО всего остального и без await: navigator.share обязан
+     сработать в той же цепочке касания, что и выбор файлов (иначе ОС
+     запрещает). Успешно открылась панель — дальше файлы грузит сам
+     Telegram (нативная очередь, 100% фон). Не открылась/отменили —
+     молча остаётся прямой стрим боту ниже (22.59). Панель «поделиться»
+     открывается ПОВЕРХ окна загрузки — настройки доступны после. */
+  tgAutoShareHandoff(files).catch(() => {});
 
   const modalOpen = !!(document.getElementById('uploadModal') || {}).classList &&
     document.getElementById('uploadModal').classList.contains('open');
@@ -16156,7 +16478,7 @@ function uploadFiles(fileList) {
     let preStarted = 0;
 
     for (const f of files) {
-      if (f && !f._preId && f._preState !== 'done' && !f._preStop &&
+      if (f && f._preState !== 'run' && f._preState !== 'done' && !f._preStop &&
           +f.size > 0) {
         f._preHold = true;   /* 22.59: сессия «недорешённая» — сервер ждёт пароль/имя */
         f._preQueued = true;
@@ -16166,6 +16488,12 @@ function uploadFiles(fileList) {
     }
 
     if (preStarted) {
+      /* 22.61: чем больше пачка, тем больше файлов в полёте + сессии
+         ВСЕЙ пачке сразу — выход из приложения больше не оставляет
+         файлы «не тронутыми» (см. prestreamInitAll) */
+      prestreamTuneConcurrency(files.length);
+      prestreamInitAll(files);
+
       prestreamKick();
 
       if (STORAGE_ENCRYPTED !== true || VAULT_PW) {
@@ -16322,30 +16650,43 @@ async function resumePendingUploads() {
   /* ВОЛНА 22.47: счётчик попыток на запись очереди. Каждая докачка
      увеличивает tries; ЛЮБОЙ успешный кусок перезаписывает запись БЕЗ
      tries (сброс) — файл, у которого есть прогресс, никогда не бросается.
-     Бросаем только совсем безнадёжные (5 докачек без единого байта) —
-     иначе очередь вечно висит и дёргает тостами на каждом открытии */
+     ВОЛНА 22.61: порог 5 → 12 — пользователь, быстро открывающий/закрывающий
+     облако, раньше исчерпывал 5 попыток раньше, чем файлы успевали хотя бы
+     получить сессию («все файлы теряются»). Теперь запас вдвое больше. */
   let dropped = 0;
+  let lostBlob = 0;
   const files = [];
 
   for (const e of entries) {
     e.tries = (+e.tries || 0) + 1;
 
-    if (e.tries > 5) { upqDel(e.k); dropped++; continue; }
+    if (e.tries > 12) { upqDel(e.k); dropped++; continue; }
 
     upqPut(e);
 
     try {
       const f = new File([e.blob], e.name || 'file.bin', { type: e.mime || '' });
 
+      /* 22.61: blob НЕ пережил закрытие WebView (размер не совпал/0) —
+         молча терять нельзя: честно говорим, что файл надо загрузить заново */
+      if (+f.size !== +e.size || !+f.size) throw new Error('blob_lost');
+
       f.uploadName = e.uploadName || e.name;
       f._entryKey = e.k;
       f._resumeId = e.uploadId || '';
       files.push(f);
-    } catch (err) { upqDel(e.k); }
+    } catch (err) { upqDel(e.k); lostBlob++; }
   }
 
   if (dropped) {
-    showToast('🧹 ' + dropped + ' файл(ов) не удалось загрузить после 5 попыток — убран(ы) из очереди');
+    showToast('🧹 ' + dropped + ' файл(ов) не удалось загрузить после 12 попыток — убран(ы) из очереди');
+  }
+
+  /* 22.61: телефон не сохранил байты между запусками (редко, но бывает
+     на iOS) — пользователь ДОЛЖЕН знать, что файлы нужно загрузить заново,
+     иначе «тихая потеря» выглядит как баг */
+  if (lostBlob) {
+    showToast('⚠️ ' + lostBlob + ' файл(ов) не сохранились на телефоне для докачки — загрузите их заново');
   }
 
   if (files.length) {
@@ -16593,6 +16934,98 @@ function sendChunk(uploadId, index, blobPart, offset, onLoaded) {
 let PRE_CONCURRENCY = 3;        /* сколько файлов грузим «впрок» одновременно */
 let PRE_RUNNING = 0;
 const PRE_QUEUE = [];
+
+/* ВОЛНА 22.61: параллельность предохранки — по размеру пачки (3..5).
+   Раньше «в полёте» жили только 3 файла: пользователь, закрывший
+   приложение на большой пачке, оставлял байты на сервере максимум у
+   трёх — остальные не успевали получить НИ БАЙТА («остаются только
+   два»). Теперь чем больше пачка, тем больше файлов в полёте. */
+function prestreamTuneConcurrency(batchN) {
+  PRE_CONCURRENCY = Math.max(3, Math.min(5,
+    Math.max(PRE_CONCURRENCY, +batchN || 0)));
+}
+
+/* ═══ ВОЛНА 22.61: СЕССИИ ВСЕЙ ПАЧКЕ СРАЗУ ═══
+   Раньше /api/upload/init (и запись докачки с uploadId) выполнялись
+   ТОЛЬКО когда файл доходивал до слота предохранки (3 одновременно) —
+   при раннем выходе из приложения остальные файлы пачки не имели на
+   сервере НИ БАЙТА и не были привязаны к сессии докачки. Теперь init
+   улетает КАЖДОМУ выбранному файлу в первые же секунды (параллельно,
+   пачками по 8): у каждого файла есть серверная сессия и запись в
+   IndexedDB с uploadId — выход из приложения в ЛЮБОЙ момент оставляет
+   ВСЕ файлы докачиваемыми с точного байта, а не «выживают только два». */
+async function prestreamInitAll(files) {
+  const list = [];
+
+  for (const f of files || []) {
+    if (f && !f._preId && !f._preInitPromise && f._preState !== 'done' &&
+        !f._preStop && +f.size > 0) {
+      list.push(f);
+    }
+  }
+
+  if (!list.length) return;
+
+  let cursor = 0;
+
+  const worker = async () => {
+    while (cursor < list.length) {
+      const f = list[cursor++];
+
+      /* файл уже взял другой воркер или стрим — не трогаем */
+      if (f._preId || f._preInitPromise || f._preState === 'done' ||
+          f._preStop) continue;
+
+      f._preInitPromise = (async () => {
+        try {
+          const initData = await apiJson('/api/upload/init', {
+            method: 'POST',
+            headers: vaultHeaders({ 'Content-Type': 'application/json' }),
+            body: JSON.stringify({
+              name: String(f.uploadName || f.name || 'file.bin').slice(0, 120),
+              size: +f.size || 0,
+              mime: f.type || '',
+              password: f._uploadPw || '',
+              hold: !!f._preHold
+            })
+          });
+
+          const uploadId = initData && initData.uploadId;
+
+          if (!uploadId) return;
+
+          f._preId = uploadId;
+          f._preHeld = !!(f._preHold && initData.encrypt === false);
+
+          if (f._preHeld) PRE_HELD.add(uploadId);
+
+          if (Array.isArray(initData.parts) && initData.parts.length) {
+            f._preParts = new Set(initData.parts);
+          }
+
+          /* запись докачки — СРАЗУ с uploadId: файл переживает выход */
+          if (f._entryKey) {
+            upqPut({
+              k: f._entryKey, blob: f, name: f.name,
+              uploadName: String(f.uploadName || f.name || 'file.bin').slice(0, 120),
+              size: +f.size || 0, mime: f.type || '',
+              uploadId: uploadId, added: Date.now()
+            });
+          }
+        } catch (e) {
+          /* лимит/сеть/пароль — молча: стрим повторит init, движок спросит */
+        } finally {
+          f._preInitPromise = null;
+        }
+      })();
+
+      await f._preInitPromise;
+    }
+  };
+
+  await Promise.all(
+    Array.from({ length: Math.min(8, Math.max(1, list.length)) }, worker));
+}
 /* ВОЛНА 22.59: PRE стал ГЛАВНЫМ путём («сразу в бота») — ведём учёт:
    • PRE_ACTIVE — файлы в полёте (для честного closed-уведомления,
      включая те, чьё окно уже закрыли);
@@ -16605,7 +17038,9 @@ function prestreamKick() {
   while (PRE_RUNNING < PRE_CONCURRENCY && PRE_QUEUE.length) {
     const f = PRE_QUEUE.shift();
 
-    if (!f || f._preStop || f._preId || f._preState === 'done') continue;
+    /* 22.61: _preId больше НЕ значит «уже летит» (init-all 22.61 ставит
+       его всей пачке заранее) — смотрим на СОСТОЯНИЕ файла */
+    if (!f || f._preStop || f._preState === 'run' || f._preState === 'done') continue;
 
     PRE_RUNNING++;
     PRE_ACTIVE.add(f);
@@ -16624,11 +17059,16 @@ function prestreamStart(files) {
   if (!IS_TELEGRAM && !WEB_TOKEN) return;
 
   for (const f of files) {
-    if (f && !f._preId && f._preState !== 'done' && !f._preStop && +f.size > 0) {
+    if (f && f._preState !== 'run' && f._preState !== 'done' && !f._preStop &&
+        +f.size > 0) {
       f._preQueued = true;
       PRE_QUEUE.push(f);
     }
   }
+
+  /* 22.61: сессии — ВСЕЙ пачке сразу (см. prestreamInitAll) */
+  prestreamTuneConcurrency(files.length);
+  prestreamInitAll(files);
 
   prestreamKick();
 }
@@ -16714,8 +17154,11 @@ async function _preSettle(file, timeoutSec) {
 
 async function _preStreamFile(file) {
   const upName = String(file.uploadName || file.name || 'file.bin').slice(0, 120);
-  let uploadId = '';
-  let serverParts = null;
+  /* ВОЛНА 22.61: сессию могла уже создать prestreamInitAll (вся пачка
+     получает сессии в первые секунды) — переиспользуем её; куски,
+     уже принятые сервером, — в _preParts */
+  let uploadId = file._preId || '';
+  let serverParts = file._preParts || null;
   let initData = null;
 
   file._preState = 'run';
@@ -16727,7 +17170,19 @@ async function _preStreamFile(file) {
 
   file._preTid = tid;
 
-  try {
+  /* 22.61: init-all создаёт сессию этому файлу ПРЯМО СЕЙЧАС — ждём её
+     результат, чтобы не получить две сессии на один файл */
+  if (!uploadId && file._preInitPromise) {
+    try { await file._preInitPromise; } catch (e) {}
+
+    uploadId = file._preId || '';
+    serverParts = file._preParts || null;
+  }
+
+  if (uploadId) {
+    /* сессия уже есть (init-all) — собственный init не нужен */
+    file._preParts = null;
+  } else try {
     initData = await apiJson('/api/upload/init', {
       method: 'POST',
       headers: vaultHeaders({ 'Content-Type': 'application/json' }),
@@ -16764,15 +17219,19 @@ async function _preStreamFile(file) {
 
   file._preId = uploadId;
 
-  /* 22.59: сервер держит «окно решения» ТОЛЬКО на plain-сессиях
-     (encrypt:false) — шифрованные уже решены паролем при init, их можно
-     финализировать сразу. Ответ init говорит правду независимо от режима. */
-  const heldSession = !!(file._preHold && initData && initData.encrypt === false);
+  /* 22.61: блок ниже — только при СОБСТВЕННОМ init (initData заполнен);
+     при сессии от init-all значение уже вычислено и лежит в file._preHeld */
+  if (initData) {
+    /* 22.59: сервер держит «окно решения» ТОЛЬКО на plain-сессиях
+       (encrypt:false) — шифрованные уже решены паролем при init, их можно
+       финализировать сразу. Ответ init говорит правду независимо от режима. */
+    const heldSession = !!(file._preHold && initData.encrypt === false);
 
-  file._preHeld = heldSession;
+    file._preHeld = heldSession;
 
-  /* 22.59: «недорешённые» сессии — на учёт (release при закрытии аппа) */
-  if (heldSession) PRE_HELD.add(uploadId);
+    /* 22.59: «недорешённые» сессии — на учёт (release при закрытии аппа) */
+    if (heldSession) PRE_HELD.add(uploadId);
+  }
 
   /* uploadId — в очередь докачки сразу: закрыл мини апп на окне имени —
      при следующем открытии докачка подхватит ИМЕННО эту сессию */
@@ -17180,8 +17639,14 @@ async function _uploadOneSession(file, reportBytes) {
   if (key) upqDel(key);
 
   /* ВОЛНА 22.50: pollUploadStatus отдаёт запись файла напрямую, обычный
-     complete — объектом {file: …}; приводим к одному виду. */
-  if (done && done.file) return done.file;
+     complete — объектом {file: …}; приводим к одному виду.
+     ВОЛНА 22.62: сервер свёл дубль (файл уже сохранён из чата —
+     автопередача обогнала прямой стрим): помечаем файл, чтобы движок
+     не добавлял вторую карточку и не хвастался «загружено» дважды. */
+  if (done && done.file) {
+    if (done.dedup) file._dupFlag = true;
+    return done.file;
+  }
 
   return done;
 }
@@ -17252,6 +17717,12 @@ async function uploadOneFile(file, reportBytes) {
      честный успех без перекачки) или ready+parts (дошлём только остаток). */
   file._preStop = true;
 
+  /* 22.61: если prestreamInitAll прямо сейчас создаёт сессию этому файлу —
+     дождёмся её, чтобы движок продолжил ИМЕННО её (а не открывал вторую) */
+  if (file._preInitPromise) {
+    try { await file._preInitPromise; } catch (e) {}
+  }
+
   try { await _preSettle(file, 120); } catch (e) {}
 
   /* имя из окна имени должно успеть «догнать» сессию до complete */
@@ -17306,6 +17777,7 @@ async function uploadEngine(bar) {
      старого движка больше не подходит */
   const fileBytes = new Map();
   let reportedTotal = 0;
+  let dedupedCount = 0;   /* 22.62: сколько файлов свёл сервер (уже из чата) */
 
   const reportTotal = () => {
     setUploadPct((reportedTotal / totalBytes) * 100, bar);
@@ -17348,7 +17820,13 @@ async function uploadEngine(bar) {
           }
         });
 
-        if (rec) added.push(rec);
+        /* 22.62: дубль сведён сервером (файл уже приехал через
+           Telegram) — карточку и похвалу не дублируем */
+        if (rec && file._dupFlag) {
+          dedupedCount++;
+        } else if (rec) {
+          added.push(rec);
+        }
 
         /* ВОЛНА 22.54: страховка имени. Файл уходил в бота под оригинальным
            именем (предохранка), пользователь назвал его в окне имени — если
@@ -17456,6 +17934,7 @@ async function uploadEngine(bar) {
 
   showToast(
     (anySafe ? '✅ Успешно! 🔒 Зашифровано и в Сейфе' : '✅ Загружено') +
+    (dedupedCount ? ' · ♻️ уже приехали через Telegram: ' + dedupedCount : '') +
     (maxQueuePos > 1 ? ' · ⏳ публикация в канале, перед вами: ' + (maxQueuePos - 1) : ''));
 
   added.forEach((rec) => {
@@ -22737,13 +23216,16 @@ async def miniapp_upload_init(request):
         })
     # ВОЛНА 22.49: капа одновременных сессий на пользователя — иначе спам
     # init создаёт неограниченное число пустых .part-файлов на диске.
+    # ВОЛНА 22.61: 5 → 64 — клиент теперь создаёт сессию КАЖДОМУ файлу
+    # пачки в момент выбора (prestreamInitAll): капа 5 резала пачки
+    # больше пяти, и «шестой» файл оставался без сессии вообще.
     _my_sessions = sum(
         1 for _s in _MINIAPP_UPLOADS.values()
         if str(_s.get("uid") or "") == str(uid))
-    if _my_sessions >= 5:
+    if _my_sessions >= 64:
         return _miniapp_err(
             429, "too_many_uploads",
-            "У вас уже 5 активных загрузок — дождитесь их завершения.")
+            "Слишком много одновременных загрузок — дождитесь завершения.")
     upload_id = ''.join(random.choices(string.ascii_lowercase + string.digits, k=16))
     path = os.path.join(_miniapp_tmpdir(), upload_id + ".part")
     open(path, "wb").close()
@@ -22924,6 +23406,33 @@ async def miniapp_upload_closed(request):
         if size > 0 and received < size:
             s["closed_hint"] = now
             marked += 1
+
+    # ВОЛНА 22.61: ЯКОРНОЕ СООБЩЕНИЕ «файлы ждут продолжения».
+    # Пользователь вышел из мини-аппа, пока не все файлы доехали (эти байты
+    # физически могут прийти ТОЛЬКО с телефона — мёртвый WebView байтов не
+    # шлёт). Молчать здесь = тихая потеря: человек видит в облаке 2 файла
+    # из 10 и решает, что «всё теряется». Одно БЕЗЗВУЧНОЕ сообщение в чат
+    # (disable_notification — без popup и звука, не оповещение, а заметка
+    # в переписке) с кнопкой открытия облака возвращает файлы: открыл —
+    # докачка сама продолжила с того же байта. Анти-спам: только при
+    # реальном закрытии (release) и не чаще раза в 3 минуты.
+    if release and marked > 0 and MINIAPP_URL:
+        if time.time() - _CLOSED_ANCHOR_TS.get(uid, 0.0) > _CLOSED_ANCHOR_COOLDOWN:
+            _CLOSED_ANCHOR_TS[uid] = time.time()
+            _bot = getattr(_MINIAPP_PTB_APP, "bot", None) if _MINIAPP_PTB_APP else None
+            if _bot is not None:
+                try:
+                    await _bot.send_message(
+                        chat_id=int(uid),
+                        disable_notification=True,
+                        text=("⏳ Не догрузилось файлов: " + str(marked) +
+                              " — телефон закрылся раньше байтов.\n"
+                              "Откройте Облако: продолжу сам, с того же места."),
+                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                            "🌐 Открыть облако",
+                            web_app=WebAppInfo(url=MINIAPP_URL))]]))
+                except Exception as e:
+                    logger.warning(f"upload closed anchor {uid}: {e}")
     return web.json_response({"ok": True, "marked": marked})
 
 
@@ -23218,6 +23727,26 @@ async def _upload_auto_complete_task(app, upid):
                                            uid, upid)
             except Exception:
                 pass
+
+
+async def miniapp_upload_tg_mark(request):
+    """ВОЛНА 22.62: пометка «файлы передаются боту через Telegram».
+
+    Мини-апп ставит её ПЕРЕД автопередачей (navigator.share → панель
+    «поделиться» → чат бота). Пока пометка свежая (15 минут), итоги
+    сохранения файлов ИЗ ЧАТА бот отправляет БЕЗЗВУЧНО
+    (disable_notification) — «как в обычном чате, но БЕЗ оповещений».
+    Прогресс пользователь видит в панели передач мини-аппа (bg_live),
+    а дубли с прямым стримом сводятся отдельно (_dup_*)."""
+    user, uid, err = await _api_get_user_any(request)
+    if err is not None:
+        return err
+    _TG_AUTOSHARE_MARK[uid] = time.time()
+    if len(_TG_AUTOSHARE_MARK) > 512:
+        cut = time.time() - 900.0
+        for k in [k for k, v in _TG_AUTOSHARE_MARK.items() if v < cut]:
+            _TG_AUTOSHARE_MARK.pop(k, None)
+    return web.json_response({"ok": True})
 
 
 def _notify_auto_complete(uid, s, payload, ok=True):
@@ -23640,6 +24169,10 @@ async def _miniapp_upload_finalize(user, uid, upid, s, pw_raw="",
     # ВАЖНО: _mt_upload_container может ПЕРЕИМЕНОВАТЬ временный файл — чистим оба пути.
     mt_renamed = os.path.join(os.path.dirname(s["path"]), s["name"] or "file.bin")
     _finished = False   # сессия закрыта (успех или неисправимая порча)
+    # ВОЛНА 22.62: анти-дубль — переменные доступны в finally (ранние
+    # return'ы до присваивания name/size больше не роняют обработчик)
+    name, size = "", 0
+    _dup_mine = False   # клейм анти-дубля держим мы — при неудаче снимем
     try:
         if s["size"] <= 0:
             # ВОЛНА 22.38: 0-байтовые файлы невозможны (init их отвергает;
@@ -23753,6 +24286,34 @@ async def _miniapp_upload_finalize(user, uid, upid, s, pw_raw="",
             _miniapp_prune_completed()
             return True, _resp
         # === режим «БЕЗ ШИФРА» (личный канал) — прежний путь, облако ===
+        # ВОЛНА 22.62: СВЕДЕНИЕ ДУБЛЕЙ (автопередача + прямой стрим).
+        # Пользователь выбрал файлы — они полетели ДВУМЯ путями: эта
+        # сессия (прямой стрим) и автопередача в Telegram (панель
+        # «поделиться» → чат бота). Кто первый довёз — тот и сохранил.
+        # Файл уже сохранён из чата — второй раз не заливаем, отдаём
+        # клиенту УЖЕ СОХРАНЁННУЮ запись (dedup: true — без второй
+        # карточки в списке). Если файл из чата сохраняют прямо сейчас —
+        # коротко ждём (фаст-путь чата — секунды) и сверяемся ещё раз.
+        _dd = _cloud_recent_dup(user, name, size)
+        if _dd is None and (_dup_held(uid, name, size) or
+                            _dup_claim(uid, name, size)):
+            for _ in range(10):
+                await asyncio.sleep(2.0)
+                _dd = _cloud_recent_dup(user, name, size)
+                if _dd is not None or not _dup_held(uid, name, size):
+                    break
+        if _dd is not None:
+            _dup_saved(uid, name, size)
+            _finished = True
+            _resp = {"file": _miniapp_rec_out(_dd), "dedup": True}
+            _MINIAPP_COMPLETED[upid] = {"ts": time.time(), "uid": uid,
+                                        "resp": _resp}
+            _miniapp_prune_completed()
+            logger.info(f"upload {upid}: дубль сведён — «{name[:40]}» "
+                        "уже в облаке (автопередача 22.62)")
+            return True, _resp
+        _dup_claim(uid, name, size)
+        _dup_mine = True
         app = _MINIAPP_PTB_APP
         sent = None
         if size <= STORAGE_MAX_FILE_BYTES:
@@ -23803,6 +24364,8 @@ async def _miniapp_upload_finalize(user, uid, upid, s, pw_raw="",
                             if isinstance(f, dict)]
         user.cloud_files.append(rec)
         save_user(user)
+        _dup_saved(uid, name, size)   # 22.62: анти-дубль — файл сохранён
+        _dup_mine = False
         # ВОЛНА 22.38: «Скрыть» в канале больше не отправляем (см. выше).
         # ВОЛНА 22.35: позиция в очереди публикаций канала (1 = печатали сразу)
         out = _miniapp_rec_out(rec)
@@ -23831,6 +24394,10 @@ async def _miniapp_upload_finalize(user, uid, upid, s, pw_raw="",
                     pass
         else:
             s["completing"] = False
+            # 22.62: сохранить не удалось — снимаем свой анти-дубль клейм,
+            # чтобы этот же файл из чата не потерялся из-за нас
+            if _dup_mine:
+                _dup_release(uid, name, size)
 
 
 # --- ВОЛНА 22.23: «МОЁ ОБЛАКО» В МИНИ-АППЕ (хранилище пользователя) ---
@@ -24477,6 +25044,9 @@ def mount_miniapp_routes(app):
     app.router.add_post("/api/upload/abort", miniapp_upload_abort)
     # ВОЛНА 22.48: «мини апп закрыли посреди загрузки» (fetch keepalive)
     app.router.add_post("/api/upload/closed", miniapp_upload_closed)
+    # ВОЛНА 22.62: пометка «файлы передаются через Telegram» (автопередача
+    # из мини-аппа: системная панель «поделиться» → чат бота)
+    app.router.add_post("/api/upload/tg_mark", miniapp_upload_tg_mark)
     # ВОЛНА 22.50: статус сессии загрузки — честный успех вместо фантомных ошибок
     app.router.add_get("/api/upload/status", miniapp_upload_status)
     # ВОЛНА 22.54: имя «догоняет» уже летящую загрузку (предохранка)
