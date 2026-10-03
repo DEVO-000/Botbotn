@@ -3001,6 +3001,10 @@ class Class:
                 'host': str(class_obj.schedule_web.get('host') or '')[:120],
                 'title': str(class_obj.schedule_web.get('title') or '')[:200],
                 'ts': str(class_obj.schedule_web.get('ts') or '')[:16],
+                # ВОЛНА 22.68: file_id последней отправки — кнопка «📅
+                # Расписание» переигрывает файл без перекачки с сайта.
+                'file_id': str(class_obj.schedule_web.get('file_id') or '')[:200],
+                'file_kind': str(class_obj.schedule_web.get('file_kind') or '')[:16],
             }
             if not (class_obj.schedule_web['text']
                     or class_obj.schedule_web['name']):
@@ -3758,7 +3762,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.67"
+BOT_BUILD = "22.68"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -8441,15 +8445,26 @@ def _dup_saved(uid, name, size):
 
 
 def _cloud_recent_dup(user, name, size):
-    """ВОЛНА 22.62: свежая (≤15 мин) запись в облаке с тем же именем и
-    размером — автопередача уже сохранила этот файл из чата."""
+    """ВОЛНА 22.62: свежая запись в облаке с тем же именем и размером —
+    автопередача уже сохранила этот файл из чата.
+    ВОЛНА 22.68: ОКНО ЗАВИСИТ ОТ ИСТОЧНИКА записи:
+      • src="chat" — 900 с (как было): файл приехал из чата, прямой стрим
+        мини-аппа мог финализироваться минутами (2 ГБ) — окно широкое;
+      • src="web"  — 600 с (= _DUP_WINDOW): защита ТОЛЬКО от повторного
+        complete той же загрузки (потерянный ответ, рестарт сервера), а не
+        от намеренной повторной загрузки. Раньше окно было 900 с для ВСЕХ
+        записей — вторая музыка с теми же именем+размером (типично для
+        треков из Telegram!) молча сводилась с первой, и пользователь
+        видел «загрузил ещё — пропала, потом пропала первая»."""
     try:
-        cut = time.time() - 900.0
+        now = time.time()
         for f in reversed(getattr(user, "cloud_files", []) or []):
             if not isinstance(f, dict):
                 continue
             if str(f.get("name") or "")[:200] == str(name or "")[:200] and \
                     int(f.get("size") or 0) == int(size or 0):
+                _win = 900.0 if str(f.get("src") or "") == "chat" else 600.0
+                cut = now - _win
                 try:
                     if float(f.get("ts") or 0) >= cut:
                         return f
@@ -8574,11 +8589,13 @@ async def _bg_upload_items(update, context, items):
             # ВОЛНА 22.62: большая загрузка шла минутами — за это время
             # прямой стрим мог сохранить ЭТОТ ЖЕ файл. Проверяем свежий
             # список облака: дубль не добавляем (файл уже там).
+            # ВОЛНА 22.68: раньше сверка была БЕЗ окна времени — любой
+            # ОДНОИМЁННЫЙ файл того же размера (даже месячной давности)
+            # «проглатывал» свежескачанный. Теперь честное окно
+            # _cloud_recent_dup (chat 900 с / web 600 с).
             try:
-                _fc = [f for f in (getattr(get_user(user_id), "cloud_files", [])
-                                   or []) if isinstance(f, dict)]
-                if any(str(f.get("name") or "")[:200] == name[:200] and
-                       int(f.get("size") or 0) == size for f in _fc):
+                _fc_user = get_user(user_id)
+                if _cloud_recent_dup(_fc_user, name, size) is not None:
                     deduped.append(name)
                     continue
             except Exception:
@@ -8889,6 +8906,73 @@ def _miniapp_prune_completed():
               if now - float(v.get("ts", 0)) > _MINIAPP_COMPLETED_TTL]:
         _MINIAPP_COMPLETED.pop(k, None)
 
+
+def _miniapp_completed_path():
+    """ВОЛНА 22.68: файл-карта завершённых загрузок (uploadId → ответ).
+    Раньше карта была только в ОЗУ: рестарт сервера стирал её, повторный
+    complete недогруженного файла создавал ВТОРУЮ запись (дубль карточки
+    в облаке). Теперь карта живёт на диске рядом с сессиями."""
+    try:
+        return os.path.join(_miniapp_tmpdir(), "completed_uploads.json")
+    except Exception:
+        return os.path.join("miniapp_uploads", "completed_uploads.json")
+
+
+def _miniapp_completed_save():
+    """Атомарно слить карту завершённых загрузок на диск (best-effort)."""
+    try:
+        p = _miniapp_completed_path()
+        _ensure_parent_dir(p)
+        tmp = p + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_MINIAPP_COMPLETED, f, ensure_ascii=False)
+        os.replace(tmp, p)
+    except Exception:
+        pass
+
+
+def _miniapp_completed_put(upid, uid, resp):
+    """Единая точка записи результата complete: память + диск.
+    (Раньше три места присваивали _MINIAPP_COMPLETED[upid] напрямую —
+    диск при этом молчал, и рестарт между complete и повторным complete
+    рождал дубль файла.)"""
+    _MINIAPP_COMPLETED[str(upid or "")] = {
+        "ts": time.time(), "uid": str(uid or ""), "resp": resp}
+    _miniapp_prune_completed()
+    _miniapp_completed_save()
+
+
+def _miniapp_completed_restore():
+    """При старте сервера: прочитать карту завершённых загрузок с диска.
+    Просроченные (TTL 1 ч) и битые записи честно выбрасываются."""
+    try:
+        p = _miniapp_completed_path()
+        if not os.path.exists(p):
+            return 0
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return 0
+        now = time.time()
+        n = 0
+        for k, v in data.items():
+            if not isinstance(k, str) or not isinstance(v, dict):
+                continue
+            if now - float(v.get("ts", 0) or 0) > _MINIAPP_COMPLETED_TTL:
+                continue
+            if not isinstance(v.get("resp"), dict):
+                continue
+            _MINIAPP_COMPLETED[k] = v
+            n += 1
+        if not _MINIAPP_COMPLETED:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+        return n
+    except Exception:
+        return 0
+
 # ВОЛНА 22.30: ОДНОРАЗОВЫЕ ССЫЛКИ СКАЧИВАНИЯ. Заголовки авторизации в ссылке
 # не передашь, а blob-загрузки в WebView Telegram часто блокированы — поэтому
 # мини-апп сначала получает короткоживущий токен (/api/files/{fid}/link), а
@@ -9083,10 +9167,16 @@ def _miniapp_rec_out(rec):
         pass  # epoch — отдаём число
     else:
         _ts = str(_ts or "")
+    # ВОЛНА 22.68: голосовые (kind="voice") показываем как музыку — фильтр
+    # «Музыка» и иконка в мини-аппе иначе их не видели (клиент знает только
+    # photo/video/audio/document).
+    _kind = str(rec.get("kind") or "document")
+    if _kind == "voice":
+        _kind = "audio"
     return {
         "id": str(rec.get("id") or ""),
         "name": str(rec.get("name") or "файл"),
-        "kind": str(rec.get("kind") or "document"),
+        "kind": _kind,
         "size": int(rec.get("size") or 0),
         "ts": _ts,
         "vault": False,
@@ -9155,7 +9245,12 @@ def _miniapp_vault_pw_from_request(request):
 
 def _miniapp_kind_from(mime, name):
     """Тип для фильтров мини-аппа по mime/расширению. Сам файл в канале
-    хранится ДОКУМЕНТОМ (без сжатия) — kind нужен только интерфейсу."""
+    хранится ДОКУМЕНТОМ (без сжатия) — kind нужен только интерфейсу.
+    ВОЛНА 22.68: расширена таблица расширений — раньше музыка .aac/.opus и
+    фото .jfif/.bmp/.webp-двойники, видео .3gp/.m4v показывались как
+    «документ» («неправильное распознавание файлов»). Проверка
+    .endswith(…), поэтому длинные хвосты («.mp3.upload») не совпадут, а
+    «.MP3» в верхнем регистре — совпадёт (имя уже приведено к нижнему)."""
     m = (mime or "").lower()
     if m.startswith("image/"):
         return "photo"
@@ -9164,12 +9259,24 @@ def _miniapp_kind_from(mime, name):
     if m.startswith("audio/"):
         return "audio"
     n = (name or "").lower()
-    for ext, k in ((".jpg", "photo"), (".jpeg", "photo"), (".png", "photo"),
-                   (".gif", "photo"), (".webp", "photo"), (".heic", "photo"),
-                   (".mp4", "video"), (".mov", "video"), (".avi", "video"),
-                   (".mkv", "video"), (".webm", "video"),
-                   (".mp3", "audio"), (".wav", "audio"), (".ogg", "audio"),
-                   (".m4a", "audio"), (".flac", "audio")):
+    for ext, k in (
+            # картинки
+            (".jpg", "photo"), (".jpeg", "photo"), (".png", "photo"),
+            (".gif", "photo"), (".webp", "photo"), (".heic", "photo"),
+            (".heif", "photo"), (".jfif", "photo"), (".bmp", "photo"),
+            (".tif", "photo"), (".tiff", "photo"), (".avif", "photo"),
+            (".svg", "photo"),
+            # видео
+            (".mp4", "video"), (".mov", "video"), (".avi", "video"),
+            (".mkv", "video"), (".webm", "video"), (".m4v", "video"),
+            (".3gp", "video"), (".3g2", "video"), (".mpg", "video"),
+            (".mpeg", "video"), (".wmv", "video"), (".ts", "video"),
+            # музыка
+            (".mp3", "audio"), (".wav", "audio"), (".ogg", "audio"),
+            (".oga", "audio"), (".opus", "audio"), (".m4a", "audio"),
+            (".m4b", "audio"), (".flac", "audio"), (".aac", "audio"),
+            (".wma", "audio"), (".amr", "audio"), (".mid", "audio"),
+            (".midi", "audio"), (".weba", "audio")):
         if n.endswith(ext):
             return k
     return "document"
@@ -13906,7 +14013,8 @@ function maybeAutoResync() {
      («файлы не синхронизируются»). */
   if (listLoading || isUploading) return;
   if (!IS_TELEGRAM && !WEB_TOKEN) return;
-  if (Date.now() - LAST_SYNC < 12000) return;
+  /* ВОЛНА 22.68: 12 с → 4 с — обновления приходят «в несколько секунд» */
+  if (Date.now() - LAST_SYNC < 4000) return;
 
   loadFiles(true);
 }
@@ -13930,15 +14038,16 @@ try {
 /* ВОЛНА 22.50: тихая авто-синхронизация. Пользователь:
    «автоматическая синхронизация мини приложения должна быть каждые сколько-то
    секунд/минут, чтобы всё было синхронизировано, но не уведомлять об этом».
-   ВОЛНА 22.64: тик 45 с → 10 с (файлы, добавленные через бота, появляются
-   в облаке заметно быстрее; троттл LAST_SYNC 12 с не даёт лишнего спама).
-   loadFiles(true) молчит (без тостов и спиннеров) и обновляет файлы, режим
-   шифрования и статус канала. В фоне и без входа не тикает. */
+   ВОЛНА 22.64: тик 45 с → 10 с.
+   ВОЛНА 22.68: тик 10 с → 4 с и троттл 12 с → 4 с — «обновление нужно
+   больше В НЕСКОЛЬКО СЕКУНД». Запрос лёгкий (сервер отвечает из ОЗУ),
+   спама нет: пока летит загрузка или прошлый запрос не доехал — тик
+   пропускается (listLoading/isUploading). В фоне и без входа не тикает. */
 setInterval(function () {
   if (document.hidden) return;
   if (!IS_TELEGRAM && !WEB_TOKEN) return;   /* не вошли — нечего синхронизировать */
   maybeAutoResync();
-}, 10000);
+}, 4000);
 
 let FILTER = 'all';
 let SEARCH = '';
@@ -16764,13 +16873,6 @@ function addMoreUploadFiles() {
 function uploadFiles(fileList) {
   let files = Array.from(fileList);
 
-  /* 22.49: раньше файлы, выбранные ВО ВРЕМЯ активной загрузки, молча
-     пропадали (return без тоста) — пользователь думал, что «не сработало» */
-  if (files.length && isUploading) {
-    showToast('⏳ Дождитесь окончания текущей загрузки — потом добавьте остальные');
-    return;
-  }
-
   if (!files.length) return;
 
   /* 22.39: пустые файлы (0 Б) не грузим вообще — «такого не должно быть»
@@ -16785,6 +16887,30 @@ function uploadFiles(fileList) {
   files = files.filter((f) => +f.size);
 
   if (!files.length) return;
+
+  /* ВОЛНА 22.49: раньше файлы, выбранные ВО ВРЕМЯ активной загрузки, молча
+     пропадали (return без тоста) — пользователь думал, что «не сработало».
+     ВОЛНА 22.68: теперь они СНАЧАЛА сохраняются в очередь докачки (IndexedDB),
+     и сразу после окончания текущей пачки движок сам подхватит их
+     (soft-resume) — «дождитесь окончания» больше не означает «потеряйте». */
+  if (files.length && isUploading) {
+    for (const f of files) {
+      if (f._entryKey || (+f.size || 0) > UPQ_MAX_PERSIST) continue;
+
+      const k = 'up_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+
+      f._entryKey = k;
+
+      upqPut({
+        k: k, blob: f, name: f.name, uploadName: f.uploadName || f.name,
+        size: +f.size || 0, mime: f.type || '', uploadId: '', added: Date.now()
+      });
+    }
+
+    showToast('⏳ Дождитесь окончания текущей загрузки — эти ' + files.length +
+      ' файл(ов) в очереди и полетят следом');
+    return;
+  }
 
   /* ВОЛНА 22.63: автопередача (панель «поделиться») удалена — выбор
      файлов сразу запускает ПРЯМОЙ стрим боту ниже: очередь IndexedDB,
@@ -18241,8 +18367,12 @@ async function uploadEngine(bar) {
         /* ВОЛНА 22.54: страховка имени. Файл уходил в бота под оригинальным
            именем (предохранка), пользователь назвал его в окне имени — если
            сервер всё же записал старое имя (финализация обогнала ренейм),
-           тихо переименовываем запись и подпись в канале (как ✏️). */
-        if (rec && rec.id && file.uploadName && rec.name &&
+           тихо переименовываем запись и подпись в канале (как ✏️).
+           ВОЛНА 22.68: ТОЛЬКО для СВОЕЙ записи! Раньше при сведении дубля
+           (dedup) сервер возвращал ЧУЖУЮ запись (первую музыку с теми же
+           именем+размером), и эта страховка ПЕРЕИМЕНОВЫВАЛА ЕЁ в имя новой
+           загрузки — «первая пропала, появилась вторая». */
+        if (rec && !file._dupFlag && rec.id && file.uploadName && rec.name &&
             String(rec.name) !== String(file.uploadName)) {
           apiJson('/api/files/' + encodeURIComponent(rec.id), {
             method: 'PATCH',
@@ -18357,17 +18487,39 @@ async function uploadEngine(bar) {
     (maxQueuePos > 1 ? ' · ⏳ публикация в канале, перед вами: ' + (maxQueuePos - 1) : ''));
 
   added.forEach((rec) => {
-    ALL_FILES.unshift({
+    /* ВОЛНА 22.68: защита от визуального дубля — живой опрос мог уже
+       принести эту запись с сервера ДО конца пачки. Раньше unshift
+       добавлял ВТОРУЮ карточку с тем же id («файлы дублируются»). */
+    if (rec && rec.id && ALL_FILES.some((f) => f.id === String(rec.id))) return;
+
+    ALL_FILES.unshift(filesMapAll({
       id: rec.id,
       name: rec.name,
       kind: rec.kind,
       size: +rec.size || 0,
       ts: rec.ts || '',
-      vault: !!rec.vault
-    });
+      vault: !!rec.vault,
+      safe: !!rec.safe,
+      plain: !!rec.plain,
+      src: 'web'
+    }));
   });
 
   renderAll({ animate: true });
+
+  /* ВОЛНА 22.68: тихая сверка с сервером СРАЗУ после пачки — подхватывает
+     записи, завершённые ботом сами (авто-догрузка), и свежие значения
+     статистики/лимита; обновления больше не ждут до 12 с. */
+  setTimeout(() => { loadFiles(true, true).catch(() => {}); }, 400);
+
+  /* ВОЛНА 22.68: файлы, выбранные ВО ВРЕМЯ этой пачки, лежат в очереди
+     IndexedDB — подхватываем их следом (soft: без тостов и без сжигания
+     бюджета попыток). */
+  setTimeout(() => {
+    if (!isUploading && !RESUMING && !document.hidden) {
+      resumePendingUploads({ soft: true }).catch(() => {});
+    }
+  }, 1600);
 
   setTimeout(() => {
     resetUploadUI(bar, checkmark, squareStop);
@@ -24812,9 +24964,8 @@ async def _miniapp_upload_finalize(user, uid, upid, s, pw_raw="",
                 "file": _miniapp_safe_rec_out(len(user.vault_files), new_rec),
                 "safe": True,
             }
-            _MINIAPP_COMPLETED[upid] = {"ts": time.time(), "uid": uid,
-                                        "resp": _resp}
-            _miniapp_prune_completed()
+            # 22.68: результат — в память И на диск (рестарт не рождает дубль)
+            _miniapp_completed_put(upid, uid, _resp)
             return True, _resp
         # === режим «БЕЗ ШИФРА» (личный канал) — прежний путь, облако ===
         # ВОЛНА 22.62: СВЕДЕНИЕ ДУБЛЕЙ (автопередача + прямой стрим).
@@ -24837,9 +24988,7 @@ async def _miniapp_upload_finalize(user, uid, upid, s, pw_raw="",
             _dup_saved(uid, name, size)
             _finished = True
             _resp = {"file": _miniapp_rec_out(_dd), "dedup": True}
-            _MINIAPP_COMPLETED[upid] = {"ts": time.time(), "uid": uid,
-                                        "resp": _resp}
-            _miniapp_prune_completed()
+            _miniapp_completed_put(upid, uid, _resp)
             logger.info(f"upload {upid}: дубль сведён — «{name[:40]}» "
                         "уже в облаке (автопередача 22.62)")
             return True, _resp
@@ -24906,9 +25055,7 @@ async def _miniapp_upload_finalize(user, uid, upid, s, pw_raw="",
             out["queue_pos"] = 1
         _finished = True
         _resp = {"file": out}
-        _MINIAPP_COMPLETED[upid] = {"ts": time.time(), "uid": uid,
-                                    "resp": _resp}
-        _miniapp_prune_completed()
+        _miniapp_completed_put(upid, uid, _resp)
         return True, _resp
     finally:
         # ВОЛНА 22.49: сессию и .part снимаем ТОЛЬКО при успехе или
@@ -39987,16 +40134,32 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # полученное монитором админ-панели («🌐 Расписание с сайтов») или
         # выбранное админом. Ученики видят его прямо в «📅 Расписание»,
         # а не только отдельным сообщением в чате.
+        # ВОЛНА 22.68: ФАЙЛОВЫЕ расписания (картинка/PDF со школы) тоже
+        # приходят В КНОПКУ: бот переигрывает файл по file_id первой
+        # отправки (без перекачки с сайта), а не только текст.
         _web = getattr(class_obj, "schedule_web", None)
-        if isinstance(_web, dict) and str(_web.get("text") or "").strip():
-            _when = str(_web.get("ts") or "").strip()
-            _host = str(_web.get("host") or "").strip()
-            _head = "\n🌐 Расписание с сайтов"
-            if _host:
-                _head += f" ({_host})"
-            if _when:
-                _head += f" — обновлено {_when}"
-            parts.append(_head + ":\n" + str(_web.get("text") or "").strip())
+        _web_file = None
+        if isinstance(_web, dict):
+            _wtext = str(_web.get("text") or "").strip()
+            if _wtext:
+                _when = str(_web.get("ts") or "").strip()
+                _host = str(_web.get("host") or "").strip()
+                _head = "\n🌐 Расписание с сайтов"
+                if _host:
+                    _head += f" ({_host})"
+                if _when:
+                    _head += f" — обновлено {_when}"
+                parts.append(_head + ":\n" + _wtext)
+            _wname = str(_web.get("name") or "").strip()
+            _wfid = str(_web.get("file_id") or "").strip()
+            if _wfid:
+                _web_file = _web          # файл можно переиграть по file_id
+            elif str(_web.get("kind")) == "file" and _wname:
+                _when = str(_web.get("ts") or "").strip()
+                parts.append(
+                    "\n🌐 Расписание с сайтов — 📄 " + _wname +
+                    (f" (файл прислан в чат класса {_when})" if _when
+                     else " (файл прислан в чат класса)"))
 
         full_text = "\n".join(parts)
 
@@ -40029,6 +40192,27 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(
                     f"🖼 Картинка расписания на {_day} не открылась — админ может "
                     "перезалить её через «📅 Редактировать расписание».")
+
+        # ВОЛНА 22.68: и САМ файл «Расписания с сайтов» — картинкой или
+        # документом (file_id первой отправки; перекачки с сайта нет).
+        if _web_file is not None:
+            _wcap = "🌐 Расписание с сайтов"
+            if str(_web_file.get("host") or "").strip():
+                _wcap += f" ({_web_file['host']})"
+            if str(_web_file.get("ts") or "").strip():
+                _wcap += f" — обновлено {_web_file['ts']}"
+            try:
+                if str(_web_file.get("file_kind") or "") == "photo":
+                    await update.message.reply_photo(
+                        _web_file["file_id"], caption=_wcap[:1024])
+                else:
+                    await update.message.reply_document(
+                        _web_file["file_id"], caption=_wcap[:1024])
+            except Exception as e:
+                logger.warning(f"schedule_web file re-send: {e}")
+                await update.message.reply_text(
+                    "🌐 Файл расписания с сайтов не открылся — админ может "
+                    "прислать его заново через «🌐 Расписание с сайтов».")
         return MAIN_MENU
 
     elif message_text == "📝 Домашнее задание":
@@ -43760,31 +43944,65 @@ async def schmon_send_text(bot, chat_id, text):
     return ok
 
 
+class _SchmonResult:
+    """ВОЛНА 22.68: результат schmon_send_item — truthy как раньше (bool-
+    совместимость всех старых `if await schmon_send_item(…)`), но ещё несёт
+    file_id последней успешной отправки и её тип ("photo"/"document") —
+    чтобы запомнить расписание В КЛАССЕ и переигрывать его из кнопки
+    «📅 Расписание» без перекачки с сайта."""
+    __slots__ = ("ok", "file_id", "kind")
+
+    def __init__(self, ok, file_id="", kind=""):
+        self.ok = bool(ok)
+        self.file_id = str(file_id or "")
+        self.kind = str(kind or "")
+
+    def __bool__(self):
+        return self.ok
+
+
 async def schmon_send_item(bot, chat_id, src_url, data, name, host):
-    """Отправить один источник расписания: картинку — фото, документ — файлом."""
+    """Отправить один источник расписания: картинку — фото, документ — файлом.
+    ВОЛНА 22.68: возвращает _SchmonResult (truthy как раньше) с file_id."""
     try:
         if (schmon_image_kind(src_url) or schmon_image_kind(name)):
             if len(data) < SCHEDMON_MIN_IMAGE_BYTES:
-                return False  # иконка/мусор — не шлём
+                return _SchmonResult(False)  # иконка/мусор — не шлём
             if len(data) <= SCHEDMON_MAX_PHOTO_MB * 1024 * 1024:
                 try:
-                    await bot.send_photo(
+                    m = await bot.send_photo(
                         chat_id=chat_id,
                         photo=InputFile(data, filename=name or "photo.jpg"),
                         caption=("🖼 Расписание\n%s" % host)[:1024])
-                    return True
+                    _fid = ""
+                    try:
+                        _fid = (m.photo[-1].file_id if getattr(m, "photo", None)
+                                else "") or ""
+                    except Exception:
+                        _fid = ""
+                    return _SchmonResult(True, _fid, "photo")
                 except Exception as e:
                     logger.warning(f"schmon_send_item photo→doc {chat_id}: {e}")
-            await bot.send_document(
+            m = await bot.send_document(
                 chat_id=chat_id,
                 document=InputFile(data, filename=name or "image.jpg"),
                 caption=("🖼 Расписание\n%s" % host)[:1024])
-            return True
-        await bot.send_document(
+            _fid = ""
+            try:
+                _fid = getattr(getattr(m, "document", None), "file_id", "") or ""
+            except Exception:
+                _fid = ""
+            return _SchmonResult(True, _fid, "document")
+        m = await bot.send_document(
             chat_id=chat_id,
             document=InputFile(data, filename=name or "file.pdf"),
             caption=("📄 %s\n%s" % (name, host))[:1024])
-        return True
+        _fid = ""
+        try:
+            _fid = getattr(getattr(m, "document", None), "file_id", "") or ""
+        except Exception:
+            _fid = ""
+        return _SchmonResult(True, _fid, "document")
     except Exception as e:
         logger.warning(f"schmon_send_item {chat_id}: {e}")
         return False
@@ -43806,13 +44024,17 @@ def schmon_recipients(class_obj):
     return ids
 
 
-def _schmon_store_web(class_obj, url, info, text="", kind="text", name=""):
+def _schmon_store_web(class_obj, url, info, text="", kind="text", name="",
+                      file_id="", file_kind=""):
     """ВОЛНА 22.67: запомнить в КЛАССЕ последнее «Расписание с сайтов».
 
     Просьба: «оно должно приходить В РАСПИСАНИЯ классу» — теперь выбранное
     или обновлённое расписание пишется в class_obj.schedule_web и видно
     ученикам в «📅 Расписание» секцией «🌐 Расписание с сайтов», а не только
-    разлетается сообщениями (которые легко потерять в чате)."""
+    разлетается сообщениями (которые легко потерять в чате).
+    ВОЛНА 22.68: для файловых расписаний запоминается ещё file_id первой
+    успешной отправки (+file_kind "photo"/"document") — кнопка «📅 Расписание»
+    переигрывает САМ ФАЙЛ по file_id, без перекачки с сайта."""
     try:
         if class_obj is None:
             return
@@ -43824,6 +44046,8 @@ def _schmon_store_web(class_obj, url, info, text="", kind="text", name=""):
             "host": schmon_host_of(url)[:120],
             "title": str((info or {}).get("title") or "")[:200],
             "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "file_id": str(file_id or "")[:200],
+            "file_kind": str(file_kind or "")[:16],
         }
         save_class(class_obj)
     except Exception as e:
@@ -43864,15 +44088,26 @@ async def schmon_notify(app, class_code, url, info, new_files=(),
             return False
         host = schmon_host_of(url)
         sent_any = False
+        # ВОЛНА 22.68: file_id первой успешной отправки — для кнопки «📅
+        # Расписание» (переигрывает файл классу без перекачки).
+        _first_res = None
         for chat_id in recipients:
-            if await schmon_send_item(bot, chat_id, f, data, name, host):
+            _res = await schmon_send_item(bot, chat_id, f, data, name, host)
+            if _res:
                 sent_any = True
+                # getattr: у файла может не быть file_id (старые заглушки),
+                # и monkeypatch-подмены в тестах возвращают просто True
+                if _first_res is None or not getattr(_first_res, "file_id", ""):
+                    _first_res = _res
         if sent_any:
             schmon_mark_sent(info, digest)
             schmon_use_daily_quota(info)
             # ВОЛНА 22.67: расписание-файл запоминаем и В КЛАССЕ — его видно
             # в «📅 Расписание» секцией «🌐 Расписание с сайтов».
-            _schmon_store_web(class_obj, url, info, kind="file", name=name)
+            # ВОЛНА 22.68: с file_id — кнопка присылает сам файл.
+            _schmon_store_web(class_obj, url, info, kind="file", name=name,
+                              file_id=(getattr(_first_res, "file_id", "") if _first_res else ""),
+                              file_kind=(getattr(_first_res, "kind", "") if _first_res else ""))
             return True  # ровно ОДИН файл/фото за день!
 
     if handled:
@@ -44402,6 +44637,9 @@ async def _schmon_send_candidate_admin(bot, url, info, u, admin_chat_id,
                                        schmon_host_of(url))
             except Exception as _e:
                 logger.warning(f"schmon also_chats {_chat}: {_e}")
+    # ВОЛНА 22.68: возвращаем _SchmonResult (truthy) — вызывающий заберёт
+    # file_id для запоминания в классе; для старых сравнений с False всё
+    # совместимо (__bool__).
     return ok
 
 
@@ -44451,8 +44689,11 @@ async def schmon_pick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                             cands[idx][0], uid,
                                             also_chats=_also)
     if ok:
+        # ВОЛНА 22.68: с file_id — кнопка «📅 Расписание» переигрывает файл
         _schmon_store_web(class_obj, url, info, kind="file",
-                          name=(cands[idx][0] or "").rsplit("/", 1)[-1])
+                          name=(cands[idx][0] or "").rsplit("/", 1)[-1],
+                          file_id=getattr(ok, "file_id", ""),
+                          file_kind=getattr(ok, "kind", ""))
     schmon_merge_info(class_code, url, info)
     if not ok:
         try:
@@ -44542,14 +44783,22 @@ async def schmon_all_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _also = [c for c in schmon_recipients(class_obj)
              if str(c) != str(uid)]
     _last_name = ""
+    _last_fid = ""
+    _last_fkind = ""
     for u, _k in (info.get("cand") or [])[:SCHEDMON_MAX_FILES_PER_NOTIFY]:
-        if await _schmon_send_candidate_admin(context.bot, url, info, u, uid,
-                                              skip_dup=True,
-                                              also_chats=_also):
+        _res = await _schmon_send_candidate_admin(context.bot, url, info, u, uid,
+                                                  skip_dup=True,
+                                                  also_chats=_also)
+        if _res:
             sent_any = True
             _last_name = str(u or "").rsplit("/", 1)[-1]
+            # getattr: совместимость с заглушками, возвращающими True
+            if getattr(_res, "file_id", ""):
+                _last_fid = _res.file_id
+                _last_fkind = _res.kind
     if sent_any:
-        _schmon_store_web(class_obj, url, info, kind="file", name=_last_name)
+        _schmon_store_web(class_obj, url, info, kind="file", name=_last_name,
+                          file_id=_last_fid, file_kind=_last_fkind)
     schmon_merge_info(class_code, url, info)
     if not sent_any:
         await schmon_send_text(context.bot, uid,
@@ -46061,6 +46310,16 @@ async def join_class_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         user = User(user_id)
     class_code = update.message.text.strip().upper()
 
+    # ВОЛНА 22.68: кнопки меню/быстрые команды — НЕ код класса. Раньше такой
+    # текст честно отвечал «класс не найден» и держал пользователя в ожидании
+    # кода («во всех кнопках ошибки»). Отдаём текст штатному меню.
+    if update.message.text.strip() in QUICK_COMMANDS or \
+            update.message.text.strip() in ALL_MAIN_MENU_BUTTONS:
+        try:
+            return await handle_main_menu(update, context)
+        except Exception:
+            return MAIN_MENU
+
     class_obj = get_class_by_code(class_code)
 
     if not class_obj:
@@ -46070,6 +46329,27 @@ async def join_class_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if str(user_id) in class_obj.students:
         await update.message.reply_text("✅ Вы уже состоите в этом классе!")
         return await class_management(update, context)
+
+    # ВОЛНА 22.68: админ класса, повторно введший код, раньше становился
+    # ЕЩЁ И УЧЕНИКОМ своего класса (дубли в уведомлениях и рассылках).
+    if str(user_id) in class_obj.admins or \
+            str(class_obj.creator_id or "") == str(user_id):
+        await update.message.reply_text(
+            f"✅ Вы админ класса '{class_obj.class_name}' — отдельно "
+            "присоединяться не нужно.")
+        return await class_management(update, context)
+
+    # ВОЛНА 22.68: состоя в ДРУГОМ классе — в новый не пускаем. Раньше
+    # пользователь попадал в ДВА класса сразу (students обоих), а
+    # user.class_code показывал только один: расписание/дежурства/уведомления
+    # шли от «первого попавшегося» класса — отсюда «во всех кнопках ошибки».
+    _mine = get_class_by_user(user_id)
+    if _mine is not None and str(_mine.class_code) != str(class_code):
+        await update.message.reply_text(
+            f"⚠️ Вы уже состоите в классе «{_mine.class_name}».\n"
+            "Сначала выйдите из него («🚪 Выйти из класса»), затем "
+            "присоединяйтесь к новому.")
+        return JOIN_CLASS
 
     if not check_class_limit(class_code):
         await update.message.reply_text("В классе максимум участников (40).")
@@ -60695,6 +60975,17 @@ async def _post_init(application):
             asyncio.create_task(_upload_auto_complete_delayed(_a_upid, 3.0))
     except Exception as e2:
         logger.error(f"Не удалось восстановить сессии загрузки: {e2}")
+
+    # === ВОЛНА 22.68: карта завершённых загрузок — с диска. ===
+    # Повторный complete после рестарта отдаёт СОХРАНЁННЫЙ результат вместо
+    # создания второй записи («файлы дублируются»).
+    try:
+        _comp_n = _miniapp_completed_restore()
+        if _comp_n:
+            logger.info(f"ВОЛНА 22.68: завершённых загрузок восстановлено: "
+                        f"{_comp_n}")
+    except Exception as e2:
+        logger.error(f"Не удалось восстановить карту завершённых загрузок: {e2}")
 
     # === ВОЛНА 22.55: восстановление очередей скачивания «через бота» ===
     # Пользователь закрыл Telegram посреди пачки — очередь жила на сервере;
