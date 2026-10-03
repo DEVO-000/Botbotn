@@ -3641,7 +3641,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.59"
+BOT_BUILD = "22.53"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -6146,12 +6146,7 @@ async def _voice_transcription_middleware(update: Update, context: ContextTypes.
         msg = getattr(update, "message", None)
         if msg is None or getattr(update, "edited_message", None) is not None:
             return
-        # ВОЛНА 22.57: транскрибируем ТОЛЬКО голосовые (voice) — ими
-        # управляют ботом. Аудио-ФАЙЛЫ (музыка, mp3 и пр.) больше НЕ
-        # гоняются через Whisper: они проваливаются к глобальному роутеру
-        # bg_chat_upload_receive и сохраняются в облако («загрузка через
-        # бота»). Раньше mp3 «расшифровывался» в мусор и терялся.
-        att = getattr(msg, "voice", None)
+        att = getattr(msg, "voice", None) or getattr(msg, "audio", None)
         # === Облако и Сейф (режимы загрузки файлов): аудио и голосовые НЕ
         # транскрибируются — пользователь сохраняет/шифрует сам файл. Флаги
         # self-heal: любой текстовый апдейт выводит из режима загрузки.
@@ -6414,8 +6409,7 @@ async def _pub_send(channel_id, coro_factory):
 
 
 async def _storage_upload_document(context, data: bytes, filename: str, caption: str = "",
-                                   channel_id=None, user=None, data_path=None,
-                                   silent=False):
+                                   channel_id=None, user=None, data_path=None):
     """Загружает документ в канал-хранилище.
 
     НОВОЕ (волна 7): если channel_id не задан явно — грузим по КРУГУ во все
@@ -6429,8 +6423,6 @@ async def _storage_upload_document(context, data: bytes, filename: str, caption:
     шлагбаумом): раньше каждый complete читал свой файл в ОЗУ ДО очереди,
     и пачка больших файлов съедала гигабайты ОЗУ сразу (до OOM на Render),
     из-за чего пакетная загрузка падала, а по одной — работала.
-    ВОЛНА 22.56: silent=True → disable_notification (снапшоты/бэкапы в
-    db-каналы больше не звонят разработчику в телефон).
     Возвращает ({"message_id", "file_id", "size", "channel_id", "queue_pos"}) или None."""
 
     def _payload_bytes():
@@ -6474,7 +6466,6 @@ async def _storage_upload_document(context, data: bytes, filename: str, caption:
                     chat_id=ch,
                     document=InputFile(await _payload_bytes_async(), filename=filename or "file.bin"),
                     caption=(caption or "")[:1024] or None,
-                    disable_notification=bool(silent),
                 )
 
             sent, queue_pos = await _pub_send(ch, _send_doc)
@@ -6520,7 +6511,7 @@ STORAGE_PART_BYTES = 19 * 1024 * 1024
 
 
 async def _storage_upload_big(context, data: bytes, base_filename: str, caption: str = "",
-                              channel_id=None, silent=False):
+                              channel_id=None):
     """Загрузка данных любого размера: до 19 МБ — одним документом, больше —
     ЧАСТЯМИ по 19 МБ (Telegram не даёт ботам отправлять файлы >50 МБ, а
     скачивать >20 МБ; поэтому честный путь — части).
@@ -6533,7 +6524,7 @@ async def _storage_upload_big(context, data: bytes, base_filename: str, caption:
                 список_частей: [{"message_id", "file_id", "size", "channel_id"}])."""
     if len(data) <= STORAGE_PART_BYTES:
         res = await _storage_upload_document(context, data, base_filename, caption,
-                                             channel_id=channel_id, silent=silent)
+                                             channel_id=channel_id)
         if res is None:
             return False, "Telegram отклонил загрузку документа в канал.", []
         return True, None, [res]
@@ -6546,7 +6537,7 @@ async def _storage_upload_big(context, data: bytes, base_filename: str, caption:
         res = await _storage_upload_document(
             context, chunk, name,
             caption=f"📦 Часть {i + 1}/{n_parts} • {caption}"[:1024],
-            channel_id=channel_id, silent=silent,
+            channel_id=channel_id,
         )
         if res is None:
             return (False,
@@ -6679,7 +6670,7 @@ async def _storage_do_backup(context):
     for ch in db_ids:
         ok_up, err_up, parts = await _storage_upload_big(
             context, payload, f"devorks_backup_{today}.zip", caption[:800],
-            channel_id=ch, silent=True,  # 22.56: бэкап без звука
+            channel_id=ch,
         )
         if ok_up:
             per_channel_parts[ch] = parts
@@ -6915,12 +6906,11 @@ async def _cdb_flush(context, force: bool = False, reason: str = ""):
             for _k, _v in _raw_sent.items():
                 if isinstance(_v, list):
                     cdb_sent[str(_k)] = [int(m) for m in _v if str(m).strip().lstrip("-").isdigit()][:50]
-        ok_ch, fail_ch, pin_warn = [], [], []
+        ok_ch, fail_ch, pin_warn, pruned_n = [], [], [], 0
         for ch in db_ids:
             try:
                 res = await _storage_upload_document(
                     context, payload, fname, caption[:1024], channel_id=ch,
-                    silent=True,  # 22.56: снапшот без звука — канал не «звонит»
                 )
                 if not res:
                     fail_ch.append(f"{ch}: загрузка не удалась")
@@ -6946,18 +6936,27 @@ async def _cdb_flush(context, force: bool = False, reason: str = ""):
                 if not pin_ok:
                     fail_ch.append(f"{ch}: пин не удался (файл в канале, но указатель не обновлён)")
                     continue
-                # ВОЛНА 22.56: старые снапшоты НЕ стираем — канал-БД хранит
-                # ПОЛНУЮ историю версий (просьба разработчика: «снапшоты в
-                # канале бот не должен удалять»). Закреп остаётся указателем
-                # на АКТУАЛЬНЫЙ снапшот, а всё, что ниже закрепа, — история.
-                _hist = list(cdb_sent.get(str(ch), []))
-                try:
-                    _hist.append(int(msg_id))
-                except (TypeError, ValueError):
-                    pass
-                # в реестре держим последние 50 id (только память конфига,
-                # сообщения в канале не трогаем)
-                cdb_sent[str(ch)] = _hist[-50:]
+                # ВОЛНА 12: свежий снапшот закреплён → старые СТИРАЕМ
+                # (best-effort), чтобы в канале остался ОДИН актуальный.
+                # Источники старых id: cdb_sent (наш список) + предыдущая
+                # запись реестра (msg_id прошлого снапшота — работает и для
+                # ПЕРВОГО слива после обновления, когда cdb_sent ещё пуст).
+                _old_ids = list(cdb_sent.get(str(ch), []))
+                _prev_reg = (registry.get(str(ch)) or {}).get("msg_id")
+                if _prev_reg:
+                    try:
+                        _old_ids.append(int(_prev_reg))
+                    except (TypeError, ValueError):
+                        pass
+                for _old in _old_ids:
+                    if int(_old) == int(msg_id):
+                        continue
+                    try:
+                        await context.bot.delete_message(chat_id=ch, message_id=int(_old))
+                        pruned_n += 1
+                    except Exception:
+                        pass
+                cdb_sent[str(ch)] = [int(msg_id)]
                 registry[str(ch)] = {
                     "msg_id": msg_id,
                     "file_id": res.get("file_id"),
@@ -6978,6 +6977,8 @@ async def _cdb_flush(context, force: bool = False, reason: str = ""):
             _CDB_LAST_FLUSH_MONO = _time.monotonic()
             report = (f"✅ Снапшот базы слит в канал(ы): {', '.join(map(str, ok_ch))} "
                       f"({len(payload)} байт, файлов данных {files_n}, {stamp})")
+            if pruned_n:
+                report += f" • 🧹 старых снапшотов стёрто: {pruned_n} (остался один актуальный)"
             if reason:
                 report += f" • причина: {reason}"
             if fail_ch:
@@ -7854,492 +7855,6 @@ async def _cloud_upload_items(update: Update, context: ContextTypes.DEFAULT_TYPE
     return CLOUD_UPLOAD_WAIT
 
 
-# ═══ ВОЛНА 22.57: ЗАГРУЗКА «ЧЕРЕЗ БОТА» — файлы из ЧАТА в ЛЮБОМ СОСТОЯНИИ ═══
-# Требование пользователя: «файлы в мини приложении должны загружаться через
-# бота, чтобы загружались в фоне — если выйти из мини приложения, все файлы
-# должны загружаться в фоне». Физика: WebView мини-аппа умирает вместе с ним,
-# и байты с телефона перестают идти НАВСЕГДА. Единственный НАСТОЯЩЕЙ фон —
-# нативная загрузка Telegram: пользователь прикладывает файлы в ЧАТ бота,
-# Telegram сам доносит их (даже с закрытым мини-аппом; на Android — даже со
-# свёрнутым Telegram), а бот сохраняет всё в облако НА СЕРВЕРЕ.
-#
-# Раньше файл, присланный в чат «просто так» (вне режима «Загрузить файлы»),
-# молча ПРОПАДАЛ — его не съедал ни один обработчик. Теперь глобальный
-# роутер ловит ВСЕ медиа-сообщения, которые не забрал ConversationHandler
-# (то есть пользователь не в режиме загрузки/Сейфа/ДЗ), и кладёт их в
-# облако — как это делает кнопка «📤 Загрузить через Telegram» в мини-аппе.
-#
-# Пачки/альбомы собираются с дебаунсом 1.6 с (как в cloud_upload_receive),
-# ≤49 МБ пересылаются в канал по file_id БЕЗ скачивания (сервер только
-# просит Telegram скопировать файл), >49 МБ — качаются потоком через
-# MTProto во временный файл и заливаются в канал (до 2 ГБ), публикации
-# идут через «шлагбаум» _pub_send (не быстрее лимитов Telegram на канал).
-
-# Пачки фоновой загрузки: (user_id, media_group_id) → {"items": [...]}
-_BG_UPLOAD_BATCHES = {}
-_BG_UPLOAD_DEBOUNCE = 1.6      # сек — Telegram присылает альбом несколькими сообщениями
-_BG_UPLOAD_MAX_MENTION = 20    # сколько файлов показывать в итоговом списке
-
-# ВОЛНА 22.58: ЖИВАЯ ВИДИМОСТЬ бот-загрузок в мини-аппе. Пока файлы из чата
-# сохраняются в облако (мгновенная пересылка по file_id или MTProto-поток
-# для больших), сервер держит их статусы в реестре _BG_UPLOAD_LIVE — мини-апп
-# забирает их обычным опросом /api/files (поле bg_live) и рисует живой
-# прогресс в панели передач: «Качаю с Telegram: 45%», «Сохраняю в облако…».
-# Реестр в памяти процесса: записи живут секунды (пока файл сохраняется),
-# зависшие чистит TTL-уборка — файлы и очередь НИКОГДА не теряются.
-_BG_UPLOAD_LIVE = {}          # user_id(str) -> {key: {"name","size","stage","pct","ts"}}
-_BG_LIVE_TTL = 6 * 3600       # самозачистка зависших записей (страховка)
-_BG_LIVE_GC_AT = [0.0]        # когда последний раз бегала уборка (throttle 5 мин)
-
-
-def _bg_live_add(user_id, key, name, size, stage="recv", pct=0):
-    """Файл из чата принят — начинаем показывать его статус в мини-аппе."""
-    try:
-        _bg_live_gc()
-        _BG_UPLOAD_LIVE.setdefault(str(user_id), {})[str(key)] = {
-            "name": str(name or "файл")[:120],
-            "size": int(size or 0),
-            "stage": str(stage or "recv"),
-            "pct": int(pct or 0),
-            "ts": time.time(),
-        }
-    except Exception:
-        pass
-
-
-def _bg_live_set(user_id, key, stage=None, pct=None):
-    """Обновляем стадию/проценты живой бот-загрузки (мини-апп увидит их
-        следующим опросом /api/files)."""
-    try:
-        ent = _BG_UPLOAD_LIVE.get(str(user_id), {}).get(str(key))
-        if ent is None:
-            return
-        if stage is not None:
-            ent["stage"] = str(stage)
-        if pct is not None:
-            ent["pct"] = max(0, min(100, int(pct)))
-        ent["ts"] = time.time()
-    except Exception:
-        pass
-
-
-def _bg_live_del(user_id, key):
-    """Файл сохранён (или честно не вышел) — убираем его из живых статусов."""
-    try:
-        d = _BG_UPLOAD_LIVE.get(str(user_id))
-        if d is not None:
-            d.pop(str(key), None)
-            if not d:
-                _BG_UPLOAD_LIVE.pop(str(user_id), None)
-    except Exception:
-        pass
-
-
-def _bg_live_gc():
-    """Раз в 5 минут выметаем записи, зависшие дольше TTL (страховка от
-        упавших посреди пути задач — на сами файлы не влияет)."""
-    try:
-        now = time.time()
-        if _BG_LIVE_GC_AT[0] and now - _BG_LIVE_GC_AT[0] < 300:
-            return
-        _BG_LIVE_GC_AT[0] = now
-        for uid in list(_BG_UPLOAD_LIVE.keys()):
-            d = _BG_UPLOAD_LIVE.get(uid) or {}
-            for k in list(d.keys()):
-                try:
-                    if now - float(d[k].get("ts") or 0) > _BG_LIVE_TTL:
-                        d.pop(k, None)
-                except Exception:
-                    d.pop(k, None)
-            if not d:
-                _BG_UPLOAD_LIVE.pop(uid, None)
-    except Exception:
-        pass
-
-
-def _bg_live_out(user_id):
-    """Список живых бот-загрузок для ответа /api/files (поле bg_live)."""
-    try:
-        _bg_live_gc()
-        d = _BG_UPLOAD_LIVE.get(str(user_id))
-        if not d:
-            return []
-        return [{"name": v.get("name", "файл"), "size": int(v.get("size") or 0),
-                 "stage": v.get("stage", "recv"), "pct": int(v.get("pct") or 0)}
-                for v in d.values()]
-    except Exception:
-        return []
-
-
-class _BgLiveProgressBar:
-    """ВОЛНА 22.58: адаптер прогресса для _mt_download_stream — вместо
-    редактирования сообщения в чате обновляет живой реестр для мини-аппа
-    (панель передач: «Качаю с Telegram: 45%»)."""
-
-    def __init__(self, user_id, key):
-        self._uid = str(user_id)
-        self._key = str(key)
-
-    async def edit(self, text, done=0, total=0):
-        try:
-            if not total:
-                return          # размера нет — проценты не трогаем
-            pct = int(done) * 100 // int(total)
-            _bg_live_set(self._uid, self._key, "mt_dl", pct)
-        except Exception:
-            pass
-
-
-def _bg_upload_target(user):
-    """Куда кладём файлы из чата: ЛИЧНЫЙ канал пользователя («Моё облако»)
-    приоритетнее, дальше — cloud-каналы по кругу. Возвращает channel_id
-    или None, если хранилища нет вообще."""
-    _uch = _user_vault_channel(user)
-    if _uch:
-        return int(_uch[0])
-    cloud_ids = get_cloud_channel_ids()
-    if not cloud_ids:
-        return None
-    try:
-        rr = int(load_storage_config().get("cloud_rr", 0) or 0) % len(cloud_ids)
-    except Exception:
-        rr = 0
-    return int(cloud_ids[rr])
-
-
-async def _bg_send_media(context, channel_id, item):
-    """Пересылает медиа в канал по file_id (БЕЗ скачивания) через шлагбаум.
-    Возвращает sent-объект или None (канал лёг/файл не прошёл)."""
-    kind = item["kind"]
-    fid = item["file_id"]
-    cap = (item.get("name") or "")[:1024] or None
-
-    async def _mk():
-        if kind == "photo":
-            return await context.bot.send_photo(chat_id=channel_id, photo=fid, caption=cap)
-        if kind == "video":
-            return await context.bot.send_video(chat_id=channel_id, video=fid, caption=cap)
-        if kind == "audio":
-            return await context.bot.send_audio(chat_id=channel_id, audio=fid, caption=cap)
-        if kind == "voice":
-            return await context.bot.send_voice(chat_id=channel_id, voice=fid, caption=cap)
-        return await context.bot.send_document(chat_id=channel_id, document=fid, caption=cap)
-
-    try:
-        sent, _pos = await _pub_send(channel_id, _mk)
-        return sent
-    except Exception as e:
-        logger.error(f"bg upload: пересылка в канал {channel_id} не удалась: {e}")
-        return None
-
-
-def _bg_new_file_id(sent, kind):
-    """file_id из отправленного в канал сообщения (для мгновенной выдачи)."""
-    if kind == "photo":
-        arr = getattr(sent, "photo", None)
-        return getattr(arr[-1], "file_id", None) if arr else None
-    if kind == "video":
-        return getattr(getattr(sent, "video", None), "file_id", None)
-    if kind == "audio":
-        return getattr(getattr(sent, "audio", None), "file_id", None)
-    if kind == "voice":
-        return getattr(getattr(sent, "voice", None), "file_id", None)
-    return getattr(getattr(sent, "document", None), "file_id", None)
-
-
-async def _bg_upload_big_mtproto(update, context, user, item, chat_msg, live=None):
-    """>49 МБ: качаем сообщение пользователя из личного чата ПОТОКОМ через
-    MTProto во временный файл и заливаем в канал контейнером (до 2 ГБ).
-    Возвращает rec-словарь или None (причина — в item['_why']).
-    ВОЛНА 22.58: live=(user_id, key) — живые проценты для мини-аппа
-    (реестр _BG_UPLOAD_LIVE: «качаю с Telegram 45%» → «загружаю 80%»)."""
-    fsize = int(item.get("size") or 0)
-    if fsize > VAULT_MTPROTO_MAX_BYTES:
-        item["_why"] = "big_hard_limit"
-        return None
-    try:
-        client = await _mt_client()
-    except Exception as e:
-        logger.error(f"bg upload: _mt_client упал: {e}")
-        client = None
-    if client is None:
-        item["_why"] = "mt_unavailable"
-        return None
-    if not _dvf2_disk_ok(fsize):
-        item["_why"] = "no_disk"
-        return None
-    try:
-        _m, doc = await _mt_fetch_document(
-            client, int(chat_msg.chat_id), int(chat_msg.message_id))
-    except Exception as e:
-        logger.error(f"bg upload: MTProto не открыл источник: {e}")
-        item["_why"] = "mt_failed"
-        return None
-    if doc is None:
-        item["_why"] = "mt_failed"
-        return None
-    job_dir = _dvf2_make_job_dir()
-    tmp_path = os.path.join(job_dir, _dvf2_safe_name(item.get("name") or "file.bin"))
-    status = None
-    if live:
-        # ВОЛНА 22.58: сообщаем мини-аппу, что большой файл поехал потоком.
-        _bg_live_set(live[0], live[1], "mt_dl", 0)
-    try:
-        try:
-            status = await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text=(f"📦 «{item['name'][:48]}» ({_fmt_bytes(fsize)}) — "
-                      "большой: качаю с Telegram потоком и сохраняю в облако…"))
-        except Exception:
-            status = None
-
-        fh = open(tmp_path, "wb")
-        try:
-            async def _sink(chunk):
-                fh.write(chunk)
-            got = await _mt_download_stream(
-                client, doc, int(getattr(doc, "size", 0) or fsize), _sink,
-                progress=(_BgLiveProgressBar(live[0], live[1]) if live else None))
-        finally:
-            fh.close()
-        if got < fsize:
-            raise RuntimeError(f"скачано {got} из {fsize} байт")
-
-        def _live_up(cur, tot, _uid=(live[0] if live else None),
-                     _key=(live[1] if live else None)):
-            # ВОЛНА 22.58: заливка контейнера в канал — живые проценты.
-            if _uid and tot:
-                _bg_live_set(_uid, _key, "mt_up", cur * 100 // tot)
-
-        sent = await _mt_upload_container(
-            client, tmp_path, os.path.getsize(tmp_path),
-            (item.get("name") or "file.bin")[:100],
-            filename=(item.get("name") or "file.bin"), user=user,
-            progress_cb=(_live_up if live else None))
-        if not sent:
-            item["_why"] = "mt_failed"
-            return None
-        rec = {
-            "id": _cloud_gen_file_id(user),
-            "name": (item.get("name") or "file.bin")[:120],
-            "kind": item.get("kind") or "document",
-            "msg_id": int(sent.get("message_id") or 0),
-            "file_id": sent.get("file_id"),
-            "size": fsize,
-            "mime": item.get("mime", ""),
-            "ts": _file_ts_now(), "tss": datetime.now().strftime("%Y-%m-%d %H:%M"),
-            "channel_id": sent.get("channel_id"),
-            "src": "chat",  # ВОЛНА 22.57: загружено «через бота» (из чата)
-        }
-        if isinstance(sent.get("mt_doc"), dict):
-            rec["mt_doc"] = sent["mt_doc"]
-        return rec
-    except Exception as e:
-        logger.error(f"bg upload: большой файл не удался: {e}")
-        item["_why"] = "mt_failed"
-        return None
-    finally:
-        if status is not None:
-            try:
-                await status.delete()
-            except Exception:
-                pass
-        _shutil.rmtree(job_dir, ignore_errors=True)
-
-
-async def _bg_upload_items(update, context, items):
-    """Сохраняет пачку файлов из чата в облако и пишет ОДИН компактный итог.
-    Вызывается из bg_chat_upload_receive (глобальный роутер 22.57)."""
-    msg = update.message
-    user_id = str(update.effective_user.id)
-    user = get_user(user_id)
-    if not user:
-        return
-    if not get_cloud_channel_ids() and not _user_vault_channel(user):
-        await msg.reply_text(
-            "❌ Хранилище не настроено — файл не сохранён. Попросите "
-            "разработчика подключить канал, либо подключите СВОЙ: "
-            "🔐 Сейф → 🔗 Моё облако.")
-        return
-
-    files = [f for f in (getattr(user, "cloud_files", []) or []) if isinstance(f, dict)]
-    limit = get_price('cloud_max_files', 50)
-
-    try:
-        await context.bot.send_chat_action(
-            chat_id=update.effective_chat.id, action="upload_document")
-    except Exception:
-        pass
-
-    saved, skipped_big, failed, limit_hit = [], [], [], False
-    warned_quality = False
-
-    _msg_mid = int(getattr(msg, "message_id", 0) or 0)
-
-    for _li, item in enumerate(items):
-        if len(files) >= limit:
-            limit_hit = True
-            skipped_big.append(item)
-            continue
-        size = int(item.get("size") or 0)
-        name = str(item.get("name") or "файл")
-        # ВОЛНА 22.58: живой статус файла для панели передач мини-аппа.
-        _lk = f"{_msg_mid}-{_li}"
-        _bg_live_add(user_id, _lk, name, size)
-        rec = None
-        if 0 < size <= STORAGE_MAX_FILE_BYTES:
-            # Быстрый путь: пересылка по file_id — сервер не качает байты.
-            channel_id = _bg_upload_target(user)
-            if channel_id is None:
-                _bg_live_del(user_id, _lk)
-                await msg.reply_text(
-                    "❌ Хранилище не настроено — файл не сохранён.")
-                return
-            _bg_live_set(user_id, _lk, "save")
-            sent = await _bg_send_media(context, channel_id, item)
-            if sent is None:
-                _bg_live_del(user_id, _lk)
-                failed.append(f"{name[:40]}: Telegram не принял")
-                continue
-            rec = {
-                "id": _cloud_gen_file_id(user),
-                "name": name[:120],
-                "kind": item.get("kind") or "document",
-                "msg_id": int(sent.message_id),
-                "file_id": _bg_new_file_id(sent, item.get("kind") or "document"),
-                "size": size,
-                "mime": item.get("mime", ""),
-                "ts": _file_ts_now(),
-                "tss": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                "channel_id": channel_id,
-                "src": "chat",
-            }
-        else:
-            # >49 МБ — поток MTProto (до 2 ГБ); недоступен — честный совет.
-            rec = await _bg_upload_big_mtproto(
-                update, context, user, item, msg, live=(user_id, _lk))
-            if rec is None:
-                _bg_live_del(user_id, _lk)
-                why = item.get("_why")
-                if why == "big_hard_limit":
-                    await msg.reply_text(
-                        f"🚫 «{name[:40]}» больше 2 ГБ — потолок Telegram "
-                        "для ботов. Разделите файл на части по ~1,5 ГБ.")
-                elif why == "mt_failed":
-                    failed.append(f"{name[:40]}: не докачался — "
-                                  "попробуйте ещё раз")
-                elif why == "no_disk":
-                    failed.append(f"{name[:40]}: на сервере нет места "
-                                  "под временный файл")
-                else:
-                    skipped_big.append(item)
-                continue
-        _bg_live_del(user_id, _lk)
-        files.append(rec)
-        saved.append(rec)
-        # Подсказка про качество — ОДНА строка и один раз за пачку.
-        if not warned_quality and item.get("kind") in ("photo", "video"):
-            warned_quality = True
-
-    if saved:
-        user.cloud_files = files
-        save_user(user)
-
-    lines = []
-    if len(saved) == 1:
-        lines.append(f"☁️ Сохранено в облако: «{saved[0]['name']}» "
-                     f"({_fmt_bytes(saved[0]['size'])}).")
-    elif saved:
-        total = sum(int(r.get("size") or 0) for r in saved)
-        lines.append(f"☁️ Сохранено в облако: {len(saved)} файл(ов), "
-                     f"{_fmt_bytes(total)}:")
-        for r in saved[:_BG_UPLOAD_MAX_MENTION]:
-            lines.append(f"  • {r['name']} ({_fmt_bytes(r['size'])})")
-        if len(saved) > _BG_UPLOAD_MAX_MENTION:
-            lines.append(f"  …и ещё {len(saved) - _BG_UPLOAD_MAX_MENTION} шт.")
-    if saved:
-        lines.append("🌐 Уже видно в мини-аппе (обновится само).")
-    if warned_quality:
-        lines.append("💡 Фото/видео Telegram сжал ещё на телефоне: для "
-                     "оригинала отправляйте «как файл» (скрепка → «Файл»).")
-    if limit_hit:
-        lines.append(f"🚫 Лимит облака ({limit} файлов) достигнут — остальное "
-                     "не влезло. Удалите что-нибудь в мини-аппе.")
-    if skipped_big:
-        lines.append(_big_file_advice_text(skipped_big[0]["size"]))
-        for item in skipped_big[1:]:
-            lines.append(f"🚫 «{item['name'][:40]}» тоже больше 49 МБ.")
-    if failed:
-        lines.append("⚠️ Не удалось: " + "; ".join(failed[:5]))
-    if lines:
-        kb = None
-        if MINIAPP_URL:
-            kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton("🌐 Открыть облако",
-                                     web_app=WebAppInfo(url=MINIAPP_URL))]])
-        try:
-            if skipped_big:
-                await msg.reply_text("\n".join(lines),
-                                     reply_markup=get_big_file_keyboard())
-            else:
-                await msg.reply_text("\n".join(lines), reply_markup=kb)
-        except Exception:
-            pass
-
-
-async def bg_chat_upload_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """ВОЛНА 22.57: глобальный роутер «файл в чате = файл в облаке».
-
-    Срабатывает ТОЛЬКО для медиа, которые НЕ забрал ConversationHandler
-    (зарегистрирован ПОСЛЕ него): пользователь не в режиме загрузки/Сейфа/
-    ДЗ — значит, прислал файл «просто так», и это значит «загрузи в облако».
-    Живёт вне FSM, поэтому работает в любом состоянии, после рестарта и
-    при потерянном разговоре — файлы больше не пропадают молча.
-    Возвращает None (обработчик НЕ меняет состояние разговора)."""
-    msg = update.message
-    if msg is None or getattr(update, "edited_message", None) is not None:
-        return None
-    # Страховка: в режимах загрузки файлы забирает FSM — сюда они не дошли бы.
-    if context.user_data.get('cloud_file_mode') or context.user_data.get('vault_put_mode'):
-        return None
-    user_id = str(update.effective_user.id)
-    user = get_user(user_id)
-    if not user:
-        return None                      # незарегистрированный — /start сам всё расскажет
-    if is_user_blocked(user_id):
-        return None                      # заблокированным файлы не сохраняем
-
-    item = _cloud_item_from_message(msg)
-    if item is None:
-        return None                      # не файл (стикер/локация/контакт) — молча
-
-    # Альбом/пачка: собираем с дебаунсом (как cloud_upload_receive).
-    mgid = getattr(msg, "media_group_id", None)
-    if mgid:
-        key = (user_id, str(mgid))
-        batch = _BG_UPLOAD_BATCHES.setdefault(key, {"items": []})
-        batch["items"].append(item)
-        await asyncio.sleep(_BG_UPLOAD_DEBOUNCE)
-        cur = _BG_UPLOAD_BATCHES.get(key)
-        if cur is not batch:
-            return None                  # нас опередили — пачку забрала другая задача
-        _BG_UPLOAD_BATCHES.pop(key, None)
-        items = list(batch["items"])
-    else:
-        items = [item]
-
-    try:
-        await _bg_upload_items(update, context, items)
-    except Exception as e:
-        logger.error(f"bg upload: пачка не удалась: {e}")
-        try:
-            await msg.reply_text(
-                "⚠️ Не удалось сохранить файл(ы) в облако — попробуйте "
-                "ещё раз чуть позже.")
-        except Exception:
-            pass
-    return None
-
 
 async def cloud_files_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -8727,10 +8242,6 @@ def _miniapp_rec_out(rec):
         "size": int(rec.get("size") or 0),
         "ts": _ts,
         "vault": False,
-        # ВОЛНА 22.57: откуда файл («web» = из мини-аппа, «chat» = «через
-        # бота», из чата) — клиент отличает фоновые загрузки для тостов
-        # «Пока вас не было».
-        "src": str(rec.get("src") or ""),
     }
 
 
@@ -14875,12 +14386,6 @@ function closeNameModal(e) {
 function startActualUpload() {
   if (!pendingFiles.length) return;
 
-  /* ВОЛНА 22.54: файлы уже летят в бота (предохранка стартовала в момент
-     подтверждения окна загрузки). Введённые имена «догоняют» загрузку:
-     живая сессия — сервер переименует до финализации, готовый файл —
-     переименуется запись и подпись в канале. */
-  prestreamApplyNames(pendingFiles);
-
   proceedUpload(pendingFiles);
 }
 
@@ -15164,21 +14669,12 @@ window.addEventListener('pageshow', () => {
    сообщений нет). Файлы не теряются в любом случае: при переоткрытии
    очередь подхватывается из IndexedDB (22.39/22.47) и догружается сама. */
 function notifyUploadClosed() {
+  if (!isUploading || !uploadQueue || !uploadQueue.length) return;
+
   try {
     /* 22.49: считаем ТОЛЬКО ещё не догруженные (загруженные файлы остаются
        в uploadQueue до конца пачки — раньше N было завышено) */
-    let pending = (isUploading && uploadQueue && uploadQueue.length)
-      ? uploadQueue.filter(function (f) { return !f._doneFlag; })
-      : [];
-
-    /* ВОЛНА 22.54: плюс файлы ПРЕДОХРАНКИ — они летят в бота параллельно
-       с окнами имени (движок ещё не запущен). closed_hint придёт сразу:
-       сторож сообщит о паузе через ~6 с тишины, а не через 30. */
-    const preRun = (pendingFiles || []).filter(function (f) {
-      return f && f._preId && f._preState === 'run' && !f._preStop;
-    });
-
-    pending = pending.concat(preRun);
+    const pending = uploadQueue.filter(function (f) { return !f._doneFlag; });
 
     if (!pending.length) return;
 
@@ -15285,14 +14781,6 @@ function openUploadModal() {
 function closeUploadModal(e) {
   if (e) e.stopPropagation();
 
-  /* ВОЛНА 22.54: крестик ДО подтверждения — как раньше, «отмена»: файлы,
-     которые ещё не начали лететь в бота (нет сессии), убираем из очереди
-     докачки, чтобы при следующем открытии не всплывала фантомная докачка.
-     Файлы предохранки (сессия уже создана) НЕ трогаем — они уже у бота. */
-  for (const f of pendingFiles) {
-    if (f && f._entryKey && !f._preId) upqDel(f._entryKey);
-  }
-
   pendingFiles = [];
   pickerAppend = false;
 
@@ -15330,16 +14818,6 @@ function confirmUploadFiles() {
   if (passInput) passInput.value = '';
 
   closeModalEl('uploadModal');
-
-  /* ВОЛНА 22.54: ПРЕДОХРАНКА — байты каждого файла летят в бота СРАЗУ,
-     пока пользователь отвечает на окна имени. Пароль уже решён (выше):
-     шифрованный режим — VAULT_PW уйдёт заголовком, «без шифрования» —
-     пароль Сейфа (если ввёл) телом init. Закрытие мини аппа посреди
-     окна имени больше НЕ теряет файлы: байты у бота, бот договорит сам. */
-  for (const f of pendingFiles) {
-    if (f && typeof f._uploadPw === 'undefined') f._uploadPw = UPLOAD_PLAIN_PW || '';
-  }
-  prestreamStart(pendingFiles.slice());
 
   /* ВОЛНА 22.43: окно имени открывается для ЛЮБОГО количества файлов —
      один файл можно назвать или пропустить, пачка — как раньше
@@ -15390,29 +14868,6 @@ function uploadFiles(fileList) {
 
   const modalOpen = !!(document.getElementById('uploadModal') || {}).classList &&
     document.getElementById('uploadModal').classList.contains('open');
-
-  /* ВОЛНА 22.54: файлы сохраняются в очередь докачки (IndexedDB) ПРЯМО В
-     МОМЕНТ ВЫБОРА — раньше запись происходила только после всех окон
-     (пароль + имя), и закрытие мини аппа до старта загрузки теряло файлы
-     целиком. Теперь даже внезапное закрытие на любом шаге оставляет файл
-     в очереди: при следующем открытии мини апп сам предложит докачку. */
-  for (const f of files) {
-    if (f._entryKey) continue;
-
-    if ((+f.size || 0) > UPQ_MAX_PERSIST) {
-      f._entryKey = '';
-      continue;
-    }
-
-    const k = 'up_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
-
-    f._entryKey = k;
-
-    upqPut({
-      k: k, blob: f, name: f.name, uploadName: f.uploadName || f.name,
-      size: +f.size || 0, mime: f.type || '', uploadId: '', added: Date.now()
-    });
-  }
 
   if (pickerAppend && modalOpen) {
     pendingFiles = pendingFiles.concat(files);
@@ -15619,11 +15074,6 @@ function proceedUpload(files, opts) {
   uploadAbortFlag = false;
   uploadQueue = files.slice();
 
-  /* ВОЛНА 22.54: движок вступает — очередь предохранки гасим (файлы из неё
-     движок загрузит сам, двойной отправки не будет). Уже ЛЕТЯЩИЕ предохранки
-     не трогаем: uploadOneFile мягко перехватит их сессии. */
-  try { PRE_QUEUE.length = 0; } catch (e) {}
-
   /* ВОЛНА 22.50: пароль именно ЭТОЙ загрузки — на каждый файл. Раньше
      UPLOAD_PLAIN_PW был глобальным: если пользователь один раз ввёл пароль
      Сейфа (загрузка в Сейф при «без шифрования»), то ПЕРЕЗАПУЩЕННАЯ сессия
@@ -15798,202 +15248,6 @@ function sendChunk(uploadId, index, blobPart, offset, onLoaded) {
   });
 }
 
-/* ═══ ВОЛНА 22.54: ПРЕДОХРАНКА — ФАЙЛЫ ИДУТ В БОТА СРАЗУ ═══
-   После подтверждения окна загрузки (пароль решён) байты КАЖДОГО файла
-   начинают уходить на сервер НЕМЕДЛЕННО — параллельно с окнами «Назовите
-   файл». Что это даёт:
-   • закрыл мини апп / Telegram посреди окна имени — байты уже у бота:
-     бот сам финализирует сессию (авто-догрузка 22.51/22.52), файл НЕ
-     теряется и появляется в облаке/Сейфе;
-   • предохранка сама зовёт complete, когда все байты на сервере — файл
-     уходит в канал ещё до конца Naming-окон;
-   • имя из окна имени применяется задним числом: живая сессия — через
-     /api/upload/rename (бот зальёт уже с новым именем), готовый файл —
-     тот же эндпоинт переименует запись и подпись в канале;
-   • движок загрузки после Naming-окон подхватывает ТУ ЖЕ сессию
-     (uploadId): перекачки байтов нет, кольцо прогресса просто честно
-     добегает до конца.
-   Дизайн и порядок окон НЕ изменились. */
-
-let PRE_CONCURRENCY = 2;        /* сколько файлов грузим «впрок» одновременно */
-let PRE_RUNNING = 0;
-const PRE_QUEUE = [];
-
-function prestreamKick() {
-  while (PRE_RUNNING < PRE_CONCURRENCY && PRE_QUEUE.length) {
-    const f = PRE_QUEUE.shift();
-
-    if (!f || f._preStop || f._preId || f._preState === 'done') continue;
-
-    PRE_RUNNING++;
-
-    _preStreamFile(f).catch(() => {}).finally(() => {
-      PRE_RUNNING--;
-      prestreamKick();
-    });
-  }
-}
-
-function prestreamStart(files) {
-  /* без входа предохранка бессмысленна (init ответит 401) — движок сам
-     покажет окно входа, как раньше */
-  if (!IS_TELEGRAM && !WEB_TOKEN) return;
-
-  for (const f of files) {
-    if (f && !f._preId && f._preState !== 'done' && !f._preStop && +f.size > 0) {
-      PRE_QUEUE.push(f);
-    }
-  }
-
-  prestreamKick();
-}
-
-/* Ожидание окончания предохранки файла (ограниченно по времени). */
-async function _preSettle(file, timeoutSec) {
-  if (!file || file._preState !== 'run') return;
-
-  const t0 = Date.now();
-  const lim = Math.max(5, +timeoutSec || 120) * 1000;
-
-  while (file._preState === 'run' && Date.now() - t0 < lim) {
-    if (file._prePromise) { await file._prePromise; break; }
-    await sleepMs(120);
-  }
-}
-
-async function _preStreamFile(file) {
-  const upName = String(file.uploadName || file.name || 'file.bin').slice(0, 120);
-  let uploadId = '';
-  let serverParts = null;
-
-  file._preState = 'run';
-
-  try {
-    const initData = await apiJson('/api/upload/init', {
-      method: 'POST',
-      headers: vaultHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify({
-        name: upName,
-        size: +file.size || 0,
-        mime: file.type || '',
-        password: file._uploadPw || ''
-      })
-    });
-
-    uploadId = initData.uploadId;
-
-    if (!uploadId) throw new Error('сервер не выдал сессию');
-
-    if (initData.resumed && Array.isArray(initData.parts) &&
-        initData.parts.length) {
-      serverParts = new Set(initData.parts);
-    }
-  } catch (e) {
-    /* предохранка не удалась (лимит/сеть/пароль) — НЕ страшно: движок после
-       окон имени сделает всё как раньше, с честной ошибкой при необходимости */
-    file._preState = 'fail';
-    return;
-  }
-
-  file._preId = uploadId;
-
-  /* uploadId — в очередь докачки сразу: закрыл мини апп на окне имени —
-     при следующем открытии докачка подхватит ИМЕННО эту сессию */
-  if (file._entryKey) {
-    upqPut({
-      k: file._entryKey, blob: file, name: file.name, uploadName: upName,
-      size: +file.size || 0, mime: file.type || '',
-      uploadId: uploadId, added: Date.now()
-    });
-  }
-
-  file._prePromise = new Promise((resolvePre) => {
-    const totalChunks = Math.ceil((+file.size || 0) / CHUNK_SIZE);
-    let nextIndex = 0;
-    let alive = true;
-
-    const worker = async () => {
-      while (alive) {
-        /* preStop — движок перехватил файл; uploadAbortFlag — пользователь
-           нажал «отмену» в кольце прогресса: гасим предохранку, как раньше */
-        if (file._preStop || uploadAbortFlag) return;
-
-        const idx = nextIndex;
-
-        if (idx >= totalChunks) return;
-
-        nextIndex++;
-
-        /* сервер уже принял этот кусок (докачка/повторный выбор) — скип */
-        if (serverParts && serverParts.has(idx)) continue;
-
-        const off = idx * CHUNK_SIZE;
-        const end = Math.min(off + CHUNK_SIZE, file.size);
-
-        for (let attempt = 0; attempt < 3; attempt++) {
-          if (!alive || file._preStop || uploadAbortFlag) return;
-
-          try {
-            await sendChunk(uploadId, idx, file.slice(off, end), off);
-            break;
-          } catch (e) {
-            if (e && e.message === 'aborted') return;
-            if (e && e.code === 'session_not_found') { alive = false; return; }
-            if (attempt < 2) await sleepMs(1200 * (attempt + 1));
-            else { alive = false; return; }
-          }
-        }
-      }
-    };
-
-    Promise.all(
-      Array.from({ length: Math.max(1, Math.min(UPLOAD_PARALLEL, 6)) }, worker))
-      .then(() => { file._preState = alive ? 'done' : 'fail'; })
-      .catch(() => { file._preState = 'fail'; })
-      .finally(resolvePre);
-  });
-
-  await file._prePromise;
-
-  /* Все байты у бота — зовём complete ПРЯМО ИЗ ПРЕДОХРАНКИ: файл уходит в
-     канал/Сейф сразу (2.5-секундная авто-финализация сервера сделала бы то
-     же самое). Неудача не фатальна: движок после окон имени добьёт через
-     status/complete. Пароль у complete — как у движка (заголовок/сессия). */
-  if (file._preState === 'done' && !file._preStop && !uploadAbortFlag) {
-    try {
-      await apiJson('/api/upload/complete', {
-        method: 'POST',
-        headers: vaultHeaders({ 'Content-Type': 'application/json' }),
-        body: JSON.stringify({ uploadId })
-      });
-    } catch (e) { /* бот догрузит сам / добьёт движок */ }
-  }
-}
-
-/* Имя из окна имени — догоняет уже летящую/готовую загрузку. */
-function prestreamApplyNames(files) {
-  for (const f of files || []) {
-    if (!f || !f._preId || !f.uploadName) continue;
-
-    const nm = String(f.uploadName).slice(0, 120);
-
-    f._preRename = apiJson('/api/upload/rename', {
-      method: 'POST',
-      headers: vaultHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify({ uploadId: f._preId, name: nm })
-    }).catch(() => {});
-
-    /* имя и в очереди докачки — резюм покажет правильное */
-    if (f._entryKey) {
-      upqPut({
-        k: f._entryKey, blob: f, name: f.name, uploadName: nm,
-        size: +f.size || 0, mime: f.type || '',
-        uploadId: f._preId, added: Date.now()
-      });
-    }
-  }
-}
-
 /* ═══ 22.39: ПАРАЛЛЕЛЬНАЯ ЗАГРУЗКА ═══
    Файл режется на куски по 6 МиБ, куски летят на сервер тремя параллельными
    потоками (сервер пишет их по offset — порядок прилёта не важен).
@@ -16024,14 +15278,6 @@ async function _uploadOneSession(file, reportBytes) {
         if (key) upqDel(key);
 
         return (st0.resp && st0.resp.file) || st0.resp;
-      }
-
-      if (st0 && st0.state === 'processing' &&
-          Array.isArray(st0.parts) && st0.parts.length) {
-        /* ВОЛНА 22.54: предохранка уложила все байты, бот ещё финализирует —
-           куски уже у сервера, перекачивать нечего; complete мягко поймает
-           already_processing и дождётся результата через статус */
-        serverParts = new Set(st0.parts);
       }
 
       if (st0 && st0.state === 'ready' &&
@@ -16309,25 +15555,6 @@ async function pollUploadStatus(uploadId, file) {
 }
 
 async function uploadOneFile(file, reportBytes) {
-  /* ВОЛНА 22.54: файл мог УЖЕ улететь в бота (предохранка стартует с момента
-     подтверждения окна загрузки). Гасим её воркеры, дожидаемся тишины и
-     продолжаем ТУ ЖЕ сессию: /api/upload/status скажет completed (файл готов —
-     честный успех без перекачки) или ready+parts (дошлём только остаток). */
-  file._preStop = true;
-
-  try { await _preSettle(file, 120); } catch (e) {}
-
-  /* имя из окна имени должно успеть «догнать» сессию до complete */
-  if (file._preRename) {
-    try { await Promise.race([file._preRename, sleepMs(10000)]); } catch (e) {}
-  }
-
-  if (file._preId && file._preState !== 'fail') {
-    file._resumeId = file._resumeId || file._preId;
-  }
-  /* _preState === 'fail' → init на сервере узнает сессию по отпечатку (22.53)
-     и продолжит с принятых кусков; совсем без сессии — обычная загрузка */
-
   for (let session = 0; session < 3; session++) {
     const r = await _uploadOneSession(file, reportBytes);
 
@@ -16363,19 +15590,6 @@ async function uploadEngine(bar) {
       });
 
       if (rec) added.push(rec);
-
-      /* ВОЛНА 22.54: страховка имени. Файл уходил в бота под оригинальным
-         именем (предохранка), пользователь назвал его в окне имени — если
-         сервер всё же записал старое имя (финализация обогнала ренейм),
-         тихо переименовываем запись и подпись в канале (как ✏️). */
-      if (rec && rec.id && file.uploadName && rec.name &&
-          String(rec.name) !== String(file.uploadName)) {
-        apiJson('/api/files/' + encodeURIComponent(rec.id), {
-          method: 'PATCH',
-          headers: authHeaders({ 'Content-Type': 'application/json' }),
-          body: JSON.stringify({ name: file.uploadName })
-        }).catch(() => {});
-      }
 
       /* 22.49: помечаем ДОСТИГНУТЫМ — notifyUploadClosed считает
          только недогруженные, «⏸ пауза» больше не преувеличивает */
@@ -17911,8 +17125,8 @@ function vpCache() {
   vpWrapperEl.addEventListener('mouseup', vpEndPress);
   vpWrapperEl.addEventListener('mouseleave', vpEndPress);
   vpWrapperEl.addEventListener('touchstart', vpStartPress, { passive: true });
-  vpWrapperEl.addEventListener('touchend', vpEndPress, { passive: true });
-  vpWrapperEl.addEventListener('touchcancel', vpEndPress, { passive: true });
+  vpWrapperEl.addEventListener('touchend', vpEndPress);
+  vpWrapperEl.addEventListener('touchcancel', vpEndPress);
 
   vpWrapperEl.addEventListener('touchstart', (e) => {
     if (e.touches.length === 2) {
@@ -17991,7 +17205,7 @@ function vpCache() {
         if (!vpForcedLandscape) vpPlayerEl.style.objectFit = 'contain';
       }
     }, 300);
-  }, { passive: true });
+  });
 
   vpPlayerEl.ontimeupdate = vpOnTimeUpdate;
 
@@ -19203,9 +18417,6 @@ async def miniapp_files_get(request):
         # ВОЛНА 22.26: сервер сам подтверждает связь — кем и чем отвечает.
         "build": BOT_BUILD,
         "bot": _miniapp_bot_username(),
-        # ВОЛНА 22.58: живые бот-загрузки — панель передач мини-аппа рисует
-        # «Качаю с Telegram: 45%» / «Сохраняю в облако…» для файлов из чата.
-        "bg_live": _bg_live_out(uid),
     })
 
 
@@ -20618,23 +19829,33 @@ async def miniapp_files_from_safe(request):
     return web.json_response({"file": _miniapp_rec_out(new_rec), "ok": True})
 
 
-async def _miniapp_send_rec_to_chat(bot, user, uid, rec, where,
-                                    password=None, http_request=None):
-    """ВОЛНА 22.55: ЯДРО отправки файла в ЛИЧНЫЙ чат пользователя с ботом.
-    Выделено из miniapp_files_to_chat, чтобы ТОЙ ЖЕ логикой пользовалась
-    серверная очередь скачивания «через бота» (_bot_dlq_worker): очередь
-    живёт на сервере и продолжает отправку, даже если пользователь вышел
-    из Telegram и мини-апп убит системой.
-
-    Возвращает (ok: bool, how: str, err: (code, message) | None).
-    err == ("no_chat", ...) — бот заблокирован пользователем/чата нет:
-    отправитель очереди должен ПРЕКРАТИТЬ всю пачку, а не молотить далее."""
+async def miniapp_files_to_chat(request):
+    """ВОЛНА 22.35: отправляет файл в ЛИЧНЫЙ чат пользователя с ботом —
+    «скачалось в ТГ и в галерею». Фото/видео остаются медиа (в галерею —
+    одним тапом), остальное — документом.
+    Облако и plain-Сейф: copy_message из канала (без перекачивания!), фолбэк —
+    отправка по file_id. Зашифрованный Сейф: DVF1 ≤20 МБ — расшифровка в
+    память и send_document; DVF2 ≤49 МБ — расшифровка в temp и отправка;
+    DVF2 >49 МБ — честный отказ (Bot API не умеет, качайте кнопкой «Скачать»)."""
+    user, uid, err = await _api_get_user_any(request)
+    if err is not None:
+        return err
+    rec, where = _miniapp_find_any(user, request.match_info["fid"])
+    if not rec:
+        return _miniapp_err(404, "not_found", "Файл не найден (возможно, уже удалён).")
+    app = _MINIAPP_PTB_APP
+    bot = getattr(app, "bot", None) if app is not None else None
+    if bot is None:
+        return _miniapp_err(503, "no_bot",
+                            "Бот ещё запускается — попробуйте через минуту.")
     try:
         chat_id = int(uid)
     except (TypeError, ValueError):
-        return False, "", ("bad_uid", "Не удалось определить ваш чат с ботом.")
+        return _miniapp_err(400, "bad_uid", "Не удалось определить ваш чат с ботом.")
     name = str(rec.get("name") or rec.get("label") or "файл")
     kind = str(rec.get("kind") or "document")
+    # ВОЛНА 22.38: под файлом в личном чате — кнопка «🙈 Скрыть» (удаляет
+    # ЭТО сообщение из чата; сам файл остаётся в облаке/Сейфе).
     hide_kb = _miniapp_hide_kb(str(rec.get("id") or ""))
 
     # --- путь 1: облако / plain-Сейф — копируем сообщение из канала ---
@@ -20648,22 +19869,12 @@ async def _miniapp_send_rec_to_chat(bot, user, uid, rec, where,
                     message_id=int(rec["msg_id"]),
                     reply_markup=hide_kb,
                 )
-                return True, "copy", None
-            except TGRetryAfter:
-                # ВОЛНА 22.55: флуд-лимит наружу — вызывающий (очередь) честно
-                # подождёт и повторит, вместо мгновенного «не удалось»
-                raise
+                return web.json_response({"ok": True, "how": "copy"})
             except Exception as e:
-                # ВОЛНА 22.55: бот заблокирован — дальше пробовать бессмысленно
-                _msg = str(e)
-                if "bot was blocked" in _msg or "chat not found" in _msg.lower():
-                    return False, "", ("no_chat",
-                                       "Напишите боту любое сообщение в чат — и "
-                                       "попробуйте снова (так бот сможет отправить файл).")
                 logger.warning(f"miniapp to_chat: copy не сработал ({e}), пробую file_id")
         file_id = rec.get("file_id")
         if not file_id:
-            return False, "", ("no_source",
+            return _miniapp_err(404, "no_source",
                                 "Источник файла недоступен (нет канала/сообщения).")
         try:
             if kind == "photo":
@@ -20678,25 +19889,27 @@ async def _miniapp_send_rec_to_chat(bot, user, uid, rec, where,
             else:
                 await bot.send_document(chat_id=chat_id, document=file_id,
                                         caption=name[:100], reply_markup=hide_kb)
-            return True, "file_id", None
-        except TGRetryAfter:
-            raise
+            return web.json_response({"ok": True, "how": "file_id"})
         except Exception as e:
             msg = str(e)
             if "bot was blocked" in msg or "chat not found" in msg.lower():
-                return False, "", ("no_chat",
+                return _miniapp_err(400, "no_chat",
                                     "Напишите боту любое сообщение в чат — и "
                                     "попробуйте снова (так бот сможет отправить файл).")
-            return False, "", ("send_failed", f"Не удалось отправить файл в чат ({e}).")
+            return _miniapp_err(502, "send_failed",
+                                f"Не удалось отправить файл в чат ({e}).")
 
     # --- путь 2: ЗАШИФРОВАННЫЙ Сейф — расшифровка и отправка ---
+    pw_raw = _miniapp_vault_pw_for(request, {})
+    password = _miniapp_vault_pw_pick(user, _vault_pw_candidates(pw_raw)) \
+        if pw_raw else None
     if not password:
-        return False, "", (
-            "safe_locked",
+        return _miniapp_err(
+            423, "safe_locked",
             "Файл зашифрован Сейфом — сначала введите пароль Сейфа "
             "(⚙️ → Сейф), затем отправляйте в чат.")
     if _miniapp_vault_pw_verify(user, password) is False:
-        return False, "", ("wrong_password", "Пароль Сейфа не подходит.")
+        return _miniapp_err(403, "wrong_password", "Пароль Сейфа не подходит.")
 
     try:
         if not rec.get("dvf2"):
@@ -20709,12 +19922,12 @@ async def _miniapp_send_rec_to_chat(bot, user, uid, rec, where,
                 caption=name[:100],
                 reply_markup=hide_kb,
             )
-            return True, "dvf1", None
+            return web.json_response({"ok": True, "how": "dvf1"})
         # DVF2: расшифровка во временный файл
         size_orig = int(rec.get("size_orig") or 0)
         if size_orig > STORAGE_MAX_FILE_BYTES:
-            return False, "", (
-                "too_big_for_chat",
+            return _miniapp_err(
+                400, "too_big_for_chat",
                 "Файл больше 49 МБ — Telegram не даёт ботам отправлять такие "
                 "документы. Скачайте его кнопкой «Скачать» (ссылка откроется "
                 "в браузере) — файл попадёт в загрузки и галерею.")
@@ -20723,15 +19936,10 @@ async def _miniapp_send_rec_to_chat(bot, user, uid, rec, where,
             tmpdir, f"chat_{rec.get('id', 'x')}_{os.getpid()}.bin")
         try:
             res = await _miniapp_stream_dvf2(
-                http_request, user, rec, password, to_file=tmp_plain)
+                request, user, rec, password, to_file=tmp_plain)
             # to_file=True возвращает (мета, размер) либо Response при ошибке
             if isinstance(res, web.Response):
-                try:
-                    _j = json.loads(res.text)
-                    return False, "", (str(_j.get("error") or "failed"),
-                                       str(_j.get("message") or "Не удалось расшифровать."))
-                except Exception:
-                    return False, "", ("failed", "Не удалось расшифровать файл.")
+                return res
             meta, orig = res
             name = str((meta or {}).get("n") or name)
             with open(tmp_plain, "rb") as fh:
@@ -20742,472 +19950,21 @@ async def _miniapp_send_rec_to_chat(bot, user, uid, rec, where,
                 caption=name[:100],
                 reply_markup=hide_kb,
             )
-            return True, "dvf2", None
+            return web.json_response({"ok": True, "how": "dvf2"})
         finally:
             try:
                 os.remove(tmp_plain)
             except Exception:
                 pass
-    except TGRetryAfter:
-        raise
     except Exception as e:
         msg = str(e)
         if "bot was blocked" in msg or "chat not found" in msg.lower():
-            return False, "", ("no_chat",
+            return _miniapp_err(400, "no_chat",
                                 "Напишите боту любое сообщение в чат — и "
                                 "попробуйте снова.")
         logger.error(f"miniapp to_chat (vault): {e}")
-        return False, "", ("send_failed", f"Не удалось отправить файл в чат ({e}).")
-
-
-async def miniapp_files_to_chat(request):
-    """ВОЛНА 22.35: отправляет файл в ЛИЧНЫЙ чат пользователя с ботом —
-    «скачалось в ТГ и в галерею». Фото/видео остаются медиа (в галерею —
-    одним тапом), остальное — документом.
-    Облако и plain-Сейф: copy_message из канала (без перекачивания!), фолбэк —
-    отправка по file_id. Зашифрованный Сейф: DVF1 ≤20 МБ — расшифровка в
-    память и send_document; DVF2 ≤49 МБ — расшифровка в temp и отправка;
-    DVF2 >49 МБ — честный отказ (Bot API не умеет, качайте кнопкой «Скачать»).
-    ВОЛНА 22.55: вся механика — в _miniapp_send_rec_to_chat (её же использует
-    серверная очередь скачивания «через бота»)."""
-    user, uid, err = await _api_get_user_any(request)
-    if err is not None:
-        return err
-    rec, where = _miniapp_find_any(user, request.match_info["fid"])
-    if not rec:
-        return _miniapp_err(404, "not_found", "Файл не найден (возможно, уже удалён).")
-    app = _MINIAPP_PTB_APP
-    bot = getattr(app, "bot", None) if app is not None else None
-    if bot is None:
-        return _miniapp_err(503, "no_bot",
-                            "Бот ещё запускается — попробуйте через минуту.")
-    pw_raw = _miniapp_vault_pw_for(request, {})
-    password = _miniapp_vault_pw_pick(user, _vault_pw_candidates(pw_raw)) \
-        if pw_raw else None
-    ok, how, serr = await _miniapp_send_rec_to_chat(
-        bot, user, uid, rec, where, password=password, http_request=request)
-    if ok:
-        return web.json_response({"ok": True, "how": how})
-    code, message = serr
-    status = {"safe_locked": 423, "wrong_password": 403,
-              "no_chat": 400, "bad_uid": 400, "no_source": 404,
-              "too_big_for_chat": 400, "send_failed": 502,
-              "failed": 502}.get(code, 502)
-    return _miniapp_err(status, code, message)
-
-
-# ════════════════════════════════════════════════════════════════
-# === ВОЛНА 22.55: ОЧЕРЕДЬ СКАЧИВАНИЯ «ЧЕРЕЗ БОТА» ===
-# Проблема: пользователь жмёт «Скачать» на пачке файлов, не закрывает
-# мини-апп крестиком, а просто ВЫХОДИТ из Telegram — WebView убивается
-# системой, клиентское скачивание (blob) умирает, очередь «исчезает».
-# Решение: очередь живёт НА СЕРВЕРЕ. Мини-апп только регистрирует список
-# файлов (POST /api/download/queue), дальше БОТ сам, в своём темпе, один
-# за другим отправляет файлы в личный чат пользователя (copy_message из
-# канала — без перекачивания). Что бы ни случилось с мини-аппом/Telegram,
-# файлы приедут в чат — а из чата Telegram сам надёжно качает в галерею.
-# Очередь переживает даже рестарт бота: состояние на диске (без пароля —
-# zero-knowledge), после старта воркеры поднимаются сами.
-# ════════════════════════════════════════════════════════════════
-
-_BOT_DLQ = {}                # uid → состояние очереди (см. _bot_dlq_state)
-_BOT_DLQ_MAX_PER_BATCH = 50  # файлов в одной пачке (как лимит облака)
-_BOT_DLQ_GAP = 2.0           # пауза между отправками в чат, сек (флуд-лимиты ТГ)
-_BOT_DLQ_TTL = 6 * 3600      # готовые очереди живут в памяти/на диске 6 ч
-_BOT_DLQ_RETRY_AFTER_MAX = 3 # повторов одного файла при флуд-лимите
-
-
-def _bot_dlq_path():
-    """JSON-файл всех очередей (в каталоге временных файлов бота)."""
-    return os.path.join(_miniapp_tmpdir(), "bot_dlq.json")
-
-
-def _bot_dlq_state(uid):
-    """Очередь пользователя (создаётся по требованию)."""
-    uid = str(uid)
-    q = _BOT_DLQ.get(uid)
-    if q is None:
-        q = {"items": [],          # [{fid,name,size,where,kind,plain,status,error,how}]
-             "running": False,
-             "task": None,         # asyncio.Task воркера (RAM-only)
-             "ts": time.time(),
-             "finished_at": 0.0,
-             "vault_pw": ""}       # пароль Сейфа ТОЛЬКО в RAM (zero-knowledge)
-        _BOT_DLQ[uid] = q
-    return q
-
-
-def _bot_dlq_persist():
-    """Все очереди → диск (без пароля!). Вызывается после каждой смены
-    статуса — файл маленький, запись дешевле потери прогресса."""
-    try:
-        out = {}
-        for uid, q in _BOT_DLQ.items():
-            items = []
-            for it in (q.get("items") or []):
-                items.append({
-                    "fid": str(it.get("fid") or ""),
-                    "name": str(it.get("name") or "файл")[:120],
-                    "size": int(it.get("size") or 0),
-                    "where": str(it.get("where") or "cloud"),
-                    "kind": str(it.get("kind") or "document"),
-                    "plain": bool(it.get("plain")),
-                    "status": str(it.get("status") or "pending"),
-                    "error": str(it.get("error") or "")[:300],
-                    "how": str(it.get("how") or ""),
-                })
-            out[uid] = {"items": items, "ts": float(q.get("ts") or 0),
-                        "finished_at": float(q.get("finished_at") or 0)}
-        with open(_bot_dlq_path(), "w", encoding="utf-8") as f:
-            json.dump(out, f)
-    except Exception:
-        pass
-
-
-def _bot_dlq_snapshot(uid):
-    """JSON-снимок очереди для мини-аппа (прогресс в панели передач)."""
-    q = _BOT_DLQ.get(str(uid)) or {"items": []}
-    items = [{"fid": str(i.get("fid") or ""),
-              "name": str(i.get("name") or "файл"),
-              "status": str(i.get("status") or "pending"),
-              "error": str(i.get("error") or "")} for i in (q.get("items") or [])]
-    total = len(items)
-    sent = sum(1 for i in items if i["status"] == "sent")
-    failed = sum(1 for i in items if i["status"] in ("failed", "canceled"))
-    pending = total - sent - failed
-    return {
-        "running": bool(q.get("running")),
-        "total": total, "sent": sent, "failed": failed, "pending": pending,
-        "items": items,
-    }
-
-
-def _bot_dlq_start(uid):
-    """Поднимает воркер очереди, если он ещё не работает."""
-    q = _bot_dlq_state(uid)
-    if q.get("running") and q.get("task") is not None:
-        return
-    try:
-        q["task"] = asyncio.create_task(_bot_dlq_worker(str(uid)))
-    except RuntimeError:
-        # event loop ещё не поднялся (не бывает в проде, но не роняем запрос)
-        q["task"] = None
-
-
-async def _bot_dlq_summary(uid, q):
-    """Итоговое сообщение в чат: сколько отправлено, что не вышло.
-    Best-effort: чат недоступен — молча пропускаем (мини-апп покажет статус)."""
-    app = _MINIAPP_PTB_APP
-    bot = getattr(app, "bot", None) if app is not None else None
-    if bot is None:
-        return
-    items = q.get("items") or []
-    sent = [i for i in items if i.get("status") == "sent"]
-    failed = [i for i in items if i.get("status") == "failed"]
-    canceled = [i for i in items if i.get("status") == "canceled"]
-    lines = []
-    if canceled:
-        lines.append(f"⏹ Отправка остановлена. Успел отправить: {len(sent)} из "
-                     f"{len(items)} файлов.")
-    else:
-        lines.append(f"✅ Облако: отправлено {len(sent)} из {len(items)} файлов.")
-    if failed:
-        lines.append("")
-        lines.append("⚠ Не отправилось:")
-        for i in failed[:5]:
-            why = str(i.get("error") or "неизвестная причина").strip()
-            lines.append(f"• {str(i.get('name') or 'файл')[:60]} — {why[:140]}")
-        if len(failed) > 5:
-            lines.append(f"… и ещё {len(failed) - 5}")
-        lines.append("")
-        lines.append("Файлы остались в облаке — попробуйте позже.")
-    try:
-        await bot.send_message(chat_id=int(uid), text="\n".join(lines))
-    except TGRetryAfter as e:
-        try:
-            await asyncio.sleep(float(getattr(e, "retry_after", 5) or 5) + 1.0)
-            await bot.send_message(chat_id=int(uid), text="\n".join(lines))
-        except Exception:
-            pass
-    except Exception:
-        pass
-
-
-async def _bot_dlq_worker(uid):
-    """Воркер очереди скачивания «через бота». Живёт на сервере: продолжает
-    отправку, когда мини-апп закрыт/убит, Telegram свёрнут, телефон offline.
-    Пауза _BOT_DLQ_GAP между файлами + честная обработка RetryAfter."""
-    q = _BOT_DLQ.get(uid)
-    if q is None:
-        return
-    q["running"] = True
-    try:
-        while True:
-            item = next((i for i in (q.get("items") or [])
-                         if i.get("status") == "pending"), None)
-            if item is None:
-                break
-            app = _MINIAPP_PTB_APP
-            bot = getattr(app, "bot", None) if app is not None else None
-            if bot is None:
-                await asyncio.sleep(5.0)     # бот ещё стартует — ждём
-                continue
-            user = get_user(uid)
-            if user is None:
-                item["status"] = "failed"
-                item["error"] = "Пользователь не найден."
-                _bot_dlq_persist()
-                continue
-            rec, where = _miniapp_find_any(user, str(item.get("fid") or ""))
-            if not rec:
-                item["status"] = "failed"
-                item["error"] = "Файл не найден (возможно, уже удалён)."
-                _bot_dlq_persist()
-                continue
-            item["status"] = "sending"
-            _bot_dlq_persist()
-            pw = str(q.get("vault_pw") or "") or None
-            sent_ok = False
-            for attempt in range(1, _BOT_DLQ_RETRY_AFTER_MAX + 1):
-                try:
-                    ok, how, serr = await _miniapp_send_rec_to_chat(
-                        bot, user, uid, rec, where, password=pw)
-                    if ok:
-                        item["status"] = "sent"
-                        item["how"] = how
-                        sent_ok = True
-                    else:
-                        code, message = serr
-                        if code == "no_chat":
-                            # бот заблокирован — вся оставшаяся пачка бессмысленна
-                            for it2 in (q.get("items") or []):
-                                if it2.get("status") in ("pending", "sending"):
-                                    it2["status"] = "failed"
-                                    it2["error"] = message
-                            q["finished_at"] = time.time()
-                            _bot_dlq_persist()
-                            return
-                        item["status"] = "failed"
-                        item["error"] = message
-                    break
-                except TGRetryAfter as e:
-                    ra = float(getattr(e, "retry_after", 5) or 5)
-                    logger.warning(f"bot-dlq: флуд-лимит у {uid}, пауза {ra} с")
-                    await asyncio.sleep(ra + 1.0)
-                    if attempt >= _BOT_DLQ_RETRY_AFTER_MAX:
-                        item["status"] = "failed"
-                        item["error"] = "Telegram просит паузу — попробуйте позже."
-            # ВОЛНА 22.55: пишем статус КАЖДОГО пункта сразу — если бот
-            # упадёт между отправками, на диске останется истина (иначе
-            # восстановление могло бы отправить уже отправленный файл дважды)
-            _bot_dlq_persist()
-            await asyncio.sleep(_BOT_DLQ_GAP)
-        # все пункты закрыты — итог в чат
-        q["finished_at"] = time.time()
-        _bot_dlq_persist()
-        if q.get("items"):
-            await _bot_dlq_summary(uid, q)
-    except asyncio.CancelledError:
-        pass
-    except Exception as e:
-        logger.error(f"bot-dlq worker {uid}: {e}")
-    finally:
-        q["running"] = False
-        q["task"] = None
-
-
-def _bot_dlq_restore():
-    """ВОЛНА 22.55: восстановление очередей после рестарта бота.
-    Возвращает список uid, у которых есть незакрытые пункты (для перезапуска
-    воркеров). Вызывать внутри event loop; задачи поднимает вызывающий."""
-    try:
-        p = _bot_dlq_path()
-        if not os.path.exists(p):
-            return []
-        with open(p, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, dict):
-            return []
-        now = time.time()
-        restart_uids = []
-        for uid, st in data.items():
-            try:
-                if not isinstance(st, dict):
-                    continue
-                items_raw = st.get("items") or []
-                items = []
-                for it in items_raw:
-                    if not isinstance(it, dict):
-                        continue
-                    _st = str(it.get("status") or "pending")
-                    # «sending» при рестарте — честно возвращаем в очередь
-                    if _st == "sending":
-                        _st = "pending"
-                    items.append({
-                        "fid": str(it.get("fid") or ""),
-                        "name": str(it.get("name") or "файл")[:120],
-                        "size": int(it.get("size") or 0),
-                        "where": str(it.get("where") or "cloud"),
-                        "kind": str(it.get("kind") or "document"),
-                        "plain": bool(it.get("plain")),
-                        "status": _st,
-                        "error": str(it.get("error") or "")[:300],
-                        "how": str(it.get("how") or ""),
-                    })
-                if not items:
-                    continue
-                if now - float(st.get("ts") or 0) > _BOT_DLQ_TTL:
-                    continue                     # старьё не поднимаем
-                q = _bot_dlq_state(uid)
-                q["items"] = items
-                q["ts"] = float(st.get("ts") or now)
-                q["finished_at"] = float(st.get("finished_at") or 0)
-                # пароля после рестарта нет (zero-knowledge): зашифрованные
-                # файлы честно упадут с «введите пароль Сейфа», обычные — уедут
-                if any(i["status"] == "pending" for i in items):
-                    restart_uids.append(uid)
-            except Exception:
-                continue
-        # чистим просроченное с диска сразу
-        for uid in list(_BOT_DLQ.keys()):
-            q = _BOT_DLQ[uid]
-            if q.get("finished_at") and now - float(q.get("finished_at") or 0) > _BOT_DLQ_TTL:
-                _BOT_DLQ.pop(uid, None)
-        _bot_dlq_persist()
-        return restart_uids
-    except Exception as e:
-        logger.error(f"bot-dlq restore: {e}")
-        return []
-
-
-async def miniapp_dlq_add(request):
-    """POST /api/download/queue {"ids": [...]} — поставить файлы в очередь
-    скачивания «через бота». Дальше сервер сам отправит их в личный чат
-    пользователя один за другим — мини-апп можно закрывать, Telegram можно
-    сворачивать/закрывать: НИЧЕГО не исчезает, всё приедет в чат."""
-    user, uid, err = await _api_get_user_any(request)
-    if err is not None:
-        return err
-    try:
-        body = await request.json()
-    except Exception:
-        return _miniapp_err(400, "bad_json", "Ожидался JSON.")
-    ids_raw = (body or {}).get("ids") or []
-    if not isinstance(ids_raw, list):
-        return _miniapp_err(400, "bad_ids", "Ожидался список ids.")
-    # уникальные id с сохранением порядка выбора
-    seen = set()
-    ids = []
-    for i in ids_raw:
-        s = str(i or "").strip()
-        if s and s not in seen:
-            seen.add(s)
-            ids.append(s)
-    if not ids:
-        return _miniapp_err(400, "empty", "Файлы не выбраны.")
-    if len(ids) > _BOT_DLQ_MAX_PER_BATCH:
-        return _miniapp_err(
-            413, "too_many",
-            f"За раз в очередь можно поставить максимум "
-            f"{_BOT_DLQ_MAX_PER_BATCH} файлов.")
-    # собираем записи; проверяем доступность каждой
-    items = []
-    need_pw = False
-    for fid in ids:
-        rec, where = _miniapp_find_any(user, fid)
-        if not rec:
-            return _miniapp_err(404, "not_found",
-                                f"Файл не найден: {fid}.")
-        encrypted = bool(where == "safe" and not rec.get("plain"))
-        if encrypted:
-            need_pw = True
-        name = str(rec.get("name") or rec.get("label") or "файл")[:120]
-        items.append({
-            "fid": fid, "name": name,
-            "size": int(rec.get("size") or 0),
-            "where": where,
-            "kind": str(rec.get("kind") or "document"),
-            "plain": bool(rec.get("plain")),
-            "status": "pending", "error": "", "how": "",
-        })
-    # пароль Сейфа: нужен, если среди файлов есть зашифрованные
-    password = None
-    if need_pw:
-        pw_raw = _miniapp_vault_pw_for(request, user, body)
-        if not pw_raw:
-            return _miniapp_err(
-                423, "safe_locked",
-                "🔒 Среди файлов есть зашифрованные Сейфом — введите пароль "
-                "Сейфа (⚙️ → Сейф), и очередь поедет.")
-        password = await asyncio.to_thread(
-            _miniapp_vault_pw_pick, user, _vault_pw_candidates(pw_raw))
-        if not password:
-            return _miniapp_err(
-                423, "safe_locked",
-                "🔒 Введите пароль Сейфа (⚙️ → Сейф) — среди файлов есть "
-                "зашифрованные.")
-        if await asyncio.to_thread(_miniapp_vault_pw_guard, user, password) is not True:
-            return _miniapp_err(403, "wrong_password",
-                                "Пароль Сейфа не подходит.")
-    # ставим в очередь: если старая пачка полностью закрыта — начинаем
-    # чистый список (не смешиваем прогресс прошлой пачки с новой)
-    q = _bot_dlq_state(uid)
-    now = time.time()
-    has_active = any(i.get("status") in ("pending", "sending")
-                     for i in (q.get("items") or []))
-    if not has_active:
-        q["items"] = []
-    active_fids = {str(i.get("fid")) for i in (q.get("items") or [])
-                   if i.get("status") in ("pending", "sending")}
-    added = 0
-    for it in items:
-        if it["fid"] in active_fids:
-            continue                      # уже стоит в очереди — не дублируем
-        q["items"].append(it)
-        added += 1
-    if password:
-        q["vault_pw"] = password
-    q["ts"] = now
-    q["finished_at"] = 0.0
-    _bot_dlq_persist()
-    _bot_dlq_start(uid)
-    snap = _bot_dlq_snapshot(uid)
-    logger.info(f"bot-dlq: пользователь {uid} поставил {added} файлов в "
-                f"очередь скачивания через бота")
-    return web.json_response({"ok": True, "queued": added, **snap})
-
-
-async def miniapp_dlq_status(request):
-    """GET /api/download/queue — статус очереди (мини-апп рисует прогресс
-    в панели передач; после переоткрытия мини-аппа очередь «находится» снова)."""
-    user, uid, err = await _api_get_user_any(request)
-    if err is not None:
-        return err
-    # попутно: чистим давно завершённые очереди
-    q = _BOT_DLQ.get(str(uid))
-    if q and q.get("finished_at") and \
-            time.time() - float(q.get("finished_at") or 0) > _BOT_DLQ_TTL:
-        _BOT_DLQ.pop(str(uid), None)
-        _bot_dlq_persist()
-    return web.json_response(_bot_dlq_snapshot(uid))
-
-
-async def miniapp_dlq_cancel(request):
-    """POST /api/download/queue/cancel — остановить оставшуюся очередь."""
-    user, uid, err = await _api_get_user_any(request)
-    if err is not None:
-        return err
-    q = _BOT_DLQ.get(str(uid))
-    stopped = 0
-    if q:
-        for it in (q.get("items") or []):
-            if it.get("status") == "pending":
-                it["status"] = "canceled"
-                it["error"] = "Остановлено пользователем."
-                stopped += 1
-        if stopped:
-            _bot_dlq_persist()
-    return web.json_response({"ok": True, "stopped": stopped})
+        return _miniapp_err(502, "send_failed",
+                            f"Не удалось отправить файл в чат ({e}).")
 
 
 # --- ВОЛНА 22.32: ЗАГРУЗКИ МИНИ-АППА ШИФРУЮТСЯ КАК В ЧАТЕ ---
@@ -21506,13 +20263,6 @@ async def miniapp_upload_init(request):
     # перезапись/удаление файлов на сервере.
     name = _dvf2_safe_name(str(body.get("name") or "").strip() or "file.bin")
     mime = str(body.get("mime") or "")[:120]
-    # ВОЛНА 22.59: hold — «недорешённая» сессия. Байты летят боту С РАБОТА
-    # ВЫБОРА файла (пользователь ещё вводит пароль/имя в окне загрузки).
-    # Сервер НЕ финализирует такую plain-сессию сам, пока открыто окно
-    # решения (hold_until) — иначе файл «убегал» в облако БЕЗ пароля раньше,
-    # чем пользователь выберет «в Сейф». Шифрованным сессиям hold не нужен:
-    # их пароль уже решён при init. Вычисляется ПОСЛЕ финального plain_mode.
-    want_hold_flag = bool(body.get("hold"))
     try:
         size = int(body.get("size") or 0)
     except (TypeError, ValueError):
@@ -21616,10 +20366,6 @@ async def miniapp_upload_init(request):
     if _reuse is not None:
         _upid, _s = _reuse
         _s["ts"] = time.time()
-        # 22.59: повторный выбор того же файла — окно решения продлеваем
-        if want_hold_flag and _s.get("plain"):
-            _s["hold_until"] = time.time() + 120.0
-            _upload_session_persist(_s)
         # пароль из ЭТОГО init (уже проверен гардом выше): сессия после
         # рестарта бота ждала пароль — теперь он есть и в RAM, значит
         # авто-догрузка сможет закончить файл даже без клиента
@@ -21666,10 +20412,6 @@ async def miniapp_upload_init(request):
         # загрузки (до complete), в базу не пишем никогда.
         "vault_pw": vault_pw or "",
         "plain": plain_mode,
-        # ВОЛНА 22.59: окно решения для plain-сессии (пароль могут ввести
-        # задним числом — complete перенацелит файл в Сейф)
-        "hold_until": (time.time() + 120.0)
-        if (want_hold_flag and plain_mode) else 0.0,
         # ВОЛНА 22.49: согласованный размер куска — фолбэк index→offset
         # работает даже если клиент шлёт куски нестандартного размера.
         "chunk": _MINIAPP_CHUNK,
@@ -21757,10 +20499,6 @@ async def miniapp_upload_chunk(request):
     if _idx >= 0:
         parts.add(_idx)
     s["ts"] = time.time()
-    # ВОЛНА 22.59: окно решения живо, пока идут байты (пользователь ещё
-    # может ввести пароль в окне загрузки)
-    if s.get("hold_until"):
-        s["hold_until"] = time.time() + 120.0
     # ВОЛНА 22.52: метаданные сессии — на диск (загрузка переживает рестарт
     # бота и «продолжается через самого бота»)
     _upload_session_persist(s)
@@ -21814,23 +20552,11 @@ async def miniapp_upload_closed(request):
     user, uid, err = await _api_get_user_any(request)
     if err is not None:
         return err
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    # ВОЛНА 22.59: release — приложение закрывается, решение по паролю
-    # принимать некому: снимаем hold, бот заканчивает файлы сам
-    release = bool((body or {}).get("release"))
     now = time.time()
     marked = 0
     for s in _MINIAPP_UPLOADS.values():
         if s.get("uid") != uid:
             continue
-        if release and s.get("hold_until") and not s.get("pw_tried"):
-            # 22.59: только «нерешённые» — сессии с неудачной попыткой
-            # пароля (pw_tried) не отпускаем: решение уже пытались принять
-            s["hold_until"] = 0.0
-            _upload_session_persist(s)
         size = int(s.get("size") or 0)
         received = int(s.get("received") or 0)
         if size > 0 and received < size:
@@ -21866,17 +20592,10 @@ async def miniapp_upload_status(request):
     s = _MINIAPP_UPLOADS.get(upid)
     if s and s.get("uid") == uid:
         if s.get("completing"):
-            # ВОЛНА 22.54: parts и в processing — предохранка могла уложить
-            # ВСЕ байты, пока бот ещё шифрует/заливает: клиент-движок, взяв
-            # сессию, не перекачивает куски (все уже в parts), а complete
-            # мягко поймает already_processing и дождётся результата.
-            _pparts = s.get("parts")
             return web.json_response({
                 "state": "processing",
                 "received": int(s.get("received") or 0),
                 "size": int(s.get("size") or 0),
-                "parts": sorted(int(i) for i in _pparts)
-                if isinstance(_pparts, (set, list)) else [],
             })
         # ВОЛНА 22.51: parts — индексы УЖЕ ПРИНЯТЫХ кусков (клиентские, по
         # 6 МиБ): докачка после закрытия мини апп шлёт только НЕДОСТАЮЩИЕ
@@ -21891,84 +20610,6 @@ async def miniapp_upload_status(request):
             "parts": sorted(int(i) for i in _parts) if isinstance(_parts, (set, list)) else [],
         })
     return web.json_response({"state": "gone"})
-
-
-async def miniapp_upload_rename(request):
-    """ВОЛНА 22.54: имя «догоняет» уже летящую загрузку.
-
-    Файлы теперь уходят в бота СРАЗУ после выбора (предохранка: init + куски
-    летят, пока пользователь ещё отвечает на окна «Назовите файл»). Введённое
-    имя применяется задним числом:
-      • сессия жива и ещё не финализируется — меняем s["name"] (файл уйдёт
-        в канал уже с новым именем), метаданные на диске обновляются;
-      • сессия уже завершена (_MINIAPP_COMPLETED, 1 ч) — переименовываем
-        созданную запись и подпись сообщения-хранилища в канале пользователя
-        (тот же механизм, что ✏️ в чате, волна 22.48);
-      • сессии нет и результата нет (предохранка не успела начаться) —
-        «none»: движок загрузит файл с новым именем как обычно."""
-    user, uid, err = await _api_get_user_any(request)
-    if err is not None:
-        return err
-    try:
-        body = await request.json()
-    except Exception:
-        return _miniapp_err(400, "bad_json", "Ожидался JSON.")
-    upid = str(body.get("uploadId") or "")
-    # сырую строку проверяем ДО санитизации: _dvf2_safe_name("") вернул бы
-    # фолбэк «file.bin», и пробельное имя молча стало бы «file.bin»
-    _raw_name = str(body.get("name") or "").strip()
-    if not _raw_name:
-        return _miniapp_err(400, "bad_name", "Пустое имя файла.")
-    # _dvf2_safe_name — как в init: имя без разделителей пути (безопасность)
-    new_name = _dvf2_safe_name(_raw_name)
-    if not upid:
-        return _miniapp_err(400, "bad_request", "Не указан uploadId.")
-    s = _MINIAPP_UPLOADS.get(upid)
-    if s and s.get("uid") == uid:
-        if s.get("completing"):
-            # финализация в разгаре: имя применит catch-all клиента после
-            # complete (PATCH /api/files/<id>) — здесь честно отвечаем busy
-            return web.json_response({"renamed": "busy"})
-        s["name"] = new_name
-        s["ts"] = time.time()
-        _upload_session_persist(s)
-        return web.json_response({"renamed": "session", "name": new_name})
-    _done = _MINIAPP_COMPLETED.get(upid)
-    if _done and _done.get("uid") == uid and \
-            time.time() - float(_done.get("ts", 0)) < 3600:
-        fid = ""
-        try:
-            fid = str((((_done.get("resp") or {}).get("file")) or {}).get("id") or "")
-        except Exception:
-            fid = ""
-        if fid:
-            rec, where = _miniapp_find_any(user, fid)
-            if rec:
-                if where == "safe":
-                    rec["label"] = new_name[:120]
-                else:
-                    rec["name"] = new_name[:120]
-                save_user(user)
-                # подпись сообщения-хранилища в канале — как ✏️ (best-effort)
-                try:
-                    _app = _MINIAPP_PTB_APP
-                    if _app is not None:
-                        await _storage_rename_caption(
-                            _app.bot, rec,
-                            rec.get("label") if where == "safe"
-                            else rec.get("name"))
-                except Exception:
-                    pass
-                if where == "safe":
-                    _idx = next(
-                        (i for i, f in enumerate(user.vault_files or [], 1)
-                         if isinstance(f, dict) and f.get("id") == rec.get("id")),
-                        1)
-                    return web.json_response(
-                        {"renamed": "file", "file": _miniapp_safe_rec_out(_idx, rec)})
-                return web.json_response(
-                    {"renamed": "file", "file": _miniapp_rec_out(rec)})
-    return web.json_response({"renamed": "none"})
 
 
 # uid → ts последнего отправленного сообщения «⏸ Загрузка на паузе»
@@ -22057,14 +20698,7 @@ async def _upload_pause_check_once(app, now=None):
                       "\nМини апп закрыли посреди загрузки, и файлы "
                       "перестали лететь на сервер.\n\n"
                       "Файлы НЕ потеряны: откройте мини апп — загрузка "
-                      "продолжится сама с того же места.\n\n"
-                      "💡 А чтобы грузилось В ФОНЕ даже с закрытым "
-                      "приложением — отправьте файлы прямо в ЭТОТ чат "
-                      "(в мини-аппе для этого есть кнопка «📤 Загрузить "
-                      "через Telegram»): Telegram сам доносит их боту, "
-                      "а я сохраню всё в облако. Прогресс виден в мини-"
-                      "аппе — карточка «Загрузка через Telegram» в панели "
-                      "передач."),
+                      "продолжится сама с того же места."),
                 reply_markup=kb,
             )
             sent += 1
@@ -22101,13 +20735,7 @@ _UPLOAD_AUTO_COOLDOWN = 90.0    # не спамим: не чаще раза в 1
 
 
 def _upload_autocomplete_candidates(now: float):
-    """Незавершённые сессии, где ВСЕ байты уже на сервере и клиент молчит.
-
-    ВОЛНА 22.56: порог тишины стал умнее. Если клиент ЧЕСТНО сказал, что
-    мини апп закрывается (closed_hint) или сторож паузы уже признал сессию
-    остановившейся (pause_notified) — бот не тянет 20 секунд, а финализирует
-    файл уже через 6: пользователь закрыл Telegram, все байты на сервере —
-    файл должен уехать в канал НЕМЕДЛЕННО, а не «когда-нибудь»."""
+    """Незавершённые сессии, где ВСЕ байты уже на сервере и клиент молчит."""
     out = []
     for upid, s in list(_MINIAPP_UPLOADS.items()):
         size = int(s.get("size") or 0)
@@ -22117,16 +20745,9 @@ def _upload_autocomplete_candidates(now: float):
         if s.get("completing") or s.get("auto_done") or s.get("auto_giveup") \
                 or s.get("auto_scheduled"):
             continue              # уже в работе / отложено / закрыта / клиент решает
-        # ВОЛНА 22.59: окно решения ещё открыто (plain + пароль могут ещё
-        # прийти с complete) — не финализируем раньше пользователя
-        if s.get("hold_until") and float(s["hold_until"]) > now:
-            continue
         if int(s.get("auto_fail_n") or 0) >= 3:
             continue                      # три неудачи — не долбим
-        silence = 20.0
-        if s.get("closed_hint") or s.get("pause_notified"):
-            silence = 6.0                 # апп точно закрыт — не ждём зря
-        if now - float(s.get("ts", now)) < silence:
+        if now - float(s.get("ts", now)) < 20.0:
             continue                      # клиент ещё может прислать complete сам
         out.append((upid, s))
     return out
@@ -22233,12 +20854,6 @@ async def _upload_auto_complete_delayed(upid, delay=2.5):
         s = _MINIAPP_UPLOADS.get(upid)
         if s is None or s.get("completing") or s.get("auto_done"):
             return
-        # ВОЛНА 22.59: «недорешённая» plain-сессия (пароль могут ввести в
-        # окне загрузки) — финализацию отдаём сторожу: он закончит файл
-        # после истечения hold (или complete решит раньше)
-        if s.get("hold_until") and float(s["hold_until"]) > time.time():
-            s["auto_scheduled"] = False
-            return
         await _upload_auto_complete_task(_MINIAPP_PTB_APP, upid)
     except asyncio.CancelledError:
         raise
@@ -22265,10 +20880,10 @@ def _upload_session_persist(s):
             "received": int(s.get("received") or 0),
             "chunk": int(s.get("chunk") or _MINIAPP_CHUNK),
             "plain": bool(s.get("plain")),
-            "hold_until": float(s.get("hold_until") or 0),
             "parts": sorted(int(i) for i in (s.get("parts") or ())),
             "ts": float(s.get("ts") or time.time()),
         }
+        _parts = s.get("parts")
         with open(_upload_session_meta_path(s), "w", encoding="utf-8") as f:
             json.dump(meta, f)
     except Exception:
@@ -22330,7 +20945,6 @@ def _miniapp_restore_upload_sessions():
                     "ts": float(meta.get("ts") or now),
                     "vault_pw": "",          # на диск не пишем и не читаем
                     "plain": bool(meta.get("plain")),
-                    "hold_until": float(meta.get("hold_until") or 0),
                     "chunk": int(meta.get("chunk") or _MINIAPP_CHUNK),
                     "parts": set(int(i) for i in (_parts or [])
                                  if isinstance(i, (int, float))),
@@ -22658,19 +21272,10 @@ async def miniapp_upload_complete(request):
             return web.json_response(_done["resp"])
         return _miniapp_err(404, "session_not_found",
                             "Загрузка не найдена или устарела — начните заново.")
-    # ВОЛНА 22.59: пароль из ТЕЛА complete — явное желание пользователя
-    # (поле в окне загрузки): им plain-сессия перенацеливается в Сейф.
-    # ВНИМАНИЕ: пароль из ЗАГОЛОВКА для этого НЕ годится — он наследуется
-    # от прежней разблокировки Сейфа и молча шифровал бы все загрузки.
-    body_pw = str((body or {}).get("password") or "")
-    # 22.59: решение принято (или файл уже не «недорешённый») — hold снимаем
-    if s.get("hold_until"):
-        s["hold_until"] = 0.0
     vault_pw_raw = _miniapp_vault_pw_from(request, body, upload_sess=s)
     ok, payload = await _miniapp_upload_finalize(user, uid, upid, s,
                                                  pw_raw=vault_pw_raw,
-                                                 http_request=request,
-                                                 body_pw=body_pw)
+                                                 http_request=request)
     if ok:
         return web.json_response(payload)
     return _payload_as_response(payload)
@@ -22689,7 +21294,7 @@ def _payload_as_response(payload):
 
 
 async def _miniapp_upload_finalize(user, uid, upid, s, pw_raw="",
-                                   http_request=None, body_pw=""):
+                                   http_request=None):
     """ВОЛНА 22.51: ОБЩЕЕ ЯДРО завершения загрузки (валидация размеров →
     шифрование в Сейф / заливка в канал → запись в базу).
     Вызывается из двух мест: HTTP-обработчик /api/upload/complete и сторож
@@ -22741,35 +21346,6 @@ async def _miniapp_upload_finalize(user, uid, upid, s, pw_raw="",
                                       f"{s['size']} байт — загрузка не завершена."}
         name = s["name"]
         size = s["size"]
-        # === ВОЛНА 22.59: ПЕРЕНАЦЕЛИВАНИЕ В СЕЙФ ПАРОЛЕМ ИЗ ТЕЛА ===
-        # Файл полетел боту СРАЗУ при выборе (hold-сессия без пароля),
-        # а пароль пользователь ввёл уже потом — файл НЕ перекачиваем:
-        # plain-сессия прямо здесь становится шифрованной (байты уже на
-        # диске сервера, они никуда не денутся).
-        if s.get("plain") and body_pw:
-            _cand = await asyncio.to_thread(
-                _miniapp_vault_pw_pick, user, _vault_pw_candidates(body_pw))
-            if _cand:
-                _okv = await asyncio.to_thread(
-                    _miniapp_vault_pw_verify, user, _cand)
-                if _okv is False:
-                    # пароль не подошёл: байты не теряем — держим сессию
-                    # (пользователь введёт правильный и повторит complete).
-                    # pw_tried: release при закрытии аппа такую сессию НЕ
-                    # отпускает — решение уже пытались принять, ждём клиента
-                    s["pw_tried"] = True
-                    s["hold_until"] = time.time() + 3600.0
-                    return False, {"error": "wrong_password",
-                                   "message": "Пароль Сейфа не подходит — "
-                                              "введите правильный: файл уже "
-                                              "у бота и никуда не пропадёт."}
-                s["plain"] = False
-                s["vault_pw"] = _cand
-                # шифрованная ветка ниже берёт пароль из pw_raw — отдаём
-                # ей проверенный пароль перенацеливания (иначе safe_locked)
-                pw_raw = _cand
-                logger.info("upload %s: plain-сессия перенацелена в Сейф "
-                            "паролем из complete", upid)
         # === ВОЛНА 22.32: ШИФРОВАННАЯ ЗАГРУЗКА (режим по умолчанию) ===
         if not s.get("plain"):
             # ВОЛНА 22.51: pw_raw приходит ИЗ ТЕЛА/ЗАГОЛОВОВ (HTTP-путь) или
@@ -23023,10 +21599,7 @@ async def miniapp_storage_connect(request):
                             "Telegram не дал посмотреть канал: "
                             f"{(getattr(e, 'message', None) or e)}. Проверьте, "
                             "что бот ДОБАВЛЕН в канал администратором.")
-    except Exception as e:
-        # ВОЛНА 22.55 (баг): раньше в этом except НЕ было «as e», а в f-string
-        # использовалась переменная e — получали NameError вместо честной
-        # ошибки «не смог проверить канал» (пользователь видел пустой сбой).
+    except Exception:
         logger.warning(f"miniapp storage: get_chat не удался: {e}")
         return _miniapp_err(502, "get_chat_error",
                             "Не смог проверить канал (сбой сети?). Попробуйте ещё раз.")
@@ -23550,8 +22123,6 @@ def mount_miniapp_routes(app):
     app.router.add_post("/api/upload/closed", miniapp_upload_closed)
     # ВОЛНА 22.50: статус сессии загрузки — честный успех вместо фантомных ошибок
     app.router.add_get("/api/upload/status", miniapp_upload_status)
-    # ВОЛНА 22.54: имя «догоняет» уже летящую загрузку (предохранка)
-    app.router.add_post("/api/upload/rename", miniapp_upload_rename)
     # ВОЛНА 22.23: «Моё облако» в мини-аппе (статус/подключить/отключить канал)
     app.router.add_get("/api/storage", miniapp_storage_get)
     app.router.add_post("/api/storage/connect", miniapp_storage_connect)
@@ -23565,11 +22136,6 @@ def mount_miniapp_routes(app):
     # ВОЛНА 22.29: мультивыбор — собранный ZIP из выбранных + распаковка ZIP
     app.router.add_post("/api/files/zip_selected", miniapp_files_zip_selected)
     app.router.add_post("/api/files/unzip", miniapp_files_unzip)
-    # ВОЛНА 22.55: очередь скачивания «через бота» — сервер сам отправляет
-    # выбранные файлы в чат пользователя (переживает выход из Telegram)
-    app.router.add_post("/api/download/queue", miniapp_dlq_add)
-    app.router.add_get("/api/download/queue", miniapp_dlq_status)
-    app.router.add_post("/api/download/queue/cancel", miniapp_dlq_cancel)
 
 
 async def cloud_exit_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -24069,32 +22635,43 @@ async def _cdb_ingest_post(context, post, doc, fname, chat_id):
                                         "НЕ удалось ЗАКРЕПИТЬ снапшот — при старте бот "
                                         "его не прочитает. Проверьте право бота на "
                                         "закрепление сообщений в канале.")
-                                # Реестр указателей (ВОЛНА 22.56: старые
-                                # снапшоты НЕ удаляем — канал хранит историю
-                                # версий; закреп — указатель на актуальный).
+                                # Реестр указателей + удаление СТАРЫХ снапшотов
+                                # этого канала (правило: один актуальный снапшот).
                                 cfg = load_storage_config()  # ПОСЛЕ apply — конфиг мог приехать из снапшота
                                 reg = dict(cfg.get("cdb_registry") or {})
                                 sent = dict(cfg.get("cdb_sent") or {})
-                                _hist = []
+                                _old_ids = []
                                 for _v in (sent.get(str(chat_id)) or []):
                                     try:
                                         _iv = int(_v)
                                     except (TypeError, ValueError):
                                         continue
-                                    if _iv not in _hist:
-                                        _hist.append(_iv)
+                                    if _iv not in _old_ids:
+                                        _old_ids.append(_iv)
+                                _prev = (reg.get(str(chat_id)) or {}).get("msg_id")
                                 try:
-                                    if int(post.message_id) not in _hist:
-                                        _hist.append(int(post.message_id))
+                                    _prev = int(_prev)
+                                    if _prev and _prev not in _old_ids:
+                                        _old_ids.append(_prev)
                                 except (TypeError, ValueError):
                                     pass
+                                pruned = 0
+                                for _old in _old_ids:
+                                    if int(_old) == int(post.message_id):
+                                        continue
+                                    try:
+                                        await context.bot.delete_message(
+                                            chat_id=chat_id, message_id=int(_old))
+                                        pruned += 1
+                                    except Exception:
+                                        pass
                                 reg[str(chat_id)] = {
                                     "msg_id": int(post.message_id),
                                     "file_id": getattr(doc, "file_id", None),
                                     "ts": stamp,
                                     "size": len(payload),
                                 }
-                                sent[str(chat_id)] = _hist[-50:]
+                                sent[str(chat_id)] = [int(post.message_id)]
                                 cfg["cdb_registry"] = reg
                                 cfg["cdb_sent"] = sent
                                 if stamp:
@@ -24112,6 +22689,9 @@ async def _cdb_ingest_post(context, post, doc, fname, chat_id):
                                              f"текущей базы ({last}) — применён "
                                              "ПРИНУДИТЕЛЬНО: файл дан вручную, "
                                              "он и есть актуальная база.")
+                                if pruned:
+                                    _rep += (f" • 🧹 старых снапшотов стёрто: {pruned} "
+                                             "(остался один актуальный)")
                                 if problems:
                                     _rep += f"\n⚠️ Проблемы: {'; '.join(problems[:3])}"
                                 for _pn in pin_notes:
@@ -24123,12 +22703,13 @@ async def _cdb_ingest_post(context, post, doc, fname, chat_id):
     except Exception as e:
         logger.error(f"cdb ingest crashed: {e}")
         _reports.append(f"❌ Снапшот из канала не принят (внутренняя ошибка): {e}")
-    # ВОЛНА 22.56: отчёты об инжесте снапшотов больше НЕ отправляются
-    # разработчику в личку («уведомления разработчику о снапшотах не к
-    # чему») — всё пишется в журнал бота, панель разработчика по-прежнему
-    # показывает статус канала-БД.
     for _t in _reports:
-        logger.info(f"cdb ingest: {_t}")
+        try:
+            if DEVELOPER_ID:
+                await context.bot.send_message(
+                    chat_id=int(str(DEVELOPER_ID).strip()), text=str(_t)[:3500])
+        except Exception:
+            pass
 
 
 async def _storage_channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -24141,9 +22722,8 @@ async def _storage_channel_post_handler(update: Update, context: ContextTypes.DE
     файл — сохраняет только указатель (chat/message_id, file_id, размер).
 
     ВОЛНА 13: документ с именем devorks_db_snapshot_… — это ВСТАВЛЕННЫЙ
-    пользователем снапшот базы: принимаем (latest-wins) и ЗАКРЕПЛЯЕМ
-    (22.56: старые снапшоты НЕ стираем — канал хранит историю версий)
-    в любом канале-хранилище."""
+    пользователем снапшот базы: принимаем (latest-wins), ЗАКРЕПЛЯЕМ и
+    стираем старые снапшоты (_cdb_ingest_post) в любом канале-хранилище."""
     try:
         post = getattr(update, "channel_post", None) or getattr(update, "edited_channel_post", None)
         if post is None:
@@ -24229,8 +22809,8 @@ async def _storage_channel_post_handler(update: Update, context: ContextTypes.DE
 #      пользователю САМ файл базы — его можно хранить где угодно;
 #   2) этот файл можно просто ОТПРАВИТЬ БОТУ В ЛИЧКУ из любого состояния —
 #      бот подтвердит, применит базу (latest-wins), скопирует файл в
-#      канал-хранилище и ЗАКРЕПИТ его (22.56: старые снапшоты остаются —
-#      история версий) — после рестарта бот вспомнит всё именно из закрепа.
+#      канал-хранилище, ЗАКРЕПИТ его и сотрёт старые снапшоты — после
+#      рестарта бот вспомнит всё именно из этого закрепа.
 # Фильтр-перехватчик зарегистрирован ПЕРЕД ConversationHandler (группа 0):
 # снапшот не попадает ни в Сейф, ни в облако, ни в старое восстановление
 # панели — двойной обработки нет; кнопки подтверждения живут вне FSM и
@@ -24312,9 +22892,8 @@ async def _cdb_private_doc_handler(update: Update, context: ContextTypes.DEFAULT
             "• применит ЭТОТ файл как актуальную базу — БЕЗ отказов «не "
             "новее»: вы дали файл вручную, значит он и есть последний "
             "(ответ — «Готово!»);\n"
-            "• скопирует файл в канал-хранилище и ЗАКРЕПИТ его — после "
-            "рестарта бот вспомнит всё из закрепа (старые снапшоты "
-            "сохранятся как история версий).\n\n"
+            "• скопирует файл в канал-хранилище, ЗАКРЕПИТ его и сотрёт "
+            "старые снапшоты — после рестарта бот вспомнит всё из закрепа.\n\n"
             "Продолжить?",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("✅ Восстановить", callback_data="cdb_rst_yes"),
@@ -24460,7 +23039,7 @@ async def _cdb_private_restore_cb(update: Update, context: ContextTypes.DEFAULT_
             _CDB_DIRTY.clear()  # данные только что из файла — заливать обратно нечего
             cfg = load_storage_config()  # ПОСЛЕ apply: каналы могли приехать из снапшота
             db_ids = get_db_channel_ids()
-            pinned_ch, fail_ch = [], []
+            pinned_ch, fail_ch, pruned_n = [], [], 0
             reg = dict(cfg.get("cdb_registry") or {})
             sent = dict(cfg.get("cdb_sent") or {})
             for ch in db_ids:
@@ -24469,7 +23048,6 @@ async def _cdb_private_restore_cb(update: Update, context: ContextTypes.DEFAULT_
                     _copy = await context.bot.copy_message(
                         chat_id=int(ch), from_chat_id=_src_chat,
                         message_id=_src_msg,
-                        disable_notification=True,  # 22.56: беззвучно
                     )
                     new_msg_id = int(getattr(_copy, "message_id", 0) or 0)
                 except Exception as e:
@@ -24491,28 +23069,38 @@ async def _cdb_private_restore_cb(update: Update, context: ContextTypes.DEFAULT_
                     _notes.append(
                         f"НЕ удалось ЗАКРЕПИТЬ в канале {ch} — при старте бот "
                         "его не прочитает. Проверьте право бота на закрепление.")
-                # ВОЛНА 22.56: старые снапшоты НЕ удаляем — канал хранит
-                # историю версий, закреп — указатель на актуальный.
-                _hist = []
+                # Чистка СТАРЫХ снапшотов канала (правило: один актуальный).
+                _old_ids = []
                 for _v in (sent.get(str(ch)) or []):
                     try:
                         _iv = int(_v)
                     except (TypeError, ValueError):
                         continue
-                    if _iv not in _hist:
-                        _hist.append(_iv)
+                    if _iv not in _old_ids:
+                        _old_ids.append(_iv)
+                _prev = (reg.get(str(ch)) or {}).get("msg_id")
                 try:
-                    if int(new_msg_id) and int(new_msg_id) not in _hist:
-                        _hist.append(int(new_msg_id))
+                    _prev = int(_prev)
+                    if _prev and _prev not in _old_ids:
+                        _old_ids.append(_prev)
                 except (TypeError, ValueError):
                     pass
+                for _old in _old_ids:
+                    if int(_old) == int(new_msg_id):
+                        continue
+                    try:
+                        await context.bot.delete_message(
+                            chat_id=int(ch), message_id=int(_old))
+                        pruned_n += 1
+                    except Exception:
+                        pass
                 reg[str(ch)] = {
                     "msg_id": int(new_msg_id),
                     "file_id": str(pend.get("file_id") or ""),
                     "ts": stamp,
                     "size": len(payload),
                 }
-                sent[str(ch)] = _hist[-50:]
+                sent[str(ch)] = [int(new_msg_id)]
             if stamp:
                 cfg["cdb_last_flush"] = stamp
             cfg["cdb_registry"] = reg
@@ -24534,7 +23122,7 @@ async def _cdb_private_restore_cb(update: Update, context: ContextTypes.DEFAULT_
         f"• файлов данных восстановлено: {len(restored)}\n"
         f"• закреплено в каналах: {len(pinned_ch)}"
         + (f" ({', '.join(str(c) for c in pinned_ch)})" if pinned_ch else "")
-        + "\n• старые снапшоты в канале сохранены (история версий)"
+        + (f"\n• 🧹 старых снапшотов стёрто: {pruned_n}" if pruned_n else "")
     )
     if problems:
         _rep += f"\n⚠️ Проблемы: {'; '.join(problems[:3])}"
@@ -43033,10 +41621,6 @@ async def dev_unblock_user_start(update: Update, context: ContextTypes.DEFAULT_T
 
     text = "✅ Выберите пользователя для разблокировки:\n\n"
     _details = []
-    # ВОЛНА 22.55 (баг): keyboard не был объявлен — при наличии хоть одного
-    # заблокированного пользователя кнопки строились через .append() на
-    # несуществующем списке (NameError), и панель разблокировки падала.
-    keyboard = []
     for blocked_id in blocked_users.keys():
         user = get_user(blocked_id)
         name = user.first_name if user else f"User {blocked_id}"
@@ -56560,19 +55144,6 @@ async def _post_init(application):
     except Exception as e2:
         logger.error(f"Не удалось восстановить сессии загрузки: {e2}")
 
-    # === ВОЛНА 22.55: восстановление очередей скачивания «через бота» ===
-    # Пользователь закрыл Telegram посреди пачки — очередь жила на сервере;
-    # даже рестарт бота её не убьёт: поднимаем воркеры и продолжаем отправку.
-    try:
-        _dlq_uids = _bot_dlq_restore()
-        for _dq_uid in _dlq_uids:
-            _bot_dlq_start(_dq_uid)
-        if _dlq_uids:
-            logger.info(f"ВОЛНА 22.55: очередей скачивания восстановлено: "
-                        f"{len(_dlq_uids)}")
-    except Exception as e2:
-        logger.error(f"Не удалось восстановить очереди скачивания: {e2}")
-
     # === ШАГ 4: диагностика уведомлений по каждому пользователю. ===
     try:
         users_for_diag = load_users()
@@ -57298,10 +55869,9 @@ def main():
             ],
             MAIN_MENU: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_main_menu),
-                # ВОЛНА 22.57: фото/документы/видео/аудио в главном меню больше
-                # НЕ отклоняются («AI не принимает фото») и НЕ пропадают молча —
-                # они проваливаются к глобальному роутеру bg_chat_upload_receive
-                # и сохраняются в облако («загрузка через бота», работает в фоне).
+                # ВОЛНА 22.4: AI больше не принимает фото — честный отказ вместо
+                # прежнего роутинга в Groq Vision (handle_main_menu_photo удалён).
+                MessageHandler(filters.PHOTO | filters.Document.IMAGE, ai_photo_reject_handler),
                 CallbackQueryHandler(handle_callback),
             ],
             CLASS_MANAGEMENT: [
@@ -57972,19 +56542,6 @@ def main():
         filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND
         & _BELLS_BULK_FILTER,
         _bells_bulk_text_handler))
-
-    # 📤 ВОЛНА 22.57: ГЛОБАЛЬНЫЙ РОУТЕР «ФАЙЛ В ЧАТЕ = ФАЙЛ В ОБЛАКЕ».
-    # Стоит ПОСЛЕ ConversationHandler: медиа забирают FSM-состояния
-    # (загрузка облака/Сейф/ДЗ/восстановление), а всё, что НЕ забрали
-    # (главное меню, любой текстовый режим, потерянный после рестарта
-    # разговор) — сохраняется в облако как «загрузка через бота».
-    # Так файлы, отправленные в чат, больше никогда не пропадают молча,
-    # а фоновая загрузка работает даже с закрытым мини-аппом и свёрнутым
-    # Telegram: доносит сам Telegram, сохраняет бот на сервере.
-    application.add_handler(MessageHandler(
-        (filters.Document.ALL | filters.PHOTO | filters.VIDEO
-         | filters.AUDIO | filters.VOICE) & filters.ChatType.PRIVATE,
-        bg_chat_upload_receive))
 
     # ВОЛНА 12: standalone-перехватчик отмены ПОСЛЕ ConversationHandler —
     # срабатывает, когда FSM-состояние ПОТЕРЯНО (state=None после
