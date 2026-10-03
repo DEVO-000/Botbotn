@@ -1523,6 +1523,17 @@ html.low-end #cornerTransfers.panel-open .ct-panel {
   animation: ctItemIn 0.35s var(--ease-snap);
 }
 
+/* ВОЛНА 22.65: строка «ждёт пароль Сейфа» нажимается целиком */
+.ct-item.ct-clickable {
+  cursor: pointer;
+  -webkit-tap-highlight-color: rgba(10, 132, 255, 0.15);
+}
+
+.ct-item.ct-clickable:active {
+  transform: scale(0.98);
+  border-color: rgba(10, 132, 255, 0.55);
+}
+
 @keyframes ctItemIn {
   from { opacity: 0; transform: translateY(8px) scale(0.97); }
   to   { opacity: 1; transform: none; }
@@ -2794,6 +2805,11 @@ body.vp-lock {
     </p>
 
     <div style="display:flex;flex-direction:column;gap:8px">
+      <!-- ВОЛНА 22.63: кнопки «Загрузить через Telegram» и «Автопередача
+           в Telegram» УДАЛЕНЫ по просьбе пользователя. Файлы всегда (по
+           умолчанию) летят боту напрямую стримом с момента выбора —
+           никаких переключателей и лишних кнопок. -->
+
       <button class="sound-item-btn" id="uploadAddBtn" onclick="pickUploadFiles()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
         <span>Добавить файл</span>
         <i data-lucide="plus" style="width:18px;height:18px"></i>
@@ -3975,6 +3991,132 @@ function handleSoundSelect(e, id) {
 const IS_TELEGRAM = !!(tg && tg.initData);
 let WEB_TOKEN = localStorage.getItem('devo_web_token') || '';
 
+/* ═══ ВОЛНА 22.66: КЭШ СПИСКА ФАЙЛОВ — «после обновления страницы всё
+   сбрасывается и ничего не остаётся» — БОЛЬШЕ НЕ ДОЛЖНО. ═══
+   При обновлении страницы список стартует пустым и наполняется только
+   после первого успешного /api/files. Пока сервер просыпается (бесплатный
+   хостинг), тихий старт ретраит 3с→7с→15с→30с→60с — и всё это время
+   пользователь видит ПУСТОЕ облако: выглядит, будто «файлы исчезли».
+   Фикс: последний успешный ответ /api/files хранится в localStorage
+   (с проверкой принадлежности текущему пользователю) и мгновенно
+   рисуется при старте — обновление страницы показывает файлы СРАЗУ,
+   а тихая досинхронизация подхватывает свежие данные в фоне. */
+const FILES_CACHE_KEY = 'dv_files_cache_v1';
+
+function filesCacheIdentity() {
+  /* Кому принадлежит кэш: Telegram → id пользователя из initData;
+     веб-вход → токен сессии. Пусто → кэшем не пользуемся. */
+  try {
+    if (IS_TELEGRAM && tg && tg.initDataUnsafe && tg.initDataUnsafe.user) {
+      return 'tg:' + (tg.initDataUnsafe.user.id || '');
+    }
+  } catch (e) {}
+
+  if (WEB_TOKEN) return 'wt:' + WEB_TOKEN;
+
+  return '';
+}
+
+function filesCacheClear() {
+  try { localStorage.removeItem(FILES_CACHE_KEY); } catch (e) {}
+}
+
+function filesCacheLoad() {
+  try {
+    const raw = localStorage.getItem(FILES_CACHE_KEY);
+
+    if (!raw) return null;
+
+    const rec = JSON.parse(raw);
+
+    if (!rec || !rec.d || !rec.k) return null;
+
+    const id = filesCacheIdentity();
+
+    if (!id || rec.k !== id) return null;  /* чужие данные не показываем */
+
+    return rec;
+  } catch (e) {
+    return null;
+  }
+}
+
+function filesCacheSave(raw, force) {
+  try {
+    const id = filesCacheIdentity();
+
+    if (!id || !raw) return;
+
+    const now = Date.now();
+
+    /* без force — не чаще раза в 60с (живой опрос 2.5с не должен
+       писать в localStorage на каждый тик) */
+    if (!force && filesCacheSave._ts && (now - filesCacheSave._ts) < 60000) return;
+
+    const rec = {
+      k: id,
+      ts: now,
+      d: {
+        files: raw.files || [],
+        bot: String(raw.bot || ''),
+        build: String(raw.build || ''),
+        plain: (typeof raw.plain === 'boolean') ? raw.plain : null,
+        pending: Array.isArray(raw.pending) ? raw.pending : [],
+        bg_live: raw.bg_live || null,
+        safe_count: +raw.safe_count || 0,
+        limit: +raw.limit || 0
+      }
+    };
+
+    localStorage.setItem(FILES_CACHE_KEY, JSON.stringify(rec));
+    filesCacheSave._ts = now;
+  } catch (e) {}
+}
+
+function filesMapAll(f) {
+  /* Единое отображение записи /api/files → карточка (используется и при
+     обычной загрузке, и при восстановлении из кэша) */
+  return {
+    id: String(f.id || ''),
+    name: String(f.name || 'файл'),
+    kind: String(f.kind || 'document'),
+    size: +f.size || 0,
+    ts: String(f.ts || ''),
+    vault: !!f.vault,
+    /* ВОЛНА 22.50: признаки Сейфа — «Достать из Сейфа» для файлов режима
+       «без шифра» (plain) идёт БЕЗ пароля (сервер 22.50 это умеет) */
+    safe: !!f.safe,
+    plain: !!f.plain,
+    /* ВОЛНА 22.57: откуда файл — «через бота» (из чата) или из веба;
+       нужно для тоста «Пока вас не было» после фоновых загрузок */
+    src: String(f.src || '')
+  };
+}
+
+function filesCacheBoot() {
+  /* Мгновенный рендер из кэша ДО первого запроса: обновление страницы
+     показывает файлы сразу, даже если сервер ещё спит. */
+  const rec = filesCacheLoad();
+
+  if (!rec) return false;
+
+  const d = rec.d;
+
+  ALL_FILES = (d.files || []).map(filesMapAll);
+  CONN.bot = String(d.bot || CONN.bot || '');
+  CONN.build = String(d.build || CONN.build || '');
+
+  if (typeof d.plain === 'boolean') STORAGE_ENCRYPTED = !d.plain;
+  else if (ALL_FILES.some((f) => f.vault && !f.plain)) STORAGE_ENCRYPTED = true;
+
+  try { renderAll({}); } catch (e) {}
+  /* 22.65: панель передач тоже оживает из кэша (недогруженное/ждёт пароль) */
+  try { srvPendingApply(d.pending); } catch (e) {}
+  try { bgUploadApply(d.bg_live); } catch (e) {}
+
+  return ALL_FILES.length > 0;
+}
+
 function authHeaders(extra) {
   const h = Object.assign({ 'Cache-Control': 'no-store' }, extra || {});
 
@@ -4003,11 +4145,38 @@ async function apiJson(url, options) {
          подпись initData может не пройти проверку — пользователь должен
          иметь возможность войти по ID и веб-паролю (путь Bearer в
          _api_get_user_any работает и внутри Telegram). */
-      openLoginModal();
+      /* ВОЛНА 22.63: ВНУТРИ TELEGRAM — сначала тихая перезагрузка ОДИН
+         раз: Telegram вносит в WebView СВЕЖИЙ initData при каждом старте
+         мини-аппа. Долгая сессия (или рестарт сервера с подвисшей
+         подписью) больше НЕ выкидывает пользователя на окно входа «ID +
+         пароль», которого у него может не быть, — синхронизация
+         восстанавливается сама. Флаг в sessionStorage страхует от
+         циклической перезагрузки; на любом УСПЕШНОМ ответе снимается. */
+      if (IS_TELEGRAM && tg && tg.initData) {
+        let reloaded = false;
+        try {
+          reloaded = sessionStorage.getItem('dv_relogin') === '1';
+        } catch (e) {}
+        if (!reloaded) {
+          try { sessionStorage.setItem('dv_relogin', '1'); } catch (e) {}
+          /* 22.66: кэш файлов НЕ чистим — после перезагрузки тот же
+             пользователь увидит свой список мгновенно, без пустоты */
+          location.reload();
+        } else {
+          filesCacheClear();
+          openLoginModal();
+        }
+      } else {
+        filesCacheClear();
+        openLoginModal();
+      }
     }
 
     throw err;
   }
+
+  /* успех — снимаем страховку от циклической перезагрузки */
+  try { sessionStorage.removeItem('dv_relogin'); } catch (e) {}
 
   return data;
 }
@@ -4329,21 +4498,7 @@ async function loadFiles(silent, quiet) {
   try {
     const data = await apiJson('/api/files');
 
-    ALL_FILES = (data.files || []).map((f) => ({
-      id: String(f.id || ''),
-      name: String(f.name || 'файл'),
-      kind: String(f.kind || 'document'),
-      size: +f.size || 0,
-      ts: String(f.ts || ''),
-      vault: !!f.vault,
-      /* ВОЛНА 22.50: признаки Сейфа — «Достать из Сейфа» для файлов режима
-         «без шифра» (plain) идёт БЕЗ пароля (сервер 22.50 это умеет) */
-      safe: !!f.safe,
-      plain: !!f.plain,
-      /* ВОЛНА 22.57: откуда файл — «через бота» (из чата) или из веба;
-         нужно для тоста «Пока вас не было» после фоновых загрузок */
-      src: String(f.src || '')
-    }));
+    ALL_FILES = (data.files || []).map(filesMapAll);
 
     CONN.bot = String(data.bot || CONN.bot || '');
     CONN.build = String(data.build || CONN.build || '');
@@ -4399,11 +4554,21 @@ async function loadFiles(silent, quiet) {
     if (_sig !== LAST_FILES_SIG) {
       LAST_FILES_SIG = _sig;
       renderAll({ animate: !quiet });
+      /* 22.66: список изменился — обновляем кэш для мгновенного старта */
+      filesCacheSave(data, true);
+    } else {
+      /* список тот же — кэш обновляется не чаще раза в 60с (pending/bg_live) */
+      filesCacheSave(data, false);
     }
 
     /* ВОЛНА 22.58: живая карточка «Загрузка через Telegram» — считаем
        приехавшие из чата файлы и серверные статусы bg_live */
     bgUploadApply(data.bg_live);
+
+    /* ВОЛНА 22.65: недогруженное с сервера — восстановление строк панели
+       передач после обновления страницы («файлы сбрасываются и ничего
+       не остаётся» — больше не должно) */
+    srvPendingApply(data.pending);
 
     return true;
   } catch (e) {
@@ -4461,8 +4626,13 @@ async function syncNow() {
 let RESYNC_TIMER = null;
 
 function maybeAutoResync() {
-  if (!IS_TELEGRAM || listLoading || isUploading) return;
-  if (Date.now() - LAST_SYNC < 20000) return;
+  /* ВОЛНА 22.64: авто-синхронизация работает и в БРАУЗЕРЕ (WEB_TOKEN) —
+     раньше (!IS_TELEGRAM) молча отключала её вне Telegram: файлы, добавленные
+     через бота в чат, не появлялись в веб-облаке без ручной синхронизации
+     («файлы не синхронизируются»). */
+  if (listLoading || isUploading) return;
+  if (!IS_TELEGRAM && !WEB_TOKEN) return;
+  if (Date.now() - LAST_SYNC < 12000) return;
 
   loadFiles(true);
 }
@@ -4483,16 +4653,18 @@ try {
   if (tg && tg.onEvent) tg.onEvent('activated', maybeAutoResync);
 } catch (e) {}
 
-/* ВОЛНА 22.50: тихая авто-синхронизация каждые 45 секунд. Пользователь:
+/* ВОЛНА 22.50: тихая авто-синхронизация. Пользователь:
    «автоматическая синхронизация мини приложения должна быть каждые сколько-то
    секунд/минут, чтобы всё было синхронизировано, но не уведомлять об этом».
+   ВОЛНА 22.64: тик 45 с → 10 с (файлы, добавленные через бота, появляются
+   в облаке заметно быстрее; троттл LAST_SYNC 12 с не даёт лишнего спама).
    loadFiles(true) молчит (без тостов и спиннеров) и обновляет файлы, режим
    шифрования и статус канала. В фоне и без входа не тикает. */
 setInterval(function () {
   if (document.hidden) return;
   if (!IS_TELEGRAM && !WEB_TOKEN) return;   /* не вошли — нечего синхронизировать */
   maybeAutoResync();
-}, 45000);
+}, 10000);
 
 let FILTER = 'all';
 let SEARCH = '';
@@ -4641,7 +4813,7 @@ function fmtDateTime(ts) {
   let d;
 
   d = new Date(s);
-  if (isNaN(d)) return s.slice(0, 10);
+  if (isNaN(d)) return escapeHtml(String(s).slice(0, 10));
 
   const p = (x) => String(x).padStart(2, '0');
 
@@ -4975,8 +5147,11 @@ function openSafeModal(mode, fileId) {
   const m = document.getElementById('safeModal');
   if (!m) return;
 
-  /* ВОЛНА 22.40: контекстное окно Сейфа — подпись кнопки зависит от действия */
-  SAFE_MODAL_MODE = (mode === 'to_safe' || mode === 'from_safe') ? mode : 'unlock';
+  /* ВОЛНА 22.40: контекстное окно Сейфа — подпись кнопки зависит от действия.
+     ВОЛНА 22.65: режим 'complete_upload' — файл уже у бота целиком и ждёт
+     пароль: верный пароль сохранит его в облако БЕЗ перекачки. */
+  SAFE_MODAL_MODE = (mode === 'to_safe' || mode === 'from_safe' ||
+                     mode === 'complete_upload') ? mode : 'unlock';
   SAFE_MODAL_FILE_ID = fileId || null;
 
   const lbl = document.getElementById('safeActionLabel');
@@ -4984,7 +5159,9 @@ function openSafeModal(mode, fileId) {
   if (lbl) {
     lbl.textContent = SAFE_MODAL_MODE === 'to_safe'
       ? 'Переместить в сейф'
-      : 'Разблокировать';
+      : SAFE_MODAL_MODE === 'complete_upload'
+        ? 'Сохранить файл в облако'
+        : 'Разблокировать';
   }
 
   const input = document.getElementById('safePassword');
@@ -5008,12 +5185,15 @@ function closeSafeModal(e) {
   closeModalEl('safeModal');
 }
 
-/* Кнопка действия в окне Сейфа: разблокировать / переместить в сейф */
+/* Кнопка действия в окне Сейфа: разблокировать / переместить в сейф /
+   сохранить ждущий файл (22.65) */
 function onSafeAction() {
   if (SAFE_MODAL_MODE === 'to_safe') {
     safeDoTransfer('to_safe');
   } else if (SAFE_MODAL_MODE === 'from_safe') {
     safeDoTransfer('from_safe');
+  } else if (SAFE_MODAL_MODE === 'complete_upload') {
+    completePendingUpload();
   } else {
     unlockSafe();
   }
@@ -5800,16 +5980,14 @@ function botQueueTrack() {
 
 /* ═══ ВОЛНА 22.58: ЖИВАЯ КАРТОЧКА «ЗАГРУЗКА ЧЕРЕЗ БОТА» ═══
    Физика WebView: мини-апп не может сам «отдать» выбранные файлы в чат
-   бота — байты уходят только пока он жив. Роутер 22.57 сохраняет файлы,
-   присланные в чат бота вручную, в облако на сервере. Здесь этот путь
-   ПРОЗРАЧЕН: карточка в панели передач включается, когда пользователь
-   недавно отправлял файлы в чат (пометка dv_bg_wait_ts), и живёт, пока
-   файлы едут: считает приехавшие из чата файлы (src='chat' свежее
-   пометки dv_bg_wait_ts) и показывает серверные статусы bg_live — в том
-   числе живые проценты больших файлов («Качаю с Telegram: 45%»).
-   ВОЛНА 22.63: кнопки «через Telegram» (22.57) и автопередача (22.62)
-   убраны — пометку больше никто не ставит, карточка спит, а файлы из
-   чата честно показываются тостом «📨 Через бота загрузилось: N». */
+   бота — байты уходят только пока он жив. Поэтому главный путь (22.57) —
+   файлы прикладываются В ЧАТЕ бота, Telegram доносит их сам (настоящий
+   фон, 100%), а бот сохраняет всё в облако на сервере. Здесь этот путь
+   становится ПРОЗРАЧНЫМ: карточка в панели передач включается в момент
+   нажатия кнопки «📤 Загрузить через Telegram» и живёт, пока файлы
+   едут: считает приехавшие из чата файлы (src='chat' свежее пометки
+   dv_bg_wait_ts) и показывает серверные статусы bg_live — в том числе
+   живые проценты больших файлов («Качаю с Telegram: 45%»). */
 let bgUploadTimer = null;
 let bgUploadLastGrow = 0;
 let bgUploadCount = 0;
@@ -5989,6 +6167,179 @@ function bgUploadRestore() {
 
   bgUploadEnsureCard();
   bgUploadSchedule(800);
+}
+
+/* ═══ ВОЛНА 22.65: НЕДОГРУЖЕННОЕ ПОСЛЕ ОБНОВЛЕНИЯ СТРАНИЦЫ ═══
+   Жалоба: «после обновления страницы в мини апп файлы все сбрасываются
+   и в мини апп ничего не остаётся». Список файлов всегда жил на сервере
+   и возвращался, а вот строки передач — нет: они были только в памяти
+   вкладки, обновление их стирало, и недоконченная загрузка становилась
+   невидимой. Теперь сервер присылает недоконченные сессии в /api/files
+   (pending), панель передач восстанавливает строки:
+     • байты ещё едут или прервались — видно процент; выбрать файл заново
+       можно в любой момент: сервер узнаёт «свою» сессию по отпечатку и
+       продолжит с того же байта;
+     • все байты уже у бота, файл ждёт пароль Сейфа — строка НАЖИМАЕТСЯ:
+       ввод пароля сохраняет файл БЕЗ перекачки (байты уже на сервере). */
+const SRV_PEND_PREFIX = 'srvp_';
+
+function srvPendingId(upid) {
+  return SRV_PEND_PREFIX + String(upid || '');
+}
+
+function srvPendingApply(list) {
+  const arr = Array.isArray(list) ? list : [];
+  const seen = new Set();
+
+  for (const p of arr) {
+    if (!p || !p.uploadId) continue;
+
+    const upid = String(p.uploadId);
+    const id = srvPendingId(upid);
+
+    seen.add(id);
+
+    /* сессию прямо сейчас ведёт этот клиент (предохранка/движок) —
+       строка уже есть, серверную не дублируем */
+    if (LOCALLY_DRIVEN.has(upid)) continue;
+
+    const size = +p.size || 0;
+    const received = Math.max(0, Math.min(+p.received || 0, size));
+    const complete = size > 0 && received >= size;
+    const waitPw = complete && !!p.wait_pw;
+    const pct = size ? Math.floor((received / size) * 100) : 0;
+
+    let t = TRANSFERS.get(id);
+
+    if (!t) {
+      transferStart({
+        id: id,
+        type: 'srvpend',
+        name: String(p.name || 'файл'),
+        total: size,
+        cancel: () => srvPendingCancel(upid)
+      });
+
+      t = TRANSFERS.get(id);
+
+      if (!t) continue;
+    }
+
+    if (t.done) continue;
+
+    t.loaded = received;
+    t.waitPw = waitPw;
+    t.note = waitPw
+      ? 'Целиком у бота — ждёт пароль Сейфа · нажмите, чтобы ввести'
+      : complete
+        ? 'Целиком у бота — сохраняю в облако…'
+        : (pct > 0
+          ? 'В пути: ' + pct + '% — можно закрыть приложение, докачаю'
+          : 'Готовлю загрузку…');
+
+    ctSync();
+  }
+
+  /* сессии, которых больше нет на сервере, — файл сохранён (или отменён):
+     строку честно закрываем, панель сама её уберёт */
+  TRANSFERS.forEach((t, id) => {
+    if (t.type === 'srvpend' && !t.done && !seen.has(id)) {
+      transferFinish(id, true, 'Сохранено в облаке');
+    }
+  });
+}
+
+function srvPendingCancel(upid) {
+  /* отмена недогруженного: сервер стирает сессию и временные байты
+     (идемпотентно, владение проверяет сервер) */
+  apiJson('/api/upload/abort', {
+    method: 'POST',
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ uploadId: upid })
+  }).catch(() => {});
+
+  LOCALLY_DRIVEN.delete(upid);
+
+  transferFinish(srvPendingId(upid), false, 'Отменено — байты стёрты');
+}
+
+function srvPendingPwPrompt(upid) {
+  const t = TRANSFERS.get(srvPendingId(upid));
+
+  if (!t || t.done || !t.waitPw) return;
+
+  /* окно Сейфа в режиме «сохранить файл»: верный пароль завершит загрузку
+     прямо с сервера — перекачивать ничего не нужно */
+  openSafeModal('complete_upload', upid);
+}
+
+async function completePendingUpload() {
+  const input = document.getElementById('safePassword');
+  const pw = (input && input.value) || '';
+  const upid = SAFE_MODAL_FILE_ID || '';
+
+  if (!upid) {
+    closeSafeModal();
+    return;
+  }
+
+  if (!pw) {
+    showToast('Введите пароль Сейфа');
+    return;
+  }
+
+  /* пароль проверяем сразу: неверный — окно остаётся открытым */
+  try {
+    await apiJson('/api/safe/unlock', {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ password: pw })
+    });
+  } catch (e) {
+    showToast(cloudErrText(e));
+    return;
+  }
+
+  VAULT_PW = pw;
+  VAULT_SERVER_UNLOCKED = true;
+
+  if (input) input.value = '';
+
+  closeSafeModal();
+
+  const tid = srvPendingId(upid);
+  const t = TRANSFERS.get(tid);
+
+  if (t && !t.done) {
+    t.note = 'Шифрую и сохраняю в облако…';
+
+    ctSync();
+  }
+
+  try {
+    await apiJson('/api/upload/complete', {
+      method: 'POST',
+      headers: vaultHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ uploadId: upid, password: pw })
+    });
+
+    LOCALLY_DRIVEN.add(upid);   /* строку закроет следующий тик loadFiles */
+
+    transferFinish(tid, true, 'Готово — в облаке');
+    showToast('✅ Файл сохранён — уже в облаке');
+    loadFiles(true);
+  } catch (e) {
+    /* сессия на сервере жива: строка остаётся, пароль можно ввести снова */
+    if (t && !t.done) {
+      t.note = (e && e.code === 'wrong_password')
+        ? 'Пароль не подошёл — нажмите и введите снова'
+        : 'Не получилось: ' + cloudErrText(e).slice(0, 60);
+
+      ctSync();
+    }
+
+    showToast(cloudErrText(e));
+  }
 }
 
 async function enqueueBotDownload(ids) {
@@ -6947,13 +7298,13 @@ function refreshUploadModal() {
 
   if (info) {
     info.textContent = !has
-      /* ВОЛНА 22.63: кнопки «через Telegram» и автопередача убраны по
-         просьбе пользователя («убери новые кнопки — всё должно быть
-         включено по умолчанию»). Единственный путь — прямой стрим боту,
-         он включён ВСЕГДА и стартует с момента выбора файлов (22.59):
-         что успело доехать — сохранится само, недокачанное продолжится
-         при следующем открытии облака (бот молча подскажет в чате). */
-      ? 'Файлы, выбранные ниже, сразу летят боту — загрузка включена всегда. Что успеет дойти — сохранится само; недокачанное продолжится при следующем открытии (бот подскажет в чате).'
+      /* ВОЛНА 22.59: файлы летят боту С МОМЕНТА ВЫБОРА — окно теперь
+         настройки (пароль/имена), а не «шлюз». ВОЛНА 22.61: текст честный:
+         что успело дойти — сохранится само; недокачанное продолжится при
+         следующем открытии, бот молча подскажет в чате.
+         ВОЛНА 22.63: упоминание кнопки «через Telegram» убрано — кнопки
+         больше нет, загрузка идёт напрямую всегда. */
+      ? 'Файлы, выбранные ниже, сразу летят боту. Что успеет дойти — сохранится само; недокачанное продолжится при следующем открытии (бот подскажет в чате).'
       : pendingFiles.length === 1
         ? (pendingFiles[0].name || 'файл') + ' — уже летит боту. Пароль (в Сейф) и имя — по кнопке «Отправить», можно и просто закрыть окно.'
         : 'Выбрано файлов: ' + pendingFiles.length + ' — все уже летят боту. Пароль (в Сейф) и имена — по кнопке «Отправить», окно можно закрыть.';
@@ -6985,6 +7336,10 @@ function refreshUploadModal() {
   if (addBtn) addBtn.classList.toggle('hidden', has);
   if (sendBtn) sendBtn.classList.toggle('hidden', !has);
   if (moreBtn) moreBtn.classList.toggle('hidden', !has);
+
+  /* ВОЛНА 22.63: тумблер автопередачи и подзаголовок кнопки «через
+     Telegram» удалены вместе с самими кнопками — окно загрузки снова
+     простое: пароль, список файлов, «Отправить» / «Добавить ещё». */
 
   /* ВОЛНА 22.40: пароль ОБЯЗАТЕЛЕН только когда хранилище шифруется
      (STORAGE_ENCRYPTED === true). Раньше поле становилось обязательным,
@@ -7123,18 +7478,14 @@ function addMoreUploadFiles() {
   document.getElementById('fileInput').click();
 }
 
-/* ═══ ВОЛНА 22.63: КНОПКИ «ЧЕРЕЗ TELEGRAM» И АВТОПЕРЕДАЧА УБРАНЫ ═══
-   Пользователь: «убери новые кнопки "загрузить через телеграм" и
-   "авто передача в телеграм" — всё должно быть включено по умолчанию.
-   Файлы вообще не синхронизируются». Причины убрать: системная панель
-   «поделиться» (22.62) открывалась ПОВЕРХ окна загрузки и путала поток,
-   а кнопка 22.57 вела в чат бота вместо загрузки. Единственный путь
-   теперь — прямой стрим боту (22.59/22.61), он включён ВСЕГДА, без
-   тумблеров: файлы летят боту с момента выбора, байты переживают
-   закрытие окна (hold-сессии), недокачанное продолжается при следующем
-   открытии облака из очереди IndexedDB. Файлы, присланные в чат бота
-   вручную («как в обычном чате»), по-прежнему сохраняются в облако
-   автоматически (сервер, роутер 22.57). */
+/* ═══ ВОЛНА 22.63: ЕДИНЫЙ ПУТЬ ЗАГРУЗКИ — ПРЯМО БОТУ, ВСЕГДА ═══
+   Кнопки «Загрузить через Telegram» и «Автопередача в Telegram»
+   (волны 22.57/22.62) удалены по решению пользователя: они путали
+   поток и ломали привычную синхронизацию. Теперь всё включено по
+   умолчанию и работает само: файлы летят боту НАПРЯМУЮ стримом с
+   момента выбора (22.59/22.61), недокачанное бот доносит сам при
+   следующем открытии облака, прогресс — в панели передач. Никаких
+   переключателей, панелей «поделиться» и переходов в чат. */
 
 function uploadFiles(fileList) {
   let files = Array.from(fileList);
@@ -7161,9 +7512,9 @@ function uploadFiles(fileList) {
 
   if (!files.length) return;
 
-  /* ВОЛНА 22.63: перехват выбора файлов автопередачей (22.62) убран —
-     никакой системной панели «поделиться», поток не прерывается:
-     сразу окно загрузки, файлы летят боту напрямую с момента выбора. */
+  /* ВОЛНА 22.63: автопередача (панель «поделиться») удалена — выбор
+     файлов сразу запускает ПРЯМОЙ стрим боту ниже: очередь IndexedDB,
+     prestreamInitAll, prestreamStart. Всё включено по умолчанию. */
 
   const modalOpen = !!(document.getElementById('uploadModal') || {}).classList &&
     document.getElementById('uploadModal').classList.contains('open');
@@ -7230,9 +7581,10 @@ function uploadFiles(fileList) {
 
       prestreamKick();
 
-      if (STORAGE_ENCRYPTED !== true || VAULT_PW) {
-        showToast('📨 Файлы сразу пошли боту — грузятся в фоне, можно закрыть приложение');
-      }
+      /* ВОЛНА 22.65: тост ВСЕГДА — байты летят боту с момента выбора
+         и в шифрованном режиме (сервер 22.65 создаёт сессию без пароля,
+         pw_pending): пароль догонит из окна, файл уже в пути */
+      showToast('📨 Файлы сразу пошли боту — грузятся в фоне, можно закрыть приложение');
     }
   }
 
@@ -7365,7 +7717,41 @@ async function upqAll() {
 
 let RESUMING = false;
 
-async function resumePendingUploads() {
+/* ═══ ВОЛНА 22.67: АВТО-РЕТРАЙ ДОКАЧКИ, ПОКА АПП ОТКРЫТ ═══
+   Жалоба: «пользователь загружает большой файл, разработчик обновляет бота
+   — всё сбрасывается». Раньше после сбоя (редеплой бота = сеть отвалилась
+   на минуты) файл оставался в очереди IndexedDB, но ДОКАЧКА ЖДАЛА,
+   ПОКА пользователь не свернёт/не переоткроет апп (resume дёргался только
+   на visibilitychange/boot). Теперь движок сам переподнимает очередь
+   через растущие паузы (20с → 5мин), пока апп открыт. Soft-режим НЕ сжигает
+   бюджет tries (12) и молчит без тостов. */
+let _upRetryTimer = null;
+let _upRetryPlan = 0;   /* индекс текущей паузы */
+let _upSoftTries = 0;   /* мягких запусков за сессию (анти-зацикливание) */
+const UP_RETRY_DELAYS = [20000, 40000, 60000, 120000, 180000, 300000];
+
+function scheduleUploadRetry() {
+  if (!IS_TELEGRAM && !WEB_TOKEN) return;
+  if (_upSoftTries >= 120) return; /* ~несколько часов попыток — хватит */
+  const delay = UP_RETRY_DELAYS[Math.min(_upRetryPlan, UP_RETRY_DELAYS.length - 1)];
+  _upRetryPlan++;
+  clearTimeout(_upRetryTimer);
+  _upRetryTimer = setTimeout(() => {
+    if (isUploading || RESUMING || document.hidden) return;
+    _upSoftTries++;
+    resumePendingUploads({ soft: true });
+  }, delay);
+}
+
+function resetUploadRetry() {
+  /* успех — схема пауз начинается заново */
+  _upRetryPlan = 0;
+  clearTimeout(_upRetryTimer);
+}
+
+async function resumePendingUploads(opts) {
+  const soft = !!(opts && opts.soft);
+
   if (isUploading || RESUMING) return;
 
   /* ВОЛНА 22.47: без входа — тихий выход (раньше этот вызов при каждом
@@ -7377,7 +7763,7 @@ async function resumePendingUploads() {
 
   try { entries = await upqAll(); } catch (e) {}
 
-  if (!entries.length) return;
+  if (!entries.length) { resetUploadRetry(); return; }
 
   RESUMING = true;
 
@@ -7392,11 +7778,16 @@ async function resumePendingUploads() {
   const files = [];
 
   for (const e of entries) {
-    e.tries = (+e.tries || 0) + 1;
+    /* 22.67: soft-режим (авто-ретрай в открытом аппе) НЕ тратит бюджет
+       tries — он только для явных открытий аппа; иначе фоновые тики
+       выкинули бы файл из очереди через 12 тиков */
+    if (!soft) {
+      e.tries = (+e.tries || 0) + 1;
 
-    if (e.tries > 12) { upqDel(e.k); dropped++; continue; }
+      if (e.tries > 12) { upqDel(e.k); dropped++; continue; }
 
-    upqPut(e);
+      upqPut(e);
+    }
 
     try {
       const f = new File([e.blob], e.name || 'file.bin', { type: e.mime || '' });
@@ -7412,19 +7803,22 @@ async function resumePendingUploads() {
     } catch (err) { upqDel(e.k); lostBlob++; }
   }
 
-  if (dropped) {
+  if (dropped && !soft) {
     showToast('🧹 ' + dropped + ' файл(ов) не удалось загрузить после 12 попыток — убран(ы) из очереди');
   }
 
   /* 22.61: телефон не сохранил байты между запусками (редко, но бывает
      на iOS) — пользователь ДОЛЖЕН знать, что файлы нужно загрузить заново,
      иначе «тихая потеря» выглядит как баг */
-  if (lostBlob) {
+  if (lostBlob && !soft) {
     showToast('⚠️ ' + lostBlob + ' файл(ов) не сохранились на телефоне для докачки — загрузите их заново');
   }
 
   if (files.length) {
-    showToast('⏳ Продолжаю прерванную загрузку: ' + files.length + ' файл(ов)');
+    /* 22.67: в soft-режиме молча — тосты только на явных открытиях */
+    if (!soft) {
+      showToast('⏳ Продолжаю прерванную загрузку: ' + files.length + ' файл(ов)');
+    }
 
     proceedUpload(files, { resume: true });
   }
@@ -7729,6 +8123,7 @@ async function prestreamInitAll(files) {
           if (!uploadId) return;
 
           f._preId = uploadId;
+          LOCALLY_DRIVEN.add(uploadId);   /* 22.65: сессию ведёт этот клиент */
           f._preHeld = !!(f._preHold && initData.encrypt === false);
 
           if (f._preHeld) PRE_HELD.add(uploadId);
@@ -7767,6 +8162,11 @@ async function prestreamInitAll(files) {
      могут прийти) — при закрытии приложения сообщаем серверу release. */
 const PRE_ACTIVE = new Set();
 const PRE_HELD = new Set();
+/* ВОЛНА 22.65: сессии, которые ПРЯМО СЕЙЧАС ведёт ЭТОТ клиент (предохранка/
+   движок/докачка). Панель недогруженного (srvp_, строки с сервера) такие
+   сессии не дублирует: своя строка уже есть. После обновления страницы
+   набор пуст — и серверные строки честно восстанавливаются. */
+const LOCALLY_DRIVEN = new Set();
 
 function prestreamKick() {
   while (PRE_RUNNING < PRE_CONCURRENCY && PRE_QUEUE.length) {
@@ -7952,6 +8352,7 @@ async function _preStreamFile(file) {
   }
 
   file._preId = uploadId;
+  LOCALLY_DRIVEN.add(uploadId);   /* 22.65: сессию ведёт этот клиент */
 
   /* 22.61: блок ниже — только при СОБСТВЕННОМ init (initData заполнен);
      при сессии от init-all значение уже вычислено и лежит в file._preHeld */
@@ -8201,6 +8602,7 @@ async function _uploadOneSession(file, reportBytes) {
   }
 
   file._lastUploadId = uploadId;
+  LOCALLY_DRIVEN.add(uploadId);   /* 22.65: сессию ведёт этот клиент */
 
   if (key) {
     upqPut({
@@ -8374,10 +8776,11 @@ async function _uploadOneSession(file, reportBytes) {
 
   /* ВОЛНА 22.50: pollUploadStatus отдаёт запись файла напрямую, обычный
      complete — объектом {file: …}; приводим к одному виду.
-     ВОЛНА 22.63: ветка dedup убрана вместе с автопередачей 22.62 —
-     сервер снова честно сохраняет КАЖДУЮ загрузку, дублей в потоке
-     нет (путь загрузки теперь один). */
+     ВОЛНА 22.62: сервер свёл дубль (тот же файл уже приехал из чата):
+     помечаем файл, чтобы движок не добавлял вторую карточку и не
+     хвастался «загружено» дважды. */
   if (done && done.file) {
+    if (done.dedup) file._dupFlag = true;
     return done.file;
   }
 
@@ -8510,6 +8913,7 @@ async function uploadEngine(bar) {
      старого движка больше не подходит */
   const fileBytes = new Map();
   let reportedTotal = 0;
+  let dedupedCount = 0;   /* 22.62: сколько файлов свёл сервер (уже из чата) */
 
   const reportTotal = () => {
     setUploadPct((reportedTotal / totalBytes) * 100, bar);
@@ -8552,9 +8956,11 @@ async function uploadEngine(bar) {
           }
         });
 
-        /* 22.63: dedup-ветки больше нет — путь загрузки один (прямой
-           стрим), каждый сохранённый файл честно попадает в карточки */
-        if (rec) {
+        /* 22.62: дубль сведён сервером (файл уже приехал через
+           Telegram) — карточку и похвалу не дублируем */
+        if (rec && file._dupFlag) {
+          dedupedCount++;
+        } else if (rec) {
           added.push(rec);
         }
 
@@ -8576,6 +8982,9 @@ async function uploadEngine(bar) {
            22.59: сессия решена — из реестра «недорешённых» убираем */
         file._doneFlag = true;
 
+        /* 22.67: файл загрузился — паузы авто-ретрая начинаются заново */
+        resetUploadRetry();
+
         if (file._preId) PRE_HELD.delete(file._preId);
       } catch (e) {
         if (e.message === 'aborted' || uploadAbortFlag) {
@@ -8594,6 +9003,12 @@ async function uploadEngine(bar) {
         }
 
         failedFiles.push({ file: file, e: e });
+
+        /* 22.67: НЕ сдаваться, пока апп открыт — бот мог просто
+           обновляться (деплой). Переподнимем очередь из IndexedDB
+           через растущие паузы; файл остаётся в очереди и докачается
+           сам, когда бот проснётся. */
+        scheduleUploadRetry();
       }
 
       topUpFile(file);
@@ -8664,6 +9079,7 @@ async function uploadEngine(bar) {
 
   showToast(
     (anySafe ? '✅ Успешно! 🔒 Зашифровано и в Сейфе' : '✅ Загружено') +
+    (dedupedCount ? ' · ♻️ дублей не создано: ' + dedupedCount : '') +
     (maxQueuePos > 1 ? ' · ⏳ публикация в канале, перед вами: ' + (maxQueuePos - 1) : ''));
 
   added.forEach((rec) => {
@@ -8976,6 +9392,14 @@ function ctSubText(t) {
     return t.note || 'Ждём файлы из чата бота…';
   }
 
+  /* ВОЛНА 22.65: недогруженное с сервера — статус текстом (готовит
+     srvPendingApply): «в пути N%», «ждёт пароль Сейфа», «сохраняю…» */
+  if (t.type === 'srvpend') {
+    if (t.done) return t.note || 'Готово';
+
+    return t.note || 'В пути…';
+  }
+
   const sec = (Date.now() - t.t0) / 1000;
   const speed = (sec > 0.8 && t.loaded) ? fmtSize(t.loaded / sec) + '/с · ' : '';
 
@@ -9003,7 +9427,7 @@ function ctRow(t) {
           ? '<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 7.5-2"/><path d="m3 3 18 18"/>'
           : t.type === 'botqueue'
             ? '<path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/>'
-            : t.type === 'bgupload'
+            : t.type === 'bgupload' || t.type === 'srvpend'
               ? '<path d="M4 14.899A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.5 8.242"/><path d="M12 12v9"/><path d="m8 17 4-4 4 4"/>'
               : '<path d="M12 5v14"/><path d="m19 12-7 7-7-7"/>')
     + '</svg>';
@@ -9055,6 +9479,16 @@ function ctRow(t) {
     btn.innerHTML = '<svg viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg>';
     btn.addEventListener('click', (ev) => ctCancelTransfer(t.id, ev));
     row.appendChild(btn);
+  }
+
+  /* ВОЛНА 22.65: строка «ждёт пароль Сейфа» нажимается целиком — ввод
+     пароля сохраняет файл без перекачки (байты уже у бота) */
+  if (t.type === 'srvpend' && t.waitPw && !t.done) {
+    row.classList.add('ct-clickable');
+    row.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      srvPendingPwPrompt(String(t.id).slice(SRV_PEND_PREFIX.length));
+    });
   }
 
   return row;
@@ -11193,6 +11627,11 @@ function quietStartRetry() {
 }
 
 async function quietStart() {
+  /* 22.66: СНАЧАЛА мгновенно рисуем файлы из кэша — обновление страницы
+     больше не выглядит как «всё сбросилось и ничего не осталось»;
+     ниже обычная тихая досинхронизация подхватит свежие данные */
+  try { filesCacheBoot(); } catch (e) {}
+
   /* ТИХО: без тостов — «HTTP 500» и «нет связи» при старте убраны */
   const ok = await loadFiles(true);
 
@@ -11222,6 +11661,7 @@ if (!IS_TELEGRAM) {
           } else if (r.status === 401 || r.status === 403) {
             localStorage.removeItem('devo_web_token');
             WEB_TOKEN = '';
+            filesCacheClear();   /* 22.66: сессия закончилась — кэш подчищаем */
             setTimeout(openLoginModal, 500);
           } else {
             /* 5xx / сервер спит — тихий повтор по лестнице */
