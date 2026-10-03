@@ -417,6 +417,9 @@ AI_CHAT = 86
 VIEW_ANONYMOUS_MESSAGES = 87
 DEV_BLOCK_USER_PRICE = 88
 MANAGE_BUTTON_VISIBILITY = 89
+# ВОЛНА 22.66: «Расписание с сайтов» — ожидание ссылки от админа.
+# (93 занято DEV_EDIT_INSTRUCTIONS — берём свободный слот 106.)
+SCHEDMON_URL = 106
 DEV_EDIT_INSTRUCTIONS = 93
 DEV_MESSAGE_USER_SELECT = 94
 DEV_MESSAGE_USER_TEXT = 95
@@ -3693,7 +3696,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.65"
+BOT_BUILD = "22.66"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -4445,6 +4448,9 @@ def get_admin_panel_keyboard():
         [InlineKeyboardButton("🔑 Показать код класса", callback_data="show_class_code_admin")],
         # ВОЛНА 22.13: настройки базы решений (авто-модерация, автоудаление).
         [InlineKeyboardButton("📚 База решений · настройки", callback_data="sol_admin_menu")],
+        # ВОЛНА 22.66: «Расписание с сайтов» — следим за страницами школы и
+        # присылаем классу обновления (фото/файл/текст) не чаще 1 раза в день.
+        [InlineKeyboardButton("🌐 Расписание с сайтов", callback_data="schmon_menu")],
         # ВОЛНА 22.30: дежурные — время, дни, очередь, кнопка «заболел».
         [InlineKeyboardButton("🕐 Дежурные", callback_data="duty_admin")],
         [InlineKeyboardButton("❌ Отмена", callback_data="cancel_action")]
@@ -13167,6 +13173,132 @@ function handleSoundSelect(e, id) {
 const IS_TELEGRAM = !!(tg && tg.initData);
 let WEB_TOKEN = localStorage.getItem('devo_web_token') || '';
 
+/* ═══ ВОЛНА 22.66: КЭШ СПИСКА ФАЙЛОВ — «после обновления страницы всё
+   сбрасывается и ничего не остаётся» — БОЛЬШЕ НЕ ДОЛЖНО. ═══
+   При обновлении страницы список стартует пустым и наполняется только
+   после первого успешного /api/files. Пока сервер просыпается (бесплатный
+   хостинг), тихий старт ретраит 3с→7с→15с→30с→60с — и всё это время
+   пользователь видит ПУСТОЕ облако: выглядит, будто «файлы исчезли».
+   Фикс: последний успешный ответ /api/files хранится в localStorage
+   (с проверкой принадлежности текущему пользователю) и мгновенно
+   рисуется при старте — обновление страницы показывает файлы СРАЗУ,
+   а тихая досинхронизация подхватывает свежие данные в фоне. */
+const FILES_CACHE_KEY = 'dv_files_cache_v1';
+
+function filesCacheIdentity() {
+  /* Кому принадлежит кэш: Telegram → id пользователя из initData;
+     веб-вход → токен сессии. Пусто → кэшем не пользуемся. */
+  try {
+    if (IS_TELEGRAM && tg && tg.initDataUnsafe && tg.initDataUnsafe.user) {
+      return 'tg:' + (tg.initDataUnsafe.user.id || '');
+    }
+  } catch (e) {}
+
+  if (WEB_TOKEN) return 'wt:' + WEB_TOKEN;
+
+  return '';
+}
+
+function filesCacheClear() {
+  try { localStorage.removeItem(FILES_CACHE_KEY); } catch (e) {}
+}
+
+function filesCacheLoad() {
+  try {
+    const raw = localStorage.getItem(FILES_CACHE_KEY);
+
+    if (!raw) return null;
+
+    const rec = JSON.parse(raw);
+
+    if (!rec || !rec.d || !rec.k) return null;
+
+    const id = filesCacheIdentity();
+
+    if (!id || rec.k !== id) return null;  /* чужие данные не показываем */
+
+    return rec;
+  } catch (e) {
+    return null;
+  }
+}
+
+function filesCacheSave(raw, force) {
+  try {
+    const id = filesCacheIdentity();
+
+    if (!id || !raw) return;
+
+    const now = Date.now();
+
+    /* без force — не чаще раза в 60с (живой опрос 2.5с не должен
+       писать в localStorage на каждый тик) */
+    if (!force && filesCacheSave._ts && (now - filesCacheSave._ts) < 60000) return;
+
+    const rec = {
+      k: id,
+      ts: now,
+      d: {
+        files: raw.files || [],
+        bot: String(raw.bot || ''),
+        build: String(raw.build || ''),
+        plain: (typeof raw.plain === 'boolean') ? raw.plain : null,
+        pending: Array.isArray(raw.pending) ? raw.pending : [],
+        bg_live: raw.bg_live || null,
+        safe_count: +raw.safe_count || 0,
+        limit: +raw.limit || 0
+      }
+    };
+
+    localStorage.setItem(FILES_CACHE_KEY, JSON.stringify(rec));
+    filesCacheSave._ts = now;
+  } catch (e) {}
+}
+
+function filesMapAll(f) {
+  /* Единое отображение записи /api/files → карточка (используется и при
+     обычной загрузке, и при восстановлении из кэша) */
+  return {
+    id: String(f.id || ''),
+    name: String(f.name || 'файл'),
+    kind: String(f.kind || 'document'),
+    size: +f.size || 0,
+    ts: String(f.ts || ''),
+    vault: !!f.vault,
+    /* ВОЛНА 22.50: признаки Сейфа — «Достать из Сейфа» для файлов режима
+       «без шифра» (plain) идёт БЕЗ пароля (сервер 22.50 это умеет) */
+    safe: !!f.safe,
+    plain: !!f.plain,
+    /* ВОЛНА 22.57: откуда файл — «через бота» (из чата) или из веба;
+       нужно для тоста «Пока вас не было» после фоновых загрузок */
+    src: String(f.src || '')
+  };
+}
+
+function filesCacheBoot() {
+  /* Мгновенный рендер из кэша ДО первого запроса: обновление страницы
+     показывает файлы сразу, даже если сервер ещё спит. */
+  const rec = filesCacheLoad();
+
+  if (!rec) return false;
+
+  const d = rec.d;
+
+  ALL_FILES = (d.files || []).map(filesMapAll);
+  CONN.bot = String(d.bot || CONN.bot || '');
+  CONN.build = String(d.build || CONN.build || '');
+
+  if (typeof d.plain === 'boolean') STORAGE_ENCRYPTED = !d.plain;
+  else if (ALL_FILES.some((f) => f.vault && !f.plain)) STORAGE_ENCRYPTED = true;
+
+  try { renderAll({}); } catch (e) {}
+  /* 22.65: панель передач тоже оживает из кэша (недогруженное/ждёт пароль) */
+  try { srvPendingApply(d.pending); } catch (e) {}
+  try { bgUploadApply(d.bg_live); } catch (e) {}
+
+  return ALL_FILES.length > 0;
+}
+
 function authHeaders(extra) {
   const h = Object.assign({ 'Cache-Control': 'no-store' }, extra || {});
 
@@ -13209,11 +13341,15 @@ async function apiJson(url, options) {
         } catch (e) {}
         if (!reloaded) {
           try { sessionStorage.setItem('dv_relogin', '1'); } catch (e) {}
+          /* 22.66: кэш файлов НЕ чистим — после перезагрузки тот же
+             пользователь увидит свой список мгновенно, без пустоты */
           location.reload();
         } else {
+          filesCacheClear();
           openLoginModal();
         }
       } else {
+        filesCacheClear();
         openLoginModal();
       }
     }
@@ -13544,21 +13680,7 @@ async function loadFiles(silent, quiet) {
   try {
     const data = await apiJson('/api/files');
 
-    ALL_FILES = (data.files || []).map((f) => ({
-      id: String(f.id || ''),
-      name: String(f.name || 'файл'),
-      kind: String(f.kind || 'document'),
-      size: +f.size || 0,
-      ts: String(f.ts || ''),
-      vault: !!f.vault,
-      /* ВОЛНА 22.50: признаки Сейфа — «Достать из Сейфа» для файлов режима
-         «без шифра» (plain) идёт БЕЗ пароля (сервер 22.50 это умеет) */
-      safe: !!f.safe,
-      plain: !!f.plain,
-      /* ВОЛНА 22.57: откуда файл — «через бота» (из чата) или из веба;
-         нужно для тоста «Пока вас не было» после фоновых загрузок */
-      src: String(f.src || '')
-    }));
+    ALL_FILES = (data.files || []).map(filesMapAll);
 
     CONN.bot = String(data.bot || CONN.bot || '');
     CONN.build = String(data.build || CONN.build || '');
@@ -13614,6 +13736,11 @@ async function loadFiles(silent, quiet) {
     if (_sig !== LAST_FILES_SIG) {
       LAST_FILES_SIG = _sig;
       renderAll({ animate: !quiet });
+      /* 22.66: список изменился — обновляем кэш для мгновенного старта */
+      filesCacheSave(data, true);
+    } else {
+      /* список тот же — кэш обновляется не чаще раза в 60с (pending/bg_live) */
+      filesCacheSave(data, false);
     }
 
     /* ВОЛНА 22.58: живая карточка «Загрузка через Telegram» — считаем
@@ -20631,6 +20758,11 @@ function quietStartRetry() {
 }
 
 async function quietStart() {
+  /* 22.66: СНАЧАЛА мгновенно рисуем файлы из кэша — обновление страницы
+     больше не выглядит как «всё сбросилось и ничего не осталось»;
+     ниже обычная тихая досинхронизация подхватит свежие данные */
+  try { filesCacheBoot(); } catch (e) {}
+
   /* ТИХО: без тостов — «HTTP 500» и «нет связи» при старте убраны */
   const ok = await loadFiles(true);
 
@@ -20660,6 +20792,7 @@ if (!IS_TELEGRAM) {
           } else if (r.status === 401 || r.status === 403) {
             localStorage.removeItem('devo_web_token');
             WEB_TOKEN = '';
+            filesCacheClear();   /* 22.66: сессия закончилась — кэш подчищаем */
             setTimeout(openLoginModal, 500);
           } else {
             /* 5xx / сервер спит — тихий повтор по лестнице */
@@ -42676,6 +42809,1588 @@ async def handle_week_schedule(update: Update, context: ContextTypes.DEFAULT_TYP
     return WEEK_SCHEDULE
 
 # ==================================
+# === ВОЛНА 22.66: «РАСПИСАНИЕ С САЙТОВ» (админ-панель) ===
+# ==================================
+# Админ-панель класса → «🌐 Расписание с сайтов»: админ присылает боту ссылку
+# на страницу школы со расписанием, бот показывает, ЧТО нашёл (файлы PDF/Word/
+# Excel, картинки-расписания, текст), админ выбирает кнопками, что присылать
+# ПОСТОЯННО — и дальше бот САМ следит за страницей и при изменении присылает
+# классу обновление: 🖼 фото (если расписание картинкой), 📄 файл (PDF/Word/
+# Excel) или 📅 текст. Не чаще ОДНОГО сообщения в день на ссылку, дубли не
+# шлём. Для сложных сайтов подключается ИИ DeepSeek (ключ опционален).
+#
+# Движок парсинга перенесён из отдельного бота «Расписание» (проверенная
+# логика): правила -> таблицы -> строки с временем -> ИИ. Все сетевые
+# операции синхронные (requests) и крутятся в отдельном потоке
+# (asyncio.to_thread) — цикл событий бота не блокируется.
+
+# Модули для движка: имя urllib до этого места модуля НЕ связано
+# (там только _urllib_parse), html не импортирован вовсе.
+import html as html_mod
+import urllib.parse
+# requests — для «Расписания с сайтов» (опциональна: без неё бот работает
+# как раньше, а раздел честно попросит доустановить библиотеку).
+try:
+    import requests as _sch_requests
+except Exception:  # pragma: no cover
+    _sch_requests = None
+
+SCHEDMON_FILE = _data_file("schedule_monitor.json")
+# Проверка ссылок каждые 5 минут; авторассылка — не чаще 1 сообщения в день.
+SCHEDMON_CHECK_INTERVAL = 300
+SCHEDMON_MAX_AUTO_PER_DAY = 1
+SCHEDMON_MAX_TRACK_PER_CLASS = 15   # сколько ссылок может следить один класс
+SCHEDMON_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+               "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+SCHEDMON_MAX_SCHEDULE_CHARS = 3500
+SCHEDMON_MIN_SCHEDULE_LEN = 60
+SCHEDMON_FILE_EXTS = ("pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx",
+                      "rtf", "odt", "ods")
+SCHEDMON_IMAGE_EXTS = ("jpg", "jpeg", "png", "webp", "gif", "bmp")
+SCHEDMON_MAX_FILE_MB = 49           # лимит Bot API на файл (с запасом)
+SCHEDMON_MAX_PHOTO_MB = 10          # лимит Telegram sendPhoto
+SCHEDMON_MIN_IMAGE_BYTES = 12 * 1024  # отсекаем иконки и мелкие картинки
+SCHEDMON_MAX_FILES_PER_NOTIFY = 5
+SCHEDMON_DEEPSEEK_MODEL = "deepseek-chat"
+SCHEDMON_DEEPSEEK_MAX_CHARS = 30000
+SCHEDMON_DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
+SCHEDMON_DEEPSEEK_PROMPT = (
+    "Найди в тексте веб-страницы расписание (занятия, звонки, мероприятия — "
+    "по дням и времени). Верни только само расписание простым текстом: "
+    "дни, время, события. Без пояснений и без markdown-разметки. "
+    "Если расписания на странице нет — верни ровно одно слово: NO_SCHEDULE")
+
+# Ключи записи ссылки в состоянии (нормализация при загрузке).
+SCHEDMON_INFO_KEYS = ("chat", "h", "ch", "title", "errors", "files", "sig",
+                      "sch", "sent", "cand", "sel", "day", "nday",
+                      "next_check", "added_by", "added_ts")
+
+_SCHMON_TLS = threading.local()
+
+
+def _schmon_session():
+    """requests.Session на поток (синхронные вызовы крутятся в to_thread)."""
+    if _sch_requests is None:
+        raise RuntimeError("Библиотека requests не установлена")
+    s = getattr(_SCHMON_TLS, "session", None)
+    if s is None:
+        s = _sch_requests.Session()
+        s.headers.update({"User-Agent": SCHEDMON_UA, "Accept-Language": "ru,en;q=0.8"})
+        _SCHMON_TLS.session = s
+    return s
+
+
+# ------------------------------ состояние -----------------------------------
+def schmon_load():
+    data = load_data(SCHEDMON_FILE, {})
+    return data if isinstance(data, dict) else {}
+
+
+def schmon_save(state):
+    try:
+        return save_data(SCHEDMON_FILE, state)
+    except Exception as e:
+        logger.error(f"schmon_save: {e}")
+        return False
+
+
+def schmon_normalize(state):
+    """Чистим состояние от мусора и заполняем значения по умолчанию
+    (аналог load_state отдельного бота «Расписание»)."""
+    clean = {}
+    for class_code, entry in (state or {}).items():
+        if not isinstance(entry, dict):
+            continue
+        urls = entry.get("urls") if isinstance(entry.get("urls"), dict) else {}
+        clean_urls = {}
+        for url, info in urls.items():
+            if not isinstance(url, str) or not isinstance(info, dict):
+                continue
+            ni = {k: info[k] for k in SCHEDMON_INFO_KEYS if k in info}
+            ni.setdefault("chat", None)
+            ni.setdefault("h", None)
+            ni.setdefault("ch", None)
+            ni.setdefault("title", "")
+            ni.setdefault("errors", 0)
+            ni.setdefault("files", {})
+            ni.setdefault("sig", None)
+            ni.setdefault("sch", "")
+            ni.setdefault("sent", {})
+            ni.setdefault("cand", [])
+            ni.setdefault("sel", [])
+            ni.setdefault("day", "")     # дата последней авторассылки
+            ni.setdefault("nday", 0)     # сколько уже прислано сегодня
+            ni.setdefault("next_check", 0)
+            ni.setdefault("added_by", "")
+            ni.setdefault("added_ts", 0)
+            clean_urls[url] = ni
+        entry["urls"] = clean_urls
+        clean[str(class_code)] = entry
+    return clean
+
+
+def schmon_class_urls(state, class_code):
+    """Словарь ссылок класса (создаёт запись при необходимости)."""
+    entry = state.get(str(class_code))
+    if not isinstance(entry, dict):
+        entry = {}
+    urls = entry.get("urls")
+    if not isinstance(urls, dict):
+        urls = {}
+    entry["urls"] = urls
+    state[str(class_code)] = entry
+    return urls
+
+
+def schmon_new_info():
+    return {"chat": None, "h": None, "ch": None, "title": "", "errors": 0,
+            "files": {}, "sig": None, "sch": "", "sent": {}, "cand": [],
+            "sel": [], "day": "", "nday": 0, "next_check": 0,
+            "added_by": "", "added_ts": 0}
+
+
+def schmon_merge_info(class_code, url, info):
+    """Сохранить ОДНУ ссылку, не затирая изменения админов: читаем свежее
+    состояние, подменяем только эту ссылку (если её не удалили) и пишем."""
+    try:
+        state = schmon_load()
+        urls = schmon_class_urls(state, class_code)
+        if url not in urls:
+            return False   # админ уже удалил ссылку — не возвращаем её
+        urls[url] = {k: info.get(k, urls[url].get(k)) for k in SCHEDMON_INFO_KEYS}
+        return schmon_save(state)
+    except Exception as e:
+        logger.error(f"schmon_merge_info: {e}")
+        return False
+
+
+def schmon_find_by_key(key):
+    """Найти ссылку по короткому md5-ключу: (state, class_code, url, info)."""
+    state = schmon_normalize(schmon_load())
+    for class_code, entry in state.items():
+        for url, info in (entry.get("urls") or {}).items():
+            if schmon_md5key(url) == key:
+                return state, str(class_code), url, info
+    return state, None, None, None
+
+
+# ------------------------------ ссылки --------------------------------------
+_SCHMON_URL_TAIL = re.compile(r"[)\]}>.,;:!?'\"«»]+$")
+_SCHMON_TLD = (r"(?:ru|su|рф|by|ua|kz|com|net|org|info|io|me|edu|gov|online"
+               r"|site|shop|club)")
+_SCHMON_BARE = re.compile(
+    r"([a-z0-9а-яё][a-z0-9а-яё\-]*(?:\.[a-z0-9а-яё\-]+)*\." + _SCHMON_TLD
+    + r")(/[^\s]*)?$", re.I)
+
+
+def schmon_extract_url(text):
+    if not text:
+        return None
+    t = str(text).strip()
+    m = re.search(r"https?://\S+", t, re.I)
+    if m:
+        return _SCHMON_URL_TAIL.sub("", m.group(0))
+    m = re.match(r"www\.\S+", t, re.I)
+    if m:
+        return "https://" + _SCHMON_URL_TAIL.sub("", m.group(0))
+    m = _SCHMON_BARE.match(t)
+    if m:
+        return "https://" + m.group(1) + (m.group(2) or "")
+    return None
+
+
+def schmon_md5key(url):
+    return hashlib.md5(url.encode("utf-8")).hexdigest()[:12]
+
+
+def schmon_host_of(url):
+    try:
+        return urllib.parse.urlparse(url).netloc or url
+    except Exception:
+        return url
+
+
+# --------------------------- чтение страниц ---------------------------------
+def schmon_fetch_page(url):
+    s = _schmon_session()
+    r = s.get(url, timeout=30)
+    if r.encoding in (None, "ISO-8859-1") and r.apparent_encoding:
+        r.encoding = r.apparent_encoding
+    r.raise_for_status()
+    return r.text
+
+
+def schmon_norm_html(text):
+    text = re.sub(r"(?is)<(script|style|noscript|template)[^>]*>.*?</\1\s*>",
+                  "", text or "")
+    text = re.sub(r"(?s)<!--.*?-->", "", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+_SCHMON_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def schmon_page_hashes(html_text):
+    norm = schmon_norm_html(html_text)
+    h1 = hashlib.sha256(norm.encode("utf-8", "ignore")).hexdigest()[:16]
+    h2 = hashlib.sha256(_SCHMON_TAG_RE.sub(" ", norm)
+                        .encode("utf-8", "ignore")).hexdigest()[:16]
+    return h1, h2
+
+
+def schmon_page_title(html_text):
+    m = re.search(r"(?is)<title[^>]*>(.*?)</title>", html_text or "")
+    if not m:
+        return ""
+    return html_mod.unescape(re.sub(r"\s+", " ", m.group(1))).strip()[:100]
+
+
+def schmon_visible_text(html_text, limit=3000):
+    t = _SCHMON_TAG_RE.sub(" ", schmon_norm_html(html_text))
+    return html_mod.unescape(re.sub(r"\s+", " ", t)).strip()[:limit]
+
+
+# ---------------------- извлечение расписания -------------------------------
+_SCHMON_SCHED_WORDS = re.compile(
+    r"(расписан|заняти|звонк|урок|консультац|\bпара\b|\bпар[ыу]\b|смен[аы]"
+    r"|понедельник|вторник|сред[ауе]|четверг|пятниц|суббот|воскресень"
+    r"|monday|tuesday|wednesday|thursday|friday|saturday|sunday"
+    r"|timetable|schedule)", re.I)
+_SCHMON_TIME_RE = re.compile(r"(?<!\d)\d{1,2}[:.]\d{2}(?!\d)")
+_SCHMON_TABLE_OPEN = re.compile(r"<table\b", re.I)
+_SCHMON_TABLE_TAG = re.compile(r"(?i)<(/?)table\b")
+_SCHMON_TR_RE = re.compile(r"(?is)<tr\b.*?</tr>")
+_SCHMON_CELL_RE = re.compile(r"(?is)<t[dh]\b.*?</t[dh]>")
+
+
+def schmon_text_hash(text):
+    return hashlib.md5((text or "").encode("utf-8", "ignore")).hexdigest()[:16]
+
+
+def schmon_looks_like_schedule(text):
+    return (len(_SCHMON_TIME_RE.findall(text)) >= 2
+            and len(_SCHMON_SCHED_WORDS.findall(text)) >= 1)
+
+
+def _schmon_page_tables(html_text):
+    text, out, end_prev = html_text or "", [], -1
+    for m in _SCHMON_TABLE_OPEN.finditer(text):
+        if m.start() < end_prev:
+            continue
+        depth = 0
+        for t in _SCHMON_TABLE_TAG.finditer(text, m.start()):
+            depth += -1 if t.group(1) else 1
+            if depth == 0:
+                out.append(text[m.start():t.end()])
+                end_prev = t.end()
+                break
+        else:
+            out.append(text[m.start():])
+            end_prev = len(text)
+    return out
+
+
+def _schmon_table_to_text(tbl):
+    rows = []
+    for tr in _SCHMON_TR_RE.finditer(tbl):
+        cells = [re.sub(r"\s+", " ",
+                        html_mod.unescape(_SCHMON_TAG_RE.sub(" ", c.group(0)))).strip()
+                 for c in _SCHMON_CELL_RE.finditer(tr.group(0))]
+        cells = [c for c in cells if c]
+        if cells:
+            rows.append(" | ".join(cells))
+    return "\n".join(rows)
+
+
+def schmon_extract_schedule(html_text):
+    tables = []
+    for tbl in _schmon_page_tables(html_text):
+        txt = _schmon_table_to_text(tbl)
+        if txt and schmon_looks_like_schedule(txt):
+            tables.append(txt)
+    if tables:
+        res, total = [], 0
+        for txt in tables:
+            if total >= SCHEDMON_MAX_SCHEDULE_CHARS:
+                break
+            res.append(txt[:SCHEDMON_MAX_SCHEDULE_CHARS - total])
+            total += len(res[-1])
+        out = "\n".join(res).strip()
+        if len(out) >= SCHEDMON_MIN_SCHEDULE_LEN:
+            return out
+
+    lines = []
+    for ln in html_mod.unescape(
+            _SCHMON_TAG_RE.sub("\n", schmon_norm_html(html_text or ""))).split("\n"):
+        ln = re.sub(r"\s+", " ", ln).strip()
+        if ln and (_SCHMON_TIME_RE.search(ln) or _SCHMON_SCHED_WORDS.search(ln)):
+            lines.append(ln)
+        if sum(len(x) for x in lines) > SCHEDMON_MAX_SCHEDULE_CHARS:
+            break
+    out = "\n".join(lines).strip()
+    if (len(lines) >= 3 and len(out) >= SCHEDMON_MIN_SCHEDULE_LEN
+            and schmon_looks_like_schedule(out)):
+        return out
+    return None
+
+
+# ------------------------------ DeepSeek (ИИ) -------------------------------
+def schmon_load_deepseek_key():
+    k = (os.environ.get("DEEPSEEK_API_KEY") or "").strip()
+    if k:
+        return k
+    try:
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "deepseek_key.txt")
+        with open(p, encoding="utf-8") as f:
+            k = f.read().strip()
+            if k:
+                return k
+    except OSError:
+        pass
+    return ""
+
+
+def schmon_deepseek_extract(page_text):
+    key = schmon_load_deepseek_key()
+    if not key or not page_text or _sch_requests is None:
+        return None
+    try:
+        r = _schmon_session().post(
+            SCHEDMON_DEEPSEEK_URL, timeout=90,
+            headers={"Authorization": "Bearer " + key},
+            json={"model": SCHEDMON_DEEPSEEK_MODEL, "temperature": 0.1,
+                  "max_tokens": 2000,
+                  "messages": [{"role": "system",
+                                "content": SCHEDMON_DEEPSEEK_PROMPT},
+                               {"role": "user",
+                                "content": page_text[:SCHEDMON_DEEPSEEK_MAX_CHARS]}]})
+        txt = (((r.json().get("choices") or [{}])[0].get("message")
+                or {}).get("content") or "").strip()
+        txt = re.sub(r"\*\*", "", txt)
+        txt = re.sub(r"^#{1,6} ", "", txt, flags=re.M).strip()
+        if not txt or "NO_SCHEDULE" in txt.upper():
+            return None
+        if len(txt) < SCHEDMON_MIN_SCHEDULE_LEN:
+            return None
+        if not (_SCHMON_TIME_RE.search(txt)
+                or len(_SCHMON_SCHED_WORDS.findall(txt)) >= 2):
+            return None
+        return txt[:SCHEDMON_MAX_SCHEDULE_CHARS]
+    except Exception:
+        return None
+
+
+def schmon_get_schedule(html_text, deep=True):
+    if not html_text:
+        return None
+    try:
+        s = schmon_extract_schedule(html_text)
+    except Exception:
+        s = None
+    if s:
+        return s
+    if deep and schmon_load_deepseek_key():
+        return schmon_deepseek_extract(
+            schmon_visible_text(html_text, SCHEDMON_DEEPSEEK_MAX_CHARS))
+    return None
+
+
+# ------------------ файлы-документы (PDF, Word, Excel...) -------------------
+_SCHMON_CLOUD_RE = re.compile(
+    r"(drive\.google\.com|docs\.google\.com|dropbox\.com|yadi\.sk"
+    r"|disk\.yandex\.ru)", re.I)
+_SCHMON_SRC_RE = re.compile(
+    r"""(?:<a\b[^>]*?\bhref|<iframe\b[^>]*?\bsrc|<embed\b[^>]*?\bsrc|<object\b[^>]*?\bdata)\s*=\s*["']([^"']+)["']""",
+    re.I)
+_SCHMON_A_RE = re.compile(
+    r"""(?is)<a\b[^>]*?\bhref\s*=\s*["']([^"']+)["'][^>]*>(.*?)</a>""")
+_SCHMON_IMG_RE = re.compile(r"(?is)<img\b[^>]*>")
+_SCHMON_ATTR_RE = re.compile(r"""(\w+)\s*=\s*["']([^"']*)["']""")
+_SCHMON_CT_EXT = {
+    "application/pdf": ".pdf", "application/msword": ".doc",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+    "application/vnd.ms-excel": ".xls",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+    "image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}
+
+# Признаки «это именно расписание» в имени файла/картинки, alt или тексте ссылки
+_SCHMON_NAME_RE = re.compile(
+    r"(расписан|raspisan|\brasp[_\-.]|schedul|timetable|звонк|zvonk"
+    r"|график|grafik|заняти|zanyat|урок|urok|\bсмен[аы]?\b|smen|consult"
+    r"|консультац)", re.I)
+
+
+def _schmon_is_schedule_named(*texts):
+    for t in texts:
+        if not t:
+            continue
+        try:
+            t = urllib.parse.unquote(t)
+        except Exception:
+            pass
+        if _SCHMON_NAME_RE.search(t):
+            return True
+    return False
+
+
+def _schmon_site_key(url):
+    """Ключ сайта: последние 2 части домена (school.ru и www.school.ru —
+    один сайт)."""
+    try:
+        host = (urllib.parse.urlparse(url).netloc or "").lower().split(":")[0]
+    except Exception:
+        return ""
+    parts = host.split(".")
+    return ".".join(parts[-2:]) if len(parts) >= 2 else host
+
+
+def _schmon_same_site(page_url, u):
+    return (_schmon_site_key(page_url)
+            and _schmon_site_key(page_url) == _schmon_site_key(u))
+
+
+def _schmon_norm_src(u):
+    """Нормализация для дедупликации URL: один файл с разными ?v=1 —
+    одно и то же."""
+    try:
+        p = urllib.parse.urlparse(u)
+        return (p.netloc.lower().split(":")[0], p.path)
+    except Exception:
+        return ("", u)
+
+
+# --------- память отправленного (чтобы не слать одинаковое повторно) --------
+def _schmon_sent_map(info):
+    s = info.get("sent")
+    if not isinstance(s, dict):
+        s = {}
+        info["sent"] = s
+    return s
+
+
+def schmon_was_sent(info, digest):
+    return digest in _schmon_sent_map(info)
+
+
+def schmon_mark_sent(info, digest):
+    s = _schmon_sent_map(info)
+    s[digest] = int(time.time())
+    if len(s) > 40:  # храним последние 40 отправок
+        for k in sorted(s, key=s.get)[:len(s) - 40]:
+            s.pop(k, None)
+
+
+# ----------------- дневной лимит авторассылки (раз в день) ------------------
+def _schmon_today():
+    return time.strftime("%Y-%m-%d", time.localtime())
+
+
+def _schmon_next_midnight_ts():
+    lt = time.localtime()
+    secs_today = lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec
+    return time.time() + (86400 - secs_today) + 60  # минута запаса
+
+
+def schmon_daily_quota_left(info):
+    if info.get("day") != _schmon_today():
+        return SCHEDMON_MAX_AUTO_PER_DAY
+    return max(0, SCHEDMON_MAX_AUTO_PER_DAY - int(info.get("nday") or 0))
+
+
+def schmon_use_daily_quota(info):
+    today = _schmon_today()
+    if info.get("day") != today:
+        info["day"], info["nday"] = today, 1
+    else:
+        info["nday"] = int(info.get("nday") or 0) + 1
+
+
+def _schmon_ext_of(url):
+    try:
+        path = urllib.parse.urlparse(url or "").path.lower()
+    except Exception:
+        return ""
+    return path.rsplit(".", 1)[-1] if "." in path else ""
+
+
+def schmon_file_kind(url):
+    ext = _schmon_ext_of(url)
+    return ext if ext in SCHEDMON_FILE_EXTS else ""
+
+
+def schmon_image_kind(url):
+    ext = _schmon_ext_of(url)
+    return ext if ext in SCHEDMON_IMAGE_EXTS else ""
+
+
+def schmon_is_cloud(url):
+    return bool(_SCHMON_CLOUD_RE.search(url or ""))
+
+
+def _schmon_cloud_download_url(url):
+    u = url or ""
+    if "dropbox.com" in u:
+        if "dl=" in u:
+            return re.sub(r"([?&])dl=0", r"\1dl=1", u)
+        return u + ("&dl=1" if "?" in u else "?dl=1")
+    if "drive.google.com" in u or "docs.google.com" in u:
+        m = (re.search(r"/d/([a-zA-Z0-9_-]{10,})", u)
+             or re.search(r"[?&]id=([a-zA-Z0-9_-]{10,})", u))
+        if m:
+            return "https://drive.google.com/uc?export=download&id=" + m.group(1)
+        return u
+    return u
+
+
+def _schmon_file_candidate(page_url, src):
+    if not src:
+        return None
+    src = html_mod.unescape(str(src).strip())
+    if not src or src.startswith(("data:", "#", "mailto:", "tel:", "javascript:")):
+        return None
+    full = urllib.parse.urljoin(page_url, src).split("#")[0]
+    return full if full.startswith(("http://", "https://")) else None
+
+
+def _schmon_anchor_texts(page_url, html_text):
+    """Карта: ссылка -> видимый текст ссылки (для оценки «это расписание?»)."""
+    out = {}
+    for m in _SCHMON_A_RE.finditer(html_text or ""):
+        full = _schmon_file_candidate(page_url, m.group(1))
+        if not full:
+            continue
+        txt = re.sub(r"\s+", " ",
+                     html_mod.unescape(_SCHMON_TAG_RE.sub(" ", m.group(2)))).strip()
+        if txt and full not in out:
+            out[full] = txt[:200]
+    return out
+
+
+def schmon_find_file_links(page_url, html_text, limit=8):
+    urls = []
+    for m in _SCHMON_SRC_RE.finditer(html_text or ""):
+        if len(urls) >= limit:
+            break
+        full = _schmon_file_candidate(page_url, m.group(1))
+        if not full:
+            continue
+        if "docs.google.com/viewer" in full:
+            m2 = re.search(r"[?&]url=([^&]+)", full)
+            if m2:
+                target = urllib.parse.unquote(m2.group(1))
+                if schmon_file_kind(target) and target not in urls:
+                    urls.append(target)
+            continue
+        if schmon_file_kind(full) or schmon_is_cloud(full):
+            if full not in urls:
+                urls.append(full)
+    return urls
+
+
+def schmon_find_image_links(page_url, html_text, limit=8, anchors=None):
+    """Картинки-расписания: <img> и ссылки на JPG/PNG с «расписательными»
+    признаками."""
+    anchors = anchors if isinstance(anchors, dict) else _schmon_anchor_texts(
+        page_url, html_text)
+    urls = []
+    # <img src=... alt=...>  — только картинки С ЭТОГО ЖЕ сайта
+    for m in _SCHMON_IMG_RE.finditer(html_text or ""):
+        if len(urls) >= limit:
+            break
+        attrs = dict((k.lower(), v)
+                     for k, v in _SCHMON_ATTR_RE.findall(m.group(0)))
+        full = _schmon_file_candidate(
+            page_url, attrs.get("src") or attrs.get("data-src") or "")
+        if not full or not schmon_image_kind(full) or full in urls:
+            continue
+        if not _schmon_same_site(page_url, full):
+            continue
+        if _schmon_is_schedule_named(full, attrs.get("alt"), attrs.get("title")):
+            urls.append(full)
+    # <a href="....jpg">Расписание</a>
+    for full, txt in anchors.items():
+        if len(urls) >= limit:
+            break
+        if not schmon_image_kind(full) or full in urls:
+            continue
+        if not _schmon_same_site(page_url, full):
+            continue
+        if _schmon_is_schedule_named(full, txt):
+            urls.append(full)
+    return urls
+
+
+def schmon_find_schedule_sources(page_url, html_text, limit=8):
+    """ТОЛЬКО источники расписания: документы (с приоритетом
+    «расписательных») и картинки-расписания."""
+    anchors = _schmon_anchor_texts(page_url, html_text)
+    docs = schmon_find_file_links(page_url, html_text, limit)
+    relevant = [f for f in docs
+                if _schmon_is_schedule_named(f, anchors.get(f, ""))]
+    if relevant:
+        docs = relevant  # есть явные файлы расписания — шлём только их
+    imgs = schmon_find_image_links(page_url, html_text, limit, anchors)
+    # Дедупликация: один файл с разными ?v=123 не считаем разными
+    out, seen = [], set()
+    for u in docs + imgs:
+        key = _schmon_norm_src(u)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(u)
+    return out[:limit]
+
+
+def schmon_file_meta_signature(url):
+    try:
+        r = _schmon_session().head(url, timeout=15, allow_redirects=True)
+        if r.status_code == 200:
+            parts = [str(r.headers.get(k) or "")
+                     for k in ("ETag", "Last-Modified", "Content-Length")]
+            if any(p.strip() for p in parts):
+                return "|".join(parts)
+    except Exception:
+        pass
+    return ""
+
+
+def schmon_file_deep_signature(url):
+    try:
+        r = _schmon_session().get(url, timeout=60, stream=True)
+        if r.status_code != 200:
+            return ""
+        data = b""
+        for chunk in r.iter_content(65536):
+            data += chunk
+            if len(data) > 8 * 1024 * 1024:
+                break
+        return "sha:" + hashlib.md5(data).hexdigest()
+    except Exception:
+        return ""
+
+
+def _schmon_filename_from_response(r, url):
+    cd = r.headers.get("Content-Disposition") or ""
+    m = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', cd, re.I)
+    name = html_mod.unescape(m.group(1)).strip() if m else ""
+    if not name:
+        path = urllib.parse.urlparse(url).path
+        name = urllib.parse.unquote(path.rsplit("/", 1)[-1])
+    ct = (r.headers.get("Content-Type") or "").lower()
+    if "." not in name:
+        for k, ext in _SCHMON_CT_EXT.items():
+            if ct.startswith(k):
+                name += ext
+                break
+    return re.sub(r'[\\/:*?"<>|]+', "_", name).strip()[:80] or "file.pdf"
+
+
+def schmon_download_file(url, referer=None):
+    """Скачать файл: (bytes, filename) или None."""
+    if _sch_requests is None:
+        return None
+    try:
+        real = _schmon_cloud_download_url(url)
+        headers = {"Referer": referer} if referer else {}
+        if "yadi.sk" in (url or "") or "disk.yandex.ru" in (url or ""):
+            r0 = _schmon_session().get(
+                "https://cloud-api.yandex.net/v1/disk/public/resources/download",
+                params={"public_key": url}, timeout=25)
+            real = (r0.json() or {}).get("href") or real
+            headers = {}
+        s = _schmon_session()
+        r = s.get(real, timeout=120, stream=True, headers=headers)
+        if r.status_code != 200:
+            return None
+        if "text/html" in (r.headers.get("Content-Type") or "").lower():
+            return None
+        name = _schmon_filename_from_response(r, url)
+        cap = SCHEDMON_MAX_FILE_MB * 1024 * 1024
+        data = b""
+        for chunk in r.iter_content(65536):
+            data += chunk
+            if len(data) > cap:
+                return None
+        return data, name
+    except Exception:
+        return None
+
+
+def _schmon_collect_file_sigs(page_url, html_text, old_files=None, deep_all=False):
+    old = old_files if isinstance(old_files, dict) else {}
+    out = {}
+    for f in schmon_find_schedule_sources(page_url, html_text):
+        if schmon_is_cloud(f):
+            out[f] = {"m": "", "d": ""}
+            continue
+        m = schmon_file_meta_signature(f)
+        prev = old.get(f) if isinstance(old.get(f), dict) else None
+        if not m and prev and prev.get("m"):
+            out[f] = {"m": prev["m"], "d": prev.get("d", "")}
+            continue
+        if m:
+            d = ""
+        elif deep_all or prev is None:
+            d = schmon_file_deep_signature(f)
+        else:
+            d = prev.get("d", "")
+        out[f] = {"m": m, "d": d}
+    return out
+
+
+def _schmon_file_changed(old, now):
+    if not isinstance(old, dict):
+        return True
+    if (old.get("m") or "") != (now.get("m") or ""):
+        return True
+    nd = now.get("d") or ""
+    return bool(nd) and nd != (old.get("d") or "")
+
+
+def schmon_short_name(u, maxlen=35):
+    """Короткое читаемое имя файла для кнопки."""
+    try:
+        path = urllib.parse.urlparse(u).path
+        name = urllib.parse.unquote(path.rsplit("/", 1)[-1]) or schmon_host_of(u)
+    except Exception:
+        name = u
+    return name[:maxlen] + ("…" if len(name) > maxlen else "")
+
+
+# ---------------------------- отправка (async) ------------------------------
+def _schmon_chunk_text(text, size=4000):
+    text = (text or "").strip()
+    if not text:
+        return []
+    if len(text) <= size:
+        return [text]
+    parts = []
+    while text:
+        parts.append(text[:size])
+        text = text[size:]
+    return parts
+
+
+async def schmon_send_text(bot, chat_id, text):
+    ok = False
+    for part in _schmon_chunk_text(text):
+        try:
+            await bot.send_message(chat_id=chat_id, text=part)
+            ok = True
+        except Exception as e:
+            logger.warning(f"schmon_send_text {chat_id}: {e}")
+    return ok
+
+
+async def schmon_send_item(bot, chat_id, src_url, data, name, host):
+    """Отправить один источник расписания: картинку — фото, документ — файлом."""
+    try:
+        if (schmon_image_kind(src_url) or schmon_image_kind(name)):
+            if len(data) < SCHEDMON_MIN_IMAGE_BYTES:
+                return False  # иконка/мусор — не шлём
+            if len(data) <= SCHEDMON_MAX_PHOTO_MB * 1024 * 1024:
+                try:
+                    await bot.send_photo(
+                        chat_id=chat_id,
+                        photo=InputFile(data, filename=name or "photo.jpg"),
+                        caption=("🖼 Расписание\n%s" % host)[:1024])
+                    return True
+                except Exception as e:
+                    logger.warning(f"schmon_send_item photo→doc {chat_id}: {e}")
+            await bot.send_document(
+                chat_id=chat_id,
+                document=InputFile(data, filename=name or "image.jpg"),
+                caption=("🖼 Расписание\n%s" % host)[:1024])
+            return True
+        await bot.send_document(
+            chat_id=chat_id,
+            document=InputFile(data, filename=name or "file.pdf"),
+            caption=("📄 %s\n%s" % (name, host))[:1024])
+        return True
+    except Exception as e:
+        logger.warning(f"schmon_send_item {chat_id}: {e}")
+        return False
+
+
+def schmon_recipients(class_obj):
+    """Кому присылать обновления: все участники класса (админы + ученики),
+    кроме заблокированных. Идентификаторы — только числовые Telegram ID."""
+    if class_obj is None:
+        return []
+    blocked = {str(b) for b in (getattr(class_obj, "blocked_users", []) or [])}
+    ids = []
+    for uid in (list(getattr(class_obj, "students", []) or [])
+                + list(getattr(class_obj, "admins", []) or [])):
+        s = str(uid or "").strip()
+        if not s or not s.isdigit() or s in blocked or s in ids:
+            continue
+        ids.append(s)
+    return ids
+
+
+async def schmon_notify(app, class_code, url, info, new_files=(),
+                        schedule_text=None):
+    """Авторассылка классу: прислать ТОЛЬКО изменившееся расписание — ОДИН
+    файл/фото или текст, и НЕ ЧАЩЕ раза в день. Дубли не шлём.
+    ВАЖНО: мутируем ТУ ЖЕ запись info, что у вызывающего (check_url/цикл), —
+    иначе финальный merge перезатрёт память отправленного и дневной лимит.
+    Сохранение делает вызывающий (schmon_merge_info)."""
+    if not isinstance(info, dict):
+        return False
+    class_obj = get_class_by_code(class_code)
+    recipients = schmon_recipients(class_obj)
+    if not recipients:
+        return False
+    bot = app.bot
+
+    files = list(new_files or [])
+    handled = False
+
+    # 1) Фото-расписания и файлы — присылаем ОДНО новое, не больше
+    for f in files[:SCHEDMON_MAX_FILES_PER_NOTIFY]:
+        dl = await asyncio.to_thread(schmon_download_file, f, url)
+        if not dl:
+            continue
+        data, name = dl
+        digest = hashlib.md5(data).hexdigest()
+        if schmon_was_sent(info, digest):
+            handled = True  # это уже присылали — повторно НЕ шлём
+            continue
+        if schmon_daily_quota_left(info) <= 0:
+            # дневной лимит исчерпан — отложим проверку до завтра
+            info["next_check"] = _schmon_next_midnight_ts()
+            return False
+        host = schmon_host_of(url)
+        sent_any = False
+        for chat_id in recipients:
+            if await schmon_send_item(bot, chat_id, f, data, name, host):
+                sent_any = True
+        if sent_any:
+            schmon_mark_sent(info, digest)
+            schmon_use_daily_quota(info)
+            return True  # ровно ОДИН файл/фото за день!
+
+    if handled:
+        return True  # всё уже присылалось — просто обновляем состояние
+
+    # 2) Расписание текстом
+    if schedule_text:
+        if schmon_daily_quota_left(info) <= 0:
+            info["next_check"] = _schmon_next_midnight_ts()
+            return False
+        head = "📅 Расписание обновилось\n%s\n\n" % schmon_host_of(url)
+        sent_any = False
+        for chat_id in recipients:
+            if await schmon_send_text(bot, chat_id, head + schedule_text):
+                sent_any = True
+        if sent_any:
+            schmon_use_daily_quota(info)
+            return True
+
+    # Если ни фото, ни файлов, ни текста расписания не нашли — молчим
+    return False
+
+
+# ---------------------------- проверка ссылок -------------------------------
+async def _schmon_check_file_url(app, class_code, url, info):
+    """Прямая ссылка на файл/картинку: следим за ETag/Last-Modified/длиной,
+    при их отсутствии — за md5 содержимого."""
+    old = info.get("sig") if isinstance(info.get("sig"), dict) else None
+    m = await asyncio.to_thread(schmon_file_meta_signature, url)
+    if m:
+        d = (old or {}).get("d", "")
+    else:
+        d = await asyncio.to_thread(schmon_file_deep_signature, url)
+    if old is None:
+        info["sig"] = {"m": m, "d": d}
+        schmon_merge_info(class_code, url, info)
+        return False
+    changed = ((bool(old.get("m")) and old.get("m") != m)
+               or (bool(d) and d != (old.get("d") or "")))
+    if not changed:
+        info["sig"] = {"m": m, "d": d}
+        schmon_merge_info(class_code, url, info)
+        return False
+    if await schmon_notify(app, class_code, url, info, [url]):
+        info["sig"] = {"m": m, "d": d}
+        schmon_merge_info(class_code, url, info)
+        return True
+    return False
+
+
+async def schmon_check_url(app, class_code, url, info):
+    """Проверить одну ссылку класса. True — было обновление (отправлено)."""
+    if not isinstance(info, dict):
+        return False
+    if schmon_file_kind(url) or schmon_image_kind(url):
+        return await _schmon_check_file_url(app, class_code, url, info)
+    try:
+        html_text = await asyncio.to_thread(schmon_fetch_page, url)
+    except Exception:
+        info["errors"] = int(info.get("errors") or 0) + 1
+        schmon_merge_info(class_code, url, info)
+        return False
+    info["errors"] = 0
+    h, ch = schmon_page_hashes(html_text)
+    first = info.get("h") is None
+    page_changed = (not first) and (h, ch) != (info.get("h"), info.get("ch"))
+    old_files = info.get("files") if isinstance(info.get("files"), dict) else {}
+    files_now = await asyncio.to_thread(
+        _schmon_collect_file_sigs, url, html_text, old_files,
+        bool(first or page_changed))
+    new_files = [f for f in files_now
+                 if _schmon_file_changed(old_files.get(f), files_now[f])]
+
+    if first:
+        info.update({"h": h, "ch": ch,
+                     "title": schmon_page_title(html_text),
+                     "files": files_now})
+        schmon_merge_info(class_code, url, info)
+        return False
+
+    # --- следим ТОЛЬКО за тем, что выбрал админ ---
+    sel = info.get("sel") or []
+    has_cand = bool(info.get("cand"))
+    if sel:
+        sel_norm = {_schmon_norm_src(s) for s in sel if s != "TEXT"}
+        new_files = [f for f in new_files if _schmon_norm_src(f) in sel_norm]
+        allow_text = "TEXT" in sel
+    elif has_cand:
+        new_files, allow_text = [], False  # админ ещё не выбрал — молчим
+    else:
+        allow_text = True  # состояние без меню выбора — как раньше
+
+    if page_changed or new_files:
+        sch_text, sch_hash = None, ""
+        if not new_files and allow_text:
+            sch_text = await asyncio.to_thread(schmon_get_schedule, html_text)
+            if sch_text:
+                sch_hash = schmon_text_hash(sch_text)
+                if sch_hash == info.get("sch"):
+                    info.update({"h": h, "ch": ch,
+                                 "title": schmon_page_title(html_text),
+                                 "files": files_now})
+                    schmon_merge_info(class_code, url, info)
+                    return False
+
+        if not new_files and not sch_text:
+            # Выбранное не изменилось — просто обновляем состояние
+            info.update({"h": h, "ch": ch,
+                         "title": schmon_page_title(html_text),
+                         "files": files_now})
+            schmon_merge_info(class_code, url, info)
+            return False
+
+        if await schmon_notify(app, class_code, url, info, new_files, sch_text):
+            upd = {"h": h, "ch": ch,
+                   "title": schmon_page_title(html_text), "files": files_now}
+            if not new_files:
+                upd["sch"] = sch_hash
+            info.update(upd)
+            schmon_merge_info(class_code, url, info)
+            return True
+        return False
+
+    info["files"] = files_now
+    schmon_merge_info(class_code, url, info)
+    return False
+
+
+async def schmon_monitor_loop(app):
+    """Фоновый цикл: раз в 30с собирает «созревшие» ссылки всех классов и
+    проверяет их (до 3 параллельно, сеть — в отдельных потоках)."""
+    logger.info("Мониторинг «Расписание с сайтов» запущен: тик 30с, "
+                "интервал проверки %dс.", SCHEDMON_CHECK_INTERVAL)
+    await asyncio.sleep(20)  # дать боту спокойно подняться
+    while True:
+        try:
+            state = schmon_normalize(schmon_load())
+            now = time.time()
+            jobs = []
+            for class_code, entry in state.items():
+                for url, info in (entry.get("urls") or {}).items():
+                    if (isinstance(info, dict)
+                            and now >= float(info.get("next_check") or 0)):
+                        jobs.append((str(class_code), url, info))
+            if jobs:
+                sem = asyncio.Semaphore(3)
+
+                async def _schmon_run_one(cc, u, inf):
+                    async with sem:
+                        try:
+                            await schmon_check_url(app, cc, u, inf)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            logger.exception("schmon check failed: %s", u)
+                        finally:
+                            # не затираем отложенную проверку (дневной лимит)
+                            inf["next_check"] = max(
+                                float(inf.get("next_check") or 0),
+                                time.time() + SCHEDMON_CHECK_INTERVAL)
+                            schmon_merge_info(cc, u, inf)
+
+                await asyncio.gather(
+                    *[_schmon_run_one(cc, u, inf) for cc, u, inf in jobs])
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("schmon_monitor_loop tick")
+        await asyncio.sleep(30)
+
+
+async def schmon_force_check(app, class_code, chat_id):
+    """«🔍 Проверить сейчас»: немедленная проверка всех ссылок класса
+    с отчётом админу."""
+    state = schmon_normalize(schmon_load())
+    urls = schmon_class_urls(state, class_code)
+    if not urls:
+        if chat_id:
+            await schmon_send_text(
+                app.bot, chat_id,
+                "📭 За классом пока не следит ни одна ссылка. Добавьте её "
+                "через «🌐 Расписание с сайтов» → «➕ Добавить ссылку».")
+        return
+    if chat_id:
+        await schmon_send_text(app.bot, chat_id,
+                               "🔍 Проверяю ссылок: %d…" % len(urls))
+    checked = changed = 0
+    for url, info in urls.items():
+        try:
+            if await schmon_check_url(app, class_code, url, info):
+                changed += 1
+            checked += 1
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("schmon force check: %s", url)
+        info["next_check"] = max(float(info.get("next_check") or 0),
+                                 time.time() + SCHEDMON_CHECK_INTERVAL)
+        schmon_merge_info(class_code, url, info)
+    if chat_id:
+        await schmon_send_text(
+            app.bot, chat_id,
+            "✔ Проверил ссылок: %d, обновлений: %d." % (checked, changed))
+
+
+# ------------------------- UI админ-панели ----------------------------------
+def _schmon_admin_class(context, uid):
+    """Класс для schmon-колбэков: рабочий класс админ-панели (или свой класс
+    админа) с проверкой прав."""
+    cls = None
+    cur = context.user_data.get('current_admin_class')
+    if cur:
+        cls = get_class_by_code(cur) if isinstance(cur, str) else cur
+    if cls is None:
+        cls = get_class_by_user(uid)
+    if cls is None or not getattr(cls, 'is_active', True):
+        return None
+    if uid not in (cls.admins or []) and uid != str(cls.creator_id or ''):
+        return None
+    return cls
+
+
+def _schmon_menu_text(class_obj):
+    state = schmon_normalize(schmon_load())
+    urls = schmon_class_urls(state, class_obj.class_code)
+    # Панель рисуется в ParseMode.HTML — все данные со страниц (title,
+    # url) экранируем, иначе «<» в <title> сломает рендер сообщения.
+    esc = html_mod.escape
+    lines = [
+        "🌐 <b>Расписание с сайтов</b> — класс «%s»" % esc(class_obj.class_name),
+        "",
+        "Слежу за страницами со расписанием и присылаю классу обновления "
+        "автоматически: 🖼 фото, 📄 файл (PDF/Word/Excel) или 📅 текст — "
+        "не чаще <b>1 раза в день</b> на ссылку, без дублей.",
+        "",
+    ]
+    if not urls:
+        lines.append("Ссылок пока нет. Нажмите «➕ Добавить ссылку» и пришлите "
+                     "адрес страницы школы с расписанием.")
+    else:
+        lines.append("Отслеживаю ссылок: %d" % len(urls))
+        for url, info in list(urls.items())[:30]:
+            sel = info.get("sel") or []
+            if sel and sel != ["TEXT"]:
+                status = "выбрано файлов: %d" % len(
+                    [s for s in sel if s != "TEXT"])
+                if "TEXT" in sel:
+                    status += " + текст"
+            elif sel == ["TEXT"]:
+                status = "текст расписания"
+            else:
+                status = "источники не выбраны"
+            title = str(info.get("title") or "").strip()
+            host = esc(schmon_host_of(url))
+            name = esc(schmon_short_name(url, 40))
+            lines.append("• 🌐 %s — %s (%s)" % (host, name, esc(status))
+                         if not title else
+                         "• 🌐 %s — %s (%s)" % (host, esc(title[:40]),
+                                                esc(status)))
+        lines.append("")
+        lines.append("«❌ …» — перестать следить за ссылкой.")
+    return "\n".join(lines)
+
+
+def _schmon_menu_kb(class_code):
+    state = schmon_normalize(schmon_load())
+    urls = schmon_class_urls(state, class_code)
+    rows = [[InlineKeyboardButton("➕ Добавить ссылку", callback_data="schmon_add")]]
+    for url in list(urls.keys())[:30]:
+        label = "❌ " + (schmon_host_of(url) + " · "
+                        + schmon_short_name(url))[:60]
+        rows.append([InlineKeyboardButton(label,
+                                          callback_data="schdel:"
+                                          + schmon_md5key(url))])
+    rows.append([InlineKeyboardButton("🔍 Проверить сейчас",
+                                      callback_data="schmon_check")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_to_admin")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def schmon_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Меню «🌐 Расписание с сайтов» (из админ-панели)."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    uid = str(query.from_user.id)
+    class_obj = _schmon_admin_class(context, uid)
+    if not class_obj:
+        try:
+            await query.answer("Только для админов класса.", show_alert=True)
+        except Exception:
+            pass
+        return MAIN_MENU
+    context.user_data['current_admin_class'] = class_obj.class_code
+    context.user_data.pop('schmon_wait_url', None)
+    try:
+        if _sch_requests is None:
+            await query.edit_message_text(
+                "⚙️ На сервере не установлена библиотека requests.\n"
+                "Попросите администратора сервера выполнить:\n"
+                "<code>pip install requests</code>",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("⬅️ Назад", callback_data="back_to_admin")]]),
+                parse_mode=ParseMode.HTML)
+            return ADMIN_PANEL
+        await query.edit_message_text(
+            _schmon_menu_text(class_obj),
+            reply_markup=_schmon_menu_kb(class_obj.class_code),
+            parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    except Exception:
+        pass
+    return ADMIN_PANEL
+
+
+async def schmon_add_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """«➕ Добавить ссылку» — ждём URL от админа (состояние SCHEDMON_URL)."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    uid = str(query.from_user.id)
+    class_obj = _schmon_admin_class(context, uid)
+    if not class_obj:
+        try:
+            await query.answer("Только для админов класса.", show_alert=True)
+        except Exception:
+            pass
+        return MAIN_MENU
+    context.user_data['current_admin_class'] = class_obj.class_code
+    context.user_data['schmon_wait_url'] = True
+    try:
+        await query.edit_message_text(
+            "🌐 Пришлите ссылку на страницу с расписанием.\n\n"
+            "Например: https://school1.ru/schedule\n\n"
+            "Я покажу, что нашёл (🖼 картинки, 📄 файлы, 📅 текст), "
+            "а вы выберете кнопками, что присылать классу ПОСТОЯННО.",
+            reply_markup=get_cancel_keyboard(), disable_web_page_preview=True)
+    except Exception:
+        pass
+    return SCHEDMON_URL
+
+
+@timeout(CONVERSATION_TIMEOUT)
+async def schmon_url_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Админ прислал ссылку: показываем источники и выбор «что присылать»."""
+    uid = str(update.effective_user.id)
+    class_obj = _schmon_admin_class(context, uid)
+    if not class_obj:
+        await update.message.reply_text("❌ Только для админов класса.")
+        return MAIN_MENU
+    class_code = class_obj.class_code
+    context.user_data['current_admin_class'] = class_code
+
+    text = (update.message.text or "").strip()
+    if not context.user_data.get('schmon_wait_url'):
+        # Текст без запроса ссылки — показываем меню как вежливый ответ
+        await update.message.reply_text(
+            _schmon_menu_text(class_obj),
+            reply_markup=_schmon_menu_kb(class_code),
+            parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        return ADMIN_PANEL
+
+    url = schmon_extract_url(text)
+    if not url:
+        await update.message.reply_text(
+            "Не похоже на ссылку. Пришлите адрес страницы (начинается с http "
+            "или www), либо нажмите «❌ Отмена».")
+        return SCHEDMON_URL
+
+    context.user_data['schmon_wait_url'] = False
+
+    if _sch_requests is None:
+        await update.message.reply_text(
+            "⚙️ На сервере не установлена библиотека requests.\n"
+            "Попросите администратора сервера выполнить:\n"
+            "<code>pip install requests</code>", parse_mode=ParseMode.HTML)
+        return ADMIN_PANEL
+
+    wait_msg = await update.message.reply_text("🔎 Открываю страницу и ищу расписание…")
+
+    state = schmon_normalize(schmon_load())
+    urls = schmon_class_urls(state, class_code)
+
+    if url in urls:
+        info = urls[url]
+        cands = info.get("cand") or []
+        if cands:
+            key = schmon_md5key(url)
+            buttons = []
+            for i, (u2, k) in enumerate(cands):
+                label = ("🖼 " if k == "img" else "📄 ") + schmon_short_name(u2)
+                buttons.append([InlineKeyboardButton(
+                    label, callback_data="schsnd:%s:%d" % (key, i))])
+            buttons.append([InlineKeyboardButton(
+                "📅 Текст расписания", callback_data="schtxt:" + key)])
+            buttons.append([InlineKeyboardButton("⬅️ В меню",
+                                                 callback_data="schmon_menu")])
+            await wait_msg.edit_text(
+                "🔗 Эта ссылка уже под наблюдением — выберите источники заново "
+                "(можно дополнить):",
+                reply_markup=InlineKeyboardMarkup(buttons),
+                disable_web_page_preview=True)
+        else:
+            await wait_msg.edit_text("🔗 Эта ссылка уже под наблюдением.")
+        return ADMIN_PANEL
+
+    if len(urls) >= SCHEDMON_MAX_TRACK_PER_CLASS:
+        await wait_msg.edit_text(
+            "⚠ Лимит: не больше %d ссылок на класс. Удалите лишние (❌ в меню) "
+            "и попробуйте снова." % SCHEDMON_MAX_TRACK_PER_CLASS)
+        return ADMIN_PANEL
+
+    info = schmon_new_info()
+    info["chat"] = uid        # куда сразу слать выбранные источники
+    info["added_by"] = uid
+    info["added_ts"] = int(time.time())
+
+    try:
+        if schmon_file_kind(url) or schmon_image_kind(url):
+            # Прямая ссылка на файл/картинку — выбирать нечего, следим сразу
+            m = await asyncio.to_thread(schmon_file_meta_signature, url)
+            d = "" if m else await asyncio.to_thread(
+                schmon_file_deep_signature, url)
+            info["sig"] = {"m": m, "d": d}
+            info["sel"] = [url]
+            urls[url] = info
+            schmon_save(state)
+            await wait_msg.edit_text(
+                "✅ Следю за файлом %s.\nПри изменении пришлю классу "
+                "(не чаще 1 раза в день)." % schmon_short_name(url))
+            return ADMIN_PANEL
+        html_text = await asyncio.to_thread(schmon_fetch_page, url)
+    except Exception:
+        await wait_msg.edit_text(
+            "⚠ Не удалось открыть страницу. Проверьте ссылку и попробуйте "
+            "ещё раз. Ссылка НЕ добавлена.")
+        return ADMIN_PANEL
+
+    h, ch = schmon_page_hashes(html_text)
+    info.update({"h": h, "ch": ch, "title": schmon_page_title(html_text)})
+    sources = await asyncio.to_thread(schmon_find_schedule_sources, url, html_text)
+    has_text = bool(await asyncio.to_thread(
+        lambda: schmon_get_schedule(html_text, deep=False)))  # без ИИ, быстро
+
+    if not sources and not has_text:
+        sch_text = await asyncio.to_thread(schmon_get_schedule, html_text)
+        if sch_text:
+            head = "📅 Расписание\n%s\n\n" % schmon_host_of(url)
+            await schmon_send_text(context.bot, uid, head + sch_text)
+            info["sch"] = schmon_text_hash(sch_text)
+            info["sel"] = ["TEXT"]
+            urls[url] = info
+            schmon_save(state)
+            await update.message.reply_text(
+                "✅ Следю за страницей: буду присылать классу текст расписания "
+                "при изменении (не чаще 1 раза в день).")
+            return ADMIN_PANEL
+        await wait_msg.edit_text(
+            "На странице не нашёл ни файлов, ни текста расписания. Ссылка НЕ "
+            "добавлена. Попробуйте другую страницу.")
+        return ADMIN_PANEL
+
+    cands = [[u2, ("img" if schmon_image_kind(u2) else "doc")]
+             for u2 in sources[:8]]
+    info["cand"] = cands
+    urls[url] = info
+    schmon_save(state)
+
+    key = schmon_md5key(url)
+    buttons = []
+    for i, (u2, k) in enumerate(cands):
+        label = ("🖼 " if k == "img" else "📄 ") + schmon_short_name(u2)
+        buttons.append([InlineKeyboardButton(
+            label, callback_data="schsnd:%s:%d" % (key, i))])
+    if has_text:
+        buttons.append([InlineKeyboardButton(
+            "📅 Текст расписания", callback_data="schtxt:" + key)])
+    if len(cands) > 1:
+        buttons.append([InlineKeyboardButton(
+            "📦 Прислать всё", callback_data="schall:" + key)])
+    buttons.append([InlineKeyboardButton("⬅️ В меню",
+                                         callback_data="schmon_menu")])
+    await wait_msg.edit_text(
+        "Вот что я нашёл на %s.\nВыберите кнопками, что присылать классу "
+        "ПОСТОЯННО (можно несколько).\nВыбранное пришлю сразу вам, дальше — "
+        "классу только при изменении, не чаще 1 раза в день."
+        % schmon_host_of(url),
+        reply_markup=InlineKeyboardMarkup(buttons),
+        disable_web_page_preview=True)
+    return ADMIN_PANEL
+
+
+async def _schmon_send_candidate_admin(bot, url, info, u, admin_chat_id,
+                                       skip_dup=False):
+    """Скачать и отправить один выбранный источник админу; запомнить выбор.
+    skip_dup=True — не слать, если такое же содержимое уже отправлялось."""
+    dl = await asyncio.to_thread(schmon_download_file, u, url)
+    if not dl:
+        return False
+    data, name = dl
+    digest = hashlib.md5(data).hexdigest()
+    sel = info.get("sel") or []
+    if skip_dup and schmon_was_sent(info, digest):
+        if u not in sel:
+            sel.append(u)
+        info["sel"] = sel
+        return True  # уже присылали такое же — выбор запомнили, дубль не шлём
+    ok = await schmon_send_item(bot, admin_chat_id, u, data, name,
+                                schmon_host_of(url))
+    if ok:
+        schmon_mark_sent(info, digest)
+        if u not in sel:
+            sel.append(u)
+        info["sel"] = sel
+    return ok
+
+
+async def schmon_pick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """schsnd:<key>:<idx> — скачать и сразу отправить источник админу."""
+    query = update.callback_query
+    parts = (query.data or "").split(":")
+    uid = str(query.from_user.id)
+    if len(parts) != 3:
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        return ADMIN_PANEL
+    key, idx = parts[1], -1
+    try:
+        idx = int(parts[2])
+    except ValueError:
+        pass
+    state, class_code, url, info = schmon_find_by_key(key)
+    class_obj = get_class_by_code(class_code) if class_code else None
+    if (not url or not isinstance(info, dict) or class_obj is None
+            or (uid not in (class_obj.admins or [])
+                and uid != str(class_obj.creator_id or ''))):
+        try:
+            await query.answer("Ссылка не найдена", show_alert=True)
+        except Exception:
+            pass
+        return ADMIN_PANEL
+    cands = info.get("cand") or []
+    if not (0 <= idx < len(cands)):
+        try:
+            await query.answer("Источник не найден", show_alert=True)
+        except Exception:
+            pass
+        return ADMIN_PANEL
+    try:
+        await query.answer("Отправляю…")
+    except Exception:
+        pass
+    ok = await _schmon_send_candidate_admin(context.bot, url, info,
+                                            cands[idx][0], uid)
+    schmon_merge_info(class_code, url, info)
+    if not ok:
+        try:
+            await query.answer("Не удалось скачать", show_alert=True)
+        except Exception:
+            pass
+    return ADMIN_PANEL
+
+
+async def schmon_text_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """schtxt:<key> — выслать админу текст расписания и следить за ним."""
+    query = update.callback_query
+    uid = str(query.from_user.id)
+    key = (query.data or "")[len("schtxt:"):]
+    state, class_code, url, info = schmon_find_by_key(key)
+    class_obj = get_class_by_code(class_code) if class_code else None
+    if (not url or not isinstance(info, dict) or class_obj is None
+            or (uid not in (class_obj.admins or [])
+                and uid != str(class_obj.creator_id or ''))):
+        try:
+            await query.answer("Ссылка не найдена", show_alert=True)
+        except Exception:
+            pass
+        return ADMIN_PANEL
+    try:
+        await query.answer("Ищу текст…")
+    except Exception:
+        pass
+    ok = False
+    try:
+        html_text = await asyncio.to_thread(schmon_fetch_page, url)
+    except Exception:
+        html_text = ""
+    sch_text = await asyncio.to_thread(schmon_get_schedule, html_text)
+    if sch_text and await schmon_send_text(
+            context.bot, uid,
+            "📅 Расписание\n%s\n\n%s" % (schmon_host_of(url), sch_text)):
+        ok = True
+        info["sch"] = schmon_text_hash(sch_text)
+        sel = info.get("sel") or []
+        if "TEXT" not in sel:
+            sel.append("TEXT")
+        info["sel"] = sel
+    schmon_merge_info(class_code, url, info)
+    if not ok:
+        await schmon_send_text(context.bot, uid,
+                               "⚠ Не удалось извлечь текст расписания.")
+    return ADMIN_PANEL
+
+
+async def schmon_all_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """schall:<key> — прислать админу все найденные источники и следить за
+    всеми."""
+    query = update.callback_query
+    uid = str(query.from_user.id)
+    key = (query.data or "")[len("schall:"):]
+    state, class_code, url, info = schmon_find_by_key(key)
+    class_obj = get_class_by_code(class_code) if class_code else None
+    if (not url or not isinstance(info, dict) or class_obj is None
+            or (uid not in (class_obj.admins or [])
+                and uid != str(class_obj.creator_id or ''))):
+        try:
+            await query.answer("Ссылка не найдена", show_alert=True)
+        except Exception:
+            pass
+        return ADMIN_PANEL
+    try:
+        await query.answer("Отправляю всё…")
+    except Exception:
+        pass
+    sent_any = False
+    for u, _k in (info.get("cand") or [])[:SCHEDMON_MAX_FILES_PER_NOTIFY]:
+        if await _schmon_send_candidate_admin(context.bot, url, info, u, uid,
+                                              skip_dup=True):
+            sent_any = True
+    schmon_merge_info(class_code, url, info)
+    if not sent_any:
+        await schmon_send_text(context.bot, uid,
+                               "⚠ Не удалось скачать файлы со страницы.")
+    return ADMIN_PANEL
+
+
+async def schmon_del_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """schdel:<key> — перестать следить за ссылкой."""
+    query = update.callback_query
+    uid = str(query.from_user.id)
+    key = (query.data or "")[len("schdel:"):]
+    state, class_code, url, info = schmon_find_by_key(key)
+    class_obj = get_class_by_code(class_code) if class_code else None
+    if url and class_obj is not None:
+        if (uid not in (class_obj.admins or [])
+                and uid != str(class_obj.creator_id or '')):
+            try:
+                await query.answer("Только для админов класса.",
+                                   show_alert=True)
+            except Exception:
+                pass
+            return ADMIN_PANEL
+        urls = schmon_class_urls(state, class_code)
+        urls.pop(url, None)
+        schmon_save(state)
+        _log_admin_action(uid, class_code,
+                          "Расписание с сайтов: ссылка удалена", url[:200])
+        try:
+            await query.answer("Удалено")
+        except Exception:
+            pass
+    else:
+        try:
+            await query.answer("Не найдено")
+        except Exception:
+            pass
+    show_obj = class_obj or _schmon_admin_class(context, uid)
+    if show_obj is not None:
+        try:
+            await query.edit_message_text(
+                _schmon_menu_text(show_obj),
+                reply_markup=_schmon_menu_kb(show_obj.class_code),
+                parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        except Exception:
+            pass
+    return ADMIN_PANEL
+
+
+async def schmon_check_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """«🔍 Проверить сейчас» — фоновая проверка всех ссылок класса + отчёт."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    uid = str(query.from_user.id)
+    class_obj = _schmon_admin_class(context, uid)
+    if not class_obj:
+        try:
+            await query.answer("Только для админов класса.", show_alert=True)
+        except Exception:
+            pass
+        return MAIN_MENU
+    class_code = class_obj.class_code
+    context.user_data['current_admin_class'] = class_code
+    state = schmon_normalize(schmon_load())
+    urls = schmon_class_urls(state, class_code)
+    if not urls:
+        try:
+            await query.answer("Сначала добавьте ссылку", show_alert=True)
+        except Exception:
+            pass
+        return ADMIN_PANEL
+    try:
+        await query.answer("Проверяю %d ссылок…" % len(urls))
+    except Exception:
+        pass
+    _task = asyncio.create_task(
+        schmon_force_check(context.application, class_code, uid))
+    try:
+        context.application.bot_data.setdefault("_bg_tasks", []).append(_task)
+    except Exception:
+        pass
+    return ADMIN_PANEL
+
+
+# ==================================
 # === АДМИНСКАЯ ПАНЕЛЬ ===
 # ==================================
 
@@ -52931,6 +54646,21 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await duty_custom_test_cb(update, context)
     elif data == "duty_custom_off":
         return await duty_custom_off_cb(update, context)
+    # ВОЛНА 22.66: «Расписание с сайтов» (админ-панель → 🌐)
+    elif data == "schmon_menu":
+        return await schmon_menu_cb(update, context)
+    elif data == "schmon_add":
+        return await schmon_add_cb(update, context)
+    elif data == "schmon_check":
+        return await schmon_check_cb(update, context)
+    elif data.startswith("schsnd:"):
+        return await schmon_pick_cb(update, context)
+    elif data.startswith("schtxt:"):
+        return await schmon_text_cb(update, context)
+    elif data.startswith("schall:"):
+        return await schmon_all_cb(update, context)
+    elif data.startswith("schdel:"):
+        return await schmon_del_cb(update, context)
     elif data == "edit_schedule":
         return await edit_schedule_start(update, context)
     elif data == "edit_teachers":
@@ -58522,6 +60252,20 @@ async def _post_init(application):
     except Exception as e2:
         logger.error(f"Не удалось восстановить очереди скачивания: {e2}")
 
+    # === ВОЛНА 22.66: мониторинг «Расписание с сайтов». ===
+    # Админ-панель → «🌐 Расписание с сайтов»: бот сам проверяет страницы
+    # школы каждые 5 минут и присылает классу обновления расписания
+    # (фото/файл/текст), не чаще 1 раза в день на ссылку.
+    try:
+        _schmon_task = asyncio.create_task(schmon_monitor_loop(application))
+        try:
+            application.bot_data.setdefault("_bg_tasks", []).append(_schmon_task)
+        except Exception:
+            pass
+        logger.info("Мониторинг «Расписание с сайтов» запущен (тик 30с).")
+    except Exception as e2:
+        logger.error(f"Не удалось запустить schmon_monitor_loop: {e2}")
+
     # === ШАГ 4: диагностика уведомлений по каждому пользователю. ===
     try:
         users_for_diag = load_users()
@@ -59303,6 +61047,11 @@ def main():
             # обрабатывался хендлером начала, зацикливая FSM навсегда.
             EDIT_BELL_END: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, save_bell_end_handler),
+                CallbackQueryHandler(handle_callback),
+            ],
+            # ВОЛНА 22.66: «Расписание с сайтов» — админ присылает ссылку.
+            SCHEDMON_URL: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, schmon_url_handler),
                 CallbackQueryHandler(handle_callback),
             ],
             SET_HOLIDAYS: [
