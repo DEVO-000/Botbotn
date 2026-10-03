@@ -3641,7 +3641,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.62"
+BOT_BUILD = "22.63"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -8147,101 +8147,20 @@ async def _bg_upload_big_mtproto(update, context, user, item, chat_msg, live=Non
         _shutil.rmtree(job_dir, ignore_errors=True)
 
 
-# ═══ ВОЛНА 22.62: АНТИ-ДУБЛИ «АВТОПЕРЕДАЧА + ПРЯМОЙ СТРИМ» ═══
-# Пользователь выбрал файлы — они летят боту ДВУМЯ путями одновременно:
-#   1) прямой стрим из мини-аппа (22.59/22.61 — байты идут, пока жив
-#      WebView);
-#   2) автопередача в Telegram (22.62 — системная панель «поделиться»
-#      через navigator.share → чат бота → нативная очередь Telegram,
-#      настоящий фон).
-# Кто первый довёз — тот и сохранил. Второй путь — дубликат: один и
-# тот же файл НЕ должен появляться в облаке дважды. Реестр ниже держит
-# «клеймы» имя+размер на окно 10 минут для обоих путей: чат-роутер
-# (_bg_upload_items) и финализация стрима (_miniapp_upload_finalize)
-# сверяются перед сохранением.
-_DUP_RECENT = {}        # uid -> {"имя|размер": [ts_claim, ts_saved?]
-_DUP_WINDOW = 600.0     # секунд
-
-
-def _dup_key(name, size):
-    return f"{str(name or '')[:200]}|{int(size or 0)}"
-
-
-def _dup_prune(uid):
-    ent = _DUP_RECENT.get(uid)
-    if not ent:
-        return
-    now = time.time()
-    for k in [k for k, v in ent.items() if now - max(v) > _DUP_WINDOW]:
-        ent.pop(k, None)
-    if not ent:
-        _DUP_RECENT.pop(uid, None)
-
-
-def _dup_claim(uid, name, size):
-    """True — такой файл УЖЕ сохраняют/сохраняли в окне 10 минут.
-    False — свободно, и мы сами поставили клейм (не забудьте
-    _dup_release при неудаче или _dup_saved при успехе)."""
-    _dup_prune(uid)
-    ent = _DUP_RECENT.setdefault(uid, {})
-    v = ent.get(_dup_key(name, size))
-    if v and time.time() - max(v) < _DUP_WINDOW:
-        return True
-    ent[_dup_key(name, size)] = [time.time()]
-    return False
-
-
-def _dup_held(uid, name, size):
-    """Клейм занят (кем-то) — без захвата, только проверка."""
-    ent = _DUP_RECENT.get(uid)
-    if not ent:
-        return False
-    v = ent.get(_dup_key(name, size))
-    return bool(v and time.time() - max(v) < _DUP_WINDOW)
-
-
-def _dup_release(uid, name, size):
-    """Наш клейм не понадобился (сохранение не удалось) — снимаем,
-    чтобы другой путь мог сохранить файл без потерь."""
-    ent = _DUP_RECENT.get(uid)
-    if ent:
-        ent.pop(_dup_key(name, size), None)
-        if not ent:
-            _DUP_RECENT.pop(uid, None)
-
-
-def _dup_saved(uid, name, size):
-    """Файл реально сохранён — клейм живёт от момента СОХРАНЕНИЯ."""
-    ent = _DUP_RECENT.setdefault(uid, {})
-    ent[_dup_key(name, size)] = [time.time(), time.time()]
-
-
-def _cloud_recent_dup(user, name, size):
-    """ВОЛНА 22.62: свежая (≤15 мин) запись в облаке с тем же именем и
-    размером — автопередача уже сохранила этот файл из чата."""
-    try:
-        cut = time.time() - 900.0
-        for f in reversed(getattr(user, "cloud_files", []) or []):
-            if not isinstance(f, dict):
-                continue
-            if str(f.get("name") or "")[:200] == str(name or "")[:200] and \
-                    int(f.get("size") or 0) == int(size or 0):
-                try:
-                    if float(f.get("ts") or 0) >= cut:
-                        return f
-                except Exception:
-                    return f
-    except Exception:
-        pass
-    return None
-
-
-# ВОЛНА 22.62: пометка «файлы сейчас передаются боту через Telegram»
-# (мини-апп ставит её перед автопередачей, POST /api/upload/tg_mark).
-# Пока пометка свежая — итоги сохранения из чата отправляются
-# БЕЗЗВУЧНО (disable_notification): «как в обычном чате, но БЕЗ
-# оповещений», прогресс виден только в панели передач мини-аппа.
-_TG_AUTOSHARE_MARK = {}
+# ═══ ВОЛНА 22.63: АНТИ-ДУБЛИ И АВТОПЕРЕДАЧА 22.62 ПОЛНОСТЬЮ УБРАНЫ ═══
+# Пользователь: «файлы вообще не синхронизируются… убери новые кнопки
+# "загрузить через телеграм" и "авто передача в телеграм" — всё должно
+# быть включено по умолчанию». Реестр анти-дублей 22.62 оказался ВРЕДНЫМ:
+#   • _dup_claim в финализации ставил клейм на файл КАК ПОБОЧНЫЙ ЭФФЕКТ
+#     проверки — и чат-роутер потом МОЛКА глотал те же файлы 10 минут;
+#   • финализация стрима могла ЖДАТЬ чужой клейм до 20 секунд — клиент
+#     видел «зависшую» загрузку и таймауты;
+#   • повторная загрузка того же файла (то же имя+размер) в течение
+#     15 минут молча «сводилась» — файл НЕ появлялся в облаке.
+# Пути загрузки снова ДВА и они НЕ пересекаются: прямой стрим из
+# мини-аппа (22.59/22.61, включён всегда) и файлы, присланные в чат
+# бота вручную («как в обычном чате», роутер 22.57). Каждый файл
+# сохраняется честно, без клеймов и ожиданий.
 
 
 async def _bg_upload_items(update, context, items):
@@ -8252,15 +8171,14 @@ async def _bg_upload_items(update, context, items):
     user = get_user(user_id)
     if not user:
         return
-    # ВОЛНА 22.62: автопередача из мини-аппа — работаем максимально тихо:
-    # итог в чат БЕЗ звука и пуша (пользователь просил «без оповещений»,
-    # прогресс он видит в панели передач мини-аппа)
-    _tg_silent = time.time() - _TG_AUTOSHARE_MARK.get(user_id, 0.0) < 900.0
+    # 22.63: беззвучность автопередачи убрана вместе с ней — файлы из
+    # чата отправлены ВРУЧНУЮ, пользователь смотрит в чат: обычный
+    # ответ бота уместен («как в обычном чате»)
     if not get_cloud_channel_ids() and not _user_vault_channel(user):
         await msg.reply_text(
             "❌ Хранилище не настроено — файл не сохранён. Попросите "
             "разработчика подключить канал, либо подключите СВОЙ: "
-            "🔐 Сейф → 🔗 Моё облако.", disable_notification=_tg_silent)
+            "🔐 Сейф → 🔗 Моё облако.")
         return
 
     files = [f for f in (getattr(user, "cloud_files", []) or []) if isinstance(f, dict)]
@@ -8273,7 +8191,6 @@ async def _bg_upload_items(update, context, items):
         pass
 
     saved, skipped_big, failed, limit_hit = [], [], [], False
-    deduped = []            # 22.62: имена, сведённые с прямым стримом
     warned_quality = False
 
     _msg_mid = int(getattr(msg, "message_id", 0) or 0)
@@ -8285,12 +8202,6 @@ async def _bg_upload_items(update, context, items):
             continue
         size = int(item.get("size") or 0)
         name = str(item.get("name") or "файл")
-        # ВОЛНА 22.62: дубль прямого стрима — автопередача и стрим грузили
-        # ОДНИ И ТЕ ЖЕ файлы одновременно. Файл уже в облаке (или стрим
-        # сохраняет его прямо сейчас) — второго не создаём, тихо пропускаем
-        if _dup_claim(user_id, name, size):
-            deduped.append(name)
-            continue
         # ВОЛНА 22.58: живой статус файла для панели передач мини-аппа.
         _lk = f"{_msg_mid}-{_li}"
         _bg_live_add(user_id, _lk, name, size)
@@ -8300,16 +8211,13 @@ async def _bg_upload_items(update, context, items):
             channel_id = _bg_upload_target(user)
             if channel_id is None:
                 _bg_live_del(user_id, _lk)
-                _dup_release(user_id, name, size)
                 await msg.reply_text(
-                    "❌ Хранилище не настроено — файл не сохранён.",
-                    disable_notification=_tg_silent)
+                    "❌ Хранилище не настроено — файл не сохранён.")
                 return
             _bg_live_set(user_id, _lk, "save")
             sent = await _bg_send_media(context, channel_id, item)
             if sent is None:
                 _bg_live_del(user_id, _lk)
-                _dup_release(user_id, name, size)
                 failed.append(f"{name[:40]}: Telegram не принял")
                 continue
             rec = {
@@ -8331,13 +8239,11 @@ async def _bg_upload_items(update, context, items):
                 update, context, user, item, msg, live=(user_id, _lk))
             if rec is None:
                 _bg_live_del(user_id, _lk)
-                _dup_release(user_id, name, size)
                 why = item.get("_why")
                 if why == "big_hard_limit":
                     await msg.reply_text(
                         f"🚫 «{name[:40]}» больше 2 ГБ — потолок Telegram "
-                        "для ботов. Разделите файл на части по ~1,5 ГБ.",
-                        disable_notification=_tg_silent)
+                        "для ботов. Разделите файл на части по ~1,5 ГБ.")
                 elif why == "mt_failed":
                     failed.append(f"{name[:40]}: не докачался — "
                                   "попробуйте ещё раз")
@@ -8347,20 +8253,7 @@ async def _bg_upload_items(update, context, items):
                 else:
                     skipped_big.append(item)
                 continue
-            # ВОЛНА 22.62: большая загрузка шла минутами — за это время
-            # прямой стрим мог сохранить ЭТОТ ЖЕ файл. Проверяем свежий
-            # список облака: дубль не добавляем (файл уже там).
-            try:
-                _fc = [f for f in (getattr(get_user(user_id), "cloud_files", [])
-                                   or []) if isinstance(f, dict)]
-                if any(str(f.get("name") or "")[:200] == name[:200] and
-                       int(f.get("size") or 0) == size for f in _fc):
-                    deduped.append(name)
-                    continue
-            except Exception:
-                pass
         _bg_live_del(user_id, _lk)
-        _dup_saved(user_id, name, size)   # 22.62: анти-дубль: файл сохранён
         files.append(rec)
         saved.append(rec)
         # Подсказка про качество — ОДНА строка и один раз за пачку.
@@ -8397,10 +8290,6 @@ async def _bg_upload_items(update, context, items):
             lines.append(f"🚫 «{item['name'][:40]}» тоже больше 49 МБ.")
     if failed:
         lines.append("⚠️ Не удалось: " + "; ".join(failed[:5]))
-    if deduped:
-        # 22.62: файлы, которые уже доехали прямым стримом — дублей нет
-        lines.append(f"♻️ {len(deduped)} файл(ов) уже загружен(ы) напрямую — "
-                     "дубли не созданы.")
     if lines:
         kb = None
         if MINIAPP_URL:
@@ -8410,11 +8299,9 @@ async def _bg_upload_items(update, context, items):
         try:
             if skipped_big:
                 await msg.reply_text("\n".join(lines),
-                                     reply_markup=get_big_file_keyboard(),
-                                     disable_notification=_tg_silent)
+                                     reply_markup=get_big_file_keyboard())
             else:
-                await msg.reply_text("\n".join(lines), reply_markup=kb,
-                                     disable_notification=_tg_silent)
+                await msg.reply_text("\n".join(lines), reply_markup=kb)
         except Exception:
             pass
 
@@ -11841,27 +11728,6 @@ body.vp-lock {
     </p>
 
     <div style="display:flex;flex-direction:column;gap:8px">
-      <button class="sound-item-btn" id="uploadViaBotBtn" onclick="uploadViaBot()" style="background:#2481cc;color:#ffffff;border-color:#2481cc">
-        <div style="text-align:left">
-          <div style="font-weight:800">📤 Загрузить через Telegram</div>
-          <div style="font-size:11px;opacity:.85;margin-top:2px" id="uploadViaBotSub">Грузится в фоне на 100% — прогресс появится здесь</div>
-        </div>
-        <i data-lucide="send" style="width:18px;height:18px"></i>
-      </button>
-
-      <!-- ВОЛНА 22.62: тумблер АВТОПЕРЕДАЧИ — после выбора файлов мини-апп
-           сам открывает системную панель «поделиться» с УЖЕ выбранными
-           файлами (Telegram → чат бота → «Отправить»). Дальше файлы грузит
-           сам Telegram: нативная очередь, настоящий фон, переживает
-           закрытие мини-аппа. Показывается только там, где поддерживается. -->
-      <button class="sound-item-btn" id="tgAutoShareRow" onclick="tgAutoShareToggle()" style="display:none">
-        <div style="text-align:left">
-          <div style="font-weight:800">🤖 Автопередача в Telegram: <span id="tgAutoShareState">вкл</span></div>
-          <div style="font-size:11px;opacity:.7;margin-top:2px" id="tgAutoShareHint">Выбрали файлы — Telegram откроется сам, останется нажать «Отправить»</div>
-        </div>
-        <i data-lucide="zap" style="width:18px;height:18px"></i>
-      </button>
-
       <button class="sound-item-btn" id="uploadAddBtn" onclick="pickUploadFiles()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
         <span>Добавить файл</span>
         <i data-lucide="plus" style="width:18px;height:18px"></i>
@@ -14868,14 +14734,16 @@ function botQueueTrack() {
 
 /* ═══ ВОЛНА 22.58: ЖИВАЯ КАРТОЧКА «ЗАГРУЗКА ЧЕРЕЗ БОТА» ═══
    Физика WebView: мини-апп не может сам «отдать» выбранные файлы в чат
-   бота — байты уходят только пока он жив. Поэтому главный путь (22.57) —
-   файлы прикладываются В ЧАТЕ бота, Telegram доносит их сам (настоящий
-   фон, 100%), а бот сохраняет всё в облако на сервере. Здесь этот путь
-   становится ПРОЗРАЧНЫМ: карточка в панели передач включается в момент
-   нажатия кнопки «📤 Загрузить через Telegram» и живёт, пока файлы
-   едут: считает приехавшие из чата файлы (src='chat' свежее пометки
-   dv_bg_wait_ts) и показывает серверные статусы bg_live — в том числе
-   живые проценты больших файлов («Качаю с Telegram: 45%»). */
+   бота — байты уходят только пока он жив. Роутер 22.57 сохраняет файлы,
+   присланные в чат бота вручную, в облако на сервере. Здесь этот путь
+   ПРОЗРАЧЕН: карточка в панели передач включается, когда пользователь
+   недавно отправлял файлы в чат (пометка dv_bg_wait_ts), и живёт, пока
+   файлы едут: считает приехавшие из чата файлы (src='chat' свежее
+   пометки dv_bg_wait_ts) и показывает серверные статусы bg_live — в том
+   числе живые проценты больших файлов («Качаю с Telegram: 45%»).
+   ВОЛНА 22.63: кнопки «через Telegram» (22.57) и автопередача (22.62)
+   убраны — пометку больше никто не ставит, карточка спит, а файлы из
+   чата честно показываются тостом «📨 Через бота загрузилось: N». */
 let bgUploadTimer = null;
 let bgUploadLastGrow = 0;
 let bgUploadCount = 0;
@@ -16013,11 +15881,13 @@ function refreshUploadModal() {
 
   if (info) {
     info.textContent = !has
-      /* ВОЛНА 22.59: файлы летят боту С МОМЕНТА ВЫБОРА — окно теперь
-         настройки (пароль/имена), а не «шлюз». ВОЛНА 22.61: текст честный:
-         что успело дойти — сохранится само; недокачанное продолжится при
-         следующем открытии облака, бот молча подскажет в чате. */
-      ? 'Файлы, выбранные ниже, сразу летят боту. Что успеет дойти — сохранится само; недокачанное продолжится при следующем открытии (бот подскажет в чате). Для 100% фона — кнопка «через Telegram» ниже.'
+      /* ВОЛНА 22.63: кнопки «через Telegram» и автопередача убраны по
+         просьбе пользователя («убери новые кнопки — всё должно быть
+         включено по умолчанию»). Единственный путь — прямой стрим боту,
+         он включён ВСЕГДА и стартует с момента выбора файлов (22.59):
+         что успело доехать — сохранится само, недокачанное продолжится
+         при следующем открытии облака (бот молча подскажет в чате). */
+      ? 'Файлы, выбранные ниже, сразу летят боту — загрузка включена всегда. Что успеет дойти — сохранится само; недокачанное продолжится при следующем открытии (бот подскажет в чате).'
       : pendingFiles.length === 1
         ? (pendingFiles[0].name || 'файл') + ' — уже летит боту. Пароль (в Сейф) и имя — по кнопке «Отправить», можно и просто закрыть окно.'
         : 'Выбрано файлов: ' + pendingFiles.length + ' — все уже летят боту. Пароль (в Сейф) и имена — по кнопке «Отправить», окно можно закрыть.';
@@ -16049,31 +15919,6 @@ function refreshUploadModal() {
   if (addBtn) addBtn.classList.toggle('hidden', has);
   if (sendBtn) sendBtn.classList.toggle('hidden', !has);
   if (moreBtn) moreBtn.classList.toggle('hidden', !has);
-
-  /* ВОЛНА 22.62: тумблер автопередачи — видим только там, где она
-     реально работает (телефон + Web Share с файлами + нет шифрования);
-     подпись синей кнопки подстраивается под режим */
-  const tgRow = document.getElementById('tgAutoShareRow');
-
-  if (tgRow) {
-    const tgCapable = tgAutoShareCapable() && IS_MOBILE_UA &&
-      STORAGE_ENCRYPTED !== true;
-
-    tgRow.style.display = tgCapable ? '' : 'none';
-
-    const tgSt = document.getElementById('tgAutoShareState');
-
-    if (tgSt) tgSt.textContent = tgAutoShareEnabled() ? 'вкл' : 'выкл';
-  }
-
-  const vbb = document.getElementById('uploadViaBotSub');
-
-  if (vbb) {
-    vbb.textContent = (tgAutoShareCapable() && IS_MOBILE_UA &&
-      tgAutoShareEnabled() && STORAGE_ENCRYPTED !== true)
-      ? 'Уже включена: после выбора файлов Telegram откроется сам'
-      : 'Грузится в фоне на 100% — прогресс появится здесь';
-  }
 
   /* ВОЛНА 22.40: пароль ОБЯЗАТЕЛЕН только когда хранилище шифруется
      (STORAGE_ENCRYPTED === true). Раньше поле становилось обязательным,
@@ -16212,190 +16057,18 @@ function addMoreUploadFiles() {
   document.getElementById('fileInput').click();
 }
 
-/* ═══ ВОЛНА 22.57: ГЛАВНЫЙ ПУТЬ ЗАГРУЗКИ — «ЧЕРЕЗ БОТА» (в фоне) ═══
-   Физика WebView: когда мини-апп закрывают, его JS умирает, и байты
-   файлов перестают идти С ТЕЛЕФОНА навсегда — сколько движок ни улучшай.
-   Единственная по-настоящему фоновая загрузка — НАТИВНАЯ загрузка
-   Telegram: пользователь прикладывает файлы в ЧАТ бота, Telegram сам
-   доносит их (даже с закрытым мини-аппом; на Android — даже со
-   свёрнутым Telegram; очередь не теряется никогда), а бот сохраняет
-   всё в облако НА СЕРВЕРЕ. Кнопка открывает чат бота — дальше
-   пользователь просто прикрепляет файлы. */
-function uploadViaBot() {
-  const uname = String(CONN.bot || '').replace(/^@/, '').trim();
-
-  if (!uname) {
-    showToast('Не нашёл адрес бота — нажмите «🔄» в шапке и попробуйте ещё раз');
-    return;
-  }
-
-  /* ВОЛНА 22.58: включаем живое отслеживание. Пометка dv_bg_wait_ts —
-     момент ухода в чат бота: всё, что приедет из чата ПОСЛЕ неё (src='chat'),
-     карточка в панели передач посчитает своим. Карточка живёт, пока
-     пользователь прикладывает файлы в чате: показывает серверные статусы
-     (bg_live: «Качаю с Telegram: 45%») и счётчик «Сохранено: N». */
-  try {
-    localStorage.setItem('dv_bg_wait_ts', String(Math.floor(Date.now() / 1000)));
-  } catch (e) {}
-  bgUploadEnsureCard();
-  bgUploadSchedule(1500);
-  showToast('Прикрепите файлы скрепкой в чате бота — Telegram доносит их в фоне, здесь появится прогресс');
-
-  const url = 'https://t.me/' + encodeURIComponent(uname);
-
-  try {
-    if (tg && tg.openTelegramLink) {
-      tg.openTelegramLink(url);
-      return;
-    }
-  } catch (e) {}
-
-  try {
-    if (tg && tg.openLink) {
-      tg.openLink(url);
-      return;
-    }
-  } catch (e) {}
-
-  window.open(url, '_blank');
-}
-
-/* ═══ ВОЛНА 22.62: АВТОПЕРЕДАЧА В TELEGRAM ПРИ ВЫБОРЕ ФАЙЛОВ ═══
-   Пользователь: «Файлы должны идти сразу в бот — как кнопка «через
-   Telegram», но АВТОМАТИЧЕСКИ, чтобы загрузка продолжалась при
-   закрытии». Физика WebView не изменилась: мини-апп не может сам
-   вложить файлы в чат бота. Но Web Share API (level 2) умеет почти
-   это: СРАЗУ после выбора файлов открываем СИСТЕМНУЮ панель
-   «поделиться» с УЖЕ выбранными файлами — пользователю остаётся
-   выбрать Telegram и нажать «Отправить». Дальше файлы грузит САМ
-   TELEGRAM (нативная очередь): настоящий фон, переживает закрытие
-   мини-аппа, гашение экрана и слабую сеть, очередь не теряется
-   никогда. Это максимум «автоматически», который допускают iOS и
-   Android (полный запрет делится без касания — защита ОС).
-   Параллельно продолжает работать прямой стрим боту (22.59/22.61):
-   кто первый довёз — тот и сохранил, дубли сводятся на сервере
-   тихо (волна 22.62, _dup_*), в облаке файл ОДИН. */
-const TG_AUTOSHARE_KEY = 'dv_tg_autoshare';
-
-const IS_MOBILE_UA = (function () {
-  try {
-    return navigator.maxTouchPoints > 0 ||
-      /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent || '');
-  } catch (e) {
-    return false;
-  }
-})();
-
-function tgAutoShareEnabled() {
-  try {
-    return localStorage.getItem(TG_AUTOSHARE_KEY) !== '0';
-  } catch (e) {
-    return true;
-  }
-}
-
-function tgAutoShareSet(on) {
-  try {
-    localStorage.setItem(TG_AUTOSHARE_KEY, on ? '1' : '0');
-  } catch (e) {}
-}
-
-function tgAutoShareToggle() {
-  const on = !tgAutoShareEnabled();
-
-  tgAutoShareSet(on);
-  refreshUploadModal();
-  showToast(on
-    ? '🤖 Автопередача вкл — после выбора файлов Telegram откроется сам'
-    : '🤖 Автопередача выкл — файлы грузятся напрямую (пока приложение открыто)');
-}
-
-function tgAutoShareCapable() {
-  /* Web Share level 2 (с файлами) доступен не везде: Android — да,
-     iOS/десктоп WebView — почти никогда. Проверяем честно. */
-  try {
-    return !!(navigator.share && navigator.canShare);
-  } catch (e) {
-    return false;
-  }
-}
-
-function tgAutoSharePick(files) {
-  /* какие файлы система реально примет в панель «поделиться» */
-  if (!files || !files.length) return [];
-  if (!tgAutoShareCapable() || !IS_MOBILE_UA) return [];
-
-  try {
-    const all = files.slice(0, 50);
-
-    if (navigator.canShare({ files: all })) return all;
-
-    const typed = all.filter((f) => f && f.type);
-
-    if (typed.length && navigator.canShare({ files: typed })) return typed;
-  } catch (e) {}
-
-  return [];
-}
-
-function tgAutoShareHandoff(files) {
-  /* Открывает панель «поделиться» СРАЗУ после выбора файлов.
-     ВАЖНО (физика браузеров): navigator.share требует ЖИВОГО касания —
-     вызов обязан случиться в той же цепочке событий, что и подтверждение
-     выбора файлов в пикере. Поэтому до самого вызова — НИ ОДНОГО await,
-     только синхронные операции, иначе ОС откажет (NotAllowedError). */
-  if (!tgAutoShareEnabled()) return Promise.resolve(false);
-
-  /* при включённом шифровании не предлагаем: файлы из чата попадают в
-     облако БЕЗ шифра — такое нельзя делать молча, пусть решает кнопка */
-  if (STORAGE_ENCRYPTED === true) return Promise.resolve(false);
-
-  const shareFiles = tgAutoSharePick(files);
-
-  if (!shareFiles.length) return Promise.resolve(false);
-
-  /* пометка «сейчас поедет через Telegram» + живая карточка (22.58):
-     как только бот сохранит файлы из чата, панель передач покажет
-     счётчик и проценты. Сервер по этой же пометке (/api/upload/tg_mark)
-     делает итоги в чате БЕЗЗВУЧНЫМИ — «как в обычном чате, но без
-     оповещений». */
-  try {
-    localStorage.setItem('dv_bg_wait_ts', String(Math.floor(Date.now() / 1000)));
-  } catch (e) {}
-
-  apiJson('/api/upload/tg_mark', {
-    method: 'POST',
-    headers: vaultHeaders({ 'Content-Type': 'application/json' }),
-    body: '{}'
-  }).catch(() => {});
-
-  bgUploadEnsureCard();
-  bgUploadSchedule(1500);
-
-  showToast('📤 Выберите Telegram и чат бота — отправится одним разом и продолжит грузиться В ФОНЕ, даже если закрыть приложение');
-
-  try {
-    return navigator.share({ files: shareFiles, title: 'Облако' })
-      .then(() => {
-        /* панель закрыта отправкой: файлы теперь грузит сам Telegram */
-        showToast('📨 Отдано Telegram — грузится в фоне, прогресс здесь');
-        return true;
-      })
-      .catch((e) => {
-        /* отменили / система не разрешила: НЕ страшно — прямой стрим
-           боту (22.59) продолжает грузить файлы, пока приложение открыто */
-        const why = (e && e.name === 'NotAllowedError')
-          ? 'Автопередача не открылась — файлы грузятся напрямую'
-          : 'Отправку отменили — файлы грузятся напрямую';
-
-        bgUploadFinish(false, 0, why);
-        return false;
-      });
-  } catch (e) {
-    bgUploadFinish(false, 0, 'Автопередача не открылась — файлы грузятся напрямую');
-    return Promise.resolve(false);
-  }
-}
+/* ═══ ВОЛНА 22.63: КНОПКИ «ЧЕРЕЗ TELEGRAM» И АВТОПЕРЕДАЧА УБРАНЫ ═══
+   Пользователь: «убери новые кнопки "загрузить через телеграм" и
+   "авто передача в телеграм" — всё должно быть включено по умолчанию.
+   Файлы вообще не синхронизируются». Причины убрать: системная панель
+   «поделиться» (22.62) открывалась ПОВЕРХ окна загрузки и путала поток,
+   а кнопка 22.57 вела в чат бота вместо загрузки. Единственный путь
+   теперь — прямой стрим боту (22.59/22.61), он включён ВСЕГДА, без
+   тумблеров: файлы летят боту с момента выбора, байты переживают
+   закрытие окна (hold-сессии), недокачанное продолжается при следующем
+   открытии облака из очереди IndexedDB. Файлы, присланные в чат бота
+   вручную («как в обычном чате»), по-прежнему сохраняются в облако
+   автоматически (сервер, роутер 22.57). */
 
 function uploadFiles(fileList) {
   let files = Array.from(fileList);
@@ -16422,14 +16095,9 @@ function uploadFiles(fileList) {
 
   if (!files.length) return;
 
-  /* ═══ ВОЛНА 22.62: АВТОПЕРЕДАЧА В TELEGRAM ═══
-     Вызов ДО всего остального и без await: navigator.share обязан
-     сработать в той же цепочке касания, что и выбор файлов (иначе ОС
-     запрещает). Успешно открылась панель — дальше файлы грузит сам
-     Telegram (нативная очередь, 100% фон). Не открылась/отменили —
-     молча остаётся прямой стрим боту ниже (22.59). Панель «поделиться»
-     открывается ПОВЕРХ окна загрузки — настройки доступны после. */
-  tgAutoShareHandoff(files).catch(() => {});
+  /* ВОЛНА 22.63: перехват выбора файлов автопередачей (22.62) убран —
+     никакой системной панели «поделиться», поток не прерывается:
+     сразу окно загрузки, файлы летят боту напрямую с момента выбора. */
 
   const modalOpen = !!(document.getElementById('uploadModal') || {}).classList &&
     document.getElementById('uploadModal').classList.contains('open');
@@ -17640,11 +17308,10 @@ async function _uploadOneSession(file, reportBytes) {
 
   /* ВОЛНА 22.50: pollUploadStatus отдаёт запись файла напрямую, обычный
      complete — объектом {file: …}; приводим к одному виду.
-     ВОЛНА 22.62: сервер свёл дубль (файл уже сохранён из чата —
-     автопередача обогнала прямой стрим): помечаем файл, чтобы движок
-     не добавлял вторую карточку и не хвастался «загружено» дважды. */
+     ВОЛНА 22.63: ветка dedup убрана вместе с автопередачей 22.62 —
+     сервер снова честно сохраняет КАЖДУЮ загрузку, дублей в потоке
+     нет (путь загрузки теперь один). */
   if (done && done.file) {
-    if (done.dedup) file._dupFlag = true;
     return done.file;
   }
 
@@ -17777,7 +17444,6 @@ async function uploadEngine(bar) {
      старого движка больше не подходит */
   const fileBytes = new Map();
   let reportedTotal = 0;
-  let dedupedCount = 0;   /* 22.62: сколько файлов свёл сервер (уже из чата) */
 
   const reportTotal = () => {
     setUploadPct((reportedTotal / totalBytes) * 100, bar);
@@ -17820,11 +17486,9 @@ async function uploadEngine(bar) {
           }
         });
 
-        /* 22.62: дубль сведён сервером (файл уже приехал через
-           Telegram) — карточку и похвалу не дублируем */
-        if (rec && file._dupFlag) {
-          dedupedCount++;
-        } else if (rec) {
+        /* 22.63: dedup-ветки больше нет — путь загрузки один (прямой
+           стрим), каждый сохранённый файл честно попадает в карточки */
+        if (rec) {
           added.push(rec);
         }
 
@@ -17934,7 +17598,6 @@ async function uploadEngine(bar) {
 
   showToast(
     (anySafe ? '✅ Успешно! 🔒 Зашифровано и в Сейфе' : '✅ Загружено') +
-    (dedupedCount ? ' · ♻️ уже приехали через Telegram: ' + dedupedCount : '') +
     (maxQueuePos > 1 ? ' · ⏳ публикация в канале, перед вами: ' + (maxQueuePos - 1) : ''));
 
   added.forEach((rec) => {
@@ -23729,24 +23392,12 @@ async def _upload_auto_complete_task(app, upid):
                 pass
 
 
-async def miniapp_upload_tg_mark(request):
-    """ВОЛНА 22.62: пометка «файлы передаются боту через Telegram».
-
-    Мини-апп ставит её ПЕРЕД автопередачей (navigator.share → панель
-    «поделиться» → чат бота). Пока пометка свежая (15 минут), итоги
-    сохранения файлов ИЗ ЧАТА бот отправляет БЕЗЗВУЧНО
-    (disable_notification) — «как в обычном чате, но БЕЗ оповещений».
-    Прогресс пользователь видит в панели передач мини-аппа (bg_live),
-    а дубли с прямым стримом сводятся отдельно (_dup_*)."""
-    user, uid, err = await _api_get_user_any(request)
-    if err is not None:
-        return err
-    _TG_AUTOSHARE_MARK[uid] = time.time()
-    if len(_TG_AUTOSHARE_MARK) > 512:
-        cut = time.time() - 900.0
-        for k in [k for k, v in _TG_AUTOSHARE_MARK.items() if v < cut]:
-            _TG_AUTOSHARE_MARK.pop(k, None)
-    return web.json_response({"ok": True})
+# ВОЛНА 22.63: эндпоинт /api/upload/tg_mark и пометка _TG_AUTOSHARE_MARK
+# УБРАНЫ вместе с автопередачей 22.62. Старые кэшированные копии мини-аппа
+# (Service Worker) могут ещё слать POST /api/upload/tg_mark — получают
+# честный 404, клиентский вызов обёрнут в .catch(() => {}), это тихо и
+# безопасно. Чат-роутер 22.57 (файлы, присланные в чат вручную) работает
+# как раньше — обычным ответом, без беззвучного режима.
 
 
 def _notify_auto_complete(uid, s, payload, ok=True):
@@ -24169,10 +23820,6 @@ async def _miniapp_upload_finalize(user, uid, upid, s, pw_raw="",
     # ВАЖНО: _mt_upload_container может ПЕРЕИМЕНОВАТЬ временный файл — чистим оба пути.
     mt_renamed = os.path.join(os.path.dirname(s["path"]), s["name"] or "file.bin")
     _finished = False   # сессия закрыта (успех или неисправимая порча)
-    # ВОЛНА 22.62: анти-дубль — переменные доступны в finally (ранние
-    # return'ы до присваивания name/size больше не роняют обработчик)
-    name, size = "", 0
-    _dup_mine = False   # клейм анти-дубля держим мы — при неудаче снимем
     try:
         if s["size"] <= 0:
             # ВОЛНА 22.38: 0-байтовые файлы невозможны (init их отвергает;
@@ -24286,34 +23933,12 @@ async def _miniapp_upload_finalize(user, uid, upid, s, pw_raw="",
             _miniapp_prune_completed()
             return True, _resp
         # === режим «БЕЗ ШИФРА» (личный канал) — прежний путь, облако ===
-        # ВОЛНА 22.62: СВЕДЕНИЕ ДУБЛЕЙ (автопередача + прямой стрим).
-        # Пользователь выбрал файлы — они полетели ДВУМЯ путями: эта
-        # сессия (прямой стрим) и автопередача в Telegram (панель
-        # «поделиться» → чат бота). Кто первый довёз — тот и сохранил.
-        # Файл уже сохранён из чата — второй раз не заливаем, отдаём
-        # клиенту УЖЕ СОХРАНЁННУЮ запись (dedup: true — без второй
-        # карточки в списке). Если файл из чата сохраняют прямо сейчас —
-        # коротко ждём (фаст-путь чата — секунды) и сверяемся ещё раз.
-        _dd = _cloud_recent_dup(user, name, size)
-        if _dd is None and (_dup_held(uid, name, size) or
-                            _dup_claim(uid, name, size)):
-            for _ in range(10):
-                await asyncio.sleep(2.0)
-                _dd = _cloud_recent_dup(user, name, size)
-                if _dd is not None or not _dup_held(uid, name, size):
-                    break
-        if _dd is not None:
-            _dup_saved(uid, name, size)
-            _finished = True
-            _resp = {"file": _miniapp_rec_out(_dd), "dedup": True}
-            _MINIAPP_COMPLETED[upid] = {"ts": time.time(), "uid": uid,
-                                        "resp": _resp}
-            _miniapp_prune_completed()
-            logger.info(f"upload {upid}: дубль сведён — «{name[:40]}» "
-                        "уже в облаке (автопередача 22.62)")
-            return True, _resp
-        _dup_claim(uid, name, size)
-        _dup_mine = True
+        # ВОЛНА 22.63: сведение дублей 22.62 убрано ПОЛНОСТЬЮ. Оно вредило:
+        # клейм ставился как побочный эффект проверки и жил 10 минут, из-за
+        # чего повторная загрузка того же файла молча «сводилась», а живой
+        # клейм чата мог ЗАМОРОЗИТЬ финализацию на 20 секунд (клиент видел
+        # зависшую загрузку и рвал связь). Путь загрузки теперь один —
+        # прямой стрим из мини-аппа: каждый complete честно сохраняет файл.
         app = _MINIAPP_PTB_APP
         sent = None
         if size <= STORAGE_MAX_FILE_BYTES:
@@ -24364,8 +23989,6 @@ async def _miniapp_upload_finalize(user, uid, upid, s, pw_raw="",
                             if isinstance(f, dict)]
         user.cloud_files.append(rec)
         save_user(user)
-        _dup_saved(uid, name, size)   # 22.62: анти-дубль — файл сохранён
-        _dup_mine = False
         # ВОЛНА 22.38: «Скрыть» в канале больше не отправляем (см. выше).
         # ВОЛНА 22.35: позиция в очереди публикаций канала (1 = печатали сразу)
         out = _miniapp_rec_out(rec)
@@ -24394,10 +24017,8 @@ async def _miniapp_upload_finalize(user, uid, upid, s, pw_raw="",
                     pass
         else:
             s["completing"] = False
-            # 22.62: сохранить не удалось — снимаем свой анти-дубль клейм,
-            # чтобы этот же файл из чата не потерялся из-за нас
-            if _dup_mine:
-                _dup_release(uid, name, size)
+            # 22.63: анти-дубль клеймы убраны — при неудаче просто
+            # возвращаем сессию клиенту (досыл/повтор complete)
 
 
 # --- ВОЛНА 22.23: «МОЁ ОБЛАКО» В МИНИ-АППЕ (хранилище пользователя) ---
@@ -25044,9 +24665,9 @@ def mount_miniapp_routes(app):
     app.router.add_post("/api/upload/abort", miniapp_upload_abort)
     # ВОЛНА 22.48: «мини апп закрыли посреди загрузки» (fetch keepalive)
     app.router.add_post("/api/upload/closed", miniapp_upload_closed)
-    # ВОЛНА 22.62: пометка «файлы передаются через Telegram» (автопередача
-    # из мини-аппа: системная панель «поделиться» → чат бота)
-    app.router.add_post("/api/upload/tg_mark", miniapp_upload_tg_mark)
+    # ВОЛНА 22.63: маршрут /api/upload/tg_mark (автопередача 22.62) убран —
+    # старым кэшированным копиям мини-аппа вернётся 404, их вызов тихо
+    # гасится клиентским .catch(() => {})
     # ВОЛНА 22.50: статус сессии загрузки — честный успех вместо фантомных ошибок
     app.router.add_get("/api/upload/status", miniapp_upload_status)
     # ВОЛНА 22.54: имя «догоняет» уже летящую загрузку (предохранка)
