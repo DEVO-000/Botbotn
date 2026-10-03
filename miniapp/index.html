@@ -2794,27 +2794,6 @@ body.vp-lock {
     </p>
 
     <div style="display:flex;flex-direction:column;gap:8px">
-      <button class="sound-item-btn" id="uploadViaBotBtn" onclick="uploadViaBot()" style="background:#2481cc;color:#ffffff;border-color:#2481cc">
-        <div style="text-align:left">
-          <div style="font-weight:800">📤 Загрузить через Telegram</div>
-          <div style="font-size:11px;opacity:.85;margin-top:2px" id="uploadViaBotSub">Грузится в фоне на 100% — прогресс появится здесь</div>
-        </div>
-        <i data-lucide="send" style="width:18px;height:18px"></i>
-      </button>
-
-      <!-- ВОЛНА 22.62: тумблер АВТОПЕРЕДАЧИ — после выбора файлов мини-апп
-           сам открывает системную панель «поделиться» с УЖЕ выбранными
-           файлами (Telegram → чат бота → «Отправить»). Дальше файлы грузит
-           сам Telegram: нативная очередь, настоящий фон, переживает
-           закрытие мини-аппа. Показывается только там, где поддерживается. -->
-      <button class="sound-item-btn" id="tgAutoShareRow" onclick="tgAutoShareToggle()" style="display:none">
-        <div style="text-align:left">
-          <div style="font-weight:800">🤖 Автопередача в Telegram: <span id="tgAutoShareState">вкл</span></div>
-          <div style="font-size:11px;opacity:.7;margin-top:2px" id="tgAutoShareHint">Выбрали файлы — Telegram откроется сам, останется нажать «Отправить»</div>
-        </div>
-        <i data-lucide="zap" style="width:18px;height:18px"></i>
-      </button>
-
       <button class="sound-item-btn" id="uploadAddBtn" onclick="pickUploadFiles()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
         <span>Добавить файл</span>
         <i data-lucide="plus" style="width:18px;height:18px"></i>
@@ -5821,14 +5800,16 @@ function botQueueTrack() {
 
 /* ═══ ВОЛНА 22.58: ЖИВАЯ КАРТОЧКА «ЗАГРУЗКА ЧЕРЕЗ БОТА» ═══
    Физика WebView: мини-апп не может сам «отдать» выбранные файлы в чат
-   бота — байты уходят только пока он жив. Поэтому главный путь (22.57) —
-   файлы прикладываются В ЧАТЕ бота, Telegram доносит их сам (настоящий
-   фон, 100%), а бот сохраняет всё в облако на сервере. Здесь этот путь
-   становится ПРОЗРАЧНЫМ: карточка в панели передач включается в момент
-   нажатия кнопки «📤 Загрузить через Telegram» и живёт, пока файлы
-   едут: считает приехавшие из чата файлы (src='chat' свежее пометки
-   dv_bg_wait_ts) и показывает серверные статусы bg_live — в том числе
-   живые проценты больших файлов («Качаю с Telegram: 45%»). */
+   бота — байты уходят только пока он жив. Роутер 22.57 сохраняет файлы,
+   присланные в чат бота вручную, в облако на сервере. Здесь этот путь
+   ПРОЗРАЧЕН: карточка в панели передач включается, когда пользователь
+   недавно отправлял файлы в чат (пометка dv_bg_wait_ts), и живёт, пока
+   файлы едут: считает приехавшие из чата файлы (src='chat' свежее
+   пометки dv_bg_wait_ts) и показывает серверные статусы bg_live — в том
+   числе живые проценты больших файлов («Качаю с Telegram: 45%»).
+   ВОЛНА 22.63: кнопки «через Telegram» (22.57) и автопередача (22.62)
+   убраны — пометку больше никто не ставит, карточка спит, а файлы из
+   чата честно показываются тостом «📨 Через бота загрузилось: N». */
 let bgUploadTimer = null;
 let bgUploadLastGrow = 0;
 let bgUploadCount = 0;
@@ -6966,11 +6947,13 @@ function refreshUploadModal() {
 
   if (info) {
     info.textContent = !has
-      /* ВОЛНА 22.59: файлы летят боту С МОМЕНТА ВЫБОРА — окно теперь
-         настройки (пароль/имена), а не «шлюз». ВОЛНА 22.61: текст честный:
-         что успело дойти — сохранится само; недокачанное продолжится при
-         следующем открытии облака, бот молча подскажет в чате. */
-      ? 'Файлы, выбранные ниже, сразу летят боту. Что успеет дойти — сохранится само; недокачанное продолжится при следующем открытии (бот подскажет в чате). Для 100% фона — кнопка «через Telegram» ниже.'
+      /* ВОЛНА 22.63: кнопки «через Telegram» и автопередача убраны по
+         просьбе пользователя («убери новые кнопки — всё должно быть
+         включено по умолчанию»). Единственный путь — прямой стрим боту,
+         он включён ВСЕГДА и стартует с момента выбора файлов (22.59):
+         что успело доехать — сохранится само, недокачанное продолжится
+         при следующем открытии облака (бот молча подскажет в чате). */
+      ? 'Файлы, выбранные ниже, сразу летят боту — загрузка включена всегда. Что успеет дойти — сохранится само; недокачанное продолжится при следующем открытии (бот подскажет в чате).'
       : pendingFiles.length === 1
         ? (pendingFiles[0].name || 'файл') + ' — уже летит боту. Пароль (в Сейф) и имя — по кнопке «Отправить», можно и просто закрыть окно.'
         : 'Выбрано файлов: ' + pendingFiles.length + ' — все уже летят боту. Пароль (в Сейф) и имена — по кнопке «Отправить», окно можно закрыть.';
@@ -7002,31 +6985,6 @@ function refreshUploadModal() {
   if (addBtn) addBtn.classList.toggle('hidden', has);
   if (sendBtn) sendBtn.classList.toggle('hidden', !has);
   if (moreBtn) moreBtn.classList.toggle('hidden', !has);
-
-  /* ВОЛНА 22.62: тумблер автопередачи — видим только там, где она
-     реально работает (телефон + Web Share с файлами + нет шифрования);
-     подпись синей кнопки подстраивается под режим */
-  const tgRow = document.getElementById('tgAutoShareRow');
-
-  if (tgRow) {
-    const tgCapable = tgAutoShareCapable() && IS_MOBILE_UA &&
-      STORAGE_ENCRYPTED !== true;
-
-    tgRow.style.display = tgCapable ? '' : 'none';
-
-    const tgSt = document.getElementById('tgAutoShareState');
-
-    if (tgSt) tgSt.textContent = tgAutoShareEnabled() ? 'вкл' : 'выкл';
-  }
-
-  const vbb = document.getElementById('uploadViaBotSub');
-
-  if (vbb) {
-    vbb.textContent = (tgAutoShareCapable() && IS_MOBILE_UA &&
-      tgAutoShareEnabled() && STORAGE_ENCRYPTED !== true)
-      ? 'Уже включена: после выбора файлов Telegram откроется сам'
-      : 'Грузится в фоне на 100% — прогресс появится здесь';
-  }
 
   /* ВОЛНА 22.40: пароль ОБЯЗАТЕЛЕН только когда хранилище шифруется
      (STORAGE_ENCRYPTED === true). Раньше поле становилось обязательным,
@@ -7165,190 +7123,18 @@ function addMoreUploadFiles() {
   document.getElementById('fileInput').click();
 }
 
-/* ═══ ВОЛНА 22.57: ГЛАВНЫЙ ПУТЬ ЗАГРУЗКИ — «ЧЕРЕЗ БОТА» (в фоне) ═══
-   Физика WebView: когда мини-апп закрывают, его JS умирает, и байты
-   файлов перестают идти С ТЕЛЕФОНА навсегда — сколько движок ни улучшай.
-   Единственная по-настоящему фоновая загрузка — НАТИВНАЯ загрузка
-   Telegram: пользователь прикладывает файлы в ЧАТ бота, Telegram сам
-   доносит их (даже с закрытым мини-аппом; на Android — даже со
-   свёрнутым Telegram; очередь не теряется никогда), а бот сохраняет
-   всё в облако НА СЕРВЕРЕ. Кнопка открывает чат бота — дальше
-   пользователь просто прикрепляет файлы. */
-function uploadViaBot() {
-  const uname = String(CONN.bot || '').replace(/^@/, '').trim();
-
-  if (!uname) {
-    showToast('Не нашёл адрес бота — нажмите «🔄» в шапке и попробуйте ещё раз');
-    return;
-  }
-
-  /* ВОЛНА 22.58: включаем живое отслеживание. Пометка dv_bg_wait_ts —
-     момент ухода в чат бота: всё, что приедет из чата ПОСЛЕ неё (src='chat'),
-     карточка в панели передач посчитает своим. Карточка живёт, пока
-     пользователь прикладывает файлы в чате: показывает серверные статусы
-     (bg_live: «Качаю с Telegram: 45%») и счётчик «Сохранено: N». */
-  try {
-    localStorage.setItem('dv_bg_wait_ts', String(Math.floor(Date.now() / 1000)));
-  } catch (e) {}
-  bgUploadEnsureCard();
-  bgUploadSchedule(1500);
-  showToast('Прикрепите файлы скрепкой в чате бота — Telegram доносит их в фоне, здесь появится прогресс');
-
-  const url = 'https://t.me/' + encodeURIComponent(uname);
-
-  try {
-    if (tg && tg.openTelegramLink) {
-      tg.openTelegramLink(url);
-      return;
-    }
-  } catch (e) {}
-
-  try {
-    if (tg && tg.openLink) {
-      tg.openLink(url);
-      return;
-    }
-  } catch (e) {}
-
-  window.open(url, '_blank');
-}
-
-/* ═══ ВОЛНА 22.62: АВТОПЕРЕДАЧА В TELEGRAM ПРИ ВЫБОРЕ ФАЙЛОВ ═══
-   Пользователь: «Файлы должны идти сразу в бот — как кнопка «через
-   Telegram», но АВТОМАТИЧЕСКИ, чтобы загрузка продолжалась при
-   закрытии». Физика WebView не изменилась: мини-апп не может сам
-   вложить файлы в чат бота. Но Web Share API (level 2) умеет почти
-   это: СРАЗУ после выбора файлов открываем СИСТЕМНУЮ панель
-   «поделиться» с УЖЕ выбранными файлами — пользователю остаётся
-   выбрать Telegram и нажать «Отправить». Дальше файлы грузит САМ
-   TELEGRAM (нативная очередь): настоящий фон, переживает закрытие
-   мини-аппа, гашение экрана и слабую сеть, очередь не теряется
-   никогда. Это максимум «автоматически», который допускают iOS и
-   Android (полный запрет делится без касания — защита ОС).
-   Параллельно продолжает работать прямой стрим боту (22.59/22.61):
-   кто первый довёз — тот и сохранил, дубли сводятся на сервере
-   тихо (волна 22.62, _dup_*), в облаке файл ОДИН. */
-const TG_AUTOSHARE_KEY = 'dv_tg_autoshare';
-
-const IS_MOBILE_UA = (function () {
-  try {
-    return navigator.maxTouchPoints > 0 ||
-      /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent || '');
-  } catch (e) {
-    return false;
-  }
-})();
-
-function tgAutoShareEnabled() {
-  try {
-    return localStorage.getItem(TG_AUTOSHARE_KEY) !== '0';
-  } catch (e) {
-    return true;
-  }
-}
-
-function tgAutoShareSet(on) {
-  try {
-    localStorage.setItem(TG_AUTOSHARE_KEY, on ? '1' : '0');
-  } catch (e) {}
-}
-
-function tgAutoShareToggle() {
-  const on = !tgAutoShareEnabled();
-
-  tgAutoShareSet(on);
-  refreshUploadModal();
-  showToast(on
-    ? '🤖 Автопередача вкл — после выбора файлов Telegram откроется сам'
-    : '🤖 Автопередача выкл — файлы грузятся напрямую (пока приложение открыто)');
-}
-
-function tgAutoShareCapable() {
-  /* Web Share level 2 (с файлами) доступен не везде: Android — да,
-     iOS/десктоп WebView — почти никогда. Проверяем честно. */
-  try {
-    return !!(navigator.share && navigator.canShare);
-  } catch (e) {
-    return false;
-  }
-}
-
-function tgAutoSharePick(files) {
-  /* какие файлы система реально примет в панель «поделиться» */
-  if (!files || !files.length) return [];
-  if (!tgAutoShareCapable() || !IS_MOBILE_UA) return [];
-
-  try {
-    const all = files.slice(0, 50);
-
-    if (navigator.canShare({ files: all })) return all;
-
-    const typed = all.filter((f) => f && f.type);
-
-    if (typed.length && navigator.canShare({ files: typed })) return typed;
-  } catch (e) {}
-
-  return [];
-}
-
-function tgAutoShareHandoff(files) {
-  /* Открывает панель «поделиться» СРАЗУ после выбора файлов.
-     ВАЖНО (физика браузеров): navigator.share требует ЖИВОГО касания —
-     вызов обязан случиться в той же цепочке событий, что и подтверждение
-     выбора файлов в пикере. Поэтому до самого вызова — НИ ОДНОГО await,
-     только синхронные операции, иначе ОС откажет (NotAllowedError). */
-  if (!tgAutoShareEnabled()) return Promise.resolve(false);
-
-  /* при включённом шифровании не предлагаем: файлы из чата попадают в
-     облако БЕЗ шифра — такое нельзя делать молча, пусть решает кнопка */
-  if (STORAGE_ENCRYPTED === true) return Promise.resolve(false);
-
-  const shareFiles = tgAutoSharePick(files);
-
-  if (!shareFiles.length) return Promise.resolve(false);
-
-  /* пометка «сейчас поедет через Telegram» + живая карточка (22.58):
-     как только бот сохранит файлы из чата, панель передач покажет
-     счётчик и проценты. Сервер по этой же пометке (/api/upload/tg_mark)
-     делает итоги в чате БЕЗЗВУЧНЫМИ — «как в обычном чате, но без
-     оповещений». */
-  try {
-    localStorage.setItem('dv_bg_wait_ts', String(Math.floor(Date.now() / 1000)));
-  } catch (e) {}
-
-  apiJson('/api/upload/tg_mark', {
-    method: 'POST',
-    headers: vaultHeaders({ 'Content-Type': 'application/json' }),
-    body: '{}'
-  }).catch(() => {});
-
-  bgUploadEnsureCard();
-  bgUploadSchedule(1500);
-
-  showToast('📤 Выберите Telegram и чат бота — отправится одним разом и продолжит грузиться В ФОНЕ, даже если закрыть приложение');
-
-  try {
-    return navigator.share({ files: shareFiles, title: 'Облако' })
-      .then(() => {
-        /* панель закрыта отправкой: файлы теперь грузит сам Telegram */
-        showToast('📨 Отдано Telegram — грузится в фоне, прогресс здесь');
-        return true;
-      })
-      .catch((e) => {
-        /* отменили / система не разрешила: НЕ страшно — прямой стрим
-           боту (22.59) продолжает грузить файлы, пока приложение открыто */
-        const why = (e && e.name === 'NotAllowedError')
-          ? 'Автопередача не открылась — файлы грузятся напрямую'
-          : 'Отправку отменили — файлы грузятся напрямую';
-
-        bgUploadFinish(false, 0, why);
-        return false;
-      });
-  } catch (e) {
-    bgUploadFinish(false, 0, 'Автопередача не открылась — файлы грузятся напрямую');
-    return Promise.resolve(false);
-  }
-}
+/* ═══ ВОЛНА 22.63: КНОПКИ «ЧЕРЕЗ TELEGRAM» И АВТОПЕРЕДАЧА УБРАНЫ ═══
+   Пользователь: «убери новые кнопки "загрузить через телеграм" и
+   "авто передача в телеграм" — всё должно быть включено по умолчанию.
+   Файлы вообще не синхронизируются». Причины убрать: системная панель
+   «поделиться» (22.62) открывалась ПОВЕРХ окна загрузки и путала поток,
+   а кнопка 22.57 вела в чат бота вместо загрузки. Единственный путь
+   теперь — прямой стрим боту (22.59/22.61), он включён ВСЕГДА, без
+   тумблеров: файлы летят боту с момента выбора, байты переживают
+   закрытие окна (hold-сессии), недокачанное продолжается при следующем
+   открытии облака из очереди IndexedDB. Файлы, присланные в чат бота
+   вручную («как в обычном чате»), по-прежнему сохраняются в облако
+   автоматически (сервер, роутер 22.57). */
 
 function uploadFiles(fileList) {
   let files = Array.from(fileList);
@@ -7375,14 +7161,9 @@ function uploadFiles(fileList) {
 
   if (!files.length) return;
 
-  /* ═══ ВОЛНА 22.62: АВТОПЕРЕДАЧА В TELEGRAM ═══
-     Вызов ДО всего остального и без await: navigator.share обязан
-     сработать в той же цепочке касания, что и выбор файлов (иначе ОС
-     запрещает). Успешно открылась панель — дальше файлы грузит сам
-     Telegram (нативная очередь, 100% фон). Не открылась/отменили —
-     молча остаётся прямой стрим боту ниже (22.59). Панель «поделиться»
-     открывается ПОВЕРХ окна загрузки — настройки доступны после. */
-  tgAutoShareHandoff(files).catch(() => {});
+  /* ВОЛНА 22.63: перехват выбора файлов автопередачей (22.62) убран —
+     никакой системной панели «поделиться», поток не прерывается:
+     сразу окно загрузки, файлы летят боту напрямую с момента выбора. */
 
   const modalOpen = !!(document.getElementById('uploadModal') || {}).classList &&
     document.getElementById('uploadModal').classList.contains('open');
@@ -8593,11 +8374,10 @@ async function _uploadOneSession(file, reportBytes) {
 
   /* ВОЛНА 22.50: pollUploadStatus отдаёт запись файла напрямую, обычный
      complete — объектом {file: …}; приводим к одному виду.
-     ВОЛНА 22.62: сервер свёл дубль (файл уже сохранён из чата —
-     автопередача обогнала прямой стрим): помечаем файл, чтобы движок
-     не добавлял вторую карточку и не хвастался «загружено» дважды. */
+     ВОЛНА 22.63: ветка dedup убрана вместе с автопередачей 22.62 —
+     сервер снова честно сохраняет КАЖДУЮ загрузку, дублей в потоке
+     нет (путь загрузки теперь один). */
   if (done && done.file) {
-    if (done.dedup) file._dupFlag = true;
     return done.file;
   }
 
@@ -8730,7 +8510,6 @@ async function uploadEngine(bar) {
      старого движка больше не подходит */
   const fileBytes = new Map();
   let reportedTotal = 0;
-  let dedupedCount = 0;   /* 22.62: сколько файлов свёл сервер (уже из чата) */
 
   const reportTotal = () => {
     setUploadPct((reportedTotal / totalBytes) * 100, bar);
@@ -8773,11 +8552,9 @@ async function uploadEngine(bar) {
           }
         });
 
-        /* 22.62: дубль сведён сервером (файл уже приехал через
-           Telegram) — карточку и похвалу не дублируем */
-        if (rec && file._dupFlag) {
-          dedupedCount++;
-        } else if (rec) {
+        /* 22.63: dedup-ветки больше нет — путь загрузки один (прямой
+           стрим), каждый сохранённый файл честно попадает в карточки */
+        if (rec) {
           added.push(rec);
         }
 
@@ -8887,7 +8664,6 @@ async function uploadEngine(bar) {
 
   showToast(
     (anySafe ? '✅ Успешно! 🔒 Зашифровано и в Сейфе' : '✅ Загружено') +
-    (dedupedCount ? ' · ♻️ уже приехали через Telegram: ' + dedupedCount : '') +
     (maxQueuePos > 1 ? ' · ⏳ публикация в канале, перед вами: ' + (maxQueuePos - 1) : ''));
 
   added.forEach((rec) => {
