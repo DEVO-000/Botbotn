@@ -3991,6 +3991,132 @@ function handleSoundSelect(e, id) {
 const IS_TELEGRAM = !!(tg && tg.initData);
 let WEB_TOKEN = localStorage.getItem('devo_web_token') || '';
 
+/* ═══ ВОЛНА 22.66: КЭШ СПИСКА ФАЙЛОВ — «после обновления страницы всё
+   сбрасывается и ничего не остаётся» — БОЛЬШЕ НЕ ДОЛЖНО. ═══
+   При обновлении страницы список стартует пустым и наполняется только
+   после первого успешного /api/files. Пока сервер просыпается (бесплатный
+   хостинг), тихий старт ретраит 3с→7с→15с→30с→60с — и всё это время
+   пользователь видит ПУСТОЕ облако: выглядит, будто «файлы исчезли».
+   Фикс: последний успешный ответ /api/files хранится в localStorage
+   (с проверкой принадлежности текущему пользователю) и мгновенно
+   рисуется при старте — обновление страницы показывает файлы СРАЗУ,
+   а тихая досинхронизация подхватывает свежие данные в фоне. */
+const FILES_CACHE_KEY = 'dv_files_cache_v1';
+
+function filesCacheIdentity() {
+  /* Кому принадлежит кэш: Telegram → id пользователя из initData;
+     веб-вход → токен сессии. Пусто → кэшем не пользуемся. */
+  try {
+    if (IS_TELEGRAM && tg && tg.initDataUnsafe && tg.initDataUnsafe.user) {
+      return 'tg:' + (tg.initDataUnsafe.user.id || '');
+    }
+  } catch (e) {}
+
+  if (WEB_TOKEN) return 'wt:' + WEB_TOKEN;
+
+  return '';
+}
+
+function filesCacheClear() {
+  try { localStorage.removeItem(FILES_CACHE_KEY); } catch (e) {}
+}
+
+function filesCacheLoad() {
+  try {
+    const raw = localStorage.getItem(FILES_CACHE_KEY);
+
+    if (!raw) return null;
+
+    const rec = JSON.parse(raw);
+
+    if (!rec || !rec.d || !rec.k) return null;
+
+    const id = filesCacheIdentity();
+
+    if (!id || rec.k !== id) return null;  /* чужие данные не показываем */
+
+    return rec;
+  } catch (e) {
+    return null;
+  }
+}
+
+function filesCacheSave(raw, force) {
+  try {
+    const id = filesCacheIdentity();
+
+    if (!id || !raw) return;
+
+    const now = Date.now();
+
+    /* без force — не чаще раза в 60с (живой опрос 2.5с не должен
+       писать в localStorage на каждый тик) */
+    if (!force && filesCacheSave._ts && (now - filesCacheSave._ts) < 60000) return;
+
+    const rec = {
+      k: id,
+      ts: now,
+      d: {
+        files: raw.files || [],
+        bot: String(raw.bot || ''),
+        build: String(raw.build || ''),
+        plain: (typeof raw.plain === 'boolean') ? raw.plain : null,
+        pending: Array.isArray(raw.pending) ? raw.pending : [],
+        bg_live: raw.bg_live || null,
+        safe_count: +raw.safe_count || 0,
+        limit: +raw.limit || 0
+      }
+    };
+
+    localStorage.setItem(FILES_CACHE_KEY, JSON.stringify(rec));
+    filesCacheSave._ts = now;
+  } catch (e) {}
+}
+
+function filesMapAll(f) {
+  /* Единое отображение записи /api/files → карточка (используется и при
+     обычной загрузке, и при восстановлении из кэша) */
+  return {
+    id: String(f.id || ''),
+    name: String(f.name || 'файл'),
+    kind: String(f.kind || 'document'),
+    size: +f.size || 0,
+    ts: String(f.ts || ''),
+    vault: !!f.vault,
+    /* ВОЛНА 22.50: признаки Сейфа — «Достать из Сейфа» для файлов режима
+       «без шифра» (plain) идёт БЕЗ пароля (сервер 22.50 это умеет) */
+    safe: !!f.safe,
+    plain: !!f.plain,
+    /* ВОЛНА 22.57: откуда файл — «через бота» (из чата) или из веба;
+       нужно для тоста «Пока вас не было» после фоновых загрузок */
+    src: String(f.src || '')
+  };
+}
+
+function filesCacheBoot() {
+  /* Мгновенный рендер из кэша ДО первого запроса: обновление страницы
+     показывает файлы сразу, даже если сервер ещё спит. */
+  const rec = filesCacheLoad();
+
+  if (!rec) return false;
+
+  const d = rec.d;
+
+  ALL_FILES = (d.files || []).map(filesMapAll);
+  CONN.bot = String(d.bot || CONN.bot || '');
+  CONN.build = String(d.build || CONN.build || '');
+
+  if (typeof d.plain === 'boolean') STORAGE_ENCRYPTED = !d.plain;
+  else if (ALL_FILES.some((f) => f.vault && !f.plain)) STORAGE_ENCRYPTED = true;
+
+  try { renderAll({}); } catch (e) {}
+  /* 22.65: панель передач тоже оживает из кэша (недогруженное/ждёт пароль) */
+  try { srvPendingApply(d.pending); } catch (e) {}
+  try { bgUploadApply(d.bg_live); } catch (e) {}
+
+  return ALL_FILES.length > 0;
+}
+
 function authHeaders(extra) {
   const h = Object.assign({ 'Cache-Control': 'no-store' }, extra || {});
 
@@ -4033,11 +4159,15 @@ async function apiJson(url, options) {
         } catch (e) {}
         if (!reloaded) {
           try { sessionStorage.setItem('dv_relogin', '1'); } catch (e) {}
+          /* 22.66: кэш файлов НЕ чистим — после перезагрузки тот же
+             пользователь увидит свой список мгновенно, без пустоты */
           location.reload();
         } else {
+          filesCacheClear();
           openLoginModal();
         }
       } else {
+        filesCacheClear();
         openLoginModal();
       }
     }
@@ -4368,21 +4498,7 @@ async function loadFiles(silent, quiet) {
   try {
     const data = await apiJson('/api/files');
 
-    ALL_FILES = (data.files || []).map((f) => ({
-      id: String(f.id || ''),
-      name: String(f.name || 'файл'),
-      kind: String(f.kind || 'document'),
-      size: +f.size || 0,
-      ts: String(f.ts || ''),
-      vault: !!f.vault,
-      /* ВОЛНА 22.50: признаки Сейфа — «Достать из Сейфа» для файлов режима
-         «без шифра» (plain) идёт БЕЗ пароля (сервер 22.50 это умеет) */
-      safe: !!f.safe,
-      plain: !!f.plain,
-      /* ВОЛНА 22.57: откуда файл — «через бота» (из чата) или из веба;
-         нужно для тоста «Пока вас не было» после фоновых загрузок */
-      src: String(f.src || '')
-    }));
+    ALL_FILES = (data.files || []).map(filesMapAll);
 
     CONN.bot = String(data.bot || CONN.bot || '');
     CONN.build = String(data.build || CONN.build || '');
@@ -4438,6 +4554,11 @@ async function loadFiles(silent, quiet) {
     if (_sig !== LAST_FILES_SIG) {
       LAST_FILES_SIG = _sig;
       renderAll({ animate: !quiet });
+      /* 22.66: список изменился — обновляем кэш для мгновенного старта */
+      filesCacheSave(data, true);
+    } else {
+      /* список тот же — кэш обновляется не чаще раза в 60с (pending/bg_live) */
+      filesCacheSave(data, false);
     }
 
     /* ВОЛНА 22.58: живая карточка «Загрузка через Telegram» — считаем
@@ -11455,6 +11576,11 @@ function quietStartRetry() {
 }
 
 async function quietStart() {
+  /* 22.66: СНАЧАЛА мгновенно рисуем файлы из кэша — обновление страницы
+     больше не выглядит как «всё сбросилось и ничего не осталось»;
+     ниже обычная тихая досинхронизация подхватит свежие данные */
+  try { filesCacheBoot(); } catch (e) {}
+
   /* ТИХО: без тостов — «HTTP 500» и «нет связи» при старте убраны */
   const ok = await loadFiles(true);
 
@@ -11484,6 +11610,7 @@ if (!IS_TELEGRAM) {
           } else if (r.status === 401 || r.status === 403) {
             localStorage.removeItem('devo_web_token');
             WEB_TOKEN = '';
+            filesCacheClear();   /* 22.66: сессия закончилась — кэш подчищаем */
             setTimeout(openLoginModal, 500);
           } else {
             /* 5xx / сервер спит — тихий повтор по лестнице */
