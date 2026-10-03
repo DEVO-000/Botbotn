@@ -4632,7 +4632,8 @@ function maybeAutoResync() {
      («файлы не синхронизируются»). */
   if (listLoading || isUploading) return;
   if (!IS_TELEGRAM && !WEB_TOKEN) return;
-  if (Date.now() - LAST_SYNC < 12000) return;
+  /* ВОЛНА 22.68: 12 с → 4 с — обновления приходят «в несколько секунд» */
+  if (Date.now() - LAST_SYNC < 4000) return;
 
   loadFiles(true);
 }
@@ -4656,15 +4657,16 @@ try {
 /* ВОЛНА 22.50: тихая авто-синхронизация. Пользователь:
    «автоматическая синхронизация мини приложения должна быть каждые сколько-то
    секунд/минут, чтобы всё было синхронизировано, но не уведомлять об этом».
-   ВОЛНА 22.64: тик 45 с → 10 с (файлы, добавленные через бота, появляются
-   в облаке заметно быстрее; троттл LAST_SYNC 12 с не даёт лишнего спама).
-   loadFiles(true) молчит (без тостов и спиннеров) и обновляет файлы, режим
-   шифрования и статус канала. В фоне и без входа не тикает. */
+   ВОЛНА 22.64: тик 45 с → 10 с.
+   ВОЛНА 22.68: тик 10 с → 4 с и троттл 12 с → 4 с — «обновление нужно
+   больше В НЕСКОЛЬКО СЕКУНД». Запрос лёгкий (сервер отвечает из ОЗУ),
+   спама нет: пока летит загрузка или прошлый запрос не доехал — тик
+   пропускается (listLoading/isUploading). В фоне и без входа не тикает. */
 setInterval(function () {
   if (document.hidden) return;
   if (!IS_TELEGRAM && !WEB_TOKEN) return;   /* не вошли — нечего синхронизировать */
   maybeAutoResync();
-}, 10000);
+}, 4000);
 
 let FILTER = 'all';
 let SEARCH = '';
@@ -4813,7 +4815,7 @@ function fmtDateTime(ts) {
   let d;
 
   d = new Date(s);
-  if (isNaN(d)) return escapeHtml(String(s).slice(0, 10));
+  if (isNaN(d)) return s.slice(0, 10);
 
   const p = (x) => String(x).padStart(2, '0');
 
@@ -7490,13 +7492,6 @@ function addMoreUploadFiles() {
 function uploadFiles(fileList) {
   let files = Array.from(fileList);
 
-  /* 22.49: раньше файлы, выбранные ВО ВРЕМЯ активной загрузки, молча
-     пропадали (return без тоста) — пользователь думал, что «не сработало» */
-  if (files.length && isUploading) {
-    showToast('⏳ Дождитесь окончания текущей загрузки — потом добавьте остальные');
-    return;
-  }
-
   if (!files.length) return;
 
   /* 22.39: пустые файлы (0 Б) не грузим вообще — «такого не должно быть»
@@ -7511,6 +7506,30 @@ function uploadFiles(fileList) {
   files = files.filter((f) => +f.size);
 
   if (!files.length) return;
+
+  /* ВОЛНА 22.49: раньше файлы, выбранные ВО ВРЕМЯ активной загрузки, молча
+     пропадали (return без тоста) — пользователь думал, что «не сработало».
+     ВОЛНА 22.68: теперь они СНАЧАЛА сохраняются в очередь докачки (IndexedDB),
+     и сразу после окончания текущей пачки движок сам подхватит их
+     (soft-resume) — «дождитесь окончания» больше не означает «потеряйте». */
+  if (files.length && isUploading) {
+    for (const f of files) {
+      if (f._entryKey || (+f.size || 0) > UPQ_MAX_PERSIST) continue;
+
+      const k = 'up_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+
+      f._entryKey = k;
+
+      upqPut({
+        k: k, blob: f, name: f.name, uploadName: f.uploadName || f.name,
+        size: +f.size || 0, mime: f.type || '', uploadId: '', added: Date.now()
+      });
+    }
+
+    showToast('⏳ Дождитесь окончания текущей загрузки — эти ' + files.length +
+      ' файл(ов) в очереди и полетят следом');
+    return;
+  }
 
   /* ВОЛНА 22.63: автопередача (панель «поделиться») удалена — выбор
      файлов сразу запускает ПРЯМОЙ стрим боту ниже: очередь IndexedDB,
@@ -8967,8 +8986,12 @@ async function uploadEngine(bar) {
         /* ВОЛНА 22.54: страховка имени. Файл уходил в бота под оригинальным
            именем (предохранка), пользователь назвал его в окне имени — если
            сервер всё же записал старое имя (финализация обогнала ренейм),
-           тихо переименовываем запись и подпись в канале (как ✏️). */
-        if (rec && rec.id && file.uploadName && rec.name &&
+           тихо переименовываем запись и подпись в канале (как ✏️).
+           ВОЛНА 22.68: ТОЛЬКО для СВОЕЙ записи! Раньше при сведении дубля
+           (dedup) сервер возвращал ЧУЖУЮ запись (первую музыку с теми же
+           именем+размером), и эта страховка ПЕРЕИМЕНОВЫВАЛА ЕЁ в имя новой
+           загрузки — «первая пропала, появилась вторая». */
+        if (rec && !file._dupFlag && rec.id && file.uploadName && rec.name &&
             String(rec.name) !== String(file.uploadName)) {
           apiJson('/api/files/' + encodeURIComponent(rec.id), {
             method: 'PATCH',
@@ -9083,17 +9106,39 @@ async function uploadEngine(bar) {
     (maxQueuePos > 1 ? ' · ⏳ публикация в канале, перед вами: ' + (maxQueuePos - 1) : ''));
 
   added.forEach((rec) => {
-    ALL_FILES.unshift({
+    /* ВОЛНА 22.68: защита от визуального дубля — живой опрос мог уже
+       принести эту запись с сервера ДО конца пачки. Раньше unshift
+       добавлял ВТОРУЮ карточку с тем же id («файлы дублируются»). */
+    if (rec && rec.id && ALL_FILES.some((f) => f.id === String(rec.id))) return;
+
+    ALL_FILES.unshift(filesMapAll({
       id: rec.id,
       name: rec.name,
       kind: rec.kind,
       size: +rec.size || 0,
       ts: rec.ts || '',
-      vault: !!rec.vault
-    });
+      vault: !!rec.vault,
+      safe: !!rec.safe,
+      plain: !!rec.plain,
+      src: 'web'
+    }));
   });
 
   renderAll({ animate: true });
+
+  /* ВОЛНА 22.68: тихая сверка с сервером СРАЗУ после пачки — подхватывает
+     записи, завершённые ботом сами (авто-догрузка), и свежие значения
+     статистики/лимита; обновления больше не ждут до 12 с. */
+  setTimeout(() => { loadFiles(true, true).catch(() => {}); }, 400);
+
+  /* ВОЛНА 22.68: файлы, выбранные ВО ВРЕМЯ этой пачки, лежат в очереди
+     IndexedDB — подхватываем их следом (soft: без тостов и без сжигания
+     бюджета попыток). */
+  setTimeout(() => {
+    if (!isUploading && !RESUMING && !document.hidden) {
+      resumePendingUploads({ soft: true }).catch(() => {});
+    }
+  }, 1600);
 
   setTimeout(() => {
     resetUploadUI(bar, checkmark, squareStop);
