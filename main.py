@@ -1382,7 +1382,7 @@ def _mongo_save(filename, data):
     return False
 
 
-def load_data(filename, default=None):
+def _load_data_raw(filename, default=None):
     """Универсальный loader. Приоритет источников:
        1) Supabase (если SUPABASE_URL+SUPABASE_KEY заданы и таблица доступна),
        2) MongoDB (если задан MONGO_URI — для обратной совместимости),
@@ -1444,6 +1444,62 @@ def load_data(filename, default=None):
     except Exception as e:
         logger.error(f"Ошибка при загрузке {filename}: {e}")
         return default if default is not None else {}
+
+
+def load_data(filename, default=None, expect=None):
+    """ВОЛНА 22.70: САМОЗАЛЕЧИВАЮЩИЙСЯ guard поверх _load_data_raw.
+
+    Жалоба: «СБОЙ: TypeError: 'str' object does not support item assignment,
+    место: /start — так на всех пользователей». Причина: в хранилище (файл /
+    Supabase / Mongo / снапшот канала) вместо объекта (dict) оказалась СТРОКА
+    (двойное json-кодирование при записи или битая запись), и первый же
+    писатель вида data[user_id] = … падал с TypeError, а /start — для ВСЕХ.
+
+    Что делает guard:
+    1) САМОЗАЛЕЧИВАНИЕ двойного кодирования: если из хранилища пришла строка,
+       которая сама является JSON'ом ({…} / […] / "зашифрованная DVF3-строка
+       в кавычках") — распаковываем один раз и честно возвращаем объект.
+       Это лечит уже повреждённые записи БЕЗ ручного вмешательства.
+    2) expect="dict" / expect="list" — вызов ОБЪЯВЛЯЕТ структуру хранилища:
+       если там всё-таки мусор (строка/число) — возвращаем пустое значение и
+       ГРОМКО пишем в лог, вместо того чтобы ронять обработчик. Первая же
+       запись в это хранилище перезапишет битую запись нормальным объектом —
+       бот самолечится на ходу.
+
+    Файлы, где верхнеуровневая строка/число — легитимное содержимое, expect
+    НЕ передают: их поведение не меняется ни на символ."""
+    data = _load_data_raw(filename, default)
+    if isinstance(data, str):
+        s = data.strip()
+        if s[:1] in ('{', '[', '"') and s[-1:] in ('}', ']', '"'):
+            try:
+                cand = json.loads(s)
+            except Exception:
+                cand = None
+            if isinstance(cand, (dict, list)):
+                logger.warning(
+                    f"Хранилище {filename}: вылечено двойное кодирование "
+                    f"(str → {type(cand).__name__}).")
+                data = cand
+            elif (isinstance(cand, str)
+                  and cand.startswith(_DB_SEAL_MAGIC + ":")):
+                # Строка-шифр, обёрнутая в кавычки при записи, —
+                # распаковываем до шифра, затем честно расшифровываем.
+                data = _db_unseal(cand, default)
+    if expect == "dict" and not isinstance(data, dict):
+        if data not in (None, {}, []):
+            logger.error(
+                f"Хранилище {filename}: ожидался объект (dict), а получен "
+                f"{type(data).__name__} — битая запись читается как пустая "
+                "и будет перезаписана при первой же записи (самолечение).")
+        data = dict(default) if isinstance(default, dict) else {}
+    elif expect == "list" and not isinstance(data, list):
+        if data not in (None, {}, []):
+            logger.error(
+                f"Хранилище {filename}: ожидался список (list), а получен "
+                f"{type(data).__name__} — битая запись читается как пустая.")
+        data = list(default) if isinstance(default, list) else []
+    return data
 
 
 def _ensure_parent_dir(path: str) -> None:
@@ -1788,7 +1844,7 @@ DEV_SETTINGS_DEFAULTS = {
 }
 
 def load_dev_settings():
-    settings = load_data(DEV_SETTINGS_FILE, dict(DEV_SETTINGS_DEFAULTS))
+    settings = load_data(DEV_SETTINGS_FILE, dict(DEV_SETTINGS_DEFAULTS), expect="dict")
     # Подставляем дефолты для отсутствующих ключей (на случай, если в файле
     # лежит старая версия настроек без новых полей).
     changed = False
@@ -3119,7 +3175,7 @@ def load_users():
     if 'users' in _cache_last_update and current_time - _cache_last_update.get('users', 0) < CACHE_TTL:
         return _users_cache
 
-    data = load_data(USERS_FILE)
+    data = load_data(USERS_FILE, expect="dict")
     users = {}
     for user_id, user_data in data.items():
         try:
@@ -3144,7 +3200,7 @@ def load_personal_buttons():
     if 'personal_buttons' in _cache_last_update and current_time - _cache_last_update.get('personal_buttons', 0) < CACHE_TTL:
         return _personal_buttons_cache
 
-    data = load_data(PERSONAL_BUTTONS_FILE)
+    data = load_data(PERSONAL_BUTTONS_FILE, expect="dict")
     buttons = {}
     for button_id, button_data in data.items():
         try:
@@ -3169,7 +3225,7 @@ def load_classes():
     if 'classes' in _cache_last_update and current_time - _cache_last_update.get('classes', 0) < CACHE_TTL:
         return _classes_cache
 
-    data = load_data(CLASSES_FILE)
+    data = load_data(CLASSES_FILE, expect="dict")
     classes = {}
     for class_code, class_data in data.items():
         try:
@@ -3216,7 +3272,7 @@ def load_global_buttons():
     if 'global_buttons' in _cache_last_update and current_time - _cache_last_update.get('global_buttons', 0) < CACHE_TTL:
         return _global_buttons_cache
 
-    data = load_data(GLOBAL_BUTTONS_FILE, {})
+    data = load_data(GLOBAL_BUTTONS_FILE, {}, expect="dict")
     buttons = {}
     for button_id, button_data in data.items():
         try:
@@ -3247,7 +3303,7 @@ def load_blocked_users():
     now = time.time()
     if _blocked_users_cache is not None and now - _blocked_users_cache_ts < CACHE_TTL:
         return _blocked_users_cache
-    data = load_data(BLOCKED_USERS_FILE, {})
+    data = load_data(BLOCKED_USERS_FILE, {}, expect="dict")
     if not isinstance(data, dict):
         data = {}
     _blocked_users_cache = data
@@ -3326,7 +3382,7 @@ def load_stars_stats():
       — top_donors: топ-10 по тратам (производная от spenders);
       — spenders_count: сколько пользователей вообще что-то тратили.
     """
-    stats = load_data(STARS_STATS_FILE, {})
+    stats = load_data(STARS_STATS_FILE, {}, expect="dict")
     if not stats:
         stats = {
             'total_stars_spent': 0,
@@ -3645,7 +3701,7 @@ async def _notify_dev_error(bot, title, err=None, detail="", user_id=""):
 # ==================================
 def load_support_messages():
     """Возвращает структуру { '<user_id>': [ {from, text, ts}, ... ] }."""
-    return load_data(SUPPORT_MESSAGES_FILE, {})
+    return load_data(SUPPORT_MESSAGES_FILE, {}, expect="dict")
 
 
 def save_support_messages(data):
@@ -3762,7 +3818,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.69"
+BOT_BUILD = "22.70"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -3868,7 +3924,7 @@ def save_instructions(instructions):
     return save_data(INSTRUCTIONS_FILE, instructions)
 
 def load_user_codes():
-    return load_data(USER_CODES_FILE, {})
+    return load_data(USER_CODES_FILE, {}, expect="dict")
 
 def save_user_codes(codes):
     return save_data(USER_CODES_FILE, codes)
@@ -4060,14 +4116,14 @@ def generate_class_code():
             return code
 
 def generate_timer_id():
-    timers = load_data(TIMERS_FILE, {})
+    timers = load_data(TIMERS_FILE, {}, expect="dict")
     while True:
         timer_id = ''.join(random.choices(string.ascii_lowercase + string.digits, k=8))
         if timer_id not in timers:
             return timer_id
 
 def generate_button_id():
-    buttons = load_data(CUSTOM_BUTTONS_FILE, {})
+    buttons = load_data(CUSTOM_BUTTONS_FILE, {}, expect="dict")
     while True:
         button_id = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
         if button_id not in buttons:
@@ -4134,7 +4190,7 @@ def update_personal_button_order(user_id, button_order):
     return False
 
 def get_class_custom_buttons(class_code):
-    buttons = load_data(CUSTOM_BUTTONS_FILE, {})
+    buttons = load_data(CUSTOM_BUTTONS_FILE, {}, expect="dict")
     class_buttons = []
     for button_data in buttons.values():
         try:
@@ -4162,7 +4218,7 @@ def get_user_custom_buttons_count(user_id, class_code, button_type="all"):
         return sum(1 for button in buttons if button.creator_id == str(user_id))
 
 def delete_custom_button(button_id):
-    buttons_data = load_data(CUSTOM_BUTTONS_FILE, {})
+    buttons_data = load_data(CUSTOM_BUTTONS_FILE, {}, expect="dict")
     if button_id in buttons_data:
         del buttons_data[button_id]
         return save_data(CUSTOM_BUTTONS_FILE, buttons_data)
@@ -5275,7 +5331,7 @@ def get_anonymous_messages_keyboard(user_id):
     кнопки массовой/одиночной очистки и покупки «места», чтобы
     пользователь мог управлять занимаемым местом.
     """
-    anonymous_messages = load_data(ANONYMOUS_MESSAGES_FILE, {})
+    anonymous_messages = load_data(ANONYMOUS_MESSAGES_FILE, {}, expect="dict")
 
     received_messages = []
     for msg_id, msg in anonymous_messages.items():
@@ -5323,7 +5379,7 @@ def get_anon_delete_mode_keyboard(user_id):
     отдельный callback `anon_del_<msg_id>`, и под списком есть кнопка
     «⬅️ Назад» для возврата в основной список.
     """
-    anonymous_messages = load_data(ANONYMOUS_MESSAGES_FILE, {})
+    anonymous_messages = load_data(ANONYMOUS_MESSAGES_FILE, {}, expect="dict")
 
     received = []
     for msg_id, msg in anonymous_messages.items():
@@ -6747,11 +6803,11 @@ def _storage_pack_payload():
         return None, {}, 0
     users_n = classes_n = 0
     try:
-        users_n = len(load_data(USERS_FILE, {}) or {})
+        users_n = len(load_data(USERS_FILE, {}, expect="dict") or {})
     except Exception:
         pass
     try:
-        classes_n = len(load_data(CLASSES_FILE, {}) or {})
+        classes_n = len(load_data(CLASSES_FILE, {}, expect="dict") or {})
     except Exception:
         pass
     now = _utcnow()
@@ -6889,7 +6945,7 @@ def _storage_restore_apply(payload: bytes, fallback_name: str = ""):
     known = {os.path.basename(str(p)): p for p in set(STORAGE_BACKUP_FILES)}
     # ВОЛНА 17: снимок ДО восстановления — источник свежей связки ключей.
     try:
-        _old_users = dict(load_data(USERS_FILE, {}) or {})
+        _old_users = dict(load_data(USERS_FILE, {}, expect="dict") or {})
     except Exception:
         _old_users = {}
     zf = None
@@ -6921,6 +6977,14 @@ def _storage_restore_apply(payload: bytes, fallback_name: str = ""):
             except Exception as e:
                 problems.append(f"{base}: не JSON ({e})")
                 continue
+            # ВОЛНА 22.70: не тащим из снапшота мусор — строка/число вместо
+            # объекта раньше отравляла хранилище, и потом каждый /start падал
+            # с TypeError: 'str' object does not support item assignment.
+            if not isinstance(parsed, (dict, list)):
+                problems.append(
+                    f"{base}: в снапшоте {type(parsed).__name__} вместо "
+                    "объекта — запись пропущена (хранилище не отравляем)")
+                continue
             try:
                 save_data(known[base], parsed)
                 restored.append(base)
@@ -6937,6 +7001,11 @@ def _storage_restore_apply(payload: bytes, fallback_name: str = ""):
             return [], [f"файл «{base}» не похож на zip-бэкап и не совпадает ни с одним файлом данных"]
         try:
             parsed = json.loads(payload.decode("utf-8"))
+            if not isinstance(parsed, (dict, list)):
+                problems.append(
+                    f"{base}: в файле {type(parsed).__name__} вместо объекта — "
+                    "восстановление отменено (хранилище не отравляем)")
+                return restored, problems
             save_data(known[base], parsed)
             restored.append(base)
         except Exception as e:
@@ -26227,7 +26296,7 @@ async def _cdb_ingest_post(context, post, doc, fname, chat_id):
                                 # связки ключей в этом снапшоте.
                                 try:
                                     _vw17 = _vault_restore_warning(
-                                        load_data(USERS_FILE, {}) or {})
+                                        load_data(USERS_FILE, {}, expect="dict") or {})
                                 except Exception:
                                     _vw17 = ""
                                 pin_notes = []
@@ -26632,7 +26701,7 @@ async def _cdb_private_restore_cb(update: Update, context: ContextTypes.DEFAULT_
                 return
             # ВОЛНА 17: честная пометка — если у файлов Сейфа нет связки ключей.
             try:
-                _vw = _vault_restore_warning(load_data(USERS_FILE, {}) or {})
+                _vw = _vault_restore_warning(load_data(USERS_FILE, {}, expect="dict") or {})
                 if _vw:
                     _notes.append(_vw)
             except Exception:
@@ -36260,7 +36329,7 @@ async def _automation_execute_action(update, context, user, class_obj, action):
         # delete_class_timer).
         if not class_obj:
             return "🚫 Вы не состоите в классе — таймеры класса не найти.", True
-        timers = load_data(CLASS_TIMERS_FILE, {}) or {}
+        timers = load_data(CLASS_TIMERS_FILE, {}, expect="dict") or {}
         mine = {t: d for t, d in timers.items()
                 if isinstance(d, dict)
                 and d.get('class_code') == class_obj.class_code}
@@ -36628,7 +36697,7 @@ async def _automation_execute_action(update, context, user, class_obj, action):
                     "Назовите время в будущем.", False
                 )
 
-        timers = load_data(TIMERS_FILE, {})
+        timers = load_data(TIMERS_FILE, {}, expect="dict")
         timer_id = generate_timer_id()
         # НОВОЕ: kind="wish" — пожелание по расписанию (бот присылает живую
         # фразу вместо «⏰ Напоминание»); repeat_daily — повторять КАЖДЫЙ ДЕНЬ.
@@ -36830,7 +36899,7 @@ async def _automation_execute_action(update, context, user, class_obj, action):
         except (TypeError, ValueError):
             return "❓ Некорректный получатель. Попробуйте ещё раз.", False
 
-        anonymous_messages = load_data(ANONYMOUS_MESSAGES_FILE, {})
+        anonymous_messages = load_data(ANONYMOUS_MESSAGES_FILE, {}, expect="dict")
         msg_id = ''.join(random.choices(string.ascii_lowercase + string.digits, k=12))
         anonymous_messages[msg_id] = {
             'from_user_id': user_id,
@@ -37482,7 +37551,7 @@ async def _automation_execute_action(update, context, user, class_obj, action):
                 _automation_resolve_when(action, local_now)
             if err:
                 return f"❓ {err}", False
-            timers = load_data(CLASS_TIMERS_FILE, {}) or {}
+            timers = load_data(CLASS_TIMERS_FILE, {}, expect="dict") or {}
             tid = generate_class_timer_id()
             timers[tid] = {
                 "class_code": class_obj.class_code,
@@ -37523,7 +37592,7 @@ async def _automation_execute_action(update, context, user, class_obj, action):
             # ВОЛНА 22.41: удалить таймер класса по id (id виден в
             # show_class_timers).
             tid = str(action.get("timer_id") or "").strip()
-            timers = load_data(CLASS_TIMERS_FILE, {}) or {}
+            timers = load_data(CLASS_TIMERS_FILE, {}, expect="dict") or {}
             td = timers.get(tid)
             if not isinstance(td, dict) or td.get('class_code') != class_obj.class_code:
                 return ("❓ Такой таймер класса не найден. Скажите «покажи "
@@ -38050,7 +38119,7 @@ def _read_subscription_confirmation(user_id) -> str:
     локального файла, либо None. Этот файл — основной источник доверия,
     т. к. он работает даже для пользователей, у которых ещё нет User-записи."""
     try:
-        data = load_data(SUBSCRIPTION_CONFIRMATIONS_FILE, {})
+        data = load_data(SUBSCRIPTION_CONFIRMATIONS_FILE, {}, expect="dict")
     except Exception:
         data = {}
     return data.get(str(user_id))
@@ -38061,7 +38130,7 @@ def _write_subscription_confirmation(user_id):
     для user_id. Используется при нажатии «Я подписался»."""
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     try:
-        data = load_data(SUBSCRIPTION_CONFIRMATIONS_FILE, {})
+        data = load_data(SUBSCRIPTION_CONFIRMATIONS_FILE, {}, expect="dict")
     except Exception:
         data = {}
     data[str(user_id)] = now_str
@@ -39054,7 +39123,7 @@ async def delete_my_data_yes(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     # 1) Таймеры и напоминания.
     try:
-        timers = load_data(TIMERS_FILE, {}) or {}
+        timers = load_data(TIMERS_FILE, {}, expect="dict") or {}
         for k in list(timers):
             rec = timers[k] if isinstance(timers[k], dict) else {}
             if str(rec.get("user_id") or rec.get("owner") or "") == uid:
@@ -39066,7 +39135,7 @@ async def delete_my_data_yes(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     # 2) Анонимные сообщения (входящие И исходящие).
     try:
-        anon = load_data(ANONYMOUS_MESSAGES_FILE, {}) or {}
+        anon = load_data(ANONYMOUS_MESSAGES_FILE, {}, expect="dict") or {}
         for k in list(anon):
             rec = anon[k] if isinstance(anon[k], dict) else {}
             if (str(rec.get("to_user_id") or "") == uid
@@ -39079,7 +39148,7 @@ async def delete_my_data_yes(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     # 3) Личные кнопки.
     try:
-        pbs = load_data(PERSONAL_BUTTONS_FILE, {}) or {}
+        pbs = load_data(PERSONAL_BUTTONS_FILE, {}, expect="dict") or {}
         for k in list(pbs):
             rec = pbs[k] if isinstance(pbs[k], dict) else {}
             if str(rec.get("user_id") or rec.get("owner") or "") == uid:
@@ -40780,7 +40849,7 @@ async def view_anon_message_detail(update: Update, context: ContextTypes.DEFAULT
     raw = query.data or ""
     msg_id = raw[len("view_anon_msg_"):] if raw.startswith("view_anon_msg_") else raw
 
-    anonymous_messages = load_data(ANONYMOUS_MESSAGES_FILE, {})
+    anonymous_messages = load_data(ANONYMOUS_MESSAGES_FILE, {}, expect="dict")
 
     if not msg_id or msg_id not in anonymous_messages:
         # Не редактируем сообщение два раза подряд (старая реализация
@@ -41944,7 +42013,7 @@ async def successful_payment_handler(update: Update, context: ContextTypes.DEFAU
         message_id = pending_payments.get(user_id)
 
         if message_id:
-            anonymous_messages = load_data(ANONYMOUS_MESSAGES_FILE, {})
+            anonymous_messages = load_data(ANONYMOUS_MESSAGES_FILE, {}, expect="dict")
             msg = anonymous_messages.get(message_id)
 
             if msg and str(msg['to_user_id']) == str(user_id):
@@ -42128,7 +42197,7 @@ async def view_sender_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not user:
         user = User(user_id)
 
-    anonymous_messages = load_data(ANONYMOUS_MESSAGES_FILE, {})
+    anonymous_messages = load_data(ANONYMOUS_MESSAGES_FILE, {}, expect="dict")
 
     received_messages = []
     for msg_id, msg in anonymous_messages.items():
@@ -42165,7 +42234,7 @@ async def view_sender_confirm_handler(update: Update, context: ContextTypes.DEFA
         user = User(user_id)
     msg_id = query.data.split("_")[2]
 
-    anonymous_messages = load_data(ANONYMOUS_MESSAGES_FILE, {})
+    anonymous_messages = load_data(ANONYMOUS_MESSAGES_FILE, {}, expect="dict")
 
     if msg_id not in anonymous_messages:
         await query.edit_message_text("Сообщение не найдено.")
@@ -42226,7 +42295,7 @@ async def pay_view_sender_handler(update: Update, context: ContextTypes.DEFAULT_
 
     msg_id = parts[3]
 
-    anonymous_messages = load_data(ANONYMOUS_MESSAGES_FILE, {})
+    anonymous_messages = load_data(ANONYMOUS_MESSAGES_FILE, {}, expect="dict")
 
     if msg_id not in anonymous_messages:
         await query.edit_message_text("Сообщение не найдено.")
@@ -42335,7 +42404,7 @@ async def anon_pay_virt_handler(update: Update, context: ContextTypes.DEFAULT_TY
         return MAIN_MENU
     msg_id = parts[3]
 
-    anonymous_messages = load_data(ANONYMOUS_MESSAGES_FILE, {})
+    anonymous_messages = load_data(ANONYMOUS_MESSAGES_FILE, {}, expect="dict")
     if msg_id not in anonymous_messages:
         try:
             await query.edit_message_text("Сообщение не найдено.")
@@ -42431,7 +42500,7 @@ async def anon_pay_xtr_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         return MAIN_MENU
     msg_id = parts[3]
 
-    anonymous_messages = load_data(ANONYMOUS_MESSAGES_FILE, {})
+    anonymous_messages = load_data(ANONYMOUS_MESSAGES_FILE, {}, expect="dict")
     if msg_id not in anonymous_messages:
         try:
             await query.edit_message_text("Сообщение не найдено.")
@@ -42599,7 +42668,7 @@ async def anon_clear_all_confirm(update: Update, context: ContextTypes.DEFAULT_T
         pass
 
     user_id = str(query.from_user.id)
-    anonymous_messages = load_data(ANONYMOUS_MESSAGES_FILE, {})
+    anonymous_messages = load_data(ANONYMOUS_MESSAGES_FILE, {}, expect="dict")
 
     deleted = 0
     new_messages = {}
@@ -42671,7 +42740,7 @@ async def anon_delete_one_handler(update: Update, context: ContextTypes.DEFAULT_
     raw = query.data or ""
     msg_id = raw[len("anon_del_"):] if raw.startswith("anon_del_") else ""
 
-    anonymous_messages = load_data(ANONYMOUS_MESSAGES_FILE, {})
+    anonymous_messages = load_data(ANONYMOUS_MESSAGES_FILE, {}, expect="dict")
     msg = anonymous_messages.get(msg_id)
     if not msg or str(msg.get('to_user_id')) != str(user_id):
         # Сообщение уже удалено / чужое — просто возвращаемся к списку.
@@ -42897,7 +42966,7 @@ async def anonymous_purge_job(context: ContextTypes.DEFAULT_TYPE):
     anonymous_messages.json.
     """
     try:
-        anonymous_messages = load_data(ANONYMOUS_MESSAGES_FILE, {})
+        anonymous_messages = load_data(ANONYMOUS_MESSAGES_FILE, {}, expect="dict")
         users = load_users()
         now = _utcnow()
 
@@ -46229,7 +46298,7 @@ async def suggest_function_handler(update: Update, context: ContextTypes.DEFAULT
     if rejected is not None:
         return rejected
 
-    suggestions = load_data(SUGGESTIONS_FILE, [])
+    suggestions = load_data(SUGGESTIONS_FILE, [], expect="list")
     suggestions.append({
         'user_id': user_id,
         'user_name': user.first_name,
@@ -48740,7 +48809,7 @@ async def custom_button_url_handler(update: Update, context: ContextTypes.DEFAUL
         button_type="url"
     )
 
-    buttons = load_data(CUSTOM_BUTTONS_FILE, {})
+    buttons = load_data(CUSTOM_BUTTONS_FILE, {}, expect="dict")
     buttons[button_id] = custom_button.to_dict()
     save_data(CUSTOM_BUTTONS_FILE, buttons)
 
@@ -48803,7 +48872,7 @@ async def custom_button_content_handler(update: Update, context: ContextTypes.DE
         button_type="text"
     )
 
-    buttons = load_data(CUSTOM_BUTTONS_FILE, {})
+    buttons = load_data(CUSTOM_BUTTONS_FILE, {}, expect="dict")
     buttons[button_id] = custom_button.to_dict()
     save_data(CUSTOM_BUTTONS_FILE, buttons)
 
@@ -48865,7 +48934,7 @@ async def admin_delete_button_handler(update: Update, context: ContextTypes.DEFA
     button_id = query.data.split("_")[3]
     class_code = context.user_data.get('current_admin_class')
 
-    buttons = load_data(CUSTOM_BUTTONS_FILE, {})
+    buttons = load_data(CUSTOM_BUTTONS_FILE, {}, expect="dict")
 
     if button_id in buttons:
         button_name = buttons[button_id].get('name', 'Неизвестно')
@@ -48931,7 +49000,7 @@ async def edit_button_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     button_id = query.data[len("edit_button_"):]
-    buttons = load_data(CUSTOM_BUTTONS_FILE, {})
+    buttons = load_data(CUSTOM_BUTTONS_FILE, {}, expect="dict")
     data = buttons.get(button_id)
     if not data:
         await query.edit_message_text("Кнопка не найдена (уже удалена?).")
@@ -49003,7 +49072,7 @@ async def class_button_edit_name_handler(update: Update, context: ContextTypes.D
         await update.message.reply_text("Кнопка не выбрана — попробуйте заново.")
         return await admin_panel(update, context)
 
-    buttons = load_data(CUSTOM_BUTTONS_FILE, {})
+    buttons = load_data(CUSTOM_BUTTONS_FILE, {}, expect="dict")
     data = buttons.get(button_id)
     if not data:
         await update.message.reply_text("Кнопка не найдена (уже удалена?).")
@@ -49050,7 +49119,7 @@ async def edit_button_delete_cb(update: Update, context: ContextTypes.DEFAULT_TY
     button_id = query.data[len("edit_button_del_"):]
     class_code = context.user_data.get('current_admin_class')
 
-    buttons = load_data(CUSTOM_BUTTONS_FILE, {})
+    buttons = load_data(CUSTOM_BUTTONS_FILE, {}, expect="dict")
     data = buttons.get(button_id)
     if not data:
         await query.edit_message_text("Кнопка не найдена (уже удалена?).")
@@ -50021,7 +50090,7 @@ async def send_anonymous_message_handler(update: Update, context: ContextTypes.D
         context.user_data.pop('anon_target', None)
         return MAIN_MENU
 
-    anonymous_messages = load_data(ANONYMOUS_MESSAGES_FILE, {})
+    anonymous_messages = load_data(ANONYMOUS_MESSAGES_FILE, {}, expect="dict")
     msg_id = ''.join(random.choices(string.ascii_lowercase + string.digits, k=12))
 
     anonymous_messages[msg_id] = {
@@ -50242,7 +50311,7 @@ async def timer_set_text_handler(update: Update, context: ContextTypes.DEFAULT_T
     if rejected is not None:
         return rejected
 
-    timers = load_data(TIMERS_FILE, {})
+    timers = load_data(TIMERS_FILE, {}, expect="dict")
     timer_id = generate_timer_id()
 
     timers[timer_id] = {
@@ -50405,7 +50474,7 @@ async def report_anon_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
     reporter_id = str(query.from_user.id)
     msg_id = query.data[len("rep_anon_"):]
-    anon = load_data(ANONYMOUS_MESSAGES_FILE, {})
+    anon = load_data(ANONYMOUS_MESSAGES_FILE, {}, expect="dict")
     rec = anon.get(msg_id)
     if not isinstance(rec, dict) or str(rec.get('to_user_id')) != reporter_id:
         await query.answer("Сообщение не найдено.", show_alert=True)
@@ -50635,7 +50704,7 @@ async def timer_list_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
     uid = str(query.from_user.id)
-    timers = load_data(TIMERS_FILE, {})
+    timers = load_data(TIMERS_FILE, {}, expect="dict")
     mine = {t: d for t, d in timers.items()
             if isinstance(d, dict) and str(d.get('user_id')) == uid}
     if not mine:
@@ -50698,7 +50767,7 @@ async def timer_toggle_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tid, new_active = data[len("tmr_off_"):], False
     else:
         tid, new_active = data[len("tmr_on_"):], True
-    timers = load_data(TIMERS_FILE, {})
+    timers = load_data(TIMERS_FILE, {}, expect="dict")
     td = _timer_owner_guard(query, timers, tid)
     if td is None:
         await query.answer("Не найдено.", show_alert=True)
@@ -50721,7 +50790,7 @@ async def timer_delete_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     tid = query.data[len("tmr_del_"):]
-    timers = load_data(TIMERS_FILE, {})
+    timers = load_data(TIMERS_FILE, {}, expect="dict")
     if _timer_owner_guard(query, timers, tid) is None:
         await query.answer("Не найдено.", show_alert=True)
         return TIMER_SET_DATE
@@ -50762,7 +50831,7 @@ async def timer_edit_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except Exception:
         pass
     tid = query.data[len("tmr_edit_"):]
-    timers = load_data(TIMERS_FILE, {})
+    timers = load_data(TIMERS_FILE, {}, expect="dict")
     td = _timer_owner_guard(query, timers, tid)
     if td is None:
         await query.answer("Напоминание не найдено.", show_alert=True)
@@ -50792,7 +50861,7 @@ async def timer_edit_text_prompt(update: Update, context: ContextTypes.DEFAULT_T
     query = update.callback_query
     await query.answer()
     tid = query.data[len("tmr_edittext_"):]
-    timers = load_data(TIMERS_FILE, {})
+    timers = load_data(TIMERS_FILE, {}, expect="dict")
     if _timer_owner_guard(query, timers, tid) is None:
         await query.answer("Напоминание не найдено.", show_alert=True)
         return TIMER_SET_DATE
@@ -50818,7 +50887,7 @@ async def timer_edit_text_save(update: Update, context: ContextTypes.DEFAULT_TYP
     rejected = await reject_if_forbidden_chars(update, new_text, TIMER_EDIT_TEXT)
     if rejected is not None:
         return rejected
-    timers = load_data(TIMERS_FILE, {})
+    timers = load_data(TIMERS_FILE, {}, expect="dict")
     td = timers.get(tid)
     if not isinstance(td, dict) or str(td.get('user_id')) != str(update.effective_user.id):
         await update.message.reply_text("Напоминание не найдено.")
@@ -50836,7 +50905,7 @@ async def timer_edit_time_prompt(update: Update, context: ContextTypes.DEFAULT_T
     query = update.callback_query
     await query.answer()
     tid = query.data[len("tmr_editt_"):]
-    timers = load_data(TIMERS_FILE, {})
+    timers = load_data(TIMERS_FILE, {}, expect="dict")
     if _timer_owner_guard(query, timers, tid) is None:
         await query.answer("Напоминание не найдено.", show_alert=True)
         return TIMER_SET_DATE
@@ -50865,7 +50934,7 @@ async def timer_edit_time_save(update: Update, context: ContextTypes.DEFAULT_TYP
     except ValueError:
         await update.message.reply_text("Не понял время. Формат ЧЧ:ММ (например 07:30):")
         return TIMER_EDIT_TIME
-    timers = load_data(TIMERS_FILE, {})
+    timers = load_data(TIMERS_FILE, {}, expect="dict")
     td = timers.get(tid)
     if not isinstance(td, dict) or str(td.get('user_id')) != str(update.effective_user.id):
         await update.message.reply_text("Напоминание не найдено.")
@@ -53346,7 +53415,7 @@ _CT_WD_FULL = ("Понедельник", "Вторник", "Среда", "Чет
 
 def generate_class_timer_id():
     """Уникальный id таймера класса (как generate_timer_id)."""
-    timers = load_data(CLASS_TIMERS_FILE, {})
+    timers = load_data(CLASS_TIMERS_FILE, {}, expect="dict")
     while True:
         timer_id = ''.join(random.choices(string.ascii_lowercase + string.digits, k=8))
         if timer_id not in timers:
@@ -53475,7 +53544,7 @@ async def _class_timer_fire_now(application, tid):
     Возвращает число доставленных сообщений (0 — ничего не отправлено).
     """
     try:
-        timers = load_data(CLASS_TIMERS_FILE, {}) or {}
+        timers = load_data(CLASS_TIMERS_FILE, {}, expect="dict") or {}
     except Exception:
         return 0
     td = timers.get(tid)
@@ -53543,7 +53612,7 @@ async def _class_timer_safety_net(context: ContextTypes.DEFAULT_TYPE):
     Двойной отправки нет: fired_key в записи таймера."""
     application = context.application
     try:
-        timers = load_data(CLASS_TIMERS_FILE, {}) or {}
+        timers = load_data(CLASS_TIMERS_FILE, {}, expect="dict") or {}
     except Exception:
         return
     if not timers:
@@ -53812,7 +53881,7 @@ async def ct_buttons_global(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "ctm_list":
-        timers = load_data(CLASS_TIMERS_FILE, {}) or {}
+        timers = load_data(CLASS_TIMERS_FILE, {}, expect="dict") or {}
         mine = {t: d for t, d in timers.items()
                 if isinstance(d, dict) and d.get('class_code') == code}
         if not mine:
@@ -53841,7 +53910,7 @@ async def ct_buttons_global(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith(("ctm_show_", "ctm_on_", "ctm_off_", "ctm_del_")):
         tid = data.split("_", 2)[2] if data.count("_") >= 2 else ""
-        timers = load_data(CLASS_TIMERS_FILE, {}) or {}
+        timers = load_data(CLASS_TIMERS_FILE, {}, expect="dict") or {}
         td = timers.get(tid)
         if not isinstance(td, dict) or td.get('class_code') != code:
             try:
@@ -54061,7 +54130,7 @@ async def _ct_pending_text_handler(update: Update,
         mode = str(pend.get("mode") or "once")
         days = [int(x) for x in (pend.get("days") or []) if 0 <= int(x) <= 6]
         tid = generate_class_timer_id()
-        timers = load_data(CLASS_TIMERS_FILE, {}) or {}
+        timers = load_data(CLASS_TIMERS_FILE, {}, expect="dict") or {}
         timers[tid] = {
             "class_code": class_obj.class_code,
             "text": raw,
@@ -55843,7 +55912,7 @@ async def start_anon_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg_id = query.data.split("_")[2]
 
-    anonymous_messages = load_data(ANONYMOUS_MESSAGES_FILE, {})
+    anonymous_messages = load_data(ANONYMOUS_MESSAGES_FILE, {}, expect="dict")
     msg = anonymous_messages.get(msg_id)
 
     if not msg:
@@ -56076,7 +56145,7 @@ async def _send_timer_notification(context: ContextTypes.DEFAULT_TYPE):
     # одно и то же напоминание дважды.
     timer_record = None
     try:
-        timers_check = load_data(TIMERS_FILE, {})
+        timers_check = load_data(TIMERS_FILE, {}, expect="dict")
         if timer_id and timer_id in timers_check:
             timer_record = timers_check[timer_id]
             if not timer_record.get('is_active', True):
@@ -56117,7 +56186,7 @@ async def _send_timer_notification(context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Не удалось отправить таймер-уведомление {timer_id} -> {user_id}: {e}")
     # Помечаем таймер как выполненный — либо переносим на завтра (repeat_daily).
     try:
-        timers = load_data(TIMERS_FILE, {})
+        timers = load_data(TIMERS_FILE, {}, expect="dict")
         if timer_id and timer_id in timers:
             td = timers[timer_id]
             if _timer_advance_repeat(td):
@@ -56161,7 +56230,7 @@ async def _timer_safety_net(context: ContextTypes.DEFAULT_TYPE):
     is_active гарантируют, что уведомление уйдёт ровно один раз.
     """
     try:
-        timers = load_data(TIMERS_FILE, {})
+        timers = load_data(TIMERS_FILE, {}, expect="dict")
         if not timers:
             return
         now_utc = _utcnow()
@@ -57537,7 +57606,7 @@ def _solutions_all():
     """Весь реестр решений: {class_code: [entry…]} (ленивая загрузка)."""
     global _SOL_CACHE
     if _SOL_CACHE is None:
-        data = load_data(SOLUTIONS_FILE, {})
+        data = load_data(SOLUTIONS_FILE, {}, expect="dict")
         _SOL_CACHE = data if isinstance(data, dict) else {}
     return _SOL_CACHE
 
@@ -60204,7 +60273,7 @@ async def _tick_send_timers(bot):
     """Часть тикера: проверяет TIMERS_FILE и отправляет все таймеры,
     чьё время уже наступило. Дубль-защищена через is_active."""
     try:
-        timers = load_data(TIMERS_FILE, {})
+        timers = load_data(TIMERS_FILE, {}, expect="dict")
     except Exception as e:
         logger.error(f"tick/timers: load error: {e}")
         return
@@ -61204,7 +61273,7 @@ async def _post_init(application):
 
     # === ШАГ 7: восстановление таймеров пользователей. ===
     try:
-        timers = load_data(TIMERS_FILE, {})
+        timers = load_data(TIMERS_FILE, {}, expect="dict")
         for timer_id, timer_data in timers.items():
             try:
                 schedule_timer_job(application, timer_id, timer_data)
@@ -61215,7 +61284,7 @@ async def _post_init(application):
 
     # === ШАГ 7b: восстановление ТАЙМЕРОВ СООБЩЕНИЙ КЛАССУ (22.41). ===
     try:
-        ctimers = load_data(CLASS_TIMERS_FILE, {}) or {}
+        ctimers = load_data(CLASS_TIMERS_FILE, {}, expect="dict") or {}
         for ct_id, ct_data in ctimers.items():
             try:
                 schedule_class_timer_job(application, ct_id, ct_data)
