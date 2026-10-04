@@ -1316,8 +1316,10 @@ html.low-end .fade-soft-in {
    Плавное раскрытие, непрозрачное окно, сколько осталось + отмена. Все иконки — SVG */
 #cornerTransfers {
   position: fixed;
-  right: 14px;
-  bottom: calc(14px + env(safe-area-inset-bottom, 0px));
+  /* 22.74: чуть больше отступ от краёв — карточка больше не обрезается
+     нижней панелью Telegram на телефонах (safe-area в WebView бывает 0) */
+  right: 12px;
+  bottom: calc(22px + env(safe-area-inset-bottom, 0px));
   z-index: 150;
   display: flex;
   flex-direction: column;
@@ -1328,8 +1330,9 @@ html.low-end .fade-soft-in {
 
 .ct-fab {
   pointer-events: auto;
-  width: 54px;
-  height: 54px;
+  /* 22.74: «сделай его немного меньше» — 54 → 42px */
+  width: 42px;
+  height: 42px;
   border-radius: 50%;
   background: var(--card-bg);
   border: 1px solid var(--border-color);
@@ -1375,7 +1378,7 @@ html.low-end .fade-soft-in {
 
 .ct-fab-ring circle {
   fill: none;
-  stroke-width: 3.5;
+  stroke-width: 3;
 }
 
 .ct-ring-bg-c {
@@ -1385,14 +1388,14 @@ html.low-end .fade-soft-in {
 .ct-ring-fill-c {
   stroke: var(--loader-bar);
   stroke-linecap: round;
-  stroke-dasharray: 163.4;
-  stroke-dashoffset: 163.4;
+  stroke-dasharray: 119.4;
+  stroke-dashoffset: 119.4;
   transition: stroke-dashoffset 0.25s linear;
 }
 
 .ct-fab-icon {
-  width: 22px;
-  height: 22px;
+  width: 18px;
+  height: 18px;
   stroke: var(--text-color);
   fill: none;
   stroke-width: 2.4;
@@ -1404,13 +1407,13 @@ html.low-end .fade-soft-in {
   position: absolute;
   top: -3px;
   right: -3px;
-  min-width: 19px;
-  height: 19px;
-  padding: 0 5px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
   border-radius: 9999px;
   background: #ef4444;
   color: #fff;
-  font-size: 11px;
+  font-size: 10px;
   font-weight: 900;
   display: flex;
   align-items: center;
@@ -1420,8 +1423,9 @@ html.low-end .fade-soft-in {
 
 .ct-panel {
   pointer-events: auto;
-  width: min(320px, calc(100vw - 28px));
-  max-height: min(430px, 62vh);
+  /* 22.74: панель компактнее */
+  width: min(292px, calc(100vw - 24px));
+  max-height: min(380px, 56vh);
   background: var(--card-bg);
   border: 1px solid var(--border-color);
   border-radius: 24px;
@@ -2527,9 +2531,9 @@ body.vp-lock {
   </div>
 
   <button class="ct-fab" id="ctFab" onclick="ctTogglePanel(event)" aria-label="Загрузки">
-    <svg class="ct-fab-ring" viewBox="0 0 54 54">
-      <circle class="ct-ring-bg-c" cx="27" cy="27" r="26"></circle>
-      <circle class="ct-ring-fill-c" id="ctRingFill" cx="27" cy="27" r="26"></circle>
+    <svg class="ct-fab-ring" viewBox="0 0 42 42">
+      <circle class="ct-ring-bg-c" cx="21" cy="21" r="19"></circle>
+      <circle class="ct-ring-fill-c" id="ctRingFill" cx="21" cy="21" r="19"></circle>
     </svg>
 
     <svg class="ct-fab-icon" viewBox="0 0 24 24">
@@ -4723,7 +4727,7 @@ function showToast(text) {
 
   const t = document.createElement('div');
   t.className = 'toast-msg';
-  t.style.cssText = 'background:var(--btn-bg);color:var(--btn-text);font-size:14px;font-weight:700;padding:12px 20px;border-radius:9999px;box-shadow:0 10px 25px rgba(0,0,0,.25);text-align:center';
+  t.style.cssText = 'background:var(--btn-bg);color:var(--btn-text);font-size:14px;font-weight:700;padding:12px 20px;border-radius:9999px;box-shadow:0 10px 25px rgba(0,0,0,.25);text-align:center;pointer-events:auto;touch-action:pan-x';
 
   t.innerHTML = String(text)
     .split(TOAST_EMOJI_RE)
@@ -4736,11 +4740,50 @@ function showToast(text) {
     })
     .join('');
 
+  /* ВОЛНА 22.74: уведомление можно УБРАТЬ СВАЙПОМ в сторону. */
+  try {
+    let _sx = 0, _sy = 0, _dx = 0, _drag = false;
+
+    t.addEventListener('touchstart', function (e) {
+      _drag = true;
+      _sx = e.touches[0].clientX;
+      _sy = e.touches[0].clientY;
+      _dx = 0;
+      t.style.transition = 'none';
+    }, { passive: true });
+
+    t.addEventListener('touchmove', function (e) {
+      if (!_drag) return;
+      _dx = e.touches[0].clientX - _sx;
+      if (Math.abs(e.touches[0].clientY - _sy) > Math.abs(_dx)) return;
+      t.style.transform = 'translateX(' + _dx + 'px)';
+      t.style.opacity = String(Math.max(0.3, 1 - Math.abs(_dx) / 130));
+    }, { passive: true });
+
+    t.addEventListener('touchend', function () {
+      if (!_drag) return;
+      _drag = false;
+      if (Math.abs(_dx) > 55) {
+        t.style.transition = 'transform .22s ease, opacity .22s ease';
+        t.style.transform = 'translateX(' + (_dx > 0 ? '120%' : '-120%') + ')';
+        t.style.opacity = '0';
+        setTimeout(function () { t.remove(); }, 230);
+      } else {
+        t.style.transition = 'transform .25s ease, opacity .25s ease';
+        t.style.transform = '';
+        t.style.opacity = '';
+      }
+    }, { passive: true });
+  } catch (e) {}
+
   c.appendChild(t);
 
   safeIcons();
 
-  setTimeout(() => t.remove(), 4000);
+  setTimeout(() => {
+    if (!t.isConnected || t.style.opacity === '0') return;
+    t.remove();
+  }, 4000);
 }
 
 function flashScreen() {
@@ -7300,16 +7343,12 @@ function refreshUploadModal() {
 
   if (info) {
     info.textContent = !has
-      /* ВОЛНА 22.59: файлы летят боту С МОМЕНТА ВЫБОРА — окно теперь
-         настройки (пароль/имена), а не «шлюз». ВОЛНА 22.61: текст честный:
-         что успело дойти — сохранится само; недокачанное продолжится при
-         следующем открытии, бот молча подскажет в чате.
-         ВОЛНА 22.63: упоминание кнопки «через Telegram» убрано — кнопки
-         больше нет, загрузка идёт напрямую всегда. */
-      ? 'Файлы, выбранные ниже, сразу летят боту. Что успеет дойти — сохранится само; недокачанное продолжится при следующем открытии (бот подскажет в чате).'
+      /* ВОЛНА 22.74: автостарт убран — файлы грузятся ТОЛЬКО по кнопке
+         «Отправить». Окно снова «шлюз»: список, пароль, «Отправить». */
+      ? 'Выберите файлы кнопкой ниже, при необходимости укажите пароль — и нажмите «Отправить». Файлы не загружаются, пока вы не нажмёте «Отправить».'
       : pendingFiles.length === 1
-        ? (pendingFiles[0].name || 'файл') + ' — уже летит боту. Пароль (в Сейф) и имя — по кнопке «Отправить», можно и просто закрыть окно.'
-        : 'Выбрано файлов: ' + pendingFiles.length + ' — все уже летят боту. Пароль (в Сейф) и имена — по кнопке «Отправить», окно можно закрыть.';
+        ? (pendingFiles[0].name || 'файл') + ' — ждёт отправки. Загрузка начнётся после нажатия кнопки «Отправить».'
+        : 'Выбрано файлов: ' + pendingFiles.length + ' — все ждут отправки. Загрузка начнётся после нажатия кнопки «Отправить».';
   }
 
   if (list) {
@@ -7351,21 +7390,22 @@ function refreshUploadModal() {
      (и в боте, и здесь); оставил пустым → обычная загрузка без пароля. */
   const pwRequired = STORAGE_ENCRYPTED === true;
 
-  if (passRow) passRow.style.display = 'block';
+  /* ВОЛНА 22.74: пользователь просил УБРАТЬ запрос пароля в режиме
+     «без шифрования» — поле пароля теперь показывается ТОЛЬКО когда
+     шифрование включено. Никаких «необязательных» паролей. */
+  if (passRow) passRow.style.display = pwRequired ? 'block' : 'none';
   if (plainHint) {
     plainHint.style.display = pwRequired ? 'none' : 'block';
     plainHint.textContent = pwRequired
       ? ''
-      : 'Шифрование отключено — пароль не нужен. Но можете ввести пароль Сейфа: тогда файл зашифруется и появится в Сейфе (в боте и здесь).';
+      : 'Шифрование отключено — пароль не нужен, файлы уйдут как есть.';
   }
 
   if (passInput) {
-    passInput.placeholder = pwRequired
-      ? 'Пароль из бота'
-      : 'Необязательно — для загрузки в Сейф';
+    passInput.placeholder = 'Пароль из бота';
 
     if (!passInput.value) {
-      passInput.value = (pwRequired && VAULT_PW) ? VAULT_PW : '';
+      passInput.value = pwRequired ? (VAULT_PW || '') : '';
     }
   }
 }
@@ -7381,11 +7421,10 @@ function openUploadModal() {
 function closeUploadModal(e) {
   if (e) e.stopPropagation();
 
-  /* ВОЛНА 22.59: закрытие окна БОЛЬШЕ НЕ отменяет загрузку — файлы уже
-     летят боту с момента выбора («сразу в бота», как при отправке в чат).
-     Отменить осознанно можно крестиком строки в панели передач (справа
-     внизу). Из очереди докачки убираем только файлы, которые ещё НЕ
-     летят (нет сессии — например, ждут пароль), — как раньше. */
+  /* ВОЛНА 22.74: загрузка начинается ТОЛЬКО по кнопке «Отправить».
+     Закрытие окна до «Отправить» отменяет партию: файлы из локальной
+     очереди докачки убираются — бот ничего не получает. Уже летящие
+     файлы (сессия открыта) не трогаем — их видно в панели передач. */
   let flying = 0;
 
   for (const f of pendingFiles) {
@@ -7396,10 +7435,6 @@ function closeUploadModal(e) {
     }
 
     if (f && f._entryKey && !f._preId) upqDel(f._entryKey);
-  }
-
-  if (flying) {
-    showToast('📨 Файлы продолжают грузиться боту — прогресс в панели справа внизу');
   }
 
   pendingFiles = [];
@@ -7569,44 +7604,12 @@ function uploadFiles(fileList) {
     openUploadModal();
   }
 
-  /* ═══ ВОЛНА 22.59: СРАЗУ В БОТА ═══
-     Байты каждого файла летят боту С МОМЕНТА ВЫБОРА — как при отправке
-     в чат бота: не дожидаясь кнопки «Отправить» и окон имени. Пользователь
-     может закрыть окно и вообще выйти — всё, что доехало до сервера,
-     бот закончит сам (финализация по последнему куску, 22.52 + hold 22.59).
-     Окно загрузки остаётся НАСТРОЙКОЙ поверх уже идущей передачи: пароль
-     (в Сейф), имена (догонят через rename), докидывание файлов.
-     В режиме шифрования без известного пароля init честно ответит 423 —
-     предохранка тихо отступит, движок спросит пароль как раньше. */
-  if (IS_TELEGRAM || WEB_TOKEN) {
-    let preStarted = 0;
-
-    for (const f of files) {
-      if (f && f._preState !== 'run' && f._preState !== 'done' && !f._preStop &&
-          +f.size > 0) {
-        f._preHold = true;   /* 22.59: сессия «недорешённая» — сервер ждёт пароль/имя */
-        f._preQueued = true;
-        PRE_QUEUE.push(f);
-        preStarted++;
-      }
-    }
-
-    if (preStarted) {
-      /* 22.61: чем больше пачка, тем больше файлов в полёте + сессии
-         ВСЕЙ пачке сразу — выход из приложения больше не оставляет
-         файлы «не тронутыми» (см. prestreamInitAll) */
-      prestreamTuneConcurrency(files.length);
-      prestreamInitAll(files);
-
-      prestreamKick();
-
-      /* ВОЛНА 22.65: тост ВСЕГДА — байты летят боту с момента выбора
-         и в шифрованном режиме (сервер 22.65 создаёт сессию без пароля,
-         pw_pending): пароль догонит из окна, файл уже в пути */
-      showToast('📨 Файлы сразу пошли боту — грузятся в фоне, можно закрыть приложение');
-    }
-  }
-
+  /* ═══ ВОЛНА 22.74: ЗАГРУЗКА ТОЛЬКО ПО КНОПКЕ «ОТПРАВИТЬ» ═══
+     Раньше (22.59–22.65) байты летели боту С МОМЕНТА ВЫБОРА и тост
+     сообщал «Файлы сразу пошли боту». По решению пользователя автостарт
+     УБРАН: выбранные файлы просто ждут в окне, а передача начинается
+     по кнопке «Отправить» (confirmUploadFiles → prestreamStart).
+     Закрытие окна до «Отправить» НЕ отправляет файлы. */
   pickerAppend = false;
 }
 
@@ -9290,7 +9293,7 @@ async function pullSettingsApply() {
    осталось, у каждой передачи кнопка отмены. Все иконки — SVG.
    ═══════════════════════════════════════════════════════════════ */
 const TRANSFERS = new Map();
-const CT_RING_C = 163.4; /* 2πr, r=26 */
+const CT_RING_C = 119.4; /* 22.74: 2πr, r=19 (FAB 42px) */
 let ctPanelOpen = false;
 let ctLastSig = '';
 let ctRaf = 0;
