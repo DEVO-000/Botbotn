@@ -3762,7 +3762,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.68"
+BOT_BUILD = "22.69"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -40155,11 +40155,13 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if _wfid:
                 _web_file = _web          # файл можно переиграть по file_id
             elif str(_web.get("kind")) == "file" and _wname:
+                # ВОЛНА 22.69: без file_id (файл в чат не уходил — уведомления
+                # выключены, или это старая запись) показываем нейтрально:
+                # имя файла и время обновления из кнопки «📅 Расписание».
                 _when = str(_web.get("ts") or "").strip()
                 parts.append(
                     "\n🌐 Расписание с сайтов — 📄 " + _wname +
-                    (f" (файл прислан в чат класса {_when})" if _when
-                     else " (файл прислан в чат класса)"))
+                    (f" (обновлено {_when})" if _when else ""))
 
         full_text = "\n".join(parts)
 
@@ -44011,6 +44013,9 @@ async def schmon_send_item(bot, chat_id, src_url, data, name, host):
 def schmon_recipients(class_obj):
     """Кому присылать обновления: все участники класса (админы + ученики),
     кроме заблокированных. Идентификаторы — только числовые Telegram ID."""
+    # ВОЛНА 22.69: ДО получения списка проверяется флаг «🔔 Уведомления
+    # классу» (schmon_notif_enabled) — но сам список нужен и при выключенных
+    # уведомлениях (там он не используется, зато тут честные ранние выходы).
     if class_obj is None:
         return []
     blocked = {str(b) for b in (getattr(class_obj, "blocked_users", []) or [])}
@@ -44022,6 +44027,44 @@ def schmon_recipients(class_obj):
             continue
         ids.append(s)
     return ids
+
+
+# ----------------- переключатель уведомлений (ВОЛНА 22.69) ------------------
+def schmon_notif_enabled(class_code):
+    """ВОЛНА 22.69: включены ли уведомления классу о новом расписании.
+
+    Флаг хранится НА УРОВНЕ КЛАССА в schedule_monitor.json (entry["notif"]).
+    По умолчанию ВКЛЮЧЕНЫ (старое поведение). schmon_normalize пропускает
+    неизвестные ключи entry нетронутыми, а schmon_merge_info подменяет только
+    ссылку внутри entry["urls"] — флаг переживает и нормализацию, и merge,
+    и перезапуски бота."""
+    try:
+        state = schmon_load()
+        entry = state.get(str(class_code))
+        if not isinstance(entry, dict):
+            return True
+        return bool(entry.get("notif", True))
+    except Exception:
+        return True
+
+
+def schmon_set_notif(class_code, enabled):
+    """ВОЛНА 22.69: сохранить флаг уведомлений класса. True — сохранено."""
+    try:
+        state = schmon_load()
+        entry = state.get(str(class_code))
+        if not isinstance(entry, dict):
+            entry = {}
+        urls = entry.get("urls")
+        if not isinstance(urls, dict):
+            urls = {}
+        entry["urls"] = urls
+        entry["notif"] = bool(enabled)
+        state[str(class_code)] = entry
+        return schmon_save(state)
+    except Exception as e:
+        logger.error(f"schmon_set_notif: {e}")
+        return False
 
 
 def _schmon_store_web(class_obj, url, info, text="", kind="text", name="",
@@ -44060,12 +44103,17 @@ async def schmon_notify(app, class_code, url, info, new_files=(),
     файл/фото или текст, и НЕ ЧАЩЕ раза в день. Дубли не шлём.
     ВАЖНО: мутируем ТУ ЖЕ запись info, что у вызывающего (check_url/цикл), —
     иначе финальный merge перезатрёт память отправленного и дневной лимит.
-    Сохранение делает вызывающий (schmon_merge_info)."""
+    Сохранение делает вызывающий (schmon_merge_info).
+    ВОЛНА 22.69: если админ выключил «🔔 Уведомления классу» в меню «🌐
+    Расписание с сайтов» — СООБЩЕНИЯ классу не шлём и дневную квоту НЕ
+    тратим, но новое расписание ВСЁ РАВНО попадает в кнопку «📅 Расписание»
+    (schedule_web) и помечается обработанным — без дублей и повторов."""
     if not isinstance(info, dict):
         return False
     class_obj = get_class_by_code(class_code)
     recipients = schmon_recipients(class_obj)
-    if not recipients:
+    notif_on = schmon_notif_enabled(class_code)
+    if not recipients and (notif_on or class_obj is None):
         return False
     bot = app.bot
 
@@ -44082,7 +44130,7 @@ async def schmon_notify(app, class_code, url, info, new_files=(),
         if schmon_was_sent(info, digest):
             handled = True  # это уже присылали — повторно НЕ шлём
             continue
-        if schmon_daily_quota_left(info) <= 0:
+        if notif_on and schmon_daily_quota_left(info) <= 0:
             # дневной лимит исчерпан — отложим проверку до завтра
             info["next_check"] = _schmon_next_midnight_ts()
             return False
@@ -44091,23 +44139,32 @@ async def schmon_notify(app, class_code, url, info, new_files=(),
         # ВОЛНА 22.68: file_id первой успешной отправки — для кнопки «📅
         # Расписание» (переигрывает файл классу без перекачки).
         _first_res = None
-        for chat_id in recipients:
-            _res = await schmon_send_item(bot, chat_id, f, data, name, host)
-            if _res:
-                sent_any = True
-                # getattr: у файла может не быть file_id (старые заглушки),
-                # и monkeypatch-подмены в тестах возвращают просто True
-                if _first_res is None or not getattr(_first_res, "file_id", ""):
-                    _first_res = _res
+        if notif_on:
+            for chat_id in recipients:
+                _res = await schmon_send_item(bot, chat_id, f, data, name, host)
+                if _res:
+                    sent_any = True
+                    # getattr: у файла может не быть file_id (старые заглушки),
+                    # и monkeypatch-подмены в тестах возвращают просто True
+                    if _first_res is None or not getattr(_first_res, "file_id", ""):
+                        _first_res = _res
+        else:
+            # ВОЛНА 22.69: уведомления выключены — классу НЕ шлём и квоту НЕ
+            # тратим, но файл считается принятым: он уйдёт В КНОПКУ
+            # «📅 Расписание» (запись без file_id — файл в чат не уходил).
+            sent_any = True
         if sent_any:
             schmon_mark_sent(info, digest)
-            schmon_use_daily_quota(info)
+            if notif_on:
+                schmon_use_daily_quota(info)
             # ВОЛНА 22.67: расписание-файл запоминаем и В КЛАССЕ — его видно
             # в «📅 Расписание» секцией «🌐 Расписание с сайтов».
             # ВОЛНА 22.68: с file_id — кнопка присылает сам файл.
             _schmon_store_web(class_obj, url, info, kind="file", name=name,
-                              file_id=(getattr(_first_res, "file_id", "") if _first_res else ""),
-                              file_kind=(getattr(_first_res, "kind", "") if _first_res else ""))
+                              file_id=(getattr(_first_res, "file_id", "")
+                                       if (notif_on and _first_res) else ""),
+                              file_kind=(getattr(_first_res, "kind", "")
+                                         if (notif_on and _first_res) else ""))
             return True  # ровно ОДИН файл/фото за день!
 
     if handled:
@@ -44115,16 +44172,22 @@ async def schmon_notify(app, class_code, url, info, new_files=(),
 
     # 2) Расписание текстом
     if schedule_text:
-        if schmon_daily_quota_left(info) <= 0:
+        if notif_on and schmon_daily_quota_left(info) <= 0:
             info["next_check"] = _schmon_next_midnight_ts()
             return False
         head = "📅 Расписание обновилось\n%s\n\n" % schmon_host_of(url)
         sent_any = False
-        for chat_id in recipients:
-            if await schmon_send_text(bot, chat_id, head + schedule_text):
-                sent_any = True
+        if notif_on:
+            for chat_id in recipients:
+                if await schmon_send_text(bot, chat_id, head + schedule_text):
+                    sent_any = True
+        else:
+            # ВОЛНА 22.69: уведомления выключены — сообщение не летит,
+            # текст расписания появляется только в кнопке «📅 Расписание».
+            sent_any = True
         if sent_any:
-            schmon_use_daily_quota(info)
+            if notif_on:
+                schmon_use_daily_quota(info)
             # ВОЛНА 22.67: текст запоминаем в КЛАССЕ (секция «📅 Расписание»).
             _schmon_store_web(class_obj, url, info,
                               text=schedule_text, kind="text")
@@ -44339,12 +44402,23 @@ def _schmon_menu_text(class_obj):
     # Панель рисуется в ParseMode.HTML — все данные со страниц (title,
     # url) экранируем, иначе «<» в <title> сломает рендер сообщения.
     esc = html_mod.escape
+    # ВОЛНА 22.69: статус уведомлений прямо в меню + подсказка, что кнопка
+    # «📅 Расписание» наполняется при любом положении переключателя.
+    if schmon_notif_enabled(class_obj.class_code):
+        _notif_line = ("🔔 Уведомления классу: <b>включены</b> — при новом "
+                       "расписании классу придёт сообщение.")
+    else:
+        _notif_line = ("🔕 Уведомления классу: <b>выключены</b> — сообщение "
+                       "не придёт, но новое расписание всё равно появится в "
+                       "кнопке «📅 Расписание».")
     lines = [
         "🌐 <b>Расписание с сайтов</b> — класс «%s»" % esc(class_obj.class_name),
         "",
         "Слежу за страницами со расписанием и присылаю классу обновления "
         "автоматически: 🖼 фото, 📄 файл (PDF/Word/Excel) или 📅 текст — "
         "не чаще <b>1 раза в день</b> на ссылку, без дублей.",
+        "",
+        _notif_line,
         "",
     ]
     if not urls:
@@ -44385,6 +44459,15 @@ def _schmon_menu_kb(class_code):
         rows.append([InlineKeyboardButton(label,
                                           callback_data="schdel:"
                                           + schmon_md5key(url))])
+    # ВОЛНА 22.69: переключатель уведомлений о новом расписании.
+    if schmon_notif_enabled(class_code):
+        rows.append([InlineKeyboardButton(
+            "🔔 Уведомления классу: ВКЛ",
+            callback_data="schmon_notif")])
+    else:
+        rows.append([InlineKeyboardButton(
+            "🔕 Уведомления классу: ВЫКЛ",
+            callback_data="schmon_notif")])
     rows.append([InlineKeyboardButton("🔍 Проверить сейчас",
                                       callback_data="schmon_check")])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_to_admin")])
@@ -44845,6 +44928,56 @@ async def schmon_del_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode=ParseMode.HTML, disable_web_page_preview=True)
         except Exception:
             pass
+    return ADMIN_PANEL
+
+
+async def schmon_notif_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.69: «🔔/🔕 Уведомления классу» — включить/выключить
+    уведомления о новом расписании. Само расписание в любом случае попадает
+    в кнопку «📅 Расписание» (schedule_web)."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    uid = str(query.from_user.id)
+    class_obj = _schmon_admin_class(context, uid)
+    if not class_obj:
+        try:
+            await query.answer("Только для админов класса.", show_alert=True)
+        except Exception:
+            pass
+        return MAIN_MENU
+    class_code = class_obj.class_code
+    context.user_data['current_admin_class'] = class_code
+    state = schmon_load()
+    entry = state.get(str(class_code))
+    if not isinstance(entry, dict):
+        entry = {}
+    urls = entry.get("urls")
+    if not isinstance(urls, dict):
+        urls = {}
+    entry["urls"] = urls
+    was_on = bool(entry.get("notif", True))
+    entry["notif"] = not was_on
+    state[str(class_code)] = entry
+    if not schmon_save(state):
+        logger.warning("schmon_notif_cb: флаг уведомлений не сохранился")
+    _log_admin_action(uid, class_code,
+                      "Расписание с сайтов: уведомления классу "
+                      + ("включены" if not was_on else "выключены"))
+    try:
+        await query.answer("Уведомления включены" if not was_on
+                           else "Уведомления выключены")
+    except Exception:
+        pass
+    try:
+        await query.edit_message_text(
+            _schmon_menu_text(class_obj),
+            reply_markup=_schmon_menu_kb(class_code),
+            parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    except Exception:
+        pass
     return ADMIN_PANEL
 
 
@@ -55390,6 +55523,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await schmon_add_cb(update, context)
     elif data == "schmon_check":
         return await schmon_check_cb(update, context)
+    elif data == "schmon_notif":
+        # ВОЛНА 22.69: 🔔/🔕 уведомления классу о новом расписании
+        return await schmon_notif_cb(update, context)
     elif data.startswith("schsnd:"):
         return await schmon_pick_cb(update, context)
     elif data.startswith("schtxt:"):
