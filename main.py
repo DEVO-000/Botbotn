@@ -1174,6 +1174,14 @@ _SANITIZE_SKIP_KEYS = {
 def _strip_forbidden_chars(text):
     if not isinstance(text, str):
         return text
+    # ИСПРАВЛЕНО (аудит): DVF3-записи («DVF3:1:<base64>») — это ШИФРТЕКСТ
+    # всей базы. В standard base64 есть символ «/» (и часто «_»/«-» в urlsafe),
+    # а он в списке запрещённых: санитайзер вырезал его из шифра, после чего
+    # файл базы больше не расшифровывался НИКОГДА (тихая потеря всех данных
+    # локального хранилища). Запечатанные записи не трогаем — пользовательский
+    # текст туда не попадает, там только шифр.
+    if text.startswith(_DB_SEAL_MAGIC + ":"):
+        return text
     if not any(ch in FORBIDDEN_INPUT_CHARS for ch in text):
         return text
     return "".join(ch for ch in text if ch not in FORBIDDEN_INPUT_CHARS)
@@ -1665,6 +1673,22 @@ def _db_unseal(value, default=None):
     return default
 
 
+# ИСПРАВЛЕНО (аудит): per-file блокировки записи (см. save_data ниже).
+# Ключ — имя файла, значение — threading.Lock. Доступ к реестру — под
+# глобальным локом, чтобы два потока не создали два лока на один файл.
+_FILE_WRITE_LOCKS = {}
+_FILE_WRITE_LOCKS_GUARD = threading.Lock()
+
+
+def _get_file_write_lock(filename):
+    with _FILE_WRITE_LOCKS_GUARD:
+        lock = _FILE_WRITE_LOCKS.get(filename)
+        if lock is None:
+            lock = threading.Lock()
+            _FILE_WRITE_LOCKS[filename] = lock
+        return lock
+
+
 def save_data(filename, data):
     """Сохраняет данные в облако (Supabase → Mongo → файл).
 
@@ -1697,16 +1721,37 @@ def save_data(filename, data):
     # посреди json.dump портил файл НАМЕРТВО (это была единственная копия).
     try:
         _ensure_parent_dir(filename)
-        _tmpf = filename + ".tmp"
-        with open(_tmpf, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(_tmpf, filename)
+        # ИСПРАВЛЕНО (аудит): раньше tmp-файл был ОБЩИМ (filename + ".tmp").
+        # При concurrent_updates(True) два потока, сохраняющих один файл
+        # (например, два save_user), открывали ОДИН и тот же .tmp: второй
+        # open('w') обрезал файл, пока первый ещё писал → порченый JSON
+        # уезжал в os.replace → невосстановимая порча базы. Теперь у каждого
+        # писателя свой tmp-файл (pid + поток), а запись в один файл
+        # сериализуется per-file блокировкой.
+        _file_lock = _get_file_write_lock(filename)
+        with _file_lock:
+            _tmpf = f"{filename}.{os.getpid()}.{threading.get_ident()}.tmp"
+            with open(_tmpf, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(_tmpf, filename)
         _cdb_mark_dirty(filename)
         _data_epoch_bump()       # 22.64: маркер свежести для защиты от отката
         return True
     except Exception as e:
         logger.error(f"Ошибка при сохранении {filename}: {e}")
         return False
+
+
+async def _async_load_data(filename, default=None, **kwargs):
+    """ИСПРАВЛЕНО (аудит): асинхронная обёртка load_data.
+
+    Раньше существовала только _async_save_data (и та не использовалась):
+    все ЧТЕНИЯ базы (Supabase/Mongo, таймаут 8–10 с) выполнялись
+    синхронно на event loop. Для тикеров, читающих базу каждые 30 с,
+    медленный ответ облака означал «бот молчит у всех» на эти секунды."""
+    if default is None:
+        default = {}
+    return await asyncio.to_thread(load_data, filename, default, **kwargs)
 
 
 async def _async_save_data(filename, data):
@@ -1806,6 +1851,14 @@ def load_prices():
     if isinstance(prices, dict):
         for k, v in default_prices.items():
             prices.setdefault(k, v)
+    # ИСПРАВЛЕНО (аудит): если в хранилище мусор (строка вместо словаря) —
+    # раньше load_prices ВОЗВРАЩАЛ СТРОКУ. Глобальный PRICES становился
+    # строкой, и PRICES.get(...) в get_price падал AttributeError'ом (не
+    # ловится except (TypeError, ValueError)) — падали все проверки цен.
+    if not isinstance(prices, dict):
+        logger.error("load_prices: в хранилище мусор вместо словаря — "
+                     "использую цены по умолчанию.")
+        prices = dict(default_prices)
     return prices
 
 def save_prices(prices):
@@ -3325,7 +3378,10 @@ def save_class_blocked_users(class_blocked):
 
 # === ВОЛНА 22.27: ЖАЛОБЫ («🚨 Пожаловаться») ===
 def load_reports():
-    return load_data(REPORTS_FILE, {})
+    # ИСПРАВЛЕНО (аудит): expect="dict" — как в 22.70. Без него битая запись
+    # возвращалась строкой, а reports[rid] = {...} падал TypeError'ом на
+    # каждой жалобе «🚨 Пожаловаться» и на кнопках разработчика.
+    return load_data(REPORTS_FILE, {}, expect="dict")
 
 def save_reports(reports):
     return save_data(REPORTS_FILE, reports)
@@ -3727,7 +3783,10 @@ def append_support_message(user_id, sender, text):
 # === РЕФЕРАЛЬНАЯ СИСТЕМА ===
 # ==================================
 def load_referrals():
-    return load_data(REFERRALS_FILE, {})
+    # ИСПРАВЛЕНО (аудит): без expect="dict" битый referrals.json ронял
+    # setdefault внутри лока — бонус реферера ТИХО не начислялся (исключение
+    # глаталось выше) и никогда не начислялся повторно.
+    return load_data(REFERRALS_FILE, {}, expect="dict")
 
 
 def save_referrals(data):
@@ -7570,10 +7629,20 @@ async def _post_shutdown(application):
     try:
         class _CtxStub:
             bot = application.bot
+            application = application
         ok, report = await _cdb_flush(_CtxStub(), force=True, reason="остановка бота")
         logger.info(f"post_shutdown: {report}")
     except Exception as e:
         logger.error(f"post_shutdown: финальный слив не удался: {e}")
+    # ИСПРАВЛЕНО (аудит): Telethon-клиент жил на процесс и никогда не
+    # отключался штатно — при SIGTERM не сохранялась сессия и сыпался шум
+    # в лог. Закрываем чисто (best-effort).
+    try:
+        if _MT_CLIENT is not None and _MT_CLIENT.is_connected():
+            await _MT_CLIENT.disconnect()
+            logger.info("post_shutdown: Telethon-клиент отключён.")
+    except Exception as e:
+        logger.warning(f"post_shutdown: Telethon disconnect: {e}")
 
 
 # ==================================
@@ -8393,7 +8462,10 @@ async def _bg_upload_big_mtproto(update, context, user, item, chat_msg, live=Non
         fh = open(tmp_path, "wb")
         try:
             async def _sink(chunk):
-                fh.write(chunk)
+                # ИСПРАВЛЕНО (аудит): fh.write — блокирующий syscall прямо на
+                # event loop (каждые 512 КиБ на файл до 2 ГБ = тысячи фризов
+                # для ВСЕХ пользователей). Уводим запись в worker-поток.
+                await asyncio.to_thread(fh.write, chunk)
             got = await _mt_download_stream(
                 client, doc, int(getattr(doc, "size", 0) or fsize), _sink,
                 progress=(_BgLiveProgressBar(live[0], live[1]) if live else None))
@@ -8951,6 +9023,22 @@ async def cloud_del_yes_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 _MINIAPP_PTB_APP = None        # ссылка на Application (ставится в _post_init)
 _MINIAPP_UPLOADS = {}          # uploadId → {path, name, mime, size, uid, received, ts}
+# ИСПРАВЛЕНО (аудит): asyncio держит только СЛАБУЮ ссылку на запущенную задачу.
+# asyncio.create_task(...) без сохранения ссылки — задача может быть собрана
+# GC прямо посреди выполнения («задача просто исчезла»): файл не финализируется
+# и навсегда остаётся .part. Храним сильные ссылки + снимаем по завершении.
+_MINIAPP_BG_TASKS = set()
+
+
+def _spawn_bg_task(coro):
+    """create_task с сильной ссылкой: задача не будет собрана GC на лету."""
+    try:
+        _t = asyncio.create_task(coro)
+    except RuntimeError:
+        return None
+    _MINIAPP_BG_TASKS.add(_t)
+    _t.add_done_callback(_MINIAPP_BG_TASKS.discard)
+    return _t
 _MINIAPP_UPLOADS_TTL = 6 * 3600
 # ВОЛНА 22.61: якорные сообщения «файлы ждут продолжения» (uid → ts).
 # Анти-спам: не чаще раза в _CLOSED_ANCHOR_COOLDOWN секунд на пользователя.
@@ -21954,9 +22042,12 @@ async def _miniapp_serve_file(request, user, rec, where, pw_override=None,
                 pass  # клиент отвалился посреди потока — это нормально
             return response
         with open(tmppath, "wb") as sink_file:
+            # ИСПРАВЛЕНО (аудит): синхронная запись через lambda фризила loop
+            # на каждом куске (файлы до 2 ГБ). Запись — в worker-поток.
+            async def _serve_sink(chunk):
+                await asyncio.to_thread(sink_file.write, chunk)
             await _mt_download_stream(
-                client, doc, doc_size,
-                lambda chunk: sink_file.write(chunk))
+                client, doc, doc_size, _serve_sink)
         response = web.StreamResponse(status=200, headers={
             "Content-Type": _serve_mime_for(cloud_like, name),
             "Content-Disposition": _miniapp_content_disposition(name, inline),
@@ -21968,7 +22059,9 @@ async def _miniapp_serve_file(request, user, rec, where, pw_override=None,
         await response.prepare(request)
         with open(tmppath, "rb") as f:
             while True:
-                chunk = f.read(1024 * 1024)
+                # ИСПРАВЛЕНО (аудит): f.read — блокирующий вызов на loop
+                # (до 1 МиБ на итерацию); уводим в worker-поток.
+                chunk = await asyncio.to_thread(f.read, 1024 * 1024)
                 if not chunk:
                     break
                 await response.write(chunk)
@@ -24065,7 +24158,7 @@ async def miniapp_upload_chunk(request):
     if s["received"] >= s["size"] and not s.get("completing") \
             and not s.get("auto_scheduled"):
         s["auto_scheduled"] = True
-        asyncio.create_task(_upload_auto_complete_delayed(upid, 2.5))
+        _spawn_bg_task(_upload_auto_complete_delayed(upid, 2.5))
     return web.json_response({"received": s["received"], "size": s["size"]})
 
 
@@ -24466,7 +24559,7 @@ async def _upload_auto_complete_task(app, upid):
             _fails = int(s.get("auto_fail_n") or 1)
             _delay = min(600.0, 30.0 * (2 ** max(0, _fails - 1)))
             try:
-                asyncio.create_task(_upload_auto_complete_delayed(upid, _delay))
+                _spawn_bg_task(_upload_auto_complete_delayed(upid, _delay))
             except Exception:
                 s["auto_scheduled"] = False
             logger.warning(
@@ -24518,7 +24611,7 @@ async def _upload_autocomplete_pass(app, now=None):
     Ядро _miniapp_upload_finalize само атомарно ставит completing=True."""
     now = time.time() if now is None else float(now)
     for upid, _s in _upload_autocomplete_candidates(now):
-        asyncio.create_task(_upload_auto_complete_task(app, upid))
+        _spawn_bg_task(_upload_auto_complete_task(app, upid))
 
 
 # === ВОЛНА 22.52: ФИНАЛИЗАЦИЯ НА ПОСЛЕДНЕМ КУСКЕ + ПЕРСИСТЕНТНОСТЬ СЕССИЙ ===
@@ -24550,6 +24643,13 @@ async def _upload_auto_complete_delayed(upid, delay=2.5):
     except asyncio.CancelledError:
         raise
     except Exception as e:
+        # ИСПРАВЛЕНО (аудит): флаг auto_scheduled не сбрасывался — после любой
+        # разовой ошибки сторож (_upload_autocomplete_candidates) игнорировал
+        # сессию ВСЕГДА: файл навсегда оставался .part («файл исчез при
+        # загрузке»). Сбрасываем — сторож/повтор попробует снова.
+        _s = _MINIAPP_UPLOADS.get(upid)
+        if _s is not None:
+            _s["auto_scheduled"] = False
         logger.error(f"upload auto-complete delayed {upid}: {e}")
 
 
@@ -29031,13 +29131,16 @@ async def _vault_get_dvf2(msg, context, user, rec, password):
         with open(out_path, "wb") as fh:
             dec = _Dvf2Decryptor(password)
 
-            def _sink(b):
+            async def _sink(b):
                 # ВОЛНА 22.5: отмена также проверяется в расшифровщике.
                 if _cancelled():
                     raise _VaultCancelled()
-                out = dec.push(b)
+                # ИСПРАВЛЕНО (аудит): расшифровка AES-GCM + fh.write были
+                # синхронными на event loop. Обе операции — в worker-поток
+                # (последовательные await сохраняют порядок chunks).
+                out = await asyncio.to_thread(dec.push, b)
                 if out:
-                    fh.write(out)
+                    await asyncio.to_thread(fh.write, out)
 
             await _mt_download_stream(
                 client, doc, doc_size, _sink, prog,
@@ -38449,6 +38552,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ПУНКТ 1: Инструкция показывается СРАЗУ при /start (для всех — новых и старых).
     # После нажатия "Я прочитал(а) инструкцию" — продолжается регистрация как раньше.
     is_new_user = user is None
+    if (not is_new_user) and referrer_candidate:
+        # ИСПРАВЛЕНО (аудит): раньше referrer фиксировался ТОЛЬКО у новых
+        # пользователей. Существующий пользователь (даже не завершивший
+        # настройку), открывший ссылку t.me/bot?start=ref_…, никому не
+        # засчитывался: pending_referrer гнил в user_data, приглашающий
+        # терял бонус, приглашённый не узнавал, что ссылка «не сработала».
+        # Дозачитываем приглашателя, если у пользователя его ещё нет.
+        if (not getattr(user, "referrer_id", None)
+                and str(referrer_candidate) != str(user.user_id)
+                and str(referrer_candidate) != str(DEVELOPER_ID)):
+            user.referrer_id = referrer_candidate
+            save_user(user)
+            logger.info(f"Реферал дозачтён: {user.user_id} ← {referrer_candidate}")
     if is_new_user:
         # Создаём заготовку, чтобы сохранить user_code и first_name
         user = User(user_id, update.effective_user.username, update.effective_user.first_name)
@@ -41233,13 +41349,25 @@ async def manage_personal_buttons_start(update: Update, context: ContextTypes.DE
 @timeout(CONVERSATION_TIMEOUT)
 async def edit_personal_button_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    # ИСПРАВЛЕНО (аудит): повторный answer (центральный уже был) мог упасть
+    # BadRequest'ом и оборвать ветку. Гасим безопасно.
+    try:
+        await query.answer()
+    except Exception:
+        pass
 
     user_id = str(query.from_user.id)
     user = get_user(user_id)
     if not user:
         user = User(user_id)
-    button_id = query.data.split("_")[3]
+    # ИСПРАВЛЕНО (аудит): раньше button_id = query.data.split("_")[3] — жёсткий
+    # индекс под префикс «edit_personal_button_». Маршрут «personal_button_{id}»
+    # (кнопки «📝 …» в меню личных кнопок) теперь тоже приходит сюда, и старый
+    # парсинг падал бы IndexError'ом. Парсим оба префикса честно.
+    if query.data.startswith("personal_button_"):
+        button_id = query.data[len("personal_button_"):]
+    else:
+        button_id = query.data.split("_")[3]
 
     buttons = get_personal_buttons(user_id)
     button = next((b for b in buttons if b.button_id == button_id), None)
@@ -51033,7 +51161,9 @@ def _pomo_cfg_from_user_data(context):
 
 
 def _pomo_load_sessions():
-    return load_data(POMODORO_FILE, {})
+    # ИСПРАВЛЕНО (аудит): без expect="dict" битый файл ломал старт/стоп/скип
+    # Pomodoro (sessions[uid] = sess → TypeError на строке).
+    return load_data(POMODORO_FILE, {}, expect="dict")
 
 
 def _pomo_get_session(uid, sessions=None):
@@ -53544,7 +53674,8 @@ async def _class_timer_fire_now(application, tid):
     Возвращает число доставленных сообщений (0 — ничего не отправлено).
     """
     try:
-        timers = load_data(CLASS_TIMERS_FILE, {}, expect="dict") or {}
+        # ИСПРАВЛЕНО (аудит): чтение базы на каждом тике — в поток.
+        timers = await _async_load_data(CLASS_TIMERS_FILE, {}, expect="dict") or {}
     except Exception:
         return 0
     td = timers.get(tid)
@@ -53557,7 +53688,7 @@ async def _class_timer_fire_now(application, tid):
     if not class_obj:
         td['is_active'] = False
         timers[tid] = td
-        save_data(CLASS_TIMERS_FILE, timers)
+        await _async_save_data(CLASS_TIMERS_FILE, timers)
         return 0
     text = (f"📢 Запланированное сообщение класса {class_obj.class_name}:\n\n"
             f"{td.get('text') or ''}")
@@ -53597,12 +53728,12 @@ async def _class_timer_fire_now(application, tid):
         pass
     if _class_timer_is_recurring(td) and _timer_advance_repeat(td):
         timers[tid] = td
-        save_data(CLASS_TIMERS_FILE, timers)
+        await _async_save_data(CLASS_TIMERS_FILE, timers)
         schedule_class_timer_job(application, tid, td)
     else:
         td['is_active'] = False
         timers[tid] = td
-        save_data(CLASS_TIMERS_FILE, timers)
+        await _async_save_data(CLASS_TIMERS_FILE, timers)
     return sent
 
 
@@ -53612,7 +53743,8 @@ async def _class_timer_safety_net(context: ContextTypes.DEFAULT_TYPE):
     Двойной отправки нет: fired_key в записи таймера."""
     application = context.application
     try:
-        timers = load_data(CLASS_TIMERS_FILE, {}, expect="dict") or {}
+        # ИСПРАВЛЕНО (аудит): блокирующее чтение базы каждые 30 с — в поток.
+        timers = await _async_load_data(CLASS_TIMERS_FILE, {}, expect="dict") or {}
     except Exception:
         return
     if not timers:
@@ -54680,6 +54812,21 @@ def _age_gate_violation(user):
 # === ОБРАБОТЧИКИ CALLBACK ===
 # ==================================
 
+async def _safe_cb_answer(query, text=None, show_alert=False):
+    """ИСПРАВЛЕНО (аудит): безопасный повторный query.answer().
+
+    Центральный «await query.answer()» в начале handle_callback уже отвечает
+    на колбэк. Любой ВТОРОЙ answer с текстом («💰 Баланс…», «Нет действия»,
+    тогглы и т.п.) поднимал BadRequest «Query is already answered»: всплывашка
+    не показывалась, а всё, что шло после неё в ветке (edit_message_text,
+    send_message), ОБРЫВАЛОСЬ — кнопка выглядела «мёртвой». Оборачиваем в
+    try/except: если toast уже не показать — это не повод ломать ветку."""
+    try:
+        await query.answer(text=text, show_alert=show_alert)
+    except Exception:
+        pass
+
+
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     # ВОЛНА 22.13: отметка дневной активности (для статистики).
@@ -54824,9 +54971,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = str(query.from_user.id)
         user = get_user(user_id)
         if user:
-            await query.answer(f"💰 Баланс: {user.stars_balance} ⭐")
+            await _safe_cb_answer(query, f"💰 Баланс: {user.stars_balance} ⭐")
         else:
-            await query.answer("Ошибка")
+            await _safe_cb_answer(query, "Ошибка")
         return MAIN_MENU
 
     # === Смена режима личности ИИ (normal / hamlo / warm) ===
@@ -54941,7 +55088,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await dev_adminlog_cb(update, context)
     elif data == "age_set_birthday":
         # ВОЛНА 22.28: ДР обязателен — текст без «необязательно».
-        await update.callback_query.answer()
+        # ИСПРАВЛЕНО (аудит): повторный answer падал BadRequest'ом (центральный
+        # answer уже был выше) — send_message не выполнялся, пользователь у
+        # экрана 13+ нажимал кнопку и НЕ ПОЛУЧАЛ никакой реакции.
+        await _safe_cb_answer(update.callback_query)
         await context.bot.send_message(
             chat_id=update.effective_user.id,
             text=("🎂 Введите вашу реальную дату рождения в формате "
@@ -54957,7 +55107,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # ВОЛНА 22.28: кнопки «Продолжить без даты» больше нет — дата
         # обязательна. Если колбэк пришёл из старого сообщения — честно
         # отправляем вводить дату, а не в меню.
-        await update.callback_query.answer()
+        # ИСПРАВЛЕНО (аудит): повторный answer → BadRequest, сообщение не
+        # отправлялось. См. комментарий к age_set_birthday.
+        await _safe_cb_answer(update.callback_query)
         await context.bot.send_message(
             chat_id=update.effective_user.id,
             text=("🎂 Продолжить без даты рождения нельзя — она обязательна "
@@ -55066,7 +55218,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # === ВОЛНА 22.10: опросы (разработчик — всем, админ — классу) ===
     elif data == "dev_poll":
         if str(update.callback_query.from_user.id) != DEVELOPER_ID:
-            await update.callback_query.answer("Доступ запрещён.", show_alert=True)
+            # ИСПРАВЛЕНО (аудит): повторный answer с alert → BadRequest,
+            # предупреждение «Доступ запрещён» никогда не показывалось.
+            await _safe_cb_answer(update.callback_query, "Доступ запрещён.", show_alert=True)
             return MAIN_MENU
         return await poll_start(update, context, "all")
     elif data == "admin_poll":
@@ -55227,7 +55381,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("qprice_set_"):
         return await dev_quick_price_set_start(update, context)
     elif data == "dev_back_panel":
-        await update.callback_query.answer()
+        # ИСПРАВЛЕНО (аудит): повторный answer → BadRequest, и edit_message_text
+        # не выполнялся — кнопка «⬅️ Назад» (8 экранов панели) не работала.
+        await _safe_cb_answer(update.callback_query)
         await update.callback_query.edit_message_text(
             "🛠️ **Панель разработчика**\n\nВыберите действие:",
             reply_markup=get_developer_keyboard(),
@@ -55249,7 +55405,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "dev_toggle_new_user_notify":
         # Тоггл «Уведомления разработчику о новых пользователях».
         new_state = toggle_dev_new_user_notifications()
-        await update.callback_query.answer(
+        # ИСПРАВЛЕНО (аудит): повторный answer → BadRequest: тост не показывался
+        # и клавиатура не перерисовывалась — казалось, что тоггл не работает.
+        await _safe_cb_answer(
+            update.callback_query,
             "Уведомления о новых пользователях: " + ("включены" if new_state else "выключены"),
             show_alert=False,
         )
@@ -55721,16 +55880,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "cancel_action":
         return await cancel_action_handler(update, context)
     elif data == "no_action":
-        await query.answer("Нет действия")
+        # ИСПРАВЛЕНО (аудит): повторный answer → BadRequest → спам в error_handler.
+        await _safe_cb_answer(query, "Нет действия")
         return MAIN_MENU
     elif data == "limit_reached":
-        await query.answer("Достигнут лимит администраторов (2)")
+        await _safe_cb_answer(query, "Достигнут лимит администраторов (2)")
         return MAIN_MENU
     elif data == "blocked_header" or data == "active_header" or data == "admin_header" or data == "no_blocked" or data == "no_active":
-        await query.answer()
+        await _safe_cb_answer(query)
         return MAIN_MENU
     elif data == "subjects_header":
-        await query.answer()
+        await _safe_cb_answer(query)
         return MAIN_MENU
 
     if data.startswith("button_type_"):
@@ -55796,6 +55956,21 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # кнопка молчала. Ведём на callback-безопасный ререндер админ-панели.
     elif data == "admin_panel":
         return await back_to_admin_panel(update, context)
+    # ИСПРАВЛЕНО (аудит мёртвых кнопок): три кнопки без маршрутов — клик по ним
+    # молча проваливался в return MAIN_MENU: ничего не происходило, а FSM-состояние
+    # незаметно сбрасывалось. Теперь каждая ведёт куда задумано.
+    elif data == "back_to_dev":
+        # «⬅️ В панель разработчика» на экране «📜 Журнал админов» — раньше
+        # застревали на экране, спасал только /start.
+        return await dev_panel_back_cb(update, context)
+    elif data.startswith("personal_button_"):
+        # Кнопки «📝 …» в «🌟 Мои личные кнопки» — раньше были мертвы.
+        # Ведём на экран управления этой кнопкой (переименовать/содержимое/тип/удалить).
+        return await edit_personal_button_start(update, context)
+    elif data.startswith("admin_info_"):
+        # Строка админа в «👑 Управление админами» — информационная, действий нет.
+        await _safe_cb_answer(query, "Чтобы изменить права — используйте кнопки ✏️/🗑 рядом.")
+        return MANAGE_ADMINS
 
     return MAIN_MENU
 
@@ -56267,7 +56442,10 @@ async def _timer_safety_net(context: ContextTypes.DEFAULT_TYPE):
                     timer_data['fired_at'] = datetime.now().strftime("%Y-%m-%d %H:%M")
                 timers[timer_id] = timer_data
                 changed = True
-                save_data(TIMERS_FILE, timers)
+                # ИСПРАВЛЕНО (аудит): blocking save_data (Supabase/Mongo, таймаут
+                # 8–10 с) прямо на event loop в тикере каждые 30 с — во время
+                # медленного ответа облака ЗАМИРАЛИ ВСЕ пользователи.
+                await _async_save_data(TIMERS_FILE, timers)
 
                 msg = _timer_message_text(timer_data)
                 try:
@@ -56282,7 +56460,7 @@ async def _timer_safety_net(context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logger.error(f"safety-net: ошибка обработки таймера {timer_id}: {e}")
         if changed:
-            save_data(TIMERS_FILE, timers)
+            await _async_save_data(TIMERS_FILE, timers)
     except Exception as e:
         logger.error(f"safety-net общий сбой: {e}")
 
@@ -60175,7 +60353,10 @@ def schedule_user_holiday_job(application, user):
 #  каждого пользователя в файле NOTIFICATION_LOG_FILE.
 
 def _load_notification_log():
-    return load_data(NOTIFICATION_LOG_FILE, {})
+    # ИСПРАВЛЕНО (аудит): без expect="dict" битый лог уведомлений отключал
+    # ВСЕ ежедневные рассылки (утро/вечер/погода/ДР): log.get() падал на
+    # строке для каждого пользователя, каждый тик.
+    return load_data(NOTIFICATION_LOG_FILE, {}, expect="dict")
 
 
 def _save_notification_log(log):
@@ -61026,6 +61207,12 @@ async def _post_init(application):
                 await asyncio.sleep(delay)
                 class _CtxStub:
                     bot = application.bot
+                    # ИСПРАВЛЕНО (аудит): стаб использовался ровно тогда, когда
+                    # JobQueue мёртв (сценарий, ради которого существует
+                    # страховочный тик), а внутри тика был context.application
+                    # → AttributeError глотался except'ом → фоновые задачи
+                    # (_bg_tasks) никогда не чистились. Даём честную ссылку.
+                    application = application
                 await _unified_notification_tick(_CtxStub())
             except asyncio.CancelledError:
                 raise
@@ -61105,6 +61292,14 @@ async def _post_init(application):
         for fname in cloud_files:
             try:
                 data = load_data(fname, {})
+                # ИСПРАВЛЕНО (аудит): раньше писали обратно ВСЕГДА. Если Supabase/
+                # Mongo на старте ответили ошибкой/таймаутом, load_data возвращал
+                # дефолт {} — и мы ЗАТИРАЛИ облачную запись пустым словарём
+                # (полное удаление базы после одного сбойного GET). Теперь пустое
+                # чтение НЕ записывается: облако трогаем только если данные реально
+                # прочитаны и непусты.
+                if not data or (isinstance(data, dict) and not data):
+                    continue
                 save_data(fname, data)
                 total += 1
                 if isinstance(data, dict) and len(data) > 0:
@@ -61177,7 +61372,7 @@ async def _post_init(application):
             logger.info(f"ВОЛНА 22.52: сессий загрузки восстановлено: {_restored}")
         for _a_upid in _auto_upids:
             # бот сам догружает plain-сессии, где все байты уже на сервере
-            asyncio.create_task(_upload_auto_complete_delayed(_a_upid, 3.0))
+            _spawn_bg_task(_upload_auto_complete_delayed(_a_upid, 3.0))
     except Exception as e2:
         logger.error(f"Не удалось восстановить сессии загрузки: {e2}")
 
