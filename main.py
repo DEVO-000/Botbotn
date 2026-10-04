@@ -537,6 +537,12 @@ DUTY_CUSTOM_DATES = 156    # ждём список «дата — имена» (
 # было ни отредактировать, ни удалить через понятное меню.
 CUSTOM_BUTTON_EDIT_NAME = 157
 
+# ВОЛНА 22.74: 🔍 поиск в панелях (классы/пользователи), фото личной кнопки,
+# фото расписания звонков.
+USER_SEARCH_WAIT = 158     # ждём поисковый запрос (панели дев/админа)
+CREATE_PB_PHOTO_WAIT = 159 # ждём фото для личной кнопки (/skip — без фото)
+BELLS_PHOTO_WAIT = 160     # ждём ФОТО расписания звонков
+
 # ВОЛНА 22.4: «🎙 Пульт» удалён ПОЛНОСТЬЮ по решению пользователя — кнопки,
 # состояний (бывшие 126–131), хендлеров и хранилищ стилей больше нет.
 
@@ -561,6 +567,10 @@ _QUICK_SKIP_STATES = frozenset({VAULT_REN_WAIT, VAULT_LABEL_WAIT,
                                 # ВОЛНА 22.20: тут вводят @username/-100…id
                                 # своего канала — это не команда.
                                 VAULT_MYCLOUD_WAIT,
+                                # ВОЛНА 22.74: поисковый запрос в панелях —
+                                # тоже не команда.
+                                USER_SEARCH_WAIT, CREATE_PB_PHOTO_WAIT,
+                                BELLS_PHOTO_WAIT,
                                 # ВОЛНА 22.29: пароль/время/даты — не команды.
                                 WEB_PW_ENTER, WEB_PW_ENTER_OLD,
                                 DND_WAIT_TIME, SICK_WAIT_FROM, SICK_WAIT_TO})
@@ -1962,6 +1972,27 @@ def get_price(key, default=0):
     except (TypeError, ValueError):
         return int(default)
 
+
+def _is_unlimited(value):
+    """ВОЛНА 22.74: «∞» — безлимит. В PRICES бесконечность хранится как -1
+    (JSON-безопасно); вводится разработчиком как «∞», «бесконечно», «inf»."""
+    if isinstance(value, str):
+        return value.strip().lower() in ("inf", "infinity", "бесконечно",
+                                         "бесконечность", "∞")
+    try:
+        return int(value) < 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _limit_str(value):
+    """Отображение лимита: -1 → «∞», иначе число."""
+    try:
+        _v = int(value)
+    except (TypeError, ValueError):
+        return str(value)
+    return "∞" if _v < 0 else str(_v)
+
 # ==================================
 # === НАСТРОЙКИ РАЗРАБОТЧИКА ===
 # ==================================
@@ -3017,6 +3048,8 @@ class PersonalButton:
         self.is_active = True
         self.position = 0
         self.row = 1
+        # ВОЛНА 22.74: изображение кнопки (file_id) — показывается при нажатии
+        self.photo = ""
 
     def to_dict(self):
         return {
@@ -3028,7 +3061,8 @@ class PersonalButton:
             'created_date': self.created_date,
             'is_active': self.is_active,
             'position': self.position,
-            'row': self.row
+            'row': self.row,
+            'photo': str(getattr(self, 'photo', '') or '')
         }
 
     @classmethod
@@ -3044,6 +3078,7 @@ class PersonalButton:
         button.is_active = data.get('is_active', True)
         button.position = data.get('position', 0)
         button.row = data.get('row', 1)
+        button.photo = str(data.get('photo', '') or '')
         return button
 
 
@@ -3086,6 +3121,9 @@ class Class:
             "5": {"start": "11:40", "end": "12:25"},
             "6": {"start": "12:35", "end": "13:20"}
         }
+        # ВОЛНА 22.74: ФОТО расписания звонков (file_id). Если задано — бот
+        # показывает фото; точный отсчёт «сколько осталось» по фото невозможен.
+        self.bells_photo = ""
         self.holidays = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
         self.created_date = datetime.now().strftime("%Y-%m-%d %H:%M")
         self.is_active = True
@@ -3140,6 +3178,8 @@ class Class:
             'schedule': self.schedule,
             'teachers': self.teachers,
             'bells': self.bells,
+            # ВОЛНА 22.74: фото звонков (может не быть у старых классов)
+            'bells_photo': str(getattr(self, 'bells_photo', '') or ''),
             'holidays': self.holidays,
             'created_date': self.created_date,
             'is_active': self.is_active,
@@ -4271,6 +4311,29 @@ def block_user(user_id, blocked_by=DEVELOPER_ID, unblock_price=None,
     if str(user_id) in users:
         users[str(user_id)].is_blocked = True
         save_users(users)
+    # ВОЛНА 22.74: СИНХРОНИЗАЦИЯ БЛОКИРОВОК В БАЗЕ — глобальная блокировка
+    # разработчика действует и ВО ВСЕХ КЛАССАХ пользователя (тот же
+    # заблокированный список в classes.json): панели админов показывают
+    # актуальное состояние сразу, без ручной переблокировки.
+    try:
+        _classes = load_classes()
+        _changed = False
+        for _code, _cls in _classes.items():
+            if not getattr(_cls, 'is_active', True):
+                continue
+            if str(user_id) in (getattr(_cls, 'students', None) or []):
+                _bl = getattr(_cls, 'blocked_users', None)
+                if not isinstance(_bl, list):
+                    _bl = []
+                if str(user_id) not in _bl:
+                    _bl.append(str(user_id))
+                    _cls.blocked_users = _bl
+                    _changed = True
+        if _changed:
+            save_classes(_classes)
+            logger.info(f"Блокировка {user_id} синхронизирована во все классы")
+    except Exception as e:
+        logger.error(f"Синхронизация блокировки по классам: {e}")
     return save_blocked_users(blocked_users)
 
 def unblock_user(user_id):
@@ -4281,6 +4344,22 @@ def unblock_user(user_id):
         if str(user_id) in users:
             users[str(user_id)].is_blocked = False
             save_users(users)
+        # ВОЛНА 22.74: синхронизация в обратную сторону — глобальный разбан
+        # снимает классовые блокировки этого пользователя во ВСЕХ классах.
+        try:
+            _classes = load_classes()
+            _changed = False
+            for _code, _cls in _classes.items():
+                _bl = getattr(_cls, 'blocked_users', None)
+                if isinstance(_bl, list) and str(user_id) in _bl:
+                    _bl.remove(str(user_id))
+                    _cls.blocked_users = _bl
+                    _changed = True
+            if _changed:
+                save_classes(_classes)
+                logger.info(f"Разбан {user_id} синхронизирован по всем классам")
+        except Exception as e:
+            logger.error(f"Синхронизация разбана по классам: {e}")
         return save_blocked_users(blocked_users)
     return True
 
@@ -5080,6 +5159,14 @@ def get_bells_edit_keyboard(class_obj):
     # ВОЛНА 22.41: «весь список вручную» — админ присылает список звонков
     # одним сообщением, парсер заменяет всё расписание звонков сразу.
     keyboard.append([InlineKeyboardButton("📜 Ввести весь список", callback_data="edit_bells_bulk")])
+    # ВОЛНА 22.74: ФОТО расписания звонков — админ присылает картинку;
+    # бот показывает её вместо текстового отсчёта («сколько осталось»
+    # по картинке посчитать нельзя — честно предупреждаем).
+    if str(getattr(class_obj, 'bells_photo', '') or ''):
+        keyboard.append([InlineKeyboardButton("📷 Заменить фото звонков", callback_data="bells_photo_set"),
+                         InlineKeyboardButton("🗑 Убрать фото", callback_data="bells_photo_del")])
+    else:
+        keyboard.append([InlineKeyboardButton("📷 Добавить фото звонков", callback_data="bells_photo_set")])
     keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_to_admin")])
     return InlineKeyboardMarkup(keyboard)
 
@@ -5181,6 +5268,9 @@ def get_classes_keyboard(classes, action_prefix):
                 callback_data=f"{action_prefix}_{class_code}"
             )])
 
+    # ВОЛНА 22.74: 🔍 поиск по классам (имя/код) — большие списки больше
+    # не приходится листать вручную.
+    keyboard.append([InlineKeyboardButton("🔍 Поиск класса", callback_data=f"usrch_c_{action_prefix}")])
     keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel_action")])
     return InlineKeyboardMarkup(keyboard)
 
@@ -6040,8 +6130,112 @@ def get_users_keyboard(users, action_prefix):
             name += f" (@{user.username})"
         keyboard.append([InlineKeyboardButton(name, callback_data=f"{action_prefix}_{user_id}")])
 
+    # ВОЛНА 22.74: 🔍 поиск по пользователям (имя/@username/ID).
+    keyboard.append([InlineKeyboardButton("🔍 Поиск пользователя", callback_data=f"usrch_u_{action_prefix}")])
     keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel_action")])
     return InlineKeyboardMarkup(keyboard)
+
+
+# === ВОЛНА 22.74: ПОИСК В ПАНЕЛЯХ (классы/пользователи) ===
+async def user_search_start(update: Update,
+                            context: ContextTypes.DEFAULT_TYPE):
+    """🔍 «Поиск класса/пользователя» — запрос вводится текстом, дальше
+    бот показывает только совпадения С ТЕМИ ЖЕ callback (обработчики
+    панелей работают как раньше)."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    data = query.data or ""
+    if data.startswith("usrch_c_"):
+        scope, prefix = "classes", data[len("usrch_c_"):]
+        prompt = ("🔍 Введите запрос для поиска КЛАССА\n\n"
+                  "Подойдёт имя класса или код (например «10А» или «ABC123»). "
+                  "Совпадения — по подстроке, без учёта регистра.")
+    else:
+        scope, prefix = "users", data[len("usrch_u_"):]
+        prompt = ("🔍 Введите запрос для поиска ПОЛЬЗОВАТЕЛЯ\n\n"
+                  "Подойдёт имя, @username или ID. Совпадения — по подстроке, "
+                  "без учёта регистра.")
+    context.user_data['usr_search_scope'] = scope
+    context.user_data['usr_search_prefix'] = prefix
+    try:
+        await query.edit_message_text(prompt, reply_markup=get_cancel_keyboard())
+    except Exception:
+        await context.bot.send_message(
+            chat_id=int(query.from_user.id), text=prompt,
+            reply_markup=get_cancel_keyboard())
+    return USER_SEARCH_WAIT
+
+
+@timeout(CONVERSATION_TIMEOUT)
+async def user_search_input(update: Update,
+                            context: ContextTypes.DEFAULT_TYPE):
+    """Приём поискового запроса → отфильтрованный список-клавиатура."""
+    user_id = str(update.effective_user.id)
+    scope = context.user_data.get('usr_search_scope', 'classes')
+    prefix = context.user_data.get('usr_search_prefix', '')
+    q = (update.message.text or "").strip().lower()
+
+    if not q or q in ("отмена", "cancel"):
+        context.user_data.pop('usr_search_scope', None)
+        context.user_data.pop('usr_search_prefix', None)
+        await update.message.reply_text("❌ Поиск отменён.")
+        return MAIN_MENU
+
+    if scope == "classes":
+        classes = load_classes()
+        found = {code: c for code, c in classes.items()
+                 if getattr(c, 'is_active', True)
+                 and (q in str(getattr(c, 'class_name', '') or '').lower()
+                      or q in str(code).lower())}
+        if not found:
+            await update.message.reply_text(
+                f"🔍 Ничего не найдено по «{q}». Попробуйте другой запрос "
+                "или отправьте /cancel.")
+            return USER_SEARCH_WAIT
+        kb_rows = [[InlineKeyboardButton(
+            f"{c.class_name} ({code})",
+            callback_data=f"{prefix}_{code}")] for code, c in found.items()]
+        kb_rows.append([InlineKeyboardButton(
+            "🔍 Искать снова", callback_data=f"usrch_c_{prefix}")])
+        kb_rows.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel_action")])
+        await update.message.reply_text(
+            f"🔍 Найдено классов: {len(found)}",
+            reply_markup=InlineKeyboardMarkup(kb_rows[:51]))
+        return USER_SEARCH_WAIT
+
+    users = load_users()
+    found = {}
+    for uid, u in users.items():
+        _uname = str(getattr(u, 'username', '') or '')
+        _fname = str(getattr(u, 'first_name', '') or '')
+        if (q in _fname.lower() or q in _uname.lower()
+                or q in str(uid)):
+            found[uid] = u
+        if len(found) >= 40:
+            break
+    if not found:
+        await update.message.reply_text(
+            f"🔍 Ничего не найдено по «{q}». Попробуйте другой запрос "
+            "или отправьте /cancel.")
+        return USER_SEARCH_WAIT
+    kb_rows = []
+    for uid, u in found.items():
+        name = getattr(u, 'first_name', None) or f"User {uid}"
+        if getattr(u, 'username', None):
+            name += f" (@{u.username})"
+        kb_rows.append([InlineKeyboardButton(
+            name, callback_data=f"{prefix}_{uid}")])
+    kb_rows.append([InlineKeyboardButton(
+        "🔍 Искать снова", callback_data=f"usrch_u_{prefix}")])
+    kb_rows.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel_action")])
+    await update.message.reply_text(
+        f"🔍 Найдено пользователей: {len(found)}" +
+        (" (показаны первые)" if len(found) >= 40 else ""),
+        reply_markup=InlineKeyboardMarkup(kb_rows))
+    return USER_SEARCH_WAIT
 
 def get_language_keyboard():
     keyboard = [
@@ -8002,7 +8196,7 @@ async def _post_shutdown(application):
 # === ЛИЧНОЕ ОБЛАКО («☁️ Облако») ===
 # ==================================
 
-CLOUD_BUTTON = "☁️ Облако"
+CLOUD_BUTTON = "☁️ DECLOUD+"
 
 # Расширения и mime-типы, которые ZIP сжимает сильно (текст/данные).
 # Фото, видео и аудио уже сжаты форматами — честно не обещаем экономии.
@@ -8168,7 +8362,7 @@ def _cloud_menu_text(user):
         f"🔐 В Сейфе: {len(vault_files)} файл(ов) • {_fmt_bytes(total_enc)} шифра\n"
         + (f"☁️ Хранилище: ВАШ личный канал «{_uch[1]}»"
            if _uch else
-           f"☁️ Каналов-хранилищ: {len(get_cloud_channel_ids())} • лимит: {limit} шт"),
+           f"☁️ Каналов-хранилищ: {len(get_cloud_channel_ids())} • лимит: {_limit_str(limit)} шт"),
     ]
     if legacy:
         lines.append(
@@ -8260,7 +8454,7 @@ def _cloud_files_text(user):
     shown = files[:30]
     # ВОЛНА 22.33: заголовок без слова «СТАРЫЕ» — раздел общий и для файлов
     # прежних версий, и для загрузок из мини-аппа (режим «без шифра»).
-    lines = [f"📁 ФАЙЛЫ БЕЗ ШИФРА ({len(files)}/{limit} • {_fmt_bytes(total)}):", ""]
+    lines = [f"📁 ФАЙЛЫ БЕЗ ШИФРА ({len(files)}/{_limit_str(limit)} • {_fmt_bytes(total)}):", ""]
     for rec in shown:
         # ВОЛНА 22.21: 🔒 — файл отмечен в Веб-облаке (Mini App) как Vault
         # (отдельная папка просмотра, НЕ шифрование Сейфа).
@@ -8469,7 +8663,7 @@ async def _cloud_upload_items(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     saved, skipped_big, failed, limit_hit = [], [], [], False
     for item in items:
-        if len(files) >= limit:
+        if limit > 0 and len(files) >= limit:
             limit_hit = True
             skipped_big.append(item)
             continue
@@ -8543,7 +8737,7 @@ async def _cloud_upload_items(update: Update, context: ContextTypes.DEFAULT_TYPE
         if len(saved) > 10:
             lines.append(f"  …и ещё {len(saved) - 10} шт.")
     if limit_hit:
-        lines.append(f"🚫 Лимит облака ({limit} файлов) достигнут — остальное не влезло. "
+        lines.append(f"🚫 Лимит облака ({_limit_str(limit)} файлов) достигнут — остальное не влезло. "
                      "Удалите что-нибудь в «📁 Мои файлы» (лимит меняется в панели цен).")
     if skipped_big:
         lines.append(_big_file_advice_text(skipped_big[0]["size"]))
@@ -9012,7 +9206,7 @@ async def _bg_upload_items(update, context, items):
     _msg_mid = int(getattr(msg, "message_id", 0) or 0)
 
     for _li, item in enumerate(items):
-        if len(files) >= limit:
+        if limit > 0 and len(files) >= limit:
             limit_hit = True
             skipped_big.append(item)
             continue
@@ -9124,7 +9318,7 @@ async def _bg_upload_items(update, context, items):
         lines.append("💡 Фото/видео Telegram сжал ещё на телефоне: для "
                      "оригинала отправляйте «как файл» (скрепка → «Файл»).")
     if limit_hit:
-        lines.append(f"🚫 Лимит облака ({limit} файлов) достигнут — остальное "
+        lines.append(f"🚫 Лимит облака ({_limit_str(limit)} файлов) достигнут — остальное "
                      "не влезло. Удалите что-нибудь в мини-аппе.")
     if skipped_big:
         lines.append(_big_file_advice_text(skipped_big[0]["size"]))
@@ -9590,8 +9784,8 @@ async def _miniapp_user_from_request(request):
     if not data:
         return None, "", _miniapp_err(
             401, "unauthorized",
-            "Откройте облако через Telegram (кнопка меню бота «☁️ DEVO+» или "
-            "☁️ Облако → 🌐 Веб-облако): подпись Telegram не подтверждена.",
+            "Откройте облако через Telegram (кнопка меню бота «☁️ DECLOUD+» или "
+            "☁️ DECLOUD+ → 🌐 Веб-облако): подпись Telegram не подтверждена.",
             extra={"bot": _miniapp_bot_username()})
     try:
         u = json.loads(data.get("user") or "{}")
@@ -9892,7 +10086,8 @@ def _miniapp_sweep_orphan_parts():
 
 # --- MINIAPP_EMBED_BEGIN (ВОЛНА 22.25: сюда сборщик scripts/embed_miniapp.py
 #     вставляет содержимое miniapp/index.html БАЙТ-В-БАЙТ — одна версия с ботом) ---
-MINIAPP_HTML = r"""<!DOCTYPE html>
+MINIAPP_HTML = r"""
+<!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="UTF-8">
@@ -11210,8 +11405,10 @@ html.low-end .fade-soft-in {
    Плавное раскрытие, непрозрачное окно, сколько осталось + отмена. Все иконки — SVG */
 #cornerTransfers {
   position: fixed;
-  right: 14px;
-  bottom: calc(14px + env(safe-area-inset-bottom, 0px));
+  /* 22.74: чуть больше отступ от краёв — карточка больше не обрезается
+     нижней панелью Telegram на телефонах (safe-area в WebView бывает 0) */
+  right: 12px;
+  bottom: calc(22px + env(safe-area-inset-bottom, 0px));
   z-index: 150;
   display: flex;
   flex-direction: column;
@@ -11222,8 +11419,9 @@ html.low-end .fade-soft-in {
 
 .ct-fab {
   pointer-events: auto;
-  width: 54px;
-  height: 54px;
+  /* 22.74: «сделай его немного меньше» — 54 → 42px */
+  width: 42px;
+  height: 42px;
   border-radius: 50%;
   background: var(--card-bg);
   border: 1px solid var(--border-color);
@@ -11269,7 +11467,7 @@ html.low-end .fade-soft-in {
 
 .ct-fab-ring circle {
   fill: none;
-  stroke-width: 3.5;
+  stroke-width: 3;
 }
 
 .ct-ring-bg-c {
@@ -11279,14 +11477,14 @@ html.low-end .fade-soft-in {
 .ct-ring-fill-c {
   stroke: var(--loader-bar);
   stroke-linecap: round;
-  stroke-dasharray: 163.4;
-  stroke-dashoffset: 163.4;
+  stroke-dasharray: 119.4;
+  stroke-dashoffset: 119.4;
   transition: stroke-dashoffset 0.25s linear;
 }
 
 .ct-fab-icon {
-  width: 22px;
-  height: 22px;
+  width: 18px;
+  height: 18px;
   stroke: var(--text-color);
   fill: none;
   stroke-width: 2.4;
@@ -11298,13 +11496,13 @@ html.low-end .fade-soft-in {
   position: absolute;
   top: -3px;
   right: -3px;
-  min-width: 19px;
-  height: 19px;
-  padding: 0 5px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
   border-radius: 9999px;
   background: #ef4444;
   color: #fff;
-  font-size: 11px;
+  font-size: 10px;
   font-weight: 900;
   display: flex;
   align-items: center;
@@ -11314,8 +11512,9 @@ html.low-end .fade-soft-in {
 
 .ct-panel {
   pointer-events: auto;
-  width: min(320px, calc(100vw - 28px));
-  max-height: min(430px, 62vh);
+  /* 22.74: панель компактнее */
+  width: min(292px, calc(100vw - 24px));
+  max-height: min(380px, 56vh);
   background: var(--card-bg);
   border: 1px solid var(--border-color);
   border-radius: 24px;
@@ -12421,9 +12620,9 @@ body.vp-lock {
   </div>
 
   <button class="ct-fab" id="ctFab" onclick="ctTogglePanel(event)" aria-label="Загрузки">
-    <svg class="ct-fab-ring" viewBox="0 0 54 54">
-      <circle class="ct-ring-bg-c" cx="27" cy="27" r="26"></circle>
-      <circle class="ct-ring-fill-c" id="ctRingFill" cx="27" cy="27" r="26"></circle>
+    <svg class="ct-fab-ring" viewBox="0 0 42 42">
+      <circle class="ct-ring-bg-c" cx="21" cy="21" r="19"></circle>
+      <circle class="ct-ring-fill-c" id="ctRingFill" cx="21" cy="21" r="19"></circle>
     </svg>
 
     <svg class="ct-fab-icon" viewBox="0 0 24 24">
@@ -14617,7 +14816,7 @@ function showToast(text) {
 
   const t = document.createElement('div');
   t.className = 'toast-msg';
-  t.style.cssText = 'background:var(--btn-bg);color:var(--btn-text);font-size:14px;font-weight:700;padding:12px 20px;border-radius:9999px;box-shadow:0 10px 25px rgba(0,0,0,.25);text-align:center';
+  t.style.cssText = 'background:var(--btn-bg);color:var(--btn-text);font-size:14px;font-weight:700;padding:12px 20px;border-radius:9999px;box-shadow:0 10px 25px rgba(0,0,0,.25);text-align:center;pointer-events:auto;touch-action:pan-x';
 
   t.innerHTML = String(text)
     .split(TOAST_EMOJI_RE)
@@ -14630,11 +14829,50 @@ function showToast(text) {
     })
     .join('');
 
+  /* ВОЛНА 22.74: уведомление можно УБРАТЬ СВАЙПОМ в сторону. */
+  try {
+    let _sx = 0, _sy = 0, _dx = 0, _drag = false;
+
+    t.addEventListener('touchstart', function (e) {
+      _drag = true;
+      _sx = e.touches[0].clientX;
+      _sy = e.touches[0].clientY;
+      _dx = 0;
+      t.style.transition = 'none';
+    }, { passive: true });
+
+    t.addEventListener('touchmove', function (e) {
+      if (!_drag) return;
+      _dx = e.touches[0].clientX - _sx;
+      if (Math.abs(e.touches[0].clientY - _sy) > Math.abs(_dx)) return;
+      t.style.transform = 'translateX(' + _dx + 'px)';
+      t.style.opacity = String(Math.max(0.3, 1 - Math.abs(_dx) / 130));
+    }, { passive: true });
+
+    t.addEventListener('touchend', function () {
+      if (!_drag) return;
+      _drag = false;
+      if (Math.abs(_dx) > 55) {
+        t.style.transition = 'transform .22s ease, opacity .22s ease';
+        t.style.transform = 'translateX(' + (_dx > 0 ? '120%' : '-120%') + ')';
+        t.style.opacity = '0';
+        setTimeout(function () { t.remove(); }, 230);
+      } else {
+        t.style.transition = 'transform .25s ease, opacity .25s ease';
+        t.style.transform = '';
+        t.style.opacity = '';
+      }
+    }, { passive: true });
+  } catch (e) {}
+
   c.appendChild(t);
 
   safeIcons();
 
-  setTimeout(() => t.remove(), 4000);
+  setTimeout(() => {
+    if (!t.isConnected || t.style.opacity === '0') return;
+    t.remove();
+  }, 4000);
 }
 
 function flashScreen() {
@@ -17194,16 +17432,12 @@ function refreshUploadModal() {
 
   if (info) {
     info.textContent = !has
-      /* ВОЛНА 22.59: файлы летят боту С МОМЕНТА ВЫБОРА — окно теперь
-         настройки (пароль/имена), а не «шлюз». ВОЛНА 22.61: текст честный:
-         что успело дойти — сохранится само; недокачанное продолжится при
-         следующем открытии, бот молча подскажет в чате.
-         ВОЛНА 22.63: упоминание кнопки «через Telegram» убрано — кнопки
-         больше нет, загрузка идёт напрямую всегда. */
-      ? 'Файлы, выбранные ниже, сразу летят боту. Что успеет дойти — сохранится само; недокачанное продолжится при следующем открытии (бот подскажет в чате).'
+      /* ВОЛНА 22.74: автостарт убран — файлы грузятся ТОЛЬКО по кнопке
+         «Отправить». Окно снова «шлюз»: список, пароль, «Отправить». */
+      ? 'Выберите файлы кнопкой ниже, при необходимости укажите пароль — и нажмите «Отправить». Файлы не загружаются, пока вы не нажмёте «Отправить».'
       : pendingFiles.length === 1
-        ? (pendingFiles[0].name || 'файл') + ' — уже летит боту. Пароль (в Сейф) и имя — по кнопке «Отправить», можно и просто закрыть окно.'
-        : 'Выбрано файлов: ' + pendingFiles.length + ' — все уже летят боту. Пароль (в Сейф) и имена — по кнопке «Отправить», окно можно закрыть.';
+        ? (pendingFiles[0].name || 'файл') + ' — ждёт отправки. Загрузка начнётся после нажатия кнопки «Отправить».'
+        : 'Выбрано файлов: ' + pendingFiles.length + ' — все ждут отправки. Загрузка начнётся после нажатия кнопки «Отправить».';
   }
 
   if (list) {
@@ -17245,21 +17479,22 @@ function refreshUploadModal() {
      (и в боте, и здесь); оставил пустым → обычная загрузка без пароля. */
   const pwRequired = STORAGE_ENCRYPTED === true;
 
-  if (passRow) passRow.style.display = 'block';
+  /* ВОЛНА 22.74: пользователь просил УБРАТЬ запрос пароля в режиме
+     «без шифрования» — поле пароля теперь показывается ТОЛЬКО когда
+     шифрование включено. Никаких «необязательных» паролей. */
+  if (passRow) passRow.style.display = pwRequired ? 'block' : 'none';
   if (plainHint) {
     plainHint.style.display = pwRequired ? 'none' : 'block';
     plainHint.textContent = pwRequired
       ? ''
-      : 'Шифрование отключено — пароль не нужен. Но можете ввести пароль Сейфа: тогда файл зашифруется и появится в Сейфе (в боте и здесь).';
+      : 'Шифрование отключено — пароль не нужен, файлы уйдут как есть.';
   }
 
   if (passInput) {
-    passInput.placeholder = pwRequired
-      ? 'Пароль из бота'
-      : 'Необязательно — для загрузки в Сейф';
+    passInput.placeholder = 'Пароль из бота';
 
     if (!passInput.value) {
-      passInput.value = (pwRequired && VAULT_PW) ? VAULT_PW : '';
+      passInput.value = pwRequired ? (VAULT_PW || '') : '';
     }
   }
 }
@@ -17275,11 +17510,10 @@ function openUploadModal() {
 function closeUploadModal(e) {
   if (e) e.stopPropagation();
 
-  /* ВОЛНА 22.59: закрытие окна БОЛЬШЕ НЕ отменяет загрузку — файлы уже
-     летят боту с момента выбора («сразу в бота», как при отправке в чат).
-     Отменить осознанно можно крестиком строки в панели передач (справа
-     внизу). Из очереди докачки убираем только файлы, которые ещё НЕ
-     летят (нет сессии — например, ждут пароль), — как раньше. */
+  /* ВОЛНА 22.74: загрузка начинается ТОЛЬКО по кнопке «Отправить».
+     Закрытие окна до «Отправить» отменяет партию: файлы из локальной
+     очереди докачки убираются — бот ничего не получает. Уже летящие
+     файлы (сессия открыта) не трогаем — их видно в панели передач. */
   let flying = 0;
 
   for (const f of pendingFiles) {
@@ -17290,10 +17524,6 @@ function closeUploadModal(e) {
     }
 
     if (f && f._entryKey && !f._preId) upqDel(f._entryKey);
-  }
-
-  if (flying) {
-    showToast('📨 Файлы продолжают грузиться боту — прогресс в панели справа внизу');
   }
 
   pendingFiles = [];
@@ -17463,44 +17693,12 @@ function uploadFiles(fileList) {
     openUploadModal();
   }
 
-  /* ═══ ВОЛНА 22.59: СРАЗУ В БОТА ═══
-     Байты каждого файла летят боту С МОМЕНТА ВЫБОРА — как при отправке
-     в чат бота: не дожидаясь кнопки «Отправить» и окон имени. Пользователь
-     может закрыть окно и вообще выйти — всё, что доехало до сервера,
-     бот закончит сам (финализация по последнему куску, 22.52 + hold 22.59).
-     Окно загрузки остаётся НАСТРОЙКОЙ поверх уже идущей передачи: пароль
-     (в Сейф), имена (догонят через rename), докидывание файлов.
-     В режиме шифрования без известного пароля init честно ответит 423 —
-     предохранка тихо отступит, движок спросит пароль как раньше. */
-  if (IS_TELEGRAM || WEB_TOKEN) {
-    let preStarted = 0;
-
-    for (const f of files) {
-      if (f && f._preState !== 'run' && f._preState !== 'done' && !f._preStop &&
-          +f.size > 0) {
-        f._preHold = true;   /* 22.59: сессия «недорешённая» — сервер ждёт пароль/имя */
-        f._preQueued = true;
-        PRE_QUEUE.push(f);
-        preStarted++;
-      }
-    }
-
-    if (preStarted) {
-      /* 22.61: чем больше пачка, тем больше файлов в полёте + сессии
-         ВСЕЙ пачке сразу — выход из приложения больше не оставляет
-         файлы «не тронутыми» (см. prestreamInitAll) */
-      prestreamTuneConcurrency(files.length);
-      prestreamInitAll(files);
-
-      prestreamKick();
-
-      /* ВОЛНА 22.65: тост ВСЕГДА — байты летят боту с момента выбора
-         и в шифрованном режиме (сервер 22.65 создаёт сессию без пароля,
-         pw_pending): пароль догонит из окна, файл уже в пути */
-      showToast('📨 Файлы сразу пошли боту — грузятся в фоне, можно закрыть приложение');
-    }
-  }
-
+  /* ═══ ВОЛНА 22.74: ЗАГРУЗКА ТОЛЬКО ПО КНОПКЕ «ОТПРАВИТЬ» ═══
+     Раньше (22.59–22.65) байты летели боту С МОМЕНТА ВЫБОРА и тост
+     сообщал «Файлы сразу пошли боту». По решению пользователя автостарт
+     УБРАН: выбранные файлы просто ждут в окне, а передача начинается
+     по кнопке «Отправить» (confirmUploadFiles → prestreamStart).
+     Закрытие окна до «Отправить» НЕ отправляет файлы. */
   pickerAppend = false;
 }
 
@@ -19184,7 +19382,7 @@ async function pullSettingsApply() {
    осталось, у каждой передачи кнопка отмены. Все иконки — SVG.
    ═══════════════════════════════════════════════════════════════ */
 const TRANSFERS = new Map();
-const CT_RING_C = 163.4; /* 2πr, r=26 */
+const CT_RING_C = 119.4; /* 22.74: 2πr, r=19 (FAB 42px) */
 let ctPanelOpen = false;
 let ctLastSig = '';
 let ctRaf = 0;
@@ -24302,10 +24500,10 @@ async def miniapp_upload_init(request):
         # в Сейфе учитываем ВЕСЬ список пользователя (как в чате)
         files = files + [f for f in (getattr(user, "vault_files", []) or [])
                          if isinstance(f, dict)]
-    if len(files) >= limit:
+    if limit > 0 and len(files) >= limit:
         return _miniapp_err(
             409, "limit",
-            f"Лимит облака ({limit} файлов) достигнут — удалите что-нибудь "
+            f"Лимит облака ({_limit_str(limit)} файлов) достигнут — удалите что-нибудь "
             "(в вебе или в чате: 🗑 у файла).")
     _miniapp_cleanup_uploads()
     # ВОЛНА 22.53: ПОВТОРНЫЙ ВЫБОР ТОГО ЖЕ ФАЙЛА = ПРОДОЛЖЕНИЕ ПРЕРВАННОЙ
@@ -26920,11 +27118,11 @@ async def _storage_channel_post_handler(update: Update, context: ContextTypes.DE
             return
         files = [f for f in (getattr(user, "cloud_files", []) or []) if isinstance(f, dict)]
         limit = get_price('cloud_max_files', 50)
-        if len(files) >= limit:
+        if limit > 0 and len(files) >= limit:
             try:
                 await context.bot.send_message(
                     chat_id=int(target_uid),
-                    text=f"🚫 «{item['name']}» не записан: лимит облака ({limit}) достигнут.",
+                    text=f"🚫 «{item['name']}» не записан: лимит облака ({_limit_str(limit)}) достигнут.",
                 )
             except Exception:
                 pass
@@ -30500,9 +30698,9 @@ async def web_pw_enter_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         # ВОЛНА 22.30: «пользователю не нужно давать ссылку на Render, где бот» —
         # сырой адрес хостинга из текста сообщения УБРАН: веб-облако открывается
-        # кнопкой ниже или кнопкой меню бота «☁️ DEVO+» (адрес нигде не светится).
+        # кнопкой ниже или кнопкой меню бота «☁️ DECLOUD+» (адрес нигде не светится).
         "✅ Веб-пароль сохранён. Откройте веб-облако кнопкой ниже "
-        "(или кнопкой меню бота «☁️ DEVO+»).\n\n"
+        "(или кнопкой меню бота «☁️ DECLOUD+»).\n\n"
         f"🆔 Логин — ваш Telegram ID: <code>{user.user_id}</code>\n"
         "Пункт «🔑 Веб-пароль» живёт в ☁️ Облако и 🔐 Сейфе.",
         parse_mode=ParseMode.HTML,
@@ -40445,6 +40643,13 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     personal_buttons = get_personal_buttons(user_id)
     for button in personal_buttons:
         if button.name == message_text:
+            # ВОЛНА 22.74: если к кнопке прикреплено ИЗОБРАЖЕНИЕ — сначала фото.
+            _pb_photo = str(getattr(button, 'photo', '') or '')
+            if _pb_photo:
+                try:
+                    await update.message.reply_photo(_pb_photo, caption=f"{button.name}")
+                except Exception as e:
+                    logger.warning(f"personal button photo: {e}")
             if button.button_type == "url":
                 await update.message.reply_text(
                     f"🔗 **{button.name}**",
@@ -40885,6 +41090,19 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if class_obj and is_user_class_blocked(user_id, class_obj.class_code):
             await update.message.reply_text("Вы заблокированы в этом классе.")
             return MAIN_MENU
+
+        # ВОЛНА 22.74: если админ добавил ФОТО звонков — показываем его;
+        # точный отсчёт «сколько осталось» по картинке невозможен.
+        _bphoto = str(getattr(class_obj, 'bells_photo', '') or '') if class_obj else ''
+        if _bphoto:
+            try:
+                await update.message.reply_photo(
+                    _bphoto,
+                    caption="🔔 Расписание звонков (фото от администратора).\n"
+                            "Точный отсчёт «сколько осталось» по фото недоступен.")
+                return MAIN_MENU
+            except Exception as e:
+                logger.warning(f"bells photo send fail: {e} — покажу текст")
 
         # Передаём user, чтобы время «сейчас» бралось по его локали.
         bells_info = get_bells_info(class_obj, user)
@@ -41642,6 +41860,78 @@ async def create_personal_button_name_handler(update: Update, context: ContextTy
         return CREATE_PERSONAL_BUTTON_CONTENT
 
 @timeout(CONVERSATION_TIMEOUT)
+async def _finish_personal_button_create(update: Update,
+                                         context: ContextTypes.DEFAULT_TYPE,
+                                         photo_fid: str = ""):
+    """ВОЛНА 22.74: общая финализация создания личной кнопки (после шага фото).
+    Слот prepaid_buttons списывается ТОЛЬКО здесь — раньше он сгорал,
+    даже если пользователь бросил создание на шаге фото."""
+    user_id = str(update.effective_user.id)
+    personal_button = context.user_data.pop('pending_personal_button', None)
+    if personal_button is None:
+        await update.message.reply_text("Сессия создания потеряна. Начните заново.")
+        return await personal_buttons_menu_from_message(update, context)
+    if photo_fid:
+        personal_button.photo = str(photo_fid)
+
+    save_personal_button(personal_button)
+
+    user = get_user(user_id)
+    if user:
+        if not user.personal_button_order:
+            user.personal_button_order = []
+        user.personal_button_order.append(personal_button.button_id)
+        # ПУНКТ (покупка кнопки): используем один оплаченный слот (если есть).
+        if getattr(user, 'prepaid_buttons', 0) > 0:
+            user.prepaid_buttons = max(0, user.prepaid_buttons - 1)
+        save_user(user)
+
+    button_name = personal_button.name
+    photo_note = ("\n🖼 Изображение прикреплено — оно откроется при нажатии кнопки."
+                  if personal_button.photo else "")
+    success_text = (f"✅ Личная кнопка '{button_name}' успешно создана!\n\n"
+                    f"Теперь она появится в вашем главном меню.{photo_note}")
+
+    # Автоматически обновляем клавиатуру снизу — без повторного /start.
+    try:
+        fresh_user = get_user(user_id) or user
+        await update.message.reply_text(
+            success_text,
+            reply_markup=get_main_menu_keyboard(fresh_user),
+        )
+    except Exception as e:
+        logger.error(f"_finish_personal_button_create: обновление клавиатуры: {e}")
+        await update.message.reply_text(success_text)
+
+    context.user_data.pop('personal_button_type', None)
+    context.user_data.pop('personal_button_name', None)
+
+    return await personal_buttons_menu_from_message(update, context)
+
+
+@timeout(CONVERSATION_TIMEOUT)
+async def personal_button_photo_handler(update: Update,
+                                        context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.74: шаг «📷 изображение кнопки» — фото или /skip."""
+    msg = update.message
+    text = (msg.text or "").strip().lower()
+    if msg.photo:
+        return await _finish_personal_button_create(update, context,
+                                                    photo_fid=msg.photo[-1].file_id)
+    if text in ("/skip", "скип", "пропустить", "пропуск", "-", "нет"):
+        return await _finish_personal_button_create(update, context, photo_fid="")
+    if text in ("/cancel", "отмена", "cancel"):
+        context.user_data.pop('pending_personal_button', None)
+        context.user_data.pop('personal_button_type', None)
+        context.user_data.pop('personal_button_name', None)
+        await msg.reply_text("❌ Создание кнопки отменено.")
+        return MAIN_MENU
+    await msg.reply_text(
+        "📷 Пришлите ИЗОБРАЖЕНИЕ одним сообщением — или напишите «пропустить», чтобы без фото.")
+    return CREATE_PB_PHOTO_WAIT
+
+
+@timeout(CONVERSATION_TIMEOUT)
 async def create_personal_button_url_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     user = get_user(user_id)
@@ -41668,35 +41958,13 @@ async def create_personal_button_url_handler(update: Update, context: ContextTyp
         button_type="url"
     )
 
-    save_personal_button(personal_button)
-
-    user = get_user(user_id)
-    if user:
-        if not user.personal_button_order:
-            user.personal_button_order = []
-        user.personal_button_order.append(button_id)
-        # ПУНКТ (покупка кнопки): используем один оплаченный слот (если есть).
-        if getattr(user, 'prepaid_buttons', 0) > 0:
-            user.prepaid_buttons = max(0, user.prepaid_buttons - 1)
-        save_user(user)
-
-    success_text = f"✅ Личная кнопка '{button_name}' успешно создана!\n\nТеперь она появится в вашем главном меню."
-
-    # Автоматически обновляем клавиатуру снизу — без повторного /start.
-    try:
-        fresh_user = get_user(user_id) or user
-        await update.message.reply_text(
-            success_text,
-            reply_markup=get_main_menu_keyboard(fresh_user),
-        )
-    except Exception as e:
-        logger.error(f"create_personal_button_url_handler: обновление клавиатуры: {e}")
-        await update.message.reply_text(success_text)
-
-    context.user_data.pop('personal_button_type', None)
-    context.user_data.pop('personal_button_name', None)
-
-    return await personal_buttons_menu_from_message(update, context)
+    # ВОЛНА 22.74: кнопка не сохраняется сразу — сначала шаг «📷 фото»
+    # (можно «пропустить»). Слот prepaid списывается только при финализации.
+    context.user_data['pending_personal_button'] = personal_button
+    await update.message.reply_text(
+        "📷 Пришлите ИЗОБРАЖЕНИЕ для кнопки (оно будет открываться при её нажатии)\n"
+        "или напишите «пропустить» — создать без изображения.")
+    return CREATE_PB_PHOTO_WAIT
 
 @timeout(CONVERSATION_TIMEOUT)
 async def create_personal_button_content_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -41726,35 +41994,12 @@ async def create_personal_button_content_handler(update: Update, context: Contex
         button_type="text"
     )
 
-    save_personal_button(personal_button)
-
-    user = get_user(user_id)
-    if user:
-        if not user.personal_button_order:
-            user.personal_button_order = []
-        user.personal_button_order.append(button_id)
-        # ПУНКТ (покупка кнопки): используем один оплаченный слот (если есть).
-        if getattr(user, 'prepaid_buttons', 0) > 0:
-            user.prepaid_buttons = max(0, user.prepaid_buttons - 1)
-        save_user(user)
-
-    success_text = f"✅ Личная кнопка '{button_name}' успешно создана!\n\nТеперь она появится в вашем главном меню."
-
-    # Автоматически обновляем клавиатуру снизу — без повторного /start.
-    try:
-        fresh_user = get_user(user_id) or user
-        await update.message.reply_text(
-            success_text,
-            reply_markup=get_main_menu_keyboard(fresh_user),
-        )
-    except Exception as e:
-        logger.error(f"create_personal_button_content_handler: обновление клавиатуры: {e}")
-        await update.message.reply_text(success_text)
-
-    context.user_data.pop('personal_button_type', None)
-    context.user_data.pop('personal_button_name', None)
-
-    return await personal_buttons_menu_from_message(update, context)
+    # ВОЛНА 22.74: кнопка не сохраняется сразу — сначала шаг «📷 фото».
+    context.user_data['pending_personal_button'] = personal_button
+    await update.message.reply_text(
+        "📷 Пришлите ИЗОБРАЖЕНИЕ для кнопки (оно будет открываться при её нажатии)\n"
+        "или напишите «пропустить» — создать без изображения.")
+    return CREATE_PB_PHOTO_WAIT
 
 @timeout(CONVERSATION_TIMEOUT)
 async def manage_personal_buttons_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -45984,6 +46229,89 @@ async def send_class_message_handler(update: Update, context: ContextTypes.DEFAU
     await update.message.reply_text(success_text)
     return await admin_panel(update, context)
 
+
+@timeout(CONVERSATION_TIMEOUT)
+async def send_class_message_media_handler(update: Update,
+                                           context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.74: УВЕДОМЛЕНИЯ С ФАЙЛАМИ — админ в «📨 Сообщение классу»
+    может прислать ФОТО / ДОКУМЕНТ / ВИДЕО (подпись — текст уведомления).
+
+    Рассылается всем участникам класса (кроме заблокированных) тем же типом
+    медиа; запись честно попадает в журнал объявлений класса (пометка
+    «📎 файл»), чтобы «🤒 Я болел(а)» видел и файловые объявления."""
+    user_id = str(update.effective_user.id)
+    user = get_user(user_id)
+    if not user:
+        user = User(user_id)
+    class_code = context.user_data.get('current_admin_class')
+
+    if not class_code:
+        await update.message.reply_text("Класс не выбран.")
+        return await admin_panel(update, context)
+
+    class_obj = get_class_by_code(class_code)
+    if not class_obj:
+        await update.message.reply_text("Класс не найден.")
+        return await admin_panel(update, context)
+
+    msg = update.message
+    caption = (msg.caption or "").strip()
+    header = f"📢 Уведомление от администратора класса {class_obj.class_name}:"
+    full_caption = (header + ("\n\n" + caption if caption else ""))[:1024]
+
+    members = [m for m in (class_obj.students + class_obj.admins)
+               if m not in (class_obj.blocked_users or [])]
+    sent_count = 0
+
+    for member_id in members:
+        if member_id == user_id:
+            continue
+        try:
+            if msg.photo:
+                await context.bot.send_photo(
+                    chat_id=member_id, photo=msg.photo[-1].file_id,
+                    caption=full_caption)
+            elif msg.video:
+                await context.bot.send_video(
+                    chat_id=member_id, video=msg.video.file_id,
+                    caption=full_caption,
+                    supports_streaming=True)
+            elif msg.document:
+                await context.bot.send_document(
+                    chat_id=member_id, document=msg.document.file_id,
+                    caption=full_caption)
+            else:
+                continue
+            sent_count += 1
+        except Exception as e:
+            logger.error(f"Ошибка при отправке файла {member_id}: {e}")
+        # Анти-флуд пауза — как в текстовой рассылке.
+        await asyncio.sleep(0.05)
+
+    # Журнал объявлений класса — с пометкой о файле.
+    try:
+        log_ann = getattr(class_obj, 'announcements', None)
+        if not isinstance(log_ann, list):
+            log_ann = []
+        log_ann.append({
+            "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "by": str(user_id),
+            "name": str(getattr(user, 'first_name', '') or ''),
+            "text": ("📎 файл" + (": " + caption[:900] if caption else "")),
+        })
+        class_obj.announcements = log_ann[-300:]
+        save_class(class_obj)
+    except Exception as e:
+        logger.error(f"send_class_message_media: журнал: {e}")
+
+    _log_admin_action(user_id, class_code, "Рассылка классу (файл)",
+                      (caption or "файл")[:200])
+
+    await update.message.reply_text(
+        f"✅ Уведомление с файлом отправлено {sent_count} участникам класса!")
+    return await admin_panel(update, context)
+
+
 @timeout(CONVERSATION_TIMEOUT)
 async def edit_schedule_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -48412,8 +48740,9 @@ def get_quick_prices_keyboard():
     keyboard = []
     for key in PRICES.keys():
         label = PRICE_LABELS.get(key, key)
+        _shown = "∞" if _is_unlimited(PRICES[key]) else PRICES[key]
         keyboard.append([
-            InlineKeyboardButton(f"{label}: {PRICES[key]} ⭐", callback_data=f"qprice_pick_{key}")
+            InlineKeyboardButton(f"{label}: {_shown} ⭐", callback_data=f"qprice_pick_{key}")
         ])
     keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="dev_back_panel")])
     return InlineKeyboardMarkup(keyboard)
@@ -48482,7 +48811,7 @@ async def dev_quick_price_delta_handler(update: Update, context: ContextTypes.DE
         await query.edit_message_text("Неизвестный ключ цены.", reply_markup=get_developer_keyboard())
         return DEV_PANEL
 
-    new_value = max(0, PRICES[key] + delta)
+    new_value = max(0, (50 if _is_unlimited(PRICES[key]) else PRICES[key]) + delta)
     PRICES[key] = new_value
     # ВОЛНА 22.40: честное сохранение (см. dev_set_prices_handler).
     _price_ok = save_prices(PRICES)
@@ -48516,7 +48845,8 @@ async def dev_quick_price_set_start(update: Update, context: ContextTypes.DEFAUL
 
     context.user_data['quick_price_key'] = key
     label = PRICE_LABELS.get(key, key)
-    text = f"✏️ Введите новое значение для «{label}» (текущее: {PRICES[key]} ⭐):"
+    _cur = "∞ (безлимит)" if _is_unlimited(PRICES[key]) else f"{PRICES[key]} ⭐"
+    text = f"✏️ Введите новое значение для «{label}» (текущее: {_cur}):"
     await query.edit_message_text(text, reply_markup=get_cancel_keyboard())
     return DEV_QUICK_PRICE_VALUE
 
@@ -48532,13 +48862,38 @@ async def dev_quick_price_value_handler(update: Update, context: ContextTypes.DE
         await update.message.reply_text("Цена не выбрана.")
         return await developer_panel(update, context)
 
+    raw_text = (update.message.text or "").strip()
+
+    # ВОЛНА 22.74: «∞» — безлимит. Разрешён ТОЛЬКО для лимита файлов облака
+    # (cloud_max_files): для платёжных цен бесконечность смысла не имеет.
+    if _is_unlimited(raw_text):
+        if key != 'cloud_max_files':
+            await update.message.reply_text(
+                "∞ доступен только для «☁️ Лимит файлов в облаке». "
+                "Введите целое число:")
+            return DEV_QUICK_PRICE_VALUE
+        PRICES[key] = -1  # JSON-безопасное представление «бесконечности»
+        label = PRICE_LABELS.get(key, key)
+        if not save_prices(PRICES):
+            await update.message.reply_text(
+                f"❌ НЕ удалось сохранить «{label}» в базу данных — "
+                "проверьте Supabase/Mongo. Значение действует только до рестарта.")
+            return DEV_QUICK_PRICE_VALUE
+        reload_prices()
+        await update.message.reply_text(
+            f"✅ «{label}» = ∞ (безлимит)\n🔄 Обновление применено во всех модулях бота.")
+        context.user_data.pop('quick_price_key', None)
+        text = "⚡ **Быстрое изменение цен**\n\nВыберите цену для изменения:"
+        await update.message.reply_text(text, reply_markup=get_quick_prices_keyboard(), parse_mode="Markdown")
+        return DEV_QUICK_PRICE_VALUE
+
     try:
-        value = int(update.message.text.strip())
+        value = int(raw_text)
         if value < 0:
             await update.message.reply_text("Цена не может быть отрицательной. Введите снова:")
             return DEV_QUICK_PRICE_VALUE
     except ValueError:
-        await update.message.reply_text("Введите целое число:")
+        await update.message.reply_text("Введите целое число (или ∞ для лимита облака):")
         return DEV_QUICK_PRICE_VALUE
 
     PRICES[key] = value
@@ -55122,6 +55477,102 @@ def _parse_bells_bulk(raw):
     return bells, errors
 
 
+# === ВОЛНА 22.74: ФОТО расписания звонков ===
+async def bells_photo_set_start(update: Update,
+                                context: ContextTypes.DEFAULT_TYPE):
+    """«📷 Добавить фото звонков»: админ присылает картинку звонков."""
+    query = update.callback_query
+    user_id = str(query.from_user.id)
+    class_obj = get_class_by_user(user_id)
+    if not class_obj or user_id not in (class_obj.admins or []):
+        try:
+            await query.answer("Только администратор класса.", show_alert=True)
+        except Exception:
+            pass
+        return MAIN_MENU
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    context.user_data['bells_photo_class'] = class_obj.class_code
+    await query.edit_message_text(
+        "📷 Пришлите ФОТО расписания звонков одним сообщением.\n\n"
+        "После этого бот будет показывать это фото по кнопке «🔔 Звонки» "
+        "(точный отсчёт «сколько осталось» по фото недоступен).\n\n"
+        "❌ Отмена — кнопкой или словом «отмена».",
+        reply_markup=get_cancel_keyboard())
+    return BELLS_PHOTO_WAIT
+
+
+@timeout(CONVERSATION_TIMEOUT)
+async def bells_photo_receive(update: Update,
+                              context: ContextTypes.DEFAULT_TYPE):
+    """Приём фото звонков → сохранение file_id в классе."""
+    msg = update.message
+    user_id = str(update.effective_user.id)
+    class_code = context.user_data.get('bells_photo_class')
+    context.user_data.pop('bells_photo_class', None)
+
+    if not class_code:
+        await msg.reply_text("Класс не выбран. Начните заново: «🔔 Редактировать звонки».")
+        return await admin_panel(update, context)
+
+    class_obj = get_class_by_code(class_code)
+    if not class_obj or user_id not in (class_obj.admins or []):
+        await msg.reply_text("Только администратор класса может задать фото звонков.")
+        return await admin_panel(update, context)
+
+    if not (msg.photo or msg.document):
+        await msg.reply_text(
+            "❌ Нужна ФОТОГРАФИЯ одним сообщением (или «❌ Отмена»).")
+        context.user_data['bells_photo_class'] = class_code
+        return BELLS_PHOTO_WAIT
+
+    if msg.photo:
+        _fid = msg.photo[-1].file_id
+    else:
+        _fid = msg.document.file_id
+    class_obj.bells_photo = str(_fid)
+    save_class(class_obj)
+    _log_admin_action(user_id, class_code, "Фото звонков", "установлено")
+    await msg.reply_text(
+        "✅ Фото звонков сохранено! Теперь по кнопке «🔔 Звонки» открывается "
+        "картинка (без отсчёта «сколько осталось» — по фото его не посчитать).",
+        reply_markup=get_main_menu_keyboard(get_user(user_id) or User(user_id)))
+    return await admin_panel(update, context)
+
+
+async def bells_photo_del_cb(update: Update,
+                             context: ContextTypes.DEFAULT_TYPE):
+    """«🗑 Убрать фото звонков» — возврат к текстовому расписанию."""
+    query = update.callback_query
+    user_id = str(query.from_user.id)
+    class_obj = get_class_by_user(user_id)
+    if not class_obj or user_id not in (class_obj.admins or []):
+        try:
+            await query.answer("Только администратор класса.", show_alert=True)
+        except Exception:
+            pass
+        return MAIN_MENU
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    class_obj.bells_photo = ""
+    save_class(class_obj)
+    _log_admin_action(user_id, class_obj.class_code, "Фото звонков", "удалено")
+    try:
+        await query.edit_message_text(
+            "✅ Фото звонков убрано — снова работает текстовый список "
+            "с отсчётом «сколько осталось».",
+            reply_markup=get_admin_panel_keyboard())
+    except Exception:
+        await context.bot.send_message(
+            chat_id=int(user_id), text="✅ Фото звонков убрано.",
+            reply_markup=get_admin_panel_keyboard())
+    return ADMIN_PANEL
+
+
 async def _bells_bulk_start_cb(update: Update,
                                context: ContextTypes.DEFAULT_TYPE):
     """«📜 Ввести весь список» в меню звонков: включаем ожидание списка."""
@@ -55597,6 +56048,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 1) poll_flow ставим синхронно, до первого await;
     # 2) повторное poll_go глушим мгновенным флагом sent.
     data = query.data
+    # ВОЛНА 22.74: 🔍 поиск в панелях — до остальных маршрутов.
+    if isinstance(data, str) and (data.startswith("usrch_c_")
+                                  or data.startswith("usrch_u_")):
+        return await user_search_start(update, context)
     if data in ("dev_poll", "admin_poll"):
         _cb_uid = str(query.from_user.id)
         _cb_ok = (_cb_uid == DEVELOPER_ID if data == "dev_poll"
@@ -56536,6 +56991,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "edit_bells_bulk":
         # ВОЛНА 22.41: «весь список вручную» — ожидание списка звонков.
         return await _bells_bulk_start_cb(update, context)
+    elif data == "bells_photo_set":
+        # ВОЛНА 22.74: фото расписания звонков — ожидание картинки.
+        return await bells_photo_set_start(update, context)
+    elif data == "bells_photo_del":
+        return await bells_photo_del_cb(update, context)
     elif data in ("bells_bulk_ok", "bells_bulk_no"):
         # ВОЛНА 22.41: подтверждение/отмена замены звонков списком.
         return await _bells_bulk_confirm_cb(update, context)
@@ -61296,17 +61756,53 @@ async def poll_cancel_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def poll_answer_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """ВОЛНА 22.10: сбор голосов. Telegram присылает PollAnswer по каждому
-    голосу в НЕанонимном опросе — складываем в общую копилку опроса."""
+    голосу в НЕанонимном опросе — складываем в общую копилку опроса.
+    ВОЛНА 22.74: СМЕНА ГОЛА синхронизируется. Telegram при каждом изменении
+    шлёт ПОЛНЫЙ текущий список option_ids пользователя: снимаем его ПРЕЖНИЕ
+    голоса (tally −1) и ставим новые — итоги всегда сходятся с реальностью
+    (раньше каждый новый ответ просто +1, и счётчик уезжал вверх), отбор
+    голоса (пустой option_ids) чисто снимает все его отметки."""
     try:
         pa = update.poll_answer
         entry = _POLL_INDEX.get(str(getattr(pa, "poll_id", "")))
         if entry is None:
             return
+        tally = entry.get("tally")
+        if not isinstance(tally, list):
+            return
+        _uid = ""
+        try:
+            _pa_user = getattr(pa, "user", None)
+            if _pa_user is not None:
+                _uid = str(getattr(_pa_user, "id", "") or "")
+        except Exception:
+            _uid = ""
+        new_opts = []
         for oi in (getattr(pa, "option_ids", None) or []):
-            _oi = int(oi)
-            if 0 <= _oi < len(entry["tally"]):
-                entry["tally"][_oi] += 1
-                entry["votes"] += 1
+            try:
+                _oi = int(oi)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= _oi < len(tally):
+                new_opts.append(_oi)
+        voters = entry.setdefault("voters", {})
+        if not isinstance(voters, dict):
+            voters = {}
+            entry["voters"] = voters
+        if _uid:
+            # Снимаем прежние отметки ЭТОГО пользователя (смена/отбор голоса).
+            for _old in (voters.get(_uid) or []):
+                if 0 <= _old < len(tally) and tally[_old] > 0:
+                    tally[_old] -= 1
+            voters[_uid] = new_opts
+            for _oi in new_opts:
+                tally[_oi] += 1
+            entry["votes"] = sum(tally)
+        else:
+            # Юзер неизвестен (старые клиенты) — старое поведение: +1.
+            for _oi in new_opts:
+                tally[_oi] += 1
+                entry["votes"] = entry.get("votes", 0) + 1
     except Exception as e:
         logger.warning(f"poll_answer: {e}")
 
@@ -62669,8 +63165,8 @@ async def _post_init(application):
         try:
             await application.bot.set_chat_menu_button(
                 menu_button=MenuButtonWebApp(
-                    text="☁️ DEVO+", web_app=WebAppInfo(url=MINIAPP_URL)))
-            logger.info("mini app: кнопка меню → «☁️ DEVO+» (%s).", MINIAPP_URL)
+                    text="☁️ DECLOUD+", web_app=WebAppInfo(url=MINIAPP_URL)))
+            logger.info("mini app: кнопка меню → «☁️ DECLOUD+» (%s).", MINIAPP_URL)
         except Exception as e:
             logger.warning("mini app: set_chat_menu_button не удался: %s", e)
 
@@ -63257,6 +63753,11 @@ def main():
             ],
             SEND_CLASS_MESSAGE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, send_class_message_handler),
+                # ВОЛНА 22.74: уведомления С ФАЙЛАМИ — админ может разослать
+                # классу фото/документ/видео с подписью.
+                MessageHandler((filters.PHOTO | filters.Document.ALL
+                                | filters.VIDEO) & ~filters.COMMAND,
+                               send_class_message_media_handler),
                 CallbackQueryHandler(handle_callback),
             ],
             EDIT_SCHEDULE: [
@@ -63280,6 +63781,13 @@ def main():
                 CallbackQueryHandler(handle_callback),
             ],
             EDIT_BELLS: [
+                CallbackQueryHandler(handle_callback),
+            ],
+            # ВОЛНА 22.74: фото расписания звонков.
+            BELLS_PHOTO_WAIT: [
+                MessageHandler((filters.PHOTO | filters.Document.ALL
+                                | filters.TEXT) & ~filters.COMMAND,
+                               bells_photo_receive),
                 CallbackQueryHandler(handle_callback),
             ],
             EDIT_BELL_TIME: [
@@ -63463,6 +63971,12 @@ def main():
             ],
             CREATE_PERSONAL_BUTTON_CONTENT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, create_personal_button_content_handler),
+                CallbackQueryHandler(handle_callback),
+            ],
+            # ВОЛНА 22.74: шаг «📷 изображение кнопки» (или /skip).
+            CREATE_PB_PHOTO_WAIT: [
+                MessageHandler((filters.PHOTO | filters.TEXT) & ~filters.COMMAND,
+                               personal_button_photo_handler),
                 CallbackQueryHandler(handle_callback),
             ],
             MANAGE_PERSONAL_BUTTONS: [
@@ -63805,6 +64319,11 @@ def main():
             DEV_STATS_PERIOD: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND,
                                dev_stats_period_receive),
+                CallbackQueryHandler(handle_callback),
+            ],
+            # ВОЛНА 22.74: 🔍 поиск класса/пользователя в панелях.
+            USER_SEARCH_WAIT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, user_search_input),
                 CallbackQueryHandler(handle_callback),
             ],
         },
