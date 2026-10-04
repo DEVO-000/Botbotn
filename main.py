@@ -256,6 +256,9 @@ BLOCKED_USERS_FILE = _data_file("blocked_users.json")
 PERSONAL_BUTTONS_FILE = _data_file("personal_buttons.json")
 CLASS_BLOCKED_USERS_FILE = _data_file("class_blocked_users.json")
 STARS_STATS_FILE = _data_file("stars_stats.json")
+# ВОЛНА 22.72: идемпотентность платежей — обработанные telegram_payment_charge_id
+# (иначе ределивери successful_payment после рестарта задваивали начисление звёзд).
+PROCESSED_PAYMENTS_FILE = _data_file("processed_payments.json")
 # ВОЛНА 22.27: жалобы («🚨 Пожаловаться» под анонимками/решениями) и
 # ЖУРНАЛ ДЕЙСТВИЙ АДМИНОВ (защита разработчика: кто реально рассылал).
 REPORTS_FILE = _data_file("reports.json")
@@ -1535,23 +1538,29 @@ def _data_epoch_path() -> str:
         return os.path.join(".", ".data_epoch")
 
 
+_data_epoch_lock = threading.Lock()
+
+
 def _data_epoch_bump() -> None:
     """Инкремент счётчика записей данных (вызывается из save_data).
     Служебный файл НЕ шифруется и НЕ входит в снапшот — это только
     локальный маркер свежести. Любая ошибка гасится: счётчик не должен
-    ломать сохранение данных."""
+    ломать сохранение данных.
+
+    ВОЛНА 22.72 (аудит): tmp-файл был ОБЩИМ (p + ".tmp") и без лока —
+    два писателя из разных потоков (save_data вызывается и с event loop,
+    и из worker-потоков через asyncio.to_thread) калечили друг друга,
+    float() падал, epoch читался как 0 и снапшот канала с большим
+    data_epoch ОТКАТЫВАЛ более свежие локальные данные. Теперь у каждого
+    писателя свой tmp + общий лок на чтение-инкремент-запись."""
     try:
-        p = _data_epoch_path()
-        cur = 0.0
-        try:
-            with open(p, "r", encoding="utf-8") as f:
-                cur = float((f.read() or "0").strip() or 0)
-        except Exception:
-            cur = 0.0
-        tmp = p + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(repr(cur + 1.0))
-        os.replace(tmp, p)
+        with _data_epoch_lock:
+            p = _data_epoch_path()
+            cur = _data_epoch_read()
+            tmp = f"{p}.{os.getpid()}.{threading.get_ident()}.tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(repr(cur + 1.0))
+            os.replace(tmp, p)
     except Exception:
         pass
 
@@ -1763,6 +1772,46 @@ async def _async_save_data(filename, data):
     «фейково-асинхронной»: те же блокирующие вызовы, но прямо на event loop,
     и каждый вызов фризил бота до ~16 с при медленном Supabase."""
     return await asyncio.to_thread(save_data, filename, data)
+
+
+async def _merge_save_keys(filename, changes, full=None):
+    """ВОЛНА 22.72 (аудит): сохранить ТОЛЬКО указанные ключи поверх свежей
+    копии базы — тикеры больше не затирают чужие изменения целиком.
+
+    Раньше тикеры таймеров/помодоро в конце сохраняли ВЕСЬ словарь,
+    прочитанный в начале тика. Если во время их работы (десятки await на
+    отправку сообщений) пользователь удалил таймер/остановил помодоро,
+    его изменение откатывалось — «воскресшие» таймеры спамили повторно.
+
+    changes: {key: value} — обновить ключ (ТОЛЬКО если он ещё существует
+    в свежей копии: удаление пользователем сильнее устаревшей записи тикера),
+             {key: ("del", snapshot)} — удалить ключ, но только если свежая
+             запись не изменилась со снапшота (пользователь не начал новую
+             сессию под тем же id).
+    full:    словарь целиком — фолбэк, если хранилище вернуло пустоту
+             (сеть/ошибка): тогда применяем изменения безусловно, чтобы не
+             потерять критичные пометки «отправлено»."""
+    try:
+        fresh = await _async_load_data(filename, {}, expect="dict")
+        if not isinstance(fresh, dict):
+            fresh = {}
+        unconditional = (not fresh) and isinstance(full, dict) and bool(full)
+        if unconditional:
+            fresh = dict(full)
+        for key, val in changes.items():
+            if isinstance(val, tuple) and len(val) == 2 and val[0] == "del":
+                snap = val[1]
+                cur = fresh.get(key)
+                if cur is None or cur == snap:
+                    fresh.pop(key, None)
+            else:
+                if key in fresh or unconditional:
+                    fresh[key] = val
+        await _async_save_data(filename, fresh)
+        return True
+    except Exception as e:
+        logger.error(f"_merge_save_keys({filename}): {e}")
+        return False
 
 
 # ==================================
@@ -2279,6 +2328,9 @@ STORAGE_BACKUP_FILES = (
     DEV_SETTINGS_FILE, SUPPORT_MESSAGES_FILE, REFERRALS_FILE,
     SOLUTIONS_FILE, SHARE_FILE, ACTIVITY_FILE, FEATURE_STATS_FILE,
     NOTIFICATION_LOG_FILE, POLL_SCHEDULES_FILE,
+    # ВОЛНА 22.72: идемпотентность платежей переживает рестарт/деплой,
+    # иначе ределивери после восстановления снапшота задвоят начисление.
+    PROCESSED_PAYMENTS_FILE,
     # ВОЛНА 22.27: жалобы и журнал действий админов тоже переживают рестарт
     # и живут в канале-БД (без них доказательства терялись бы при деплое).
     REPORTS_FILE, ADMIN_LOG_FILE,
@@ -2361,6 +2413,9 @@ class User:
         self.username = username or ""
         self.first_name = first_name or "User"
         self.timezone = 3
+        # ВОЛНА 22.72: IANA-имя пояса («Europe/Moscow») — по нему тикеры
+        # считают актуальное смещение с учётом DST (см. _user_tz_offset).
+        self.tz_id = None
         self.local_time_set = False
         self.class_code = None
         self.role = "student"
@@ -2606,6 +2661,7 @@ class User:
             'username': self.username,
             'first_name': self.first_name,
             'timezone': self.timezone,
+            'tz_id': getattr(self, 'tz_id', None),
             'local_time_set': self.local_time_set,
             'class_code': self.class_code,
             'role': self.role,
@@ -3240,11 +3296,102 @@ def load_users():
     _cache_last_update['users'] = current_time
     return users
 
+_users_save_lock = threading.RLock()
+# Недавно удалённые пользователи (uid → ts): параллельная «полная» запись
+# save_users не должна их воскресить. TTL 10 мин, реестр подрезается.
+_recently_removed_users = {}
+_REMOVED_USER_TTL = 600.0
+
+
 def save_users(users):
+    """Сохраняет пользователей.
+
+    ВОЛНА 22.72 (аудит): раньше кэш и база ЗАТИРАЛИСЬ словарём вызывающего
+    целиком. При concurrent_updates(True) две корутины читают базу, мутируют
+    СВОИХ пользователей и по очереди сохраняют весь файл — вторая запись
+    откатывала изменения первой (исчезали звёзды/настройки, «воскресали»
+    удалённые пользователи — корень жалоб «база откатывается»).
+    Теперь под общим локом: свежая копия базы из хранилища MERGE-ится с
+    записями вызывающего (его ключи побеждают). Удаление пользователя —
+    только через remove_user()."""
     global _users_cache
-    _users_cache = users
-    data = {user_id: user.to_dict() for user_id, user in users.items()}
-    return save_data(USERS_FILE, data)
+    if not isinstance(users, dict):
+        users = dict(users)
+    data = {}
+    for user_id, user in users.items():
+        try:
+            data[user_id] = user.to_dict() if hasattr(user, "to_dict") else user
+        except Exception as e:
+            logger.error(f"save_users: не сериализован {user_id}: {e}")
+    with _users_save_lock:
+        # ВОЛНА 22.72: ключи, удалённые через remove_user в последние минуты,
+        # НЕ реанимируем из «полного» словаря вызывающего — иначе параллельная
+        # корутина, начатая ДО удаления, воскресит пользователя.
+        try:
+            _now = time.time()
+            for _uid in list(data):
+                if _now - _recently_removed_users.get(str(_uid), 0) < _REMOVED_USER_TTL:
+                    data.pop(_uid, None)
+        except Exception:
+            pass
+        try:
+            fresh = load_data(USERS_FILE, {}, expect="dict")
+            # Пустой ответ хранилища не считаем «база пуста»: при сбое сети
+            # load_data вернёт {} — в этом случае мержить НЕЧЕГО, но и
+            # затирать чужие записи нечем; сохраняем как есть.
+            if isinstance(fresh, dict) and fresh:
+                fresh.update(data)
+                data = fresh
+        except Exception as e:
+            logger.error(f"save_users: merge не удался: {e}")
+        # Кэш обновляем ПО-КЛЮЧЕВО, а не подменой словаря: записи других
+        # корутин сохраняются, TTL продлевается. Недавно удалённые — мимо кэша.
+        try:
+            cache = _users_cache if isinstance(_users_cache, dict) else {}
+            _now = time.time()
+            for _uid, _u in users.items():
+                if _now - _recently_removed_users.get(str(_uid), 0) < _REMOVED_USER_TTL:
+                    cache.pop(str(_uid), None)
+                else:
+                    cache[_uid] = _u
+            _users_cache = cache
+            _cache_last_update['users'] = time.time()
+        except Exception:
+            pass
+        return save_data(USERS_FILE, data)
+
+
+def remove_user(user_id):
+    """ВОЛНА 22.72: удаляет пользователя и из базы, и из кэша.
+
+    Раньше delete_my_data делал pop в своей копии и save_users(users): при
+    concurrent_updates параллельная корутина с НЕзнанием об удалении
+    записывала пользователя обратно. Теперь удаление идёт через общий лок
+    поверх СВЕЖЕЙ копии — «воскрешение» исключено."""
+    uid = str(user_id)
+    with _users_save_lock:
+        _recently_removed_users[uid] = time.time()
+        try:
+            # подрезка реестра удалений
+            if len(_recently_removed_users) > 5000:
+                _now = time.time()
+                for _k in [k for k, ts in _recently_removed_users.items()
+                           if _now - ts > _REMOVED_USER_TTL][:1000]:
+                    _recently_removed_users.pop(_k, None)
+        except Exception:
+            pass
+        try:
+            fresh = load_data(USERS_FILE, {}, expect="dict")
+            if isinstance(fresh, dict) and fresh:
+                fresh.pop(uid, None)
+                save_data(USERS_FILE, fresh)
+        except Exception as e:
+            logger.error(f"remove_user({uid}): база: {e}")
+        try:
+            if isinstance(_users_cache, dict):
+                _users_cache.pop(uid, None)
+        except Exception:
+            pass
 
 def load_personal_buttons():
     global _personal_buttons_cache
@@ -4153,6 +4300,24 @@ def is_user_class_admin(user_id):
             return True
     return False
 
+
+def is_admin_of_class(user_id, class_code):
+    """ВОЛНА 22.72 (аудит): админ ИМЕННО этого класса.
+
+    Раньше колбэки блокировки/удаления доверяли context.user_data
+    ['current_admin_class'], установленному ранее: отозванный админ
+    сохранял контроль (блок участников, удаление кнопок/ДЗ/предметов)
+    до рестарта процесса. Теперь права перепроверяются в каждом
+    чувствительном колбэке."""
+    try:
+        classes = load_classes()
+        class_obj = classes.get(str(class_code or ""))
+        if class_obj and class_obj.is_active:
+            return str(user_id) in (class_obj.admins or [])
+    except Exception as e:
+        logger.error(f"is_admin_of_class: {e}")
+    return False
+
 def is_user_class_creator(user_id, class_code):
     classes = load_classes()
     class_obj = classes.get(class_code)
@@ -4291,22 +4456,44 @@ def get_button_price(button_count):
     else:
         return PRICES['button_base'] + (button_count - 1) * PRICES['button_increment']
 
+# ВОЛНА 22.72: пер-юзерные локи для read-modify-write над балансом —
+# иначе две параллельные транзакции читают один баланс и одна теряется
+# (тот же паттерн, что в _referral_credit_lock).
+_user_rw_locks = {}
+_user_rw_locks_guard = threading.Lock()
+
+
+def _user_lock(user_id):
+    with _user_rw_locks_guard:
+        lock = _user_rw_locks.get(str(user_id))
+        if lock is None:
+            lock = threading.Lock()
+            _user_rw_locks[str(user_id)] = lock
+        return lock
+
+
 def add_stars_transaction(user_id, amount, description):
     """Меняет баланс виртуальных звёзд пользователя и обновляет агрегированную
     статистику трат.
 
     ИЗМЕНЕНО по требованию пользователя: подробная история переводов больше
     НЕ ведётся (никаких 'transactions'). Для отрицательных сумм обновляются
-    только общая сумма трат и агрегат пользователя в топе — без истории."""
-    user = get_user(user_id)
-    if not user:
-        return False
+    только общая сумма трат и агрегат пользователя в топе — без истории.
 
-    user.stars_balance += amount
-    if amount < 0:
-        user.total_stars_spent -= amount
+    ВОЛНА 22.72: баланс теперь читается и пишется ПОД пер-юзерным локом с
+    перечитыванием — параллельные начисления/списания больше не затирают
+    друг друга."""
+    with _user_lock(user_id):
+        # Перечитываем ПОД ЛОКОМ: конкурентное начисление не потеряется.
+        user = get_user(user_id)
+        if not user:
+            return False
 
-    save_user(user)
+        user.stars_balance += amount
+        if amount < 0:
+            user.total_stars_spent -= amount
+
+        save_user(user)
 
     if amount < 0:
         # Агрегированная статистика трат — без записи деталей перевода.
@@ -4347,18 +4534,35 @@ def calculate_timezone(user_time_str):
     try:
         utc_now = _utcnow()
         user_time = datetime.strptime(user_time_str, "%H:%M").time()
+        # ВОЛНА 22.72 (аудит): раньше разница считалась БЕЗ переноса через
+        # полночь: пользователь в 02:30 по местному (UTC 23:30) получал
+        # tz = -21 вместо +3 — таймеры/рассылки уезжали на сутки. Дробные
+        # пояса больше не обрезаются до целого (int(round) ломал их).
         user_datetime = datetime.combine(utc_now.date(), user_time)
-        time_diff = user_datetime - utc_now
-        total_seconds = time_diff.total_seconds()
-        hours_diff = total_seconds / 3600
-        return int(round(hours_diff))
+        hours_diff = (user_datetime - utc_now).total_seconds() / 3600.0
+        # Перенос через полночь (старый код возвращал -21 вместо +3):
+        # реальные пояса лежат в диапазоне [-10; +14]. Если «сырая» разница
+        # попала ЗОНУ НИЖЕ -10.25 (настоящих поясов там нет), значит локальная
+        # дата уже перешла через полночь — сдвигаем на сутки вперёд.
+        # (Пояса -10 Гавайев и -9.5 Маркизса сохраняются без сдвига.)
+        if hours_diff < -10.25 and hours_diff + 24.0 <= 14.25:
+            hours_diff += 24.0
+        # Все реальные пояса кратны 15 минутам (Индия +5.5, Непал +5.75,
+        # Чатем +12.75) — округляем до ближайшей четверти, гася дрейф секунд.
+        return round(hours_diff * 4.0) / 4.0
     except Exception as e:
         logger.error(f"Ошибка вычисления часового пояса: {e}")
         return 3
 
+# ВОЛНА 22.72: IANA-идентификатор пояса, определённый последним вызовом
+# detect_timezone_for_city (используется сразу после вызова в выборе города).
+_LAST_DETECTED_TZ_ID = ""
+
 def get_local_time(user):
     utc_time = _utcnow()
-    return utc_time + timedelta(hours=user.timezone)
+    # ВОЛНА 22.72: смещение теперь с учётом DST (если известен tz_id) и
+    # безопасным разбором строковых tz (см. _user_tz_offset).
+    return utc_time + timedelta(hours=_user_tz_offset(user))
 
 def get_bells_info(class_obj, user=None):
     if not class_obj or not class_obj.bells:
@@ -6525,7 +6729,8 @@ def _fmt_bytes(n):
 def _cloud_gen_file_id(user):
     files = getattr(user, "cloud_files", []) or []
     while True:
-        fid = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
+        # 22.72: secrets вместо random (id участвует в share-ссылках)
+        fid = secrets.token_hex(5)
         if all(f.get("id") != fid for f in files if isinstance(f, dict)):
             return fid
 
@@ -9076,11 +9281,14 @@ def _miniapp_completed_path():
 
 
 def _miniapp_completed_save():
-    """Атомарно слить карту завершённых загрузок на диск (best-effort)."""
+    """Атомарно слить карту завершённых загрузок на диск (best-effort).
+
+    ВОЛНА 22.72 (аудит): tmp-файл был общим (p + ".tmp") — два одновременных
+    писателя калечили друг друга. Теперь у каждого свой tmp (pid + поток)."""
     try:
         p = _miniapp_completed_path()
         _ensure_parent_dir(p)
-        tmp = p + ".tmp"
+        tmp = f"{p}.{os.getpid()}.{threading.get_ident()}.tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(_MINIAPP_COMPLETED, f, ensure_ascii=False)
         os.replace(tmp, p)
@@ -24036,7 +24244,7 @@ async def miniapp_upload_init(request):
         return _miniapp_err(
             429, "too_many_uploads",
             "Слишком много одновременных загрузок — дождитесь завершения.")
-    upload_id = ''.join(random.choices(string.ascii_lowercase + string.digits, k=16))
+    upload_id = secrets.token_hex(8)  # 22.72: secrets вместо предсказуемого random
     path = os.path.join(_miniapp_tmpdir(), upload_id + ".part")
     open(path, "wb").close()
     _MINIAPP_UPLOADS[upload_id] = {
@@ -24677,8 +24885,15 @@ def _upload_session_persist(s):
             "parts": sorted(int(i) for i in (s.get("parts") or ())),
             "ts": float(s.get("ts") or time.time()),
         }
-        with open(_upload_session_meta_path(s), "w", encoding="utf-8") as f:
+        # ВОЛНА 22.72 (аудит): запись была НЕ атомарной — краш посреди
+        # json.dump портил мету, и недогруженный файл терялся (ради
+        # переживания рестарта мету и делали). tmp + os.replace.
+        mp = _upload_session_meta_path(s)
+        _ensure_parent_dir(mp)
+        tmp = f"{mp}.{os.getpid()}.{threading.get_ident()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(meta, f)
+        os.replace(tmp, mp)
     except Exception:
         pass
 
@@ -25456,6 +25671,34 @@ _WEB_LOGIN_GLOBAL_WINDOW = 600   # за 10 минут
 _WEB_LOGIN_GLOBAL = {}           # ip → [timestamp попыток]
 
 
+def _client_ip_of(request) -> str:
+    """ВОЛНА 22.72 (аудит): реальный IP клиента для лимитов перебора.
+
+    Раньше X-Forwarded-For принимался НА ВЕРУ: любой клиент мог подменять
+    заголовок на каждый запрос и обходить глобальный IP-лимит. Теперь XFF
+    доверяем только если СОЕДИНЕНИЕ пришло с приватного/loopback адреса
+    (т.е. через НАШ реверс-прокси: Render/Railway/Nginx), иначе берём
+    фактического пира соединения."""
+    try:
+        peer = (request.remote or "?").split(",")[0].strip()
+        xff = (request.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+        if xff and _is_trusted_proxy_ip(peer):
+            return xff
+        return peer or "?"
+    except Exception:
+        return "?"
+
+
+def _is_trusted_proxy_ip(ip) -> bool:
+    """Приватный/loopback источник = наш прокси, ему можно верить насчёт XFF."""
+    try:
+        import ipaddress as _ipa
+        a = _ipa.ip_address(str(ip).replace("::ffff:", "").strip("[]"))
+        return a.is_loopback or a.is_private
+    except Exception:
+        return False
+
+
 def _web_login_global_allowed(ip: str) -> bool:
     """Разрешена ли попытка входа с этого IP (скользящее окно)."""
     now = time.time()
@@ -25505,8 +25748,9 @@ async def miniapp_web_login(request):
     if not user_id or not password:
         return _miniapp_err(400, "bad_request", "Укажите ID и пароль.")
     # ВОЛНА 22.49: глобальный лимит попыток с одного IP (анти-перебор).
-    _ip = (request.headers.get("X-Forwarded-For") or "").split(",")[0].strip() \
-        or request.remote or "?"
+    # ВОЛНА 22.72: IP через _client_ip_of — подменный X-Forwarded-For больше
+    # не обходить лимит (XFF верим только за доверенным прокси).
+    _ip = _client_ip_of(request)
     if not _web_login_global_allowed(_ip):
         return _miniapp_err(
             429, "locked",
@@ -36620,7 +36864,7 @@ async def _automation_execute_action(update, context, user, class_obj, action):
         if rejected is not None:
             return None, False
 
-        tz_offset = getattr(user, "timezone", 3) if user else 3
+        tz_offset = _user_tz_offset(user) if user else 3.0  # 22.72: строки не роняют AI-таймеры
         local_now = _now_utc() + timedelta(hours=tz_offset)
 
         # ВОЛНА 22.13: «каждый понедельник в 15:00» — повторяемый день недели.
@@ -39326,11 +39570,15 @@ async def delete_my_data_yes(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except Exception as e:
         logger.error(f"delete_my_data: файлы Сейфа: {e}")
 
-    # 7) Сохраняем пользователей без удаляемого.
+    # 7) Удаляем пользователя из базы и кэша.
+    # ВОЛНА 22.72: remove_user вместо save_users(users) — при параллельных
+    # корутинах старый путь мог «воскресить» пользователя чужой устаревшей
+    # копией словаря (merge-on-save теперь защищает, но удаление делаем
+    # явно поверх свежей копии).
     try:
-        save_users(users)
+        remove_user(uid)
     except Exception as e:
-        logger.error(f"delete_my_data: save_users: {e}")
+        logger.error(f"delete_my_data: remove_user: {e}")
 
     # 8) Сброс кэша PTB-данных пользователя.
     try:
@@ -39412,6 +39660,12 @@ async def set_time_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_time_dt = datetime.strptime(time_str, "%H:%M")
         timezone = calculate_timezone(time_str)
         user.timezone = timezone
+        # ВОЛНА 22.72: ручная установка времени = пользователь сам задал своё
+        # смещение; IANA-резинхрон по tz_id может с ним спорить — сбрасываем.
+        try:
+            user.tz_id = None
+        except Exception:
+            pass
         user.local_time_set = True
         user.setup_completed = True
         save_user(user)
@@ -42033,8 +42287,41 @@ async def buy_stars_invoice_handler(update: Update, context: ContextTypes.DEFAUL
     return MAIN_MENU
 
 async def precheckout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.72 (аудит): сверяем сумму счёта с ценой из payload.
+
+    Раньше на ЛЮБОЙ payload с известным префиксом отвечали ok=True, не
+    проверяя query.total_amount: при баге в ценообразовании (или подмене
+    цены между созданием счёта и оплатой) списание/начисление разъезжались.
+    Теперь цена извлекается из payload (там её кладёт сам бот при send_invoice)
+    и сравнивается с фактической суммой."""
     query = update.pre_checkout_query
     payload = query.invoice_payload
+
+    expected_price = None
+    try:
+        if payload.startswith("buy_stars_"):
+            expected_price = int(payload.split("_")[2])
+        elif payload.startswith("buy_button_"):
+            expected_price = int(payload.split("_")[2])
+        elif payload.startswith("buy_unblock_class_"):
+            # Цена класс-разблокировки фиксируется в момент счёта (PRICES['unblock']).
+            expected_price = int(PRICES.get('unblock', 40))
+        elif payload.startswith("buy_unblock_"):
+            expected_price = int(payload.split("_")[2])
+        elif payload.startswith("buy_view_sender_"):
+            expected_price = int(payload.split("_")[3])
+        elif payload.startswith("buy_anon_space_"):
+            expected_price = int(payload.split("_")[3])
+    except (ValueError, IndexError, TypeError):
+        expected_price = None
+
+    if (expected_price is not None
+            and int(getattr(query, "total_amount", 0) or 0) != int(expected_price)):
+        await query.answer(
+            ok=False,
+            error_message=("Сумма счёта не совпадает с ценой. Счёт устарел — "
+                           "создайте оплату заново."))
+        return MAIN_MENU
 
     if payload.startswith("buy_stars_"):
         await query.answer(ok=True)
@@ -42054,6 +42341,47 @@ async def precheckout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     return MAIN_MENU
 
+
+# === ВОЛНА 22.72: идемпотентность платежей ===
+# Telegram может ределиверить successful_payment (рестарт/крах бота между
+# отправкой ответа и сохранением состояния). Раньше charge_id не проверялся
+# ВООБЩЕ — повторное получение апдейта задваивало звёзды/кнопки/разблокировки.
+_PROCESSED_PAYMENTS_CACHE = None
+
+
+def _load_processed_payments():
+    global _PROCESSED_PAYMENTS_CACHE
+    if _PROCESSED_PAYMENTS_CACHE is None:
+        try:
+            raw = load_data(PROCESSED_PAYMENTS_FILE, {}, expect="dict")
+            _PROCESSED_PAYMENTS_CACHE = raw if isinstance(raw, dict) else {}
+        except Exception:
+            _PROCESSED_PAYMENTS_CACHE = {}
+    return _PROCESSED_PAYMENTS_CACHE
+
+
+def _payment_mark_processed(charge_key):
+    """True — платёж видим впервые (можно начислять); False — уже обработан."""
+    cache = _load_processed_payments()
+    key = str(charge_key or "")
+    if not key:
+        return True  # нечего дедуплицировать — ведём себя как раньше
+    if key in cache:
+        return False
+    cache[key] = time.time()
+    try:
+        # Прореживание: храним последние 5000 платежей (файл не растёт вечно).
+        if len(cache) > 5000:
+            for _k, _ts in sorted(cache.items(), key=lambda kv: kv[1])[:len(cache) - 5000]:
+                cache.pop(_k, None)
+    except Exception:
+        pass
+    try:
+        save_data(PROCESSED_PAYMENTS_FILE, cache)
+    except Exception as e:
+        logger.error(f"processed_payments: не сохранён: {e}")
+    return True
+
 async def successful_payment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     user = get_user(user_id)
@@ -42061,6 +42389,25 @@ async def successful_payment_handler(update: Update, context: ContextTypes.DEFAU
         user = User(user_id)
     payment = update.message.successful_payment
     payload = payment.invoice_payload
+
+    # === ВОЛНА 22.72: дедупликация платежа по charge_id ===
+    # Повторный апдейт того же платежа (ределивери после рестарта) больше
+    # НЕ начисляет звёзды/кнопки второй раз.
+    _charge_id = str(getattr(payment, "telegram_payment_charge_id", "") or "")
+    _provider_charge_id = str(getattr(payment, "provider_payment_charge_id", "") or "")
+    _dedup_key = _charge_id or _provider_charge_id or ""
+    if not _dedup_key:
+        # Фолбэк: составной ключ из payload+суммы (charge_id отсутствует —
+        # бывает у некоторых провайдеров/старых клиентов).
+        _dedup_key = f"fb:{payload}:{getattr(payment, 'total_amount', 0)}:{user_id}"
+    if not _payment_mark_processed(_dedup_key):
+        logger.warning(f"successful_payment: ДУБЛЬ платежа пропущен ({_dedup_key[:48]})")
+        try:
+            await update.message.reply_text(
+                "ℹ️ Этот платёж уже был зачислен ранее — повторного начисления нет.")
+        except Exception:
+            pass
+        return MAIN_MENU
 
     # === НОВОЕ: единая регистрация потраченных Stars ===
     # Подробной истории переводов больше нет: только агрегаты (общая сумма
@@ -45639,6 +45986,11 @@ async def change_time_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         user_time_dt = datetime.strptime(time_str, "%H:%M")
         timezone = calculate_timezone(time_str)
         user.timezone = timezone
+        # ВОЛНА 22.72: ручная установка времени — сбрасываем IANA-резинхрон.
+        try:
+            user.tz_id = None
+        except Exception:
+            pass
         user.local_time_set = True
         save_user(user)
 
@@ -49062,6 +49414,14 @@ async def admin_delete_button_handler(update: Update, context: ContextTypes.DEFA
     button_id = query.data.split("_")[3]
     class_code = context.user_data.get('current_admin_class')
 
+    # ВОЛНА 22.72: перепроверка прав (отозванный админ — не админ).
+    user_id = str(query.from_user.id)
+    if not class_code or not is_admin_of_class(user_id, class_code):
+        context.user_data.pop('current_admin_class', None)
+        await query.edit_message_text(
+            "⛔ Действие недоступно: вы больше не администратор этого класса.")
+        return MAIN_MENU
+
     buttons = load_data(CUSTOM_BUTTONS_FILE, {}, expect="dict")
 
     if button_id in buttons:
@@ -49385,6 +49745,14 @@ async def hw_delete_subject_handler(update: Update, context: ContextTypes.DEFAUL
 
     subject = query.data.replace("hw_del_subj_", "")
     class_code = context.user_data.get('current_admin_class')
+
+    # ВОЛНА 22.72: перепроверка прав (отозванный админ — не админ).
+    if not class_code or not is_admin_of_class(str(query.from_user.id), class_code):
+        context.user_data.pop('current_admin_class', None)
+        await query.edit_message_text(
+            "⛔ Действие недоступно: вы больше не администратор этого класса.")
+        return MAIN_MENU
+
     class_obj = get_class_by_code(class_code)
 
     if class_obj:
@@ -49855,6 +50223,13 @@ async def delete_homework_start(update: Update, context: ContextTypes.DEFAULT_TY
         user = User(user_id)
 
     class_code = context.user_data.get('current_admin_class')
+    # ВОЛНА 22.72: перепроверка прав (отозванный админ — не админ).
+    if not class_code or not is_admin_of_class(user_id, class_code):
+        context.user_data.pop('current_admin_class', None)
+        await query.edit_message_text(
+            "⛔ Действие недоступно: вы больше не администратор этого класса.")
+        return ADMIN_PANEL
+
     class_obj = get_class_by_code(class_code)
 
     if not class_obj:
@@ -50044,6 +50419,23 @@ async def class_block_user_handler(update: Update, context: ContextTypes.DEFAULT
     blocked_user_id = query.data.split("_")[2]
     class_code = context.user_data.get('current_admin_class')
 
+    # ВОЛНА 22.72: перепроверка прав (отозванный админ — не админ).
+    if not class_code or not is_admin_of_class(user_id, class_code):
+        context.user_data.pop('current_admin_class', None)
+        await query.edit_message_text(
+            "⛔ Действие недоступно: вы больше не администратор этого класса.")
+        return MAIN_MENU
+
+    # Защита: нельзя блокировать участников НЕ своего класса по подделанному
+    # callback_data (раньше block_user_in_class вызывался для любого user_id).
+    class_obj = get_class_by_code(class_code)
+    if class_obj and str(blocked_user_id) not in [
+            str(s) for s in (list(class_obj.students or [])
+                             + list(class_obj.admins or []))]:
+        await query.edit_message_text(
+            "⛔ Этот пользователь не состоит в вашем классе.")
+        return MAIN_MENU
+
     class_obj = get_class_by_code(class_code)
     if class_obj:
         if blocked_user_id not in class_obj.blocked_users:
@@ -50083,6 +50475,13 @@ async def class_unblock_user_handler(update: Update, context: ContextTypes.DEFAU
 
     unblocked_user_id = query.data.split("_")[2]
     class_code = context.user_data.get('current_admin_class')
+
+    # ВОЛНА 22.72: перепроверка прав (отозванный админ — не админ).
+    if not class_code or not is_admin_of_class(user_id, class_code):
+        context.user_data.pop('current_admin_class', None)
+        await query.edit_message_text(
+            "⛔ Действие недоступно: вы больше не администратор этого класса.")
+        return MAIN_MENU
 
     class_obj = get_class_by_code(class_code)
     if class_obj:
@@ -50357,6 +50756,15 @@ async def timer_set_date_handler(update: Update, context: ContextTypes.DEFAULT_T
     # Попробуем распарсить "ГГГГ-ММ-ДД ЧЧ:ММ"
     try:
         dt = datetime.strptime(input_str, "%Y-%m-%d %H:%M")
+        # ВОЛНА 22.72 (аудит): не даём поставить таймер в прошлое.
+        tz_offset = _user_tz_offset(user) if user else 3.0
+        local_now = (_utcnow() + timedelta(hours=tz_offset)).replace(second=0, microsecond=0)
+        if dt <= local_now:
+            await update.message.reply_text(
+                "⚠️ Это время уже прошло. Введите дату и время в будущем:\n(ГГГГ-ММ-ДД ЧЧ:ММ)",
+                reply_markup=get_cancel_keyboard()
+            )
+            return TIMER_SET_DATE
         context.user_data['timer_date'] = dt.strftime("%Y-%m-%d")
         context.user_data['timer_time'] = dt.strftime("%H:%M")
         await update.message.reply_text(
@@ -50369,10 +50777,17 @@ async def timer_set_date_handler(update: Update, context: ContextTypes.DEFAULT_T
     # Попробуем только время "ЧЧ:ММ" (сегодня)
     try:
         t = datetime.strptime(input_str, "%H:%M")
-        tz_offset = user.timezone if user else 3
+        tz_offset = _user_tz_offset(user) if user else 3.0  # 22.72: без TypeError
         now_utc = _utcnow()
         local_now = now_utc + timedelta(hours=tz_offset)
         date_str = local_now.strftime("%Y-%m-%d")
+        # ВОЛНА 22.72 (аудит): если это время СЕГОДНЯ уже прошло — ставим на
+        # завтра, а не молча на прошедшее время (раньше таймер срабатывал
+        # через 5 секунд после создания).
+        if datetime.strptime(f"{date_str} {input_str}", "%Y-%m-%d %H:%M") <= local_now.replace(second=0, microsecond=0):
+            date_str = (local_now + timedelta(days=1)).strftime("%Y-%m-%d")
+            await update.message.reply_text(
+                "ℹ️ Это время сегодня уже прошло — поставлю на завтра.")
         context.user_data['timer_date'] = date_str
         context.user_data['timer_time'] = input_str
         await update.message.reply_text(
@@ -50411,6 +50826,23 @@ async def timer_set_time_handler(update: Update, context: ContextTypes.DEFAULT_T
 
     try:
         datetime.strptime(time_str, "%H:%M")
+        # ВОЛНА 22.72 (аудит): таймер нельзя ставить в ПРОШЛОЕ — если время
+        # сегодня уже прошло, переносим на завтра (раньше джоба срабатывала
+        # через 5 секунд после создания).
+        date_str = context.user_data.get('timer_date')
+        if date_str:
+            try:
+                tz_offset = _user_tz_offset(user) if user else 3.0
+                local_now = (_utcnow() + timedelta(hours=tz_offset)).replace(second=0, microsecond=0)
+                target = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
+                if target <= local_now:
+                    new_date = (local_now + timedelta(days=1)).strftime("%Y-%m-%d")
+                    context.user_data['timer_date'] = new_date
+                    await update.message.reply_text(
+                        f"ℹ️ Это время ({date_str} {time_str}) уже прошло — "
+                        f"перенёс на {new_date} {time_str}.")
+            except ValueError:
+                pass
         context.user_data['timer_time'] = time_str
 
         await update.message.reply_text(f"⏰ Время: {time_str}\n\n📝 Введите текст напоминания:")
@@ -50434,6 +50866,23 @@ async def timer_set_text_handler(update: Update, context: ContextTypes.DEFAULT_T
     if not date_str or not time_str:
         await update.message.reply_text("Данные не найдены.")
         return MAIN_MENU
+
+    # ВОЛНА 22.72 (аудит): финальная проверка — время должно быть в будущем.
+    # Раньше через диалог можно было поставить таймер в прошлое, и он
+    # «срабатывал» через 5 секунд (schedule_timer_job при delay<=0).
+    try:
+        tz_offset = _user_tz_offset(user) if user else 3.0
+        local_now = (_utcnow() + timedelta(hours=tz_offset)).replace(second=0, microsecond=0)
+        target_dt = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
+        if target_dt <= local_now:
+            await update.message.reply_text(
+                "⚠️ Указанное время уже прошло. Введите дату и время заново:\n"
+                "(ГГГГ-ММ-ДД ЧЧ:ММ)",
+                reply_markup=get_cancel_keyboard())
+            context.user_data.pop('timer_time', None)
+            return TIMER_SET_DATE
+    except ValueError:
+        pass
 
     rejected = await reject_if_forbidden_chars(update, text, TIMER_SET_TEXT)
     if rejected is not None:
@@ -51076,7 +51525,7 @@ async def timer_edit_time_save(update: Update, context: ContextTypes.DEFAULT_TYP
     try:
         _u = get_user(str(update.effective_user.id))
         if _u is not None:
-            tz_offset = getattr(_u, 'timezone', 3)
+            tz_offset = _user_tz_offset(_u)  # 22.72: строки не роняют timedelta
     except Exception:
         pass
     now_local = _now_utc() + timedelta(hours=tz_offset)
@@ -51233,7 +51682,7 @@ async def pomo_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cfg = _pomo_cfg_from_user_data(context)
     sess = _pomo_get_session(uid)
     _u = get_user(uid)
-    _tz = getattr(_u, 'timezone', 3) if _u else 3
+    _tz = _user_tz_offset(_u) if _u else 3.0  # 22.72: строки не роняют
     _txt = _pomo_menu_text(sess, cfg, tz=_tz)
     _kb = _pomo_menu_kb(sess, cfg)
     try:
@@ -51318,7 +51767,7 @@ async def pomo_start_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     cfg = (_pomo_cfg_from_user_data(context)
            if query.data == "pomo_start_cfg" else dict(_POMO_DEFAULTS))
-    tz_offset = getattr(user, 'timezone', 3) or 3
+    tz_offset = _user_tz_offset(user)  # 22.72: строки не роняют timedelta
     now_local = _utcnow() + timedelta(hours=tz_offset)
     sess = {
         'user_id': uid,
@@ -51407,6 +51856,7 @@ async def _tick_send_pomodoro(bot):
         return
     now_utc = _utcnow()
     changed = False
+    touched = {}  # 22.72: {uid: dict} — обновления; {uid: ("del", snap)} — закрытия
     for uid, s in list(sessions.items()):
         try:
             if not isinstance(s, dict) or not s.get('is_active'):
@@ -51415,10 +51865,11 @@ async def _tick_send_pomodoro(bot):
                 ends_local = datetime.strptime(str(s.get('ends')), "%Y-%m-%d %H:%M")
             except (TypeError, ValueError):
                 sessions.pop(uid, None)
+                touched[uid] = ("del", s)  # 22.72: условное удаление
                 changed = True
                 continue
             user = get_user(uid)
-            tz = getattr(user, 'timezone', 3) if user else 3
+            tz = _user_tz_offset(user) if user else 3.0  # 22.72: строки/DST не роняют тикер
             if (now_utc - (ends_local - timedelta(hours=tz))).total_seconds() < 0:
                 continue  # фаза ещё не закончилась
             phase = s.get('phase')
@@ -51433,6 +51884,7 @@ async def _tick_send_pomodoro(bot):
             elif phase == 'long':
                 # длинный перерыв закончился — сессия завершена
                 sessions.pop(uid, None)
+                touched[uid] = ("del", s)  # 22.72: условное удаление
                 changed = True
                 try:
                     await bot.send_message(
@@ -51448,12 +51900,14 @@ async def _tick_send_pomodoro(bot):
                 continue
             else:
                 sessions.pop(uid, None)
+                touched[uid] = ("del", s)  # 22.72: условное удаление
                 changed = True
                 continue
             now_local = now_utc + timedelta(hours=tz)
             s['phase'] = nxt
             s['ends'] = (now_local + timedelta(minutes=dur)).strftime("%Y-%m-%d %H:%M")
             sessions[uid] = s
+            touched[uid] = s  # 22.72: merge-обновление этой сессии
             changed = True
             if nxt == 'break':
                 _msg = (f"🍅 Готово {s['cycle_done']} из {s.get('cycles', 4)}!\n\n"
@@ -51477,7 +51931,10 @@ async def _tick_send_pomodoro(bot):
             logger.error(f"tick/pomodoro: error on {uid}: {e}")
     if changed:
         try:
-            save_data(POMODORO_FILE, sessions)
+            # 22.72: мержим только изменённые тиком сессии — stop/skip,
+            # сделанные пользователем во время отправки сообщений, больше
+            # не затираются устаревшей копией тикера.
+            await _merge_save_keys(POMODORO_FILE, touched, full=sessions)
         except Exception as e:
             logger.error(f"tick/pomodoro: final save failed: {e}")
 
@@ -53553,15 +54010,18 @@ def generate_class_timer_id():
 
 
 def _class_timer_tz(td):
-    """Часовой пояс СОЗДАТЕЛЯ таймера класса (как у личных таймеров)."""
-    tz_offset = 3
+    """Часовой пояс СОЗДАТЕЛЯ таймера класса (как у личных таймеров).
+
+    ВОЛНА 22.72: через _user_tz_offset — без TypeError на строковых tz,
+    с учётом DST по tz_id; раньше int(getattr(...)) и три разных пути
+    разбора tz расходились в поведении."""
     try:
         u = get_user(str(td.get('created_by') or ''))
         if u is not None:
-            tz_offset = int(getattr(u, 'timezone', 3) or 3)
+            return _user_tz_offset(u)
     except Exception:
         pass
-    return tz_offset
+    return 3.0
 
 
 def _class_timer_label(td):
@@ -53684,11 +54144,21 @@ async def _class_timer_fire_now(application, tid):
     key = f"{td.get('target_date')} {td.get('target_time')}"
     if str(td.get('fired_key') or '') == key:
         return 0  # этот запуск уже ушёл
+    # ВОЛНА 22.72 (аудит): помечаем запуск ОТПРАВЛЕННЫМ ДО рассылки и сразу
+    # сохраняем. Раньше метка ставилась ПОСЛЕ цикла рассылки (десятки await
+    # send_message): safety-net, успев прочитать немеченую запись, отправлял
+    # весь класс ВТОРОЙ раз. Цена возможной недоставки при краше в середине
+    # рассылки < цена двойной массовой рассылки всем участникам.
+    td['fired_key'] = key
+    td['last_sent'] = datetime.now().strftime("%Y-%m-%d %H:%M")
+    try:
+        await _merge_save_keys(CLASS_TIMERS_FILE, {tid: td}, full=timers)
+    except Exception as e:
+        logger.error(f"class_timer {tid}: предсохранение метки: {e}")
     class_obj = get_class_by_code(td.get('class_code'))
     if not class_obj:
         td['is_active'] = False
-        timers[tid] = td
-        await _async_save_data(CLASS_TIMERS_FILE, timers)
+        await _merge_save_keys(CLASS_TIMERS_FILE, {tid: td}, full=timers)
         return 0
     text = (f"📢 Запланированное сообщение класса {class_obj.class_name}:\n\n"
             f"{td.get('text') or ''}")
@@ -53703,8 +54173,6 @@ async def _class_timer_fire_now(application, tid):
             sent += 1
         except Exception as e:
             logger.error(f"class_timer {tid}: не доставлено {member_id}: {e}")
-    td['fired_key'] = key
-    td['last_sent'] = datetime.now().strftime("%Y-%m-%d %H:%M")
     # Журнал объявлений класса (для «🤒 Я болел(а)») — как у обычной рассылки.
     try:
         log_ann = getattr(class_obj, 'announcements', None)
@@ -53727,13 +54195,15 @@ async def _class_timer_fire_now(application, tid):
     except Exception:
         pass
     if _class_timer_is_recurring(td) and _timer_advance_repeat(td):
-        timers[tid] = td
-        await _async_save_data(CLASS_TIMERS_FILE, timers)
         schedule_class_timer_job(application, tid, td)
     else:
         td['is_active'] = False
-        timers[tid] = td
-        await _async_save_data(CLASS_TIMERS_FILE, timers)
+    # ВОЛНА 22.72: финальное сохранение мержит только ЭТУ запись —
+    # изменения других таймеров (вкл/выкл/удаление админом) не затираются.
+    try:
+        await _merge_save_keys(CLASS_TIMERS_FILE, {tid: td}, full=timers)
+    except Exception as e:
+        logger.error(f"class_timer {tid}: финальное сохранение: {e}")
     return sent
 
 
@@ -56410,6 +56880,7 @@ async def _timer_safety_net(context: ContextTypes.DEFAULT_TYPE):
             return
         now_utc = _utcnow()
         changed = False
+        touched = {}  # 22.72: ключи, изменённые именно safety-net (для merge-save)
         for timer_id, timer_data in list(timers.items()):
             try:
                 if not timer_data.get('is_active'):
@@ -56426,7 +56897,7 @@ async def _timer_safety_net(context: ContextTypes.DEFAULT_TYPE):
                 except ValueError:
                     continue
                 user = get_user(user_id)
-                tz_offset = getattr(user, 'timezone', 3) if user else 3
+                tz_offset = _user_tz_offset(user) if user else 3.0  # 22.72: без TypeError на строках
                 target_utc = target_local - timedelta(hours=tz_offset)
                 # Срабатываем, только если время уже прошло.
                 if (now_utc - target_utc).total_seconds() < 0:
@@ -56441,11 +56912,14 @@ async def _timer_safety_net(context: ContextTypes.DEFAULT_TYPE):
                     timer_data['is_active'] = False
                     timer_data['fired_at'] = datetime.now().strftime("%Y-%m-%d %H:%M")
                 timers[timer_id] = timer_data
+                touched[timer_id] = timer_data
                 changed = True
                 # ИСПРАВЛЕНО (аудит): blocking save_data (Supabase/Mongo, таймаут
                 # 8–10 с) прямо на event loop в тикере каждые 30 с — во время
                 # медленного ответа облака ЗАМИРАЛИ ВСЕ пользователи.
-                await _async_save_data(TIMERS_FILE, timers)
+                # 22.72: и мержим только свой ключ — не затирая чужие изменения.
+                await _merge_save_keys(TIMERS_FILE, {timer_id: timer_data},
+                                       full=timers)
 
                 msg = _timer_message_text(timer_data)
                 try:
@@ -56460,7 +56934,8 @@ async def _timer_safety_net(context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logger.error(f"safety-net: ошибка обработки таймера {timer_id}: {e}")
         if changed:
-            await _async_save_data(TIMERS_FILE, timers)
+            # 22.72: merge только своих ключей вместо полного сохранения.
+            await _merge_save_keys(TIMERS_FILE, touched, full=timers)
     except Exception as e:
         logger.error(f"safety-net общий сбой: {e}")
 
@@ -56480,9 +56955,9 @@ def schedule_timer_job(application, timer_id, timer_data):
         user_id = timer_data.get('user_id')
         if not date_str or not time_str or not user_id:
             return
-        # Учитываем часовой пояс пользователя
+        # Учитываем часовой пояс пользователя (22.72: безопасно, с DST по tz_id)
         user = get_user(user_id)
-        tz_offset = user.timezone if user else 3
+        tz_offset = _user_tz_offset(user) if user else 3.0
         target_local = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
         # Переводим из локального времени пользователя в UTC
         when_utc = target_local - timedelta(hours=tz_offset)
@@ -56604,7 +57079,7 @@ def _days_until_birthday_for_user(user):
     if not user or not user.birthday:
         return None
     try:
-        tz_offset = getattr(user, 'timezone', 3)
+        tz_offset = _user_tz_offset(user)  # 22.72: DST по tz_id, строки не падают
         local_today = (_utcnow() + timedelta(hours=tz_offset)).date()
         birthday = datetime.strptime(user.birthday, "%Y-%m-%d").date()
         next_birthday = birthday.replace(year=local_today.year)
@@ -56642,7 +57117,7 @@ async def _send_birthday_notification(context: ContextTypes.DEFAULT_TYPE):
     if not user.birthday:
         return
     try:
-        tz_offset = getattr(user, 'timezone', 3)
+        tz_offset = _user_tz_offset(user)  # 22.72: DST по tz_id, строки не падают
         local_today = (_utcnow() + timedelta(hours=tz_offset)).date()
         try:
             birthday = datetime.strptime(user.birthday, "%Y-%m-%d").date()
@@ -56907,9 +57382,12 @@ async def detect_timezone_for_city(city):
     # 1. WeatherAPI: получаем location и tz_id.
     data = await _weather_api_get("current.json", {"q": city})
     tz_id = None
+    global _LAST_DETECTED_TZ_ID  # ВОЛНА 22.72: сохраняем IANA-имя для user.tz_id
     if data and "location" in data:
         loc = data["location"]
         tz_id = loc.get("tz_id")
+        if tz_id:
+            _LAST_DETECTED_TZ_ID = str(tz_id)
 
         if tz_id and ZoneInfo is not None:
             # ГЛАВНЫЙ ПУТЬ: точный офлайн-расчёт по IANA-имени пояса.
@@ -57195,6 +57673,13 @@ async def enter_city_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         logger.warning(f"detect_timezone_for_city failed: {e}")
         tz_offset = 3
     user.timezone = tz_offset
+    # ВОЛНА 22.72: сохраняем IANA-имя пояса — тикеры будут считать смещение
+    # с учётом DST на каждый момент (см. _user_tz_offset), а не раз в жизни
+    # при регистрации.
+    try:
+        user.tz_id = _LAST_DETECTED_TZ_ID or None
+    except Exception:
+        pass
     # Время «настройки» нам больше не нужно вводить руками — фиксируем
     # «эталонное» 12:00 локального времени, чтобы не ломать функции,
     # завязанные на user.set_time / setup_completed.
@@ -57386,13 +57871,17 @@ async def weather_recalc_tz_handler(update: Update, context: ContextTypes.DEFAUL
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="weather_settings")]]),
         )
         return USER_SETTINGS
-    old_tz = getattr(user, 'timezone', 3)
+    old_tz = _user_tz_offset(user)  # 22.72: строки не роняют сравнение
     try:
         new_tz = await detect_timezone_for_city(user.city)
     except Exception as e:
         logger.warning(f"weather_recalc_tz: {e}")
         new_tz = old_tz
     user.timezone = new_tz
+    try:
+        user.tz_id = _LAST_DETECTED_TZ_ID or None  # 22.72: DST-резинхрон
+    except Exception:
+        pass
     save_user(user)
     sign = "+" if float(new_tz) >= 0 else "−"
     pretty = int(new_tz) if float(new_tz) == int(new_tz) else float(new_tz)
@@ -57488,9 +57977,13 @@ async def change_city_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     try:
         tz_offset = await detect_timezone_for_city(canonical)
         user.timezone = tz_offset
+        try:
+            user.tz_id = _LAST_DETECTED_TZ_ID or None  # 22.72: DST-резинхрон
+        except Exception:
+            pass
     except Exception as e:
         logger.warning(f"detect_timezone_for_city failed on change_city: {e}")
-        tz_offset = getattr(user, "timezone", 3) or 3
+        tz_offset = _norm_tz(getattr(user, "timezone", 3))  # 22.72: не тащим строку в базу
     save_user(user)
     try:
         schedule_user_weather_job(context.application, user)
@@ -57798,8 +58291,8 @@ def _sol_class_entries(class_code):
 
 
 def _sol_gen_id():
-    return "sol_" + "".join(random.choices(
-        string.ascii_lowercase + string.digits, k=8))
+    # 22.72: secrets вместо random
+    return "sol_" + secrets.token_hex(4)
 
 
 def _sol_find_entry(sol_id):
@@ -58678,8 +59171,9 @@ def _share_save():
 
 
 def _share_gen_tok():
-    return "dl_" + "".join(random.choices(
-        string.ascii_letters + string.digits, k=10))
+    # ВОЛНА 22.72 (аудит): random (Mersenne Twister) предсказуем при наблюдении
+    # соседних выводов — токен даёт доступ к файлам. Только secrets.
+    return "dl_" + secrets.token_urlsafe(12)
 
 
 def _share_draft(context):
@@ -59404,7 +59898,8 @@ async def share_pin_receive(update: Update,
         await msg.reply_text(
             "🔒 Слишком много неверных попыток — ссылка заперта на 10 минут.")
         return MAIN_MENU
-    if pin != str(rec.get("pw") or ""):
+    # 22.72: compare_digest — константное время сравнения PIN.
+    if not hmac.compare_digest(str(pin), str(rec.get("pw") or "")):
         fails = int(rec.get("pin_fails", 0) or 0) + 1
         rec["pin_fails"] = fails
         _share_save()
@@ -60102,6 +60597,15 @@ def _parse_sched_time(text, now=None):
             when = datetime(year, mo, dd, hh, mm)
         except ValueError:
             return None
+        if yy is None and when <= now:
+            # ВОЛНА 22.72 (аудит): «05.10 18:30» в декабре возвращало ПРОШЕДШУЮ
+            # дату текущего года — воркер считал delay<=0 и отправлял опрос
+            # МГНОВЕННО с текстом «запланирован на 05.10». Без указанного года
+            # считаем ближайшее БУДУЩЕЕ: прошли в этом году — берём следующий.
+            try:
+                when = when.replace(year=year + 1)
+            except ValueError:  # 29 февраля
+                return None
         return when
     return None
 
@@ -60374,6 +60878,50 @@ def _mark_notification_sent(log, user_id, key, local_today_str):
     user_log[key] = local_today_str
 
 
+def _norm_tz(value, default=3.0):
+    """ВОЛНА 22.72 (аудит): числовое смещение UTC из user.timezone.
+
+    Раньше тикеры таймеров/помодоро/ДР делали timedelta(hours=raw) напрямую:
+    если timezone хранился СТРОКОЙ («+3», «UTC+3»), падал TypeError, исключение
+    глоталось — и пользователь молча терял ВСЕ напоминания. Единый парсер:
+    число / строка / мусор → безопасный float, кламп в [-12; +14]."""
+    default = float(default) if not isinstance(default, (int, float)) else default
+    try:
+        tz_num = float(value)
+    except (TypeError, ValueError):
+        s = str(value or "").strip().upper().replace("UTC", "").replace(" ", "").replace(",", ".")
+        try:
+            tz_num = float(s) if s else default
+        except Exception:
+            tz_num = default
+    if not (-12.0 <= tz_num <= 14.0):
+        tz_num = float(default)
+    return tz_num
+
+
+def _user_tz_offset(user):
+    """ВОЛНА 22.72: АКТУАЛЬНОЕ смещение пользователя от UTC (часы, float).
+
+    1) Если известен IANA-идентификатор (user.tz_id, сохраняется при выборе
+       города) — смещение считается через zoneinfo НА ТЕКУЩИЙ момент:
+       переход на летнее/зимнее время (DST) учитывается автоматически.
+       Раньше смещение фиксировалось один раз при настройке и через полгода
+       «уезжало» на час для жителей стран с DST.
+    2) Иначе — сохранённое число с безопасным разбором (_norm_tz)."""
+    if user is not None:
+        tz_id = getattr(user, 'tz_id', None)
+        if tz_id and ZoneInfo is not None:
+            try:
+                now_utc_aware = datetime.now(timezone.utc)
+                _off = now_utc_aware.astimezone(ZoneInfo(str(tz_id))).utcoffset()
+                if _off is not None:
+                    return _off.total_seconds() / 3600.0
+            except Exception:
+                pass
+        return _norm_tz(getattr(user, 'timezone', 3))
+    return 3.0
+
+
 def _user_local_now(user):
     """Локальное время пользователя (наивный datetime) с учётом его tz.
 
@@ -60387,22 +60935,11 @@ def _user_local_now(user):
     ИСПРАВЛЕНО: tz теперь может быть дробным (UTC+5:30 от
     detect_timezone_for_city) — считаем через float, а не int(),
     иначе получасовые пояса обрезались до целого часа.
+
+    ВОЛНА 22.72: смещение через _user_tz_offset — учёт DST по tz_id
+    и безопасный разбор строковых tz (единая логика со всеми тикерами).
     """
-    tz_raw = getattr(user, 'timezone', 3) if user else 3
-    try:
-        tz_num = float(tz_raw)
-    except Exception:
-        # Бывают случаи, когда timezone сохранён как строка типа "+3" или
-        # "UTC+3". Аккуратно вынем число — иначе timedelta(hours=str)
-        # упал бы и весь тикер для этого пользователя «съедал» исключение.
-        s = str(tz_raw or "").strip().upper().replace("UTC", "").replace(" ", "").replace(",", ".")
-        try:
-            tz_num = float(s) if s else 3.0
-        except Exception:
-            tz_num = 3.0
-    if not (-12 <= tz_num <= 14):
-        tz_num = 3.0
-    return _now_utc() + timedelta(hours=tz_num)
+    return _now_utc() + timedelta(hours=_user_tz_offset(user))
 
 
 def _is_daily_time_due(local_now, target_hhmm, max_late_minutes=360):
@@ -60462,6 +60999,7 @@ async def _tick_send_timers(bot):
         return
     now_utc = _utcnow()
     changed = False
+    touched = {}  # 22.72: ключи, изменённые именно этим тиком (для merge-save)
     for timer_id, timer_data in list(timers.items()):
         try:
             if not timer_data.get('is_active'):
@@ -60478,7 +61016,7 @@ async def _tick_send_timers(bot):
             except ValueError:
                 continue
             user = get_user(user_id)
-            tz = getattr(user, 'timezone', 3) if user else 3
+            tz = _user_tz_offset(user) if user else 3.0  # 22.72: строки/DST не роняют тикер
             # ВОЛНА 22.29: окно тишины «не беспокоить» для явных напоминаний.
             # По умолчанию таймеры НЕ глушатся (dnd_mute['timers']=False) —
             # но если пользователь сам их заглушил, напоминание просто
@@ -60498,8 +61036,11 @@ async def _tick_send_timers(bot):
                 timer_data['is_active'] = False
                 timer_data['fired_at'] = datetime.now().strftime("%Y-%m-%d %H:%M")
             timers[timer_id] = timer_data
+            touched[timer_id] = timer_data
             try:
-                save_data(TIMERS_FILE, timers)
+                # 22.72: пометка «отправлено» — мержим только этот ключ.
+                await _merge_save_keys(TIMERS_FILE, {timer_id: timer_data},
+                                       full=timers)
             except Exception as e:
                 logger.error(f"tick/timers: save before send failed for {timer_id}: {e}")
             changed = True
@@ -60526,12 +61067,16 @@ async def _tick_send_timers(bot):
                     timer_data["send_fails"] = _fails
                     timer_data["is_active"] = _fails <= 10
                 timers[timer_id] = timer_data
+                touched[timer_id] = timer_data
                 changed = True
         except Exception as e:
             logger.error(f"tick/timers: error on timer {timer_id}: {e}")
     if changed:
         try:
-            save_data(TIMERS_FILE, timers)
+            # 22.72: финальный save мержит ТОЛЬКО изменённые тиком ключи —
+            # таймер, удалённый/выключенный пользователем во время отправок,
+            # больше не «воскресает" устаревшей копией.
+            await _merge_save_keys(TIMERS_FILE, touched, full=timers)
         except Exception as e:
             logger.error(f"tick/timers: final save failed: {e}")
 
