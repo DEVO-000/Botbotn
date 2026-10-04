@@ -1045,15 +1045,41 @@ def _now_utc():
     return _utcnow() + timedelta(seconds=_time_drift_seconds)
 
 
+# === ВОЛНА 22.73 (аудит): ОБЩАЯ переиспользуемая aiohttp-сессия ===
+# Раньше каждый HTTP-запрос открывал новую ClientSession: рвался keep-alive,
+# лишние TLS-рукопожатия и сокеты на бесплатном хостинге. Теперь одна ленивая
+# сессия на процесс: пересоздаётся, если закрыта или event loop сменился
+# (перезапуск бота/теста), таймауты задаются ПОЗАПРОСНО.
+_AIO_SHARED_SESSION = None
+_AIO_SHARED_LOOP = None
+
+
+def _aio_session():
+    """Общая ClientSession текущего event loop'а (ленивая, авто-пересоздание)."""
+    global _AIO_SHARED_SESSION, _AIO_SHARED_LOOP
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # Нет запущенного loop'а (синхронный контекст) — не кэшируем.
+        return aiohttp.ClientSession()
+    s = _AIO_SHARED_SESSION
+    if s is not None and not s.closed and _AIO_SHARED_LOOP is loop:
+        return s
+    s = aiohttp.ClientSession()
+    _AIO_SHARED_SESSION = s
+    _AIO_SHARED_LOOP = loop
+    return s
+
+
 async def _refresh_time_drift():
     """Один проход: опрашивает внешние сервисы времени, обновляет
     глобальный `_time_drift_seconds`. Не падает, если сеть недоступна."""
     global _time_drift_seconds, _time_drift_last_synced_at
+    _t6 = aiohttp.ClientTimeout(total=6)
     for url, key in _TIME_SOURCES:
         try:
-            timeout = aiohttp.ClientTimeout(total=6)
-            async with aiohttp.ClientSession(timeout=timeout) as s:
-                async with s.get(url) as resp:
+            s = _aio_session()
+            async with s.get(url, timeout=_t6) as resp:
                     if resp.status != 200:
                         continue
                     j = await resp.json(content_type=None)
@@ -2514,6 +2540,11 @@ class User:
         # пригласителю за этого юзера — защита от дубль-начисления при
         # повторных /start.
         self.referral_bonus_paid = False
+        # ВОЛНА 22.73: приватность в статистике трат. True — пользователя
+        # НЕ показывают в «📊 Статистика звезд» → «Топ по тратам» и не
+        # добавляют в карту тративших (spenders/top_donors). Тоггл —
+        # ⚙️ Настройки. Общая сумма трат бота при этом честно растёт.
+        self.hide_spend_stats = False
         # === Цвет/тема кнопок (UI) ===
         # Идентификатор цветовой темы для кнопок главного меню. Влияет только
         # на префикс-эмодзи в подписях кнопок и на наличие/тип «декорации»
@@ -2722,6 +2753,8 @@ class User:
             'referrer_id': getattr(self, 'referrer_id', None),
             'referrals_count': getattr(self, 'referrals_count', 0),
             'referral_bonus_paid': getattr(self, 'referral_bonus_paid', False),
+            # ВОЛНА 22.73: приватность в статистике трат
+            'hide_spend_stats': bool(getattr(self, 'hide_spend_stats', False)),
             # Цвет/тема кнопок
             'button_theme': getattr(self, 'button_theme', 'default'),
             # Цветные inline-кнопки (новая фича)
@@ -2891,6 +2924,9 @@ class User:
             user.referrals_count = 0
         if not hasattr(user, 'referral_bonus_paid'):
             user.referral_bonus_paid = False
+        # Бэк-совместимость: ВОЛНА 22.73, приватность в статистике трат.
+        if not hasattr(user, 'hide_spend_stats'):
+            user.hide_spend_stats = False
         if not hasattr(user, 'button_theme') or not user.button_theme:
             user.button_theme = 'default'
         if not hasattr(user, 'colored_buttons_enabled') or user.colored_buttons_enabled is None:
@@ -3089,6 +3125,10 @@ class Class:
         #  "host": str, "title": str, "ts": "YYYY-MM-DD HH:MM"}
         # Показывается ученикам в «📅 Расписание» секцией «🌐 Расписание с сайтов».
         self.schedule_web = None
+        # ВОЛНА 22.73: применывать ли «Расписание с сайтов» в кнопках
+        # «📅 Сегодня» / «📅 Завтра» (чтобы расписание с сайта ставилось
+        # автоматически). Тоггл — админ-панель → «🌐 Расписание с сайтов».
+        self.sched_web_auto = True
 
     def to_dict(self):
         return {
@@ -3123,6 +3163,8 @@ class Class:
             'duty_custom': getattr(self, 'duty_custom', None),
             # ВОЛНА 22.67: «Расписание с сайтов» (последнее присланное классу)
             'schedule_web': getattr(self, 'schedule_web', None),
+            # ВОЛНА 22.73: авто-применение расписания с сайта в Сегодня/Завтра
+            'sched_web_auto': bool(getattr(self, 'sched_web_auto', True)),
         }
 
     @classmethod
@@ -3174,6 +3216,9 @@ class Class:
             if not (class_obj.schedule_web['text']
                     or class_obj.schedule_web['name']):
                 class_obj.schedule_web = None
+        # ВОЛНА 22.73: тоггл авто-применения к Сегодня/Завтра — по умолчанию ВКЛ.
+        if not isinstance(getattr(class_obj, 'sched_web_auto', None), bool):
+            class_obj.sched_web_auto = True
         return class_obj
 
 
@@ -3625,6 +3670,11 @@ def register_stars_spending(user_id, user_name, amount):
 
     НЕ пишет никаких записей-переводов: только инкремент общей суммы,
     обновление карты тративших (spenders) и производного топ-10.
+
+    ВОЛНА 22.73: если у пользователя включена настройка «Скрывать меня
+    в топе трат» (hide_spend_stats) — в карту тративших его запись НЕ
+    добавляется, а существующая (если была) УДАЛЯЕТСЯ из spenders и
+    производного топ-10. Общая сумма трат бота при этом честно растёт.
     """
     try:
         amount = int(amount)
@@ -3639,10 +3689,21 @@ def register_stars_spending(user_id, user_name, amount):
     if not isinstance(spenders, dict):
         spenders = {}
     key = str(user_id)
-    spenders[key] = int(spenders.get(key, 0)) + amount
+    # ВОЛНА 22.73: приватность — персональный агрегат не пишем.
+    _hidden = False
+    try:
+        _u = load_users().get(key)
+        _hidden = bool(getattr(_u, 'hide_spend_stats', False)) if _u else False
+    except Exception:
+        _hidden = False
+    if _hidden:
+        spenders.pop(key, None)
+    else:
+        spenders[key] = int(spenders.get(key, 0)) + amount
     stats['spenders'] = spenders
 
-    # Топ-10 — производная от полной карты тративших.
+    # Топ-10 — производная от полной карты тративших (плюс фильтр приватности
+    # на случай, если флаг включили ПОСЛЕ накопления статистики — ВОЛНА 22.73).
     users = load_users()
     def _name_for(uid):
         u = users.get(str(uid))
@@ -3650,6 +3711,7 @@ def register_stars_spending(user_id, user_name, amount):
     stats['top_donors'] = [
         {'user_id': uid, 'user_name': _name_for(uid) or 'Пользователь', 'total_spent': total}
         for uid, total in sorted(spenders.items(), key=lambda kv: kv[1], reverse=True)[:10]
+        if not bool(getattr(users.get(str(uid)), 'hide_spend_stats', False))
     ]
     stats['spenders_count'] = len(spenders)
     save_stars_stats(stats)
@@ -3998,7 +4060,12 @@ def credit_referrer_for(new_user_id, referrer_id):
         inviter_list.append(str(new_user_id))
         save_referrals(referrals)
         referrer.referrals_count = getattr(referrer, 'referrals_count', 0) + 1
-        new_u.referral_bonus_paid = True
+        # ВОЛНА 22.73: раньше new_u.referral_bonus_paid = True падал
+        # AttributeError'ом, если записи новичка ещё нет в хранилище, —
+        # исключение глушило ВСЁ начисление. Теперь бонус приглашающему
+        # выдаётся в любом случае, а отметка ставится только когда возможно.
+        if new_u is not None:
+            new_u.referral_bonus_paid = True
         save_users(users)
         # ПУНКТ 7: НЕ начисляем звёзды напрямую через `referrer.stars_balance`,
         # иначе они удваивались бы — `add_stars_transaction` ниже сам прибавляет
@@ -4024,7 +4091,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.70"
+BOT_BUILD = "22.73"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -4764,16 +4831,60 @@ def _iter_assignment_media(homework_dict):
                 yield m
 
 
+def _web_schedule_section(class_obj):
+    """ВОЛНА 22.73: подготовка секции «🌐 Расписание с сайтов» для кнопок
+    «📅 Сегодня» / «📅 Завтра» (чтобы расписание со школьного сайта
+    ставилось автоматически, пока админ не выключил это в меню «🌐
+    Расписание с сайтов»).
+
+    Возвращает (текст_секции | None, веб-файл | None).
+    """
+    _web = getattr(class_obj, "schedule_web", None)
+    if not isinstance(_web, dict):
+        return (None, None)
+    # Тоггл админа (по умолчанию ВКЛ).
+    if not schmon_dayauto_enabled(class_obj):
+        return (None, None)
+    _host = str(_web.get("host") or "").strip()
+    _when = str(_web.get("ts") or "").strip()
+    _head = "🌐 Расписание с сайтов"
+    if _host:
+        _head += f" ({_host})"
+    if _when:
+        _head += f" — обновлено {_when}"
+    _wtext = str(_web.get("text") or "").strip()
+    _web_file = None
+    _wname = str(_web.get("name") or "").strip()
+    _wfid = str(_web.get("file_id") or "").strip()
+    if _wfid:
+        _web_file = _web  # файл можно переиграть по file_id
+    if _wtext:
+        return (_head + ":\n" + _wtext, _web_file)
+    if _web_file or (str(_web.get("kind")) == "file" and _wname):
+        # Файловое расписание: текста нет — короткая шапка, файл досылается
+        # следом (или пометка, если file_id не сохранился).
+        line = _head + (" — 📄 " + _wname if not _wfid and _wname else
+                        " — присылаю файлом ниже" if _wfid else "")
+        return (line, _web_file)
+    return (None, None)
+
+
 async def _send_day_schedule_screen(update, context, class_obj, day_name,
                                     when_word, when_str, homework):
     """ВОЛНА 22.4: единый экран «Расписание на сегодня/завтра» + ДЗ.
 
     Поддерживает дни-КАРТИНКИ (schedule[day] = {"image": file_id, …}): фото
     отправляется с шапкой, ДЗ и вложения идут следом отдельными сообщениями.
-    Текстовые дни работают ровно как раньше."""
+    Текстовые дни работают ровно как раньше.
+    ВОЛНА 22.73: если админ подключил «🌐 Расписание с сайтов» (и не
+    выключил показ), к экрану автоматически добавляется секция свежего
+    расписания с сайта: текст в том же сообщении (для текстового дня) и/или
+    файл (фото/PDF) по file_id последней отправки."""
     kind, payload = _schedule_day_view(class_obj, day_name)
     header = f"📅 Расписание на {when_word} ({day_name}, {when_str})"
     hw_text = format_homework(homework, when_word).replace("**", "") if homework else ""
+    # ВОЛНА 22.73: секция «Расписание с сайтов» (текст + файл).
+    _web_section, _web_file = _web_schedule_section(class_obj)
 
     if kind == "image":
         cap = header + " 🖼"
@@ -4787,6 +4898,9 @@ async def _send_day_schedule_screen(update, context, class_obj, day_name,
             await update.message.reply_text(
                 header + ":\n\n🖼 Картинка расписания не открылась — админ может "
                          "перезалить её через «📅 Редактировать расписание».")
+        # ВОЛНА 22.73: при дне-картинке текст сайта идёт отдельным сообщением.
+        if _web_section:
+            await update.message.reply_text(_web_section[:4000])
         if hw_text:
             await update.message.reply_text(hw_text)
         else:
@@ -4794,9 +4908,38 @@ async def _send_day_schedule_screen(update, context, class_obj, day_name,
                 f"📝 Домашнее задание на {when_word} не задано.")
     else:
         message = f"{header}:\n\n{payload}"
+        # ВОЛНА 22.73: расписание с сайта — автоматом в тот же экран.
+        if _web_section:
+            message += f"\n\n{_web_section}"
         message += f"\n\n{hw_text}" if homework else (
             f"\n\n📝 Домашнее задание на {when_word} не задано.")
-        await update.message.reply_text(message)
+        # Защита от лимита Telegram: с длинной секцией сайта текст может
+        # не влезть — шлём частями с сохранением читаемости.
+        if len(message) <= 4000:
+            await update.message.reply_text(message)
+        else:
+            await update.message.reply_text(message[:4000])
+            _rest = message[4000:].strip()
+            if _rest:
+                await update.message.reply_text(_rest[:4000])
+
+    # ВОЛНА 22.73: и САМ файл «Расписания с сайтов» — фото или документ
+    # (file_id последней отправки; перекачки с сайта нет).
+    if _web_file is not None:
+        _wcap = "🌐 Расписание с сайтов"
+        if str(_web_file.get("host") or "").strip():
+            _wcap += f" ({_web_file['host']})"
+        if str(_web_file.get("ts") or "").strip():
+            _wcap += f" — обновлено {_web_file['ts']}"
+        try:
+            if str(_web_file.get("file_kind") or "") == "photo":
+                await update.message.reply_photo(
+                    _web_file["file_id"], caption=_wcap[:1024])
+            else:
+                await update.message.reply_document(
+                    _web_file["file_id"], caption=_wcap[:1024])
+        except Exception as e:
+            logger.warning(f"schedule_web file re-send (day screen): {e}")
 
     # Вложения ДЗ — в обоих вариантах.
     for _m_list in _iter_assignment_media(homework):
@@ -5721,6 +5864,11 @@ def get_settings_keyboard(user=None):
         [InlineKeyboardButton(
             f"🔔 Уведомления о решениях: {'вкл' if getattr(user, 'sol_notify', True) else 'выкл'}",
             callback_data="sol_toggle_notify")],
+        # ВОЛНА 22.73: приватность в «📊 Статистика звезд» — топ трат.
+        # ВКЛ = пользователя НЕ видно в топе по тратам.
+        [InlineKeyboardButton(
+            f"🚫 Скрывать меня в топе трат: {'вкл' if getattr(user, 'hide_spend_stats', False) else 'выкл'}",
+            callback_data="toggle_spend_privacy")],
         [InlineKeyboardButton("🌟 Мои кнопки", callback_data="personal_buttons")],
         [InlineKeyboardButton("💡 Предложить функцию", callback_data="suggest_function")],
         # ПУНКТ 3: чат поддержки доступен из настроек (помимо главного меню).
@@ -6037,8 +6185,8 @@ async def _deepseek_chat(messages, timeout=60, temperature=0.2, force_json=False
     if force_json:
         payload["response_format"] = {"type": "json_object"}
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
+        session = _aio_session()  # 22.73: общая сессия вместо новой на запрос
+        async with session.post(
                 f"{DEEPSEEK_API_BASE}/chat/completions",
                 json=payload,
                 headers=headers,
@@ -38770,6 +38918,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 share_tok = payload
     except Exception as e:
         logger.error(f"start: ошибка разбора реферального payload: {e}")
+    # ВОЛНА 22.73 (аудит жалоб «за приглашение не начисляются звёзды»):
+    # если первый /start по реферальной ссылке был ПРЕРВАН (не подписан на
+    # канал / закрыл бот до создания аккаунта), кандидат сохранялся в
+    # user_data как pending_referrer, но НИГДЕ не читался: повторный /start
+    # (уже без payload — Telegram-кнопка «START» его не повторяет) создавал
+    # аккаунт БЕЗ referrer_id, и бонус терялся навсегда. Теперь подтягиваем
+    # кандидата из user_data.
+    try:
+        if not referrer_candidate:
+            _stale = context.user_data.get('pending_referrer')
+            if (isinstance(_stale, str) and _stale.isdigit()
+                    and _stale != user_id
+                    and _stale != str(DEVELOPER_ID)):
+                referrer_candidate = _stale
+    except Exception as e:
+        logger.error(f"start: ошибка чтения pending_referrer: {e}")
     if referrer_candidate:
         context.user_data['pending_referrer'] = referrer_candidate
     if share_tok:
@@ -38809,6 +38973,33 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user.referrer_id = referrer_candidate
             save_user(user)
             logger.info(f"Реферал дозачтён: {user.user_id} ← {referrer_candidate}")
+    # ВОЛНА 22.73: страховочное начисление ПРЯМО в /start. Раньше бонус
+    # выдавался только в show_main_menu / после выбора города; путь
+    # «⏭ Пропустить город» и некоторые fallback'и попадали в меню мимо
+    # этих точек — приглашающий оставался без звёзд. Начисление
+    # идемпотентно (referral_bonus_paid + лок в credit_referrer_for).
+    if (not is_new_user) and user is not None:
+        try:
+            _ref_id = getattr(user, "referrer_id", None)
+            _paid = bool(getattr(user, "referral_bonus_paid", False))
+            _done = bool(getattr(user, "setup_completed", False))
+            if _ref_id and _done and not _paid:
+                if credit_referrer_for(user.user_id, _ref_id):
+                    logger.info(
+                        f"Реферальный бонус дозачислен в /start: "
+                        f"{_ref_id} ← {user.user_id}")
+                    try:
+                        await context.bot.send_message(
+                            chat_id=int(_ref_id),
+                            text=(f"🎉 Ваш приглашённый пользователь "
+                                  f"зарегистрировался!\n"
+                                  f"+{REFERRAL_REWARD_STARS} ⭐ зачислены на "
+                                  f"ваш виртуальный баланс."),
+                        )
+                    except Exception:
+                        pass
+        except Exception as e:
+            logger.warning(f"start: страховочный реферальный бонус: {e}")
     if is_new_user:
         # Создаём заготовку, чтобы сохранить user_code и first_name
         user = User(user_id, update.effective_user.username, update.effective_user.first_name)
@@ -43565,6 +43756,15 @@ async def stars_stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
 
     top = stats.get('top_donors', []) or []
+    # ВОЛНА 22.73: приватность — включившие «Скрывать меня в топе трат»
+    # не показываются даже если их агрегат успел накопиться ранее.
+    try:
+        _all_users = load_users()
+        top = [d for d in top
+               if not bool(getattr(_all_users.get(str(d.get('user_id'))),
+                                   'hide_spend_stats', False))]
+    except Exception:
+        pass
     if top:
         for i, donor in enumerate(top[:10], 1):
             text += f"{i}. {donor.get('user_name', 'Пользователь')} — {int(donor.get('total_spent', 0))} ⭐\n"
@@ -44611,6 +44811,19 @@ def schmon_set_notif(class_code, enabled):
         return False
 
 
+# ----------- тоггл «Сегодня/Завтра с сайта» (ВОЛНА 22.73) ----------------
+def schmon_dayauto_enabled(class_obj):
+    """ВОЛНА 22.73: применывать ли «Расписание с сайтов» в кнопках
+    «📅 Сегодня» / «📅 Завтра» (чтобы расписание со школьного сайта
+    ставилось автоматически). Флаг хранится В САМОМ КЛАССЕ
+    (class_obj.sched_web_auto) — по умолчанию ВКЛ, админ может выключить
+    в меню «🌐 Расписание с сайтов»."""
+    try:
+        return bool(getattr(class_obj, "sched_web_auto", True))
+    except Exception:
+        return True
+
+
 def _schmon_store_web(class_obj, url, info, text="", kind="text", name="",
                       file_id="", file_kind=""):
     """ВОЛНА 22.67: запомнить в КЛАССЕ последнее «Расписание с сайтов».
@@ -44955,6 +45168,14 @@ def _schmon_menu_text(class_obj):
         _notif_line = ("🔕 Уведомления классу: <b>выключены</b> — сообщение "
                        "не придёт, но новое расписание всё равно появится в "
                        "кнопке «📅 Расписание».")
+    # ВОЛНА 22.73: статус авто-применения к «📅 Сегодня» / «📅 Завтра».
+    if schmon_dayauto_enabled(class_obj):
+        _dayauto_line = ("📅 Сегодня/Завтра с сайта: <b>вкл</b> — расписание "
+                         "со школьного сайта автоматически показывается в "
+                         "кнопках «📅 Сегодня» и «📅 Завтра».")
+    else:
+        _dayauto_line = ("📅 Сегодня/Завтра с сайта: <b>выкл</b> — эти кнопки "
+                         "показывают только расписание, заданное админом вручную.")
     lines = [
         "🌐 <b>Расписание с сайтов</b> — класс «%s»" % esc(class_obj.class_name),
         "",
@@ -44963,6 +45184,7 @@ def _schmon_menu_text(class_obj):
         "не чаще <b>1 раза в день</b> на ссылку, без дублей.",
         "",
         _notif_line,
+        _dayauto_line,
         "",
     ]
     if not urls:
@@ -45012,6 +45234,18 @@ def _schmon_menu_kb(class_code):
         rows.append([InlineKeyboardButton(
             "🔕 Уведомления классу: ВЫКЛ",
             callback_data="schmon_notif")])
+    # ВОЛНА 22.73: тоггл авто-применения к «📅 Сегодня» / «📅 Завтра».
+    # Флаг хранится в классе — загружаем его по коду (в эту функцию
+    # передаётся только class_code).
+    _cls_obj = get_class_by_code(class_code)
+    if schmon_dayauto_enabled(_cls_obj):
+        rows.append([InlineKeyboardButton(
+            "📅 Сегодня/Завтра с сайта: ВКЛ",
+            callback_data="schmon_dayauto")])
+    else:
+        rows.append([InlineKeyboardButton(
+            "📅 Сегодня/Завтра с сайта: ВЫКЛ",
+            callback_data="schmon_dayauto")])
     rows.append([InlineKeyboardButton("🔍 Проверить сейчас",
                                       callback_data="schmon_check")])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_to_admin")])
@@ -45513,6 +45747,55 @@ async def schmon_notif_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await query.answer("Уведомления включены" if not was_on
                            else "Уведомления выключены")
+    except Exception:
+        pass
+    try:
+        await query.edit_message_text(
+            _schmon_menu_text(class_obj),
+            reply_markup=_schmon_menu_kb(class_code),
+            parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    except Exception:
+        pass
+    return ADMIN_PANEL
+
+
+async def schmon_dayauto_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.73: «📅 Сегодня/Завтра с сайта» — включить/выключить
+    автоматическое применение «Расписания с сайтов» в кнопках
+    «📅 Сегодня» / «📅 Завтра». Флаг хранится в самом классе."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    uid = str(query.from_user.id)
+    class_obj = _schmon_admin_class(context, uid)
+    if not class_obj:
+        try:
+            await query.answer("Только для админов класса.", show_alert=True)
+        except Exception:
+            pass
+        return MAIN_MENU
+    class_code = class_obj.class_code
+    context.user_data['current_admin_class'] = class_code
+    # ВОЛНА 22.72 (аудит): права перепроверяются в каждом чувствительном
+    # колбэке — этот тоже меняет поведение для всего класса.
+    if uid != DEVELOPER_ID and not is_admin_of_class(uid, class_code):
+        try:
+            await query.answer("Вы больше не админ этого класса.",
+                               show_alert=True)
+        except Exception:
+            pass
+        return MAIN_MENU
+    was_on = schmon_dayauto_enabled(class_obj)
+    class_obj.sched_web_auto = not was_on
+    save_class(class_obj)
+    _log_admin_action(uid, class_code,
+                      "Расписание с сайтов: Сегодня/Завтра "
+                      + ("включены" if not was_on else "выключены"))
+    try:
+        await query.answer("Показ в Сегодня/Завтра включён" if not was_on
+                           else "Показ в Сегодня/Завтра выключен")
     except Exception:
         pass
     try:
@@ -55710,6 +55993,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await sol_menu_cb(update, context)
     elif data == "sol_send":
         return await sol_send_cb(update, context)
+    elif data == "sol_more":
+        # ВОЛНА 22.73: «➕ Ещё файл» — накопление нескольких файлов.
+        return await sol_more_cb(update, context)
+    elif data == "sol_next":
+        # ВОЛНА 22.73: «✅ Далее» — переход к выбору авторства.
+        return await sol_next_cb(update, context)
     elif data == "sol_cancel":
         return await sol_cancel_cb(update, context)
     elif data in ("sol_anon_yes", "sol_anon_no"):
@@ -55728,6 +56017,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await sol_view_cb(update, context)
     elif data == "sol_toggle_notify":
         return await sol_toggle_notify_cb(update, context)
+    elif data == "toggle_spend_privacy":
+        # ВОЛНА 22.73: приватность в топе трат (⚙️ Настройки).
+        return await toggle_spend_privacy_cb(update, context)
     elif data == "sol_admin_menu":
         # ВОЛНА 22.13: настройки базы решений для старосты (админ-панель).
         return await sol_admin_menu_cb(update, context)
@@ -56224,6 +56516,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "schmon_notif":
         # ВОЛНА 22.69: 🔔/🔕 уведомления классу о новом расписании
         return await schmon_notif_cb(update, context)
+    elif data == "schmon_dayauto":
+        # ВОЛНА 22.73: тоггл «Сегодня/Завтра с сайта» (админ-панель).
+        return await schmon_dayauto_cb(update, context)
     elif data.startswith("schsnd:"):
         return await schmon_pick_cb(update, context)
     elif data.startswith("schtxt:"):
@@ -57177,18 +57472,18 @@ async def _self_ping_job(context: ContextTypes.DEFAULT_TYPE):
     """Периодически пингует keep-alive сервер, чтобы бот не засыпал."""
     port = int(os.environ.get('PORT', 8080))
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(f"http://localhost:{port}/health", timeout=aiohttp.ClientTimeout(total=10)):
-                pass
+        session = _aio_session()  # 22.73: общая сессия вместо новой на запрос
+        async with session.get(f"http://localhost:{port}/health", timeout=aiohttp.ClientTimeout(total=10)):
+            pass
     except Exception:
         pass
     # Пингуем внешний URL если он задан (Render / Railway)
     ext_url = os.environ.get('RENDER_EXTERNAL_URL') or os.environ.get('RAILWAY_STATIC_URL')
     if ext_url:
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(f"{ext_url}/health", timeout=aiohttp.ClientTimeout(total=10)):
-                    pass
+            session = _aio_session()
+            async with session.get(f"{ext_url}/health", timeout=aiohttp.ClientTimeout(total=10)):
+                pass
         except Exception:
             pass
 
@@ -57279,8 +57574,8 @@ async def _weather_api_get(endpoint, params):
     full_params = {"key": WEATHER_API_KEY, "lang": "ru"}
     full_params.update(params)
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
+        session = _aio_session()  # 22.73: общая сессия вместо новой на запрос
+        async with session.get(
                 url,
                 params=full_params,
                 timeout=aiohttp.ClientTimeout(total=15),
@@ -57434,10 +57729,10 @@ async def detect_timezone_for_city(city):
     if tz_id:
         try:
             url = f"https://worldtimeapi.org/api/timezone/{tz_id}"
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
+            session = _aio_session()
+            async with session.get(
                     url, timeout=aiohttp.ClientTimeout(total=10)
-                ) as resp:
+            ) as resp:
                     if resp.status == 200:
                         wt = await resp.json()
                         # raw_offset — секунды от UTC без DST,
@@ -57782,6 +58077,26 @@ async def skip_city_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user.set_time = datetime.now().isoformat()
         user.setup_completed = True
         save_user(user)
+        # ВОЛНА 22.73: путь «⏭ Пропустить город» тоже завершает регистрацию —
+        # начисляем реферальный бонус здесь (раньше приглашающий ждал бы
+        # следующего /start или не получал звёзды вовсе).
+        try:
+            _ref_id = getattr(user, "referrer_id", None)
+            _paid = bool(getattr(user, "referral_bonus_paid", False))
+            if _ref_id and not _paid:
+                if credit_referrer_for(user.user_id, _ref_id):
+                    try:
+                        await context.bot.send_message(
+                            chat_id=int(_ref_id),
+                            text=(f"🎉 Ваш приглашённый пользователь "
+                                  f"зарегистрировался!\n"
+                                  f"+{REFERRAL_REWARD_STARS} ⭐ зачислены на "
+                                  f"ваш виртуальный баланс."),
+                        )
+                    except Exception:
+                        pass
+        except Exception as e:
+            logger.warning(f"skip_city_cb: реферальный бонус: {e}")
     try:
         await query.edit_message_text(
             "✅ Хорошо, пропускаем.\n\n"
@@ -58256,6 +58571,11 @@ SOL_WAIT_FILE = 133  # (константа объявлена в блоке со
 
 _SOL_MAX_PER_CLASS = 50  # храним последние 50 решений на класс (FIFO)
 _SOL_SUBJECT_MAX = 100
+# ВОЛНА 22.73: к одному решению можно прикрепить НЕСКОЛЬКО файлов
+# (просьба: «в базу решений пользователь может ложить больше файлов,
+# а не 1»). Капа — от злоупотребления хранилищем; дальше бот честно
+# просит опубликовать текущие файлы и прислать следующие отдельной записью.
+_SOL_MAX_FILES = 6
 
 # ВОЛНА 22.13: автоудаление решений. Отправитель выбирает срок при отправке,
 # староста может поменять его при модерации, а староста класса может включить
@@ -58335,15 +58655,22 @@ def _sol_alive_entries(class_code):
 
 
 async def _sol_delete_channel_file(context, entry):
-    """Лучшие усилия: удалить шифр файла решения из канала-хранилища."""
-    _f = entry.get("file") or {}
-    _ch, _mid = int(_f.get("ch") or 0), int(_f.get("mid") or 0)
-    if not _ch or not _mid:
-        return
-    try:
-        await context.bot.delete_message(chat_id=_ch, message_id=_mid)
-    except Exception:
-        pass
+    """Лучшие усилия: удалить шифры файлов решения из канала-хранилища.
+    ВОЛНА 22.73: удаляем ВСЕ файлы записи (files), не только первый."""
+    _files = entry.get("files") if isinstance(entry.get("files"), list) else []
+    _legacy = entry.get("file")
+    if isinstance(_legacy, dict):
+        _files = list(_files) + [_legacy]
+    for _f in _files:
+        if not isinstance(_f, dict):
+            continue
+        _ch, _mid = int(_f.get("ch") or 0), int(_f.get("mid") or 0)
+        if not _ch or not _mid:
+            continue
+        try:
+            await context.bot.delete_message(chat_id=_ch, message_id=_mid)
+        except Exception:
+            pass
 
 
 async def _sol_purge_expired(context):
@@ -58455,6 +58782,8 @@ async def sol_send_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return MAIN_MENU
     await query.message.reply_text(
         "📤 ПРИШЛИТЕ РЕШЕНИЕ — фото или файл одним сообщением.\n\n"
+        "📎 Файлов может быть НЕСКОЛЬКО: пришлите первый, потом остальные "
+        "(до 6) — и нажмите «✅ Далее».\n\n"
         "В подписи укажите предмет: например «Алгебра» (не обязательно, "
         "но так его легче найти в базе).",
         reply_markup=InlineKeyboardMarkup([[
@@ -58483,7 +58812,11 @@ async def sol_file_receive(update: Update,
                            context: ContextTypes.DEFAULT_TYPE):
     """ВОЛНА 22.12: приём фото/файла решения → выбор анонимности.
     ВОЛНА 22.13: запоминаем file_id/mime — файл уйдёт в канал ШИФРОМ,
-    и добавляем шаг «⏳ Через сколько удалить»."""
+    и добавляем шаг «⏳ Через сколько удалить».
+    ВОЛНА 22.73: файлов может быть НЕСКОЛЬКО (до _SOL_MAX_FILES) — каждый
+    пришлённый файл добавляется в sol_pending['files']; после каждого
+    файла бот предлагает «➕ Ещё файл» / «✅ Далее» (выбор авторства —
+    как раньше, по «✅ Далее» или сразу кнопками авторства на первом файле)."""
     msg = update.message
     user = get_user(str(update.effective_user.id))
     class_obj = get_class_by_user(str(update.effective_user.id)) if user else None
@@ -58491,9 +58824,18 @@ async def sol_file_receive(update: Update,
         await msg.reply_text("База решений доступна участникам класса.")
         return MAIN_MENU
     if not (msg.photo or msg.document):
-        await msg.reply_text(
-            "❌ Нужен ФОТО или ФАЙЛ одним сообщением. Текст решением не "
-            "считается. Попробуйте ещё раз или нажмите «❌ Отмена».")
+        # ВОЛНА 22.73: текст вместо файла — если файлы уже копятся,
+        # честно напоминаем про «✅ Далее», а не повторяем сухой отказ.
+        _pend_txt = context.user_data.get('sol_pending')
+        if isinstance(_pend_txt, dict) and _pend_txt.get('files'):
+            await msg.reply_text(
+                "❌ Текст решением не считается — пришлите ФОТО или ФАЙЛ. "
+                "Если файлы уже собраны, нажмите «✅ Далее» под прошлым "
+                "сообщением или «❌ Отмена».")
+        else:
+            await msg.reply_text(
+                "❌ Нужен ФОТО или ФАЙЛ одним сообщением. Текст решением не "
+                "считается. Попробуйте ещё раз или нажмите «❌ Отмена».")
         return SOL_WAIT_FILE
     subject = (msg.caption or "").strip()[:_SOL_SUBJECT_MAX]
     if msg.photo:
@@ -58514,19 +58856,107 @@ async def sol_file_receive(update: Update,
             "❌ Файл больше 20 МБ — бот не сможет скачать его для шифрования. "
             "Пришлите файл меньшего размера или нажмите «❌ Отмена».")
         return SOL_WAIT_FILE
-    context.user_data['sol_pending'] = {
-        "ch": int(msg.chat_id),
-        "mid": int(msg.message_id),
+
+    # ВОЛНА 22.73: накапливаем файлы (бэк-совместимость со старой записью
+    # sol_pending из одиночных полей — мигрируем её в список files).
+    pend = context.user_data.get('sol_pending')
+    if not isinstance(pend, dict):
+        pend = {}
+    files = pend.get('files')
+    if not isinstance(files, list):
+        files = []
+        for _legacy_key in ("fid",):
+            if pend.get(_legacy_key):
+                files.append({
+                    "ftype": pend.get("ftype") or "document",
+                    "fid": pend.get("fid"),
+                    "mime": pend.get("mime") or "",
+                    "fname": pend.get("fname") or "file.bin",
+                    "size": int(pend.get("size") or 0),
+                })
+                break
+    if len(files) >= _SOL_MAX_FILES:
+        await msg.reply_text(
+            f"⚠️ Максимум {_SOL_MAX_FILES} файлов на одно решение. Нажмите "
+            "«✅ Далее» под прошлым сообщением, чтобы опубликовать эти, "
+            "а остальные пришлите отдельной записью базы.")
+        return SOL_WAIT_FILE
+    files.append({
         "ftype": _ftype,
-        "subject": subject,
         "fid": _fid,
         "mime": _mime,
         "fname": _fname,
         "size": _size,
-    }
+    })
+    pend["files"] = files
+    pend["ch"] = int(msg.chat_id)
+    pend["mid"] = int(msg.message_id)
+    # Предмет: берём из подписи первого файла, у которого она указана
+    # (у дополнительных файлов подпись часто пустая).
+    if subject and not pend.get("subject"):
+        pend["subject"] = subject
+    context.user_data['sol_pending'] = pend
+    _n = len(files)
     await msg.reply_text(
-        "✅ Решение получено."
-        + (f"\n📘 Предмет: «{subject}»" if subject else "")
+        f"✅ Файл {_n}/{_SOL_MAX_FILES} получен."
+        + (f"\n📘 Предмет: «{pend.get('subject')}»" if pend.get("subject") else "")
+        + "\n\nДобавить ЕЩЁ файл или публикуем? Кто автор — выберете после.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Ещё файл", callback_data="sol_more"),
+             InlineKeyboardButton("✅ Далее", callback_data="sol_next")],
+            [InlineKeyboardButton("❌ Отмена", callback_data="sol_cancel")],
+        ]),
+    )
+    return SOL_WAIT_FILE
+
+
+async def sol_more_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.73: «➕ Ещё файл» — ждём следующий фото/файл."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    pend = context.user_data.get('sol_pending')
+    if not isinstance(pend, dict) or not pend.get('files'):
+        await query.answer("Сессия потеряна — начните заново: «📚 Решения».",
+                           show_alert=True)
+        return MAIN_MENU
+    _n = len(pend.get("files") or [])
+    if _n >= _SOL_MAX_FILES:
+        await query.answer(f"Максимум {_SOL_MAX_FILES} файлов — нажмите «✅ Далее».",
+                           show_alert=True)
+        return SOL_WAIT_FILE
+    await query.message.reply_text(
+        f"📎 Пришлите следующий файл ({_n}/{_SOL_MAX_FILES} уже собрано). "
+        "Готовы — нажмите «✅ Далее».",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Далее", callback_data="sol_next"),
+             InlineKeyboardButton("❌ Отмена", callback_data="sol_cancel")],
+        ]))
+    return SOL_WAIT_FILE
+
+
+async def sol_next_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.73: «✅ Далее» — переходим к выбору авторства (как раньше
+    было сразу после первого файла)."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    user = get_user(str(query.from_user.id))
+    class_obj = get_class_by_user(str(query.from_user.id)) if user else None
+    pend = context.user_data.get('sol_pending')
+    if not user or not class_obj or not isinstance(pend, dict) \
+            or not pend.get('files'):
+        await query.edit_message_text(
+            "Сессия потеряна — пришлите решение заново: «📚 Решения».")
+        return MAIN_MENU
+    _n = len(pend["files"])
+    await query.edit_message_text(
+        f"📎 Файлов в записи: {_n}"
+        + (f"\n📘 Предмет: «{pend.get('subject')}»" if pend.get("subject") else "")
         + "\n\nКТО автор? Опубликуем с вашим именем или анонимно?",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("📝 От моего имени", callback_data="sol_anon_no"),
@@ -58639,7 +59069,10 @@ async def sol_ttl_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _sol_publish_pending(update, context, user, class_obj, pend, ttl_h):
     """ВОЛНА 22.13: скачала файл → зашифровала ключом бота → в канал →
-    запись в реестр → модерация (или мгновенная публикация)."""
+    запись в реестр → модерация (или мгновенная публикация).
+    ВОЛНА 22.73: файлов может быть НЕСКОЛЬКО — каждый скачивается,
+    шифруется и загружается отдельно; в записи entry['files'] — список,
+    entry['file'] дублирует ПЕРВЫЙ файл (совместимость со старым кодом)."""
     query = update.callback_query
     channels = get_cloud_channel_ids()
     if not channels:
@@ -58650,34 +59083,59 @@ async def _sol_publish_pending(update, context, user, class_obj, pend, ttl_h):
     _author = user.user_id
     _author_name = _sol_user_label(user)
     _anon = bool(pend.get("anon"))
+    # ВОЛНА 22.73: собираем список файлов (бэк-совместимость: старый
+    # одиночный pend['fid'] / новый pend['files']).
+    _files = pend.get("files") if isinstance(pend.get("files"), list) else []
+    if not _files and pend.get("fid"):
+        _files = [{
+            "ftype": pend.get("ftype") or "document",
+            "fid": pend.get("fid"),
+            "mime": pend.get("mime") or "",
+            "fname": pend.get("fname") or "file.bin",
+            "size": int(pend.get("size") or 0),
+        }]
+    if not _files:
+        await query.edit_message_text(
+            "Сессия потеряна — пришлите решение заново: «📚 Решения».")
+        context.user_data.pop('sol_pending', None)
+        return MAIN_MENU
     try:
         await query.edit_message_text(
-            "🔒 Шифрую файл и кладу в хранилище… (несколько секунд)")
+            f"🔒 Шифрую файлы ({len(_files)} шт.) и кладу в хранилище… "
+            "(это займёт несколько секунд)")
     except Exception:
         pass
+    _stored_files = []
     try:
-        raw = await _vault_botapi_download(context, pend["fid"])
-        if not raw:
-            raise RuntimeError("файл пуст")
-        sealed = await asyncio.to_thread(
-            _seal_pack, raw, pend.get("fname") or "file.bin",
-            pend.get("mime") or "", "sol")
-        raw = b""
+        for _idx, _f in enumerate(_files, 1):
+            raw = await _vault_botapi_download(context, _f["fid"])
+            if not raw:
+                raise RuntimeError(f"файл {_idx} пуст")
+            sealed = await asyncio.to_thread(
+                _seal_pack, raw, _f.get("fname") or "file.bin",
+                _f.get("mime") or "", "sol")
+            raw = b""
+            _up = await _storage_upload_document(
+                context, sealed, filename=f"sol_{_sol_gen_id()}.dvf",
+                caption="", channel_id=channels[0])
+            sealed = b""
+            if not _up:
+                raise RuntimeError(f"хранилище не приняло файл {_idx}")
+            _stored_files.append({
+                "ch": int(_up.get("channel_id") or channels[0]),
+                "mid": int(_up.get("message_id") or 0),
+                "fid": str(_up.get("file_id") or ""),
+                "ftype": "seal",
+                "name": _f.get("fname") or "file.bin",
+                "mime": _f.get("mime") or "",
+                "kind": _f.get("ftype") or "document",
+            })
     except Exception as e:
         logger.error(f"solutions: шифрование не удалось: {e}")
         context.user_data.pop('sol_pending', None)
         await query.edit_message_text(
-            "❌ Не смог скачать файл для шифрования (он удалён или больше "
+            "❌ Не смог скачать/зашифровать файлы (они удалены или больше "
             "20 МБ?). Пришлите решение заново: «📚 Решения».")
-        return MAIN_MENU
-    _up = await _storage_upload_document(
-        context, sealed, filename=f"sol_{_sol_gen_id()}.dvf",
-        caption="", channel_id=channels[0])
-    sealed = b""
-    if not _up:
-        context.user_data.pop('sol_pending', None)
-        await query.edit_message_text(
-            "❌ Хранилище не приняло шифр файла. Попробуйте позже.")
         return MAIN_MENU
     entry = {
         "id": _sol_gen_id(),
@@ -58687,13 +59145,9 @@ async def _sol_publish_pending(update, context, user, class_obj, pend, ttl_h):
         "author_name": _author_name if not _anon else "",
         "real_author": _author,  # внутри бот знает автора (жалобы/злоупотреб)
         "anon": _anon,
-        "file": {"ch": int(_up.get("channel_id") or channels[0]),
-                 "mid": int(_up.get("message_id") or 0),
-                 "fid": str(_up.get("file_id") or ""),
-                 "ftype": "seal",
-                 "name": pend.get("fname") or "file.bin",
-                 "mime": pend.get("mime") or "",
-                 "kind": pend.get("ftype") or "document"},
+        # ВОЛНА 22.73: список файлов + первый как «file» для старого кода.
+        "files": _stored_files,
+        "file": dict(_stored_files[0]),
         "status": "pending",
         "approved_by": "",
         "ts": datetime.now().strftime("%d.%m %H:%M"),
@@ -58891,7 +59345,9 @@ async def sol_ttlmod_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def sol_list_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """ВОЛНА 22.12: «📚 Открыть базу» — последние одобренные решения."""
+    """ВОЛНА 22.12: «📚 Открыть базу» — последние одобренные решения.
+    ВОЛНА 22.73: сначала честная загрузка («⏳ Загружаю базу…») — база
+    открывается не мгновенно, а пустой экран «нажми и ждёшь» путает."""
     query = update.callback_query
     try:
         await query.answer()
@@ -58903,6 +59359,12 @@ async def sol_list_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("База решений доступна участникам класса.",
                            show_alert=True)
         return MAIN_MENU
+    # ВОЛНА 22.73: индикатор загрузки — рисуем сразу, ДО чтения реестра
+    # и построения списка (на медленном хранилище это секунды).
+    try:
+        await query.edit_message_text("⏳ Загружаю базу решений…")
+    except Exception:
+        pass
     entries = [e for e in _sol_alive_entries(class_obj.class_code)
                if isinstance(e, dict) and e.get("status") == "approved"]
     if not entries:
@@ -58920,8 +59382,11 @@ async def sol_list_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _label = (e.get("subject") or "Без предмета")[:32]
         # ВОЛНА 22.27: помеченные жалобой решения честно видны в списке.
         _flag = " 🚩" if e.get("flagged") else ""
+        # ВОЛНА 22.73: пометка многотомных записей (несколько файлов).
+        _n_files = len(e.get("files") or []) or (1 if e.get("file") else 0)
+        _multi = f" 📎×{_n_files}" if _n_files > 1 else ""
         kb.append([InlineKeyboardButton(
-            f"📘 {_flag}{_label} · {e.get('ts', '')}",
+            f"📘 {_flag}{_label}{_multi} · {e.get('ts', '')}",
             callback_data=f"sol_view_{e['id']}")])
     kb.append([InlineKeyboardButton("⬅️ В меню базы", callback_data="sol_menu")])
     try:
@@ -58938,7 +59403,10 @@ async def sol_list_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def sol_view_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """ВОЛНА 22.12: показать решение (копия файла из канала в чат).
     ВОЛНА 22.13: файл в канале лежит ШИФОМ — скачиваем, расшифровываем
-    ключом бота и отправляем в чат (фото — как фото, файл — как файл)."""
+    ключом бота и отправляем в чат (фото — как фото, файл — как файл).
+    ВОЛНА 22.73: отправляем ВСЕ файлы записи (первый — с подписью,
+    остальные следом с пометкой «файл N/M»); перед скачиванием показываем
+    статус «⏳ Расшифровываю…» — файлы открываются не мгновенно."""
     query = update.callback_query
     try:
         await query.answer()
@@ -58953,11 +59421,18 @@ async def sol_view_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             or entry.get("status") != "approved"):
         await query.answer("Решение недоступно.", show_alert=True)
         return MAIN_MENU
-    _f = entry.get("file") or {}
     _exp = entry.get("expire_ts")
     if _exp and float(_exp) < time.time():
         await query.answer("⏳ Срок хранения записи истёк — она удалена.",
                            show_alert=True)
+        return MAIN_MENU
+    # ВОЛНА 22.73: список файлов записи (бэк-совместимость — один file).
+    _entry_files = entry.get("files")
+    if not isinstance(_entry_files, list) or not _entry_files:
+        _entry_files = [entry.get("file") or {}]
+    _entry_files = [f for f in _entry_files if isinstance(f, dict) and f]
+    if not _entry_files:
+        await query.answer("Решение недоступно (нет файлов).", show_alert=True)
         return MAIN_MENU
     _cap = (f"📘 {entry.get('subject') or 'Без предмета'} · "
             f"{_sol_author_label(entry)} · {entry.get('ts', '')}"
@@ -58967,59 +59442,86 @@ async def sol_view_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _rep_kb = InlineKeyboardMarkup([[
         InlineKeyboardButton("🚨 Пожаловаться",
                              callback_data=f"rep_sol_{sol_id}")]])
+    # ВОЛНА 22.73: статус «расшифровываю» — видно сразу, до сетевой работы.
+    _status_msg = None
+    if any(f.get("ftype") == "seal" for f in _entry_files):
+        try:
+            _status_msg = await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text=(f"⏳ Открываю решение — скачиваю и расшифровываю "
+                      f"{len(_entry_files)} файл(ов)…"))
+        except Exception:
+            _status_msg = None
     try:
-        if _f.get("ftype") == "seal":
-            # 22.13: расшифровка (file_id из Bot API или MTProto-канал).
-            payload = None
-            if _f.get("fid"):
-                try:
-                    payload = await _vault_botapi_download(context, _f["fid"])
-                except Exception:
-                    payload = None
-            if payload is None:
-                _ch, _mid = int(_f.get("ch") or 0), int(_f.get("mid") or 0)
-                client = await _mt_client() if _ch and _mid else None
-                if client is None:
-                    raise RuntimeError("хранилище недоступно")
-                _m, doc = await _mt_fetch_document(client, _ch, _mid, 0)
-                if doc is None:
-                    raise RuntimeError("шифр не найден")
-                buf = io.BytesIO()
-                await _mt_download_stream(client, doc,
-                                          int(getattr(doc, "size", 0) or 0),
-                                          buf.write, None, "")
-                payload = buf.getvalue()
-            meta, plain = await asyncio.to_thread(_seal_unpack, payload)
-            payload = b""
-            name = _dvf2_safe_name(str(meta.get("n") or "file.bin"))
-            if _f.get("kind") == "photo":
-                await context.bot.send_photo(
-                    chat_id=query.message.chat_id, photo=plain, caption=_cap,
-                    reply_markup=_rep_kb)
+        _sent = 0
+        for _fi, _f in enumerate(_entry_files):
+            _part_cap = _cap if _fi == 0 else (
+                f"📎 Файл {_fi + 1}/{len(_entry_files)}"
+                + (f" · {_f.get('name')}" if _f.get("name") else ""))
+            if _f.get("ftype") == "seal":
+                # 22.13: расшифровка (file_id из Bot API или MTProto-канал).
+                payload = None
+                if _f.get("fid"):
+                    try:
+                        payload = await _vault_botapi_download(context, _f["fid"])
+                    except Exception:
+                        payload = None
+                if payload is None:
+                    _ch, _mid = int(_f.get("ch") or 0), int(_f.get("mid") or 0)
+                    client = await _mt_client() if _ch and _mid else None
+                    if client is None:
+                        raise RuntimeError("хранилище недоступно")
+                    _m, doc = await _mt_fetch_document(client, _ch, _mid, 0)
+                    if doc is None:
+                        raise RuntimeError("шифр не найден")
+                    buf = io.BytesIO()
+                    await _mt_download_stream(client, doc,
+                                              int(getattr(doc, "size", 0) or 0),
+                                              buf.write, None, "")
+                    payload = buf.getvalue()
+                meta, plain = await asyncio.to_thread(_seal_unpack, payload)
+                payload = b""
+                name = _dvf2_safe_name(str(meta.get("n") or "file.bin"))
+                if _f.get("kind") == "photo":
+                    await context.bot.send_photo(
+                        chat_id=query.message.chat_id, photo=plain,
+                        caption=_part_cap[:1024], reply_markup=_rep_kb)
+                else:
+                    await context.bot.send_document(
+                        chat_id=query.message.chat_id,
+                        document=InputFile(plain, filename=name),
+                        caption=_part_cap[:1024], reply_markup=_rep_kb)
+                plain = b""
             else:
-                await context.bot.send_document(
-                    chat_id=query.message.chat_id,
-                    document=InputFile(plain, filename=name), caption=_cap,
-                    reply_markup=_rep_kb)
-            plain = b""
-        else:
-            # ЛЕГАСИ (до 22.13): открытые копии в канале.
-            if _f.get("ftype") == "photo":
-                await context.bot.send_photo(
-                    chat_id=query.message.chat_id,
-                    from_chat_id=int(_f.get("ch") or 0),
-                    photo=int(_f.get("mid") or 0), caption=_cap,
-                    reply_markup=_rep_kb)
-            else:
-                await context.bot.send_document(
-                    chat_id=query.message.chat_id,
-                    from_chat_id=int(_f.get("ch") or 0),
-                    document=int(_f.get("mid") or 0), caption=_cap,
-                    reply_markup=_rep_kb)
+                # ЛЕГАСИ (до 22.13): открытые копии в канале.
+                if _f.get("ftype") == "photo":
+                    await context.bot.send_photo(
+                        chat_id=query.message.chat_id,
+                        from_chat_id=int(_f.get("ch") or 0),
+                        photo=int(_f.get("mid") or 0),
+                        caption=_part_cap[:1024], reply_markup=_rep_kb)
+                else:
+                    await context.bot.send_document(
+                        chat_id=query.message.chat_id,
+                        from_chat_id=int(_f.get("ch") or 0),
+                        document=int(_f.get("mid") or 0),
+                        caption=_part_cap[:1024], reply_markup=_rep_kb)
+            _sent += 1
+        if _sent == 0:
+            raise RuntimeError("ни один файл не отправлен")
     except Exception as e:
         logger.error(f"solutions: выдача решения не удалась: {e}")
         await query.answer("Не удалось открыть файл — он удалён из хранилища?",
                            show_alert=True)
+    finally:
+        # ВОЛНА 22.73: служебное «расшифровываю» больше не нужно.
+        if _status_msg is not None:
+            try:
+                await context.bot.delete_message(
+                    chat_id=_status_msg.chat_id,
+                    message_id=_status_msg.message_id)
+            except Exception:
+                pass
     return MAIN_MENU
 
 
@@ -59034,6 +59536,55 @@ async def sol_toggle_notify_cb(update: Update,
         user = User(user_id)
     user.sol_notify = not bool(getattr(user, "sol_notify", True))
     save_user(user)
+    return await user_settings(update, context)
+
+
+async def toggle_spend_privacy_cb(update: Update,
+                                  context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.73: «🚫 Скрывать меня в топе трат» (⚙️ Настройки).
+
+    ВКЛ  — пользователя больше НЕ видно в «📊 Статистика звезд» → топе
+           по тратам, а его накопленный агрегат удаляется из spenders и
+           производного топ-10 (статистика пересчитывается сразу).
+    ВЫКЛ — будущие траты снова попадают в топ (старый агрегат не
+           восстанавливаем — он честно начинается заново).
+    """
+    query = update.callback_query
+    await query.answer()
+    user_id = str(query.from_user.id)
+    user = get_user(user_id)
+    if not user:
+        user = User(user_id)
+    user.hide_spend_stats = not bool(getattr(user, "hide_spend_stats", False))
+    save_user(user)
+    if user.hide_spend_stats:
+        # Сразу убираем накопленный агрегат из статистики — ждать
+        # следующей траты нечестно по отношению к запросу приватности.
+        try:
+            stats = load_stars_stats()
+            spenders = stats.get('spenders') or {}
+            if isinstance(spenders, dict) and str(user_id) in spenders:
+                spenders.pop(str(user_id), None)
+                stats['spenders'] = spenders
+                users = load_users()
+                stats['top_donors'] = [
+                    {'user_id': uid,
+                     'user_name': (users.get(str(uid)).first_name
+                                   if users.get(str(uid))
+                                   and getattr(users.get(str(uid)),
+                                               'first_name', None)
+                                   else 'Пользователь'),
+                     'total_spent': total}
+                    for uid, total in sorted(spenders.items(),
+                                             key=lambda kv: kv[1],
+                                             reverse=True)[:10]
+                    if not bool(getattr(users.get(str(uid)),
+                                        'hide_spend_stats', False))
+                ]
+                stats['spenders_count'] = len(spenders)
+                save_stars_stats(stats)
+        except Exception as e:
+            logger.error(f"toggle_spend_privacy_cb: очистка статистики: {e}")
     return await user_settings(update, context)
 
 
