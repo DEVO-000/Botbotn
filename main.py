@@ -211,6 +211,26 @@ if not DEVELOPER_ID:
 groq_client = AsyncGroq(api_key=GROQ_API_KEY)
 user_conversations = {}
 
+
+def _ai_hist_save(user_id):
+    """ВОЛНА 22.75 (M2): сохранить историю AI-диалога в БД (AI_HIST_FILE —
+    входит в STORAGE_BACKUP_FILES и снапшот канал-БД), чтобы контекст
+    DEVORKS+ai переживал рестарт/передеплой. Раньше история жила только
+    в ОЗУ и терялась при каждом деплое. Ошибки глотаются: история не должна
+    ломать диалог."""
+    try:
+        _hist = user_conversations.get(str(user_id))
+        if not isinstance(_hist, list) or not _hist:
+            return
+        data = load_data(AI_HIST_FILE, {}, expect="dict")
+        if not isinstance(data, dict):
+            data = {}
+        data[str(user_id)] = _hist
+        save_data(AI_HIST_FILE, data)
+    except Exception as e:
+        logger.debug(f"ai hist save: {e}")
+
+
 # Тайм-аут для ConversationHandler (в секундах)
 CONVERSATION_TIMEOUT = 86400  # 24 часа — бот не должен засыпать
 
@@ -303,6 +323,23 @@ SUPPORT_MESSAGES_FILE = _data_file("support_messages.json")
 # Карта «кто кого пригласил» и счётчик удачных приглашений на пользователя.
 # Структура: { "<inviter_user_id>": [ "<invited_user_id>", ... ] }
 REFERRALS_FILE = _data_file("referrals.json")
+# ВОЛНА 22.75 (M2): история диалогов с AI — тоже в БД. Раньше
+# user_conversations жил ТОЛЬКО в ОЗУ: при передеплое контекст диалога
+# с DEVORKS+ai терялся. Структура: { "<user_id>": [msg, ...] } (те же словари,
+# что и в памяти: role/content, system + последние 10 сообщений).
+AI_HIST_FILE = _data_file("ai_history.json")
+# ВОЛНА 22.75 (M2): конфиг монитора расписаний сайтов (классы, ссылки,
+# автосинхронизация). Файл объявлен здесь (а не в блоке schmon ниже), потому
+# что входит в STORAGE_BACKUP_FILES — тот собирается раньше.
+SCHEDMON_FILE = _data_file("schedule_monitor.json")
+# ВОЛНА 22.75 (M4): WAL-журнал облачных операций (Write-Ahead Log).
+# Прежде чем/сразу после того как файл попал в канал-хранилище, запись о нём
+# (полный словарь записи) пишется сюда. Если после успешной загрузки база
+# откатится/потеряется (деплой, сбой) — на старте бот ВОССТАНОВИТ записи
+# из журнала: файл в канале есть, значит и запись обязана быть.
+# Удалённые пользователем файлы получают «tombstone» (событие "delete"),
+# чтобы реконсиляция НИКОГДА не воскресила то, что пользователь стёр сам.
+CLOUD_WAL_FILE = _data_file("cloud_wal.json")
 # Маркер однократной очистки JSON — рядом с данными (см. `_data_file`).
 _SANITIZE_MARKER_FILE = _data_file(".forbidden_chars_cleaned")
 # === Облачное хранилище (приватный Telegram-канал) ===
@@ -542,6 +579,11 @@ CUSTOM_BUTTON_EDIT_NAME = 157
 USER_SEARCH_WAIT = 158     # ждём поисковый запрос (панели дев/админа)
 CREATE_PB_PHOTO_WAIT = 159 # ждём фото для личной кнопки (/skip — без фото)
 BELLS_PHOTO_WAIT = 160     # ждём ФОТО расписания звонков
+# ВОЛНА 22.75 (M1): шаг «📎 файлы кнопки» — ЛЮБЫЕ файлы (фото/видео/доки/
+# музыка), каждый шифруется с анимацией; «⏭ Пропустить» — кнопкой.
+CREATE_PB_FILES_WAIT = 161 # файлы ЛИЧНОЙ кнопки
+CREATE_GB_FILES_WAIT = 162 # файлы ГЛОБАЛЬНОЙ кнопки (разработчик)
+CREATE_CB_FILES_WAIT = 163 # файлы кнопки КЛАССА (админ класса)
 
 # ВОЛНА 22.4: «🎙 Пульт» удалён ПОЛНОСТЬЮ по решению пользователя — кнопки,
 # состояний (бывшие 126–131), хендлеров и хранилищ стилей больше нет.
@@ -571,6 +613,11 @@ _QUICK_SKIP_STATES = frozenset({VAULT_REN_WAIT, VAULT_LABEL_WAIT,
                                 # тоже не команда.
                                 USER_SEARCH_WAIT, CREATE_PB_PHOTO_WAIT,
                                 BELLS_PHOTO_WAIT,
+                                # ВОЛНА 22.75: на шаге файлов кнопки тексты —
+                                # не команды (пользователь может прислать
+                                # подпись/комментарий — просто подскажем).
+                                CREATE_PB_FILES_WAIT, CREATE_GB_FILES_WAIT,
+                                CREATE_CB_FILES_WAIT,
                                 # ВОЛНА 22.29: пароль/время/даты — не команды.
                                 WEB_PW_ENTER, WEB_PW_ENTER_OLD,
                                 DND_WAIT_TIME, SICK_WAIT_FROM, SICK_WAIT_TO})
@@ -2391,6 +2438,11 @@ STORAGE_BACKUP_FILES = (
     # ВОЛНА 22.27: жалобы и журнал действий админов тоже переживают рестарт
     # и живут в канале-БД (без них доказательства терялись бы при деплое).
     REPORTS_FILE, ADMIN_LOG_FILE,
+    # ВОЛНА 22.75 (M2): монитору расписаний (ссылки сайтов классов) тоже место
+    # в БД — раньше конфиг слетал при каждом передеплое.
+    SCHEDMON_FILE,
+    # ВОЛНА 22.75 (M2/M4): история AI-диалогов + WAL облачных операций.
+    AI_HIST_FILE, CLOUD_WAL_FILE,
     # ВОЛНА 22.28: активные помодоро-сессии переживают рестарт — тикер
     # продолжит прерванные фазы (работа/перерыв) автоматически.
     POMODORO_FILE,
@@ -3050,6 +3102,12 @@ class PersonalButton:
         self.row = 1
         # ВОЛНА 22.74: изображение кнопки (file_id) — показывается при нажатии
         self.photo = ""
+        # ВОЛНА 22.75: ПРИКРЕПЛЁННЫЕ ФАЙЛЫ кнопки — список записей вида
+        # {"id", "fid" (file_id шифра), "ch"/"mid" (канал), "ftype", "name",
+        #  "mime", "size", "cover": bool, "plain": bool}. Каждый файл перед
+        # сохранением в канал ШИФРУЕТСЯ (_seal_pack); при нажатии кнопки
+        # расшифровывается и отправляется. Пустой список = файлов нет.
+        self.files = []
 
     def to_dict(self):
         return {
@@ -3062,7 +3120,9 @@ class PersonalButton:
             'is_active': self.is_active,
             'position': self.position,
             'row': self.row,
-            'photo': str(getattr(self, 'photo', '') or '')
+            'photo': str(getattr(self, 'photo', '') or ''),
+            'files': [f for f in (getattr(self, 'files', []) or [])
+                      if isinstance(f, dict)]
         }
 
     @classmethod
@@ -3079,6 +3139,9 @@ class PersonalButton:
         button.position = data.get('position', 0)
         button.row = data.get('row', 1)
         button.photo = str(data.get('photo', '') or '')
+        _files = data.get('files')
+        button.files = [f for f in (_files if isinstance(_files, list) else [])
+                        if isinstance(f, dict)]
         return button
 
 
@@ -3299,6 +3362,8 @@ class CustomButton:
         self.button_type = button_type
         self.created_date = datetime.now().strftime("%Y-%m-%d %H:%M")
         self.is_active = True
+        # ВОЛНА 22.75: файлы кнопки класса (шифрованные; см. PersonalButton.files)
+        self.files = []
 
     def to_dict(self):
         return {
@@ -3309,7 +3374,9 @@ class CustomButton:
             'creator_id': self.creator_id,
             'button_type': self.button_type,
             'created_date': self.created_date,
-            'is_active': self.is_active
+            'is_active': self.is_active,
+            'files': [f for f in (getattr(self, 'files', []) or [])
+                      if isinstance(f, dict)]
         }
 
     @classmethod
@@ -3324,6 +3391,9 @@ class CustomButton:
         )
         button.created_date = data.get('created_date', datetime.now().strftime("%Y-%m-%d %H:%M"))
         button.is_active = data.get('is_active', True)
+        _files = data.get('files')
+        button.files = [f for f in (_files if isinstance(_files, list) else [])
+                        if isinstance(f, dict)]
         return button
 
 
@@ -3335,6 +3405,8 @@ class GlobalButton:
         self.button_type = button_type
         self.created_date = datetime.now().strftime("%Y-%m-%d %H:%M")
         self.is_active = True
+        # ВОЛНА 22.75: файлы глобальной кнопки (шифрованные; см. PersonalButton.files)
+        self.files = []
 
     def to_dict(self):
         return {
@@ -3343,7 +3415,9 @@ class GlobalButton:
             'content': self.content,
             'button_type': self.button_type,
             'created_date': self.created_date,
-            'is_active': self.is_active
+            'is_active': self.is_active,
+            'files': [f for f in (getattr(self, 'files', []) or [])
+                      if isinstance(f, dict)]
         }
 
     @classmethod
@@ -3356,6 +3430,9 @@ class GlobalButton:
         )
         button.created_date = data.get('created_date', datetime.now().strftime("%Y-%m-%d %H:%M"))
         button.is_active = data.get('is_active', True)
+        _files = data.get('files')
+        button.files = [f for f in (_files if isinstance(_files, list) else [])
+                        if isinstance(f, dict)]
         return button
 
 # ==================================
@@ -4131,7 +4208,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.73"
+BOT_BUILD = "22.75"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -7199,6 +7276,138 @@ async def _pub_send(channel_id, coro_factory):
         st["waiters"] = max(0, st["waiters"] - 1)
 
 
+# ============================================================
+# === ВОЛНА 22.75 (M4): WAL-ЖУРНАЛ ОБЛАЧНЫХ ОПЕРАЦИЙ ===
+# ============================================================
+# Гарантия «файлы в облаке не исчезают, пока их не удалит пользователь»:
+# 1) после каждой УСПЕШНОЙ загрузки файла в канал-хранилище сюда пишется
+#    полная запись о файле (event="upload");
+# 2) каждое УДАЛЕНИЕ пользователем пишется «надгробием» (event="delete"),
+#    чтобы реконсиляция НИКОГДА не воскресила стёртое пользователем;
+# 3) на старте _cloud_wal_reconcile() сверяет журнал с базой: если файл
+#    есть в журнале, но его запись потерялась из users.json (откат базы,
+#    порча, неудачный деплой) — запись ВОССТАНАВЛИВАЕТСЯ из журнала.
+# Журнал живёт в БД (CLOUD_WAL_FILE входит в STORAGE_BACKUP_FILES и в
+# снапшот канал-БД), значит переживает передеплой. Хвост старше 14 дней
+# подрезается: за это время любой деплой точно завершится.
+
+_WAL_MAX_EVENTS = 3000
+_WAL_TTL_SEC = 14 * 24 * 3600
+_WAL_CACHE = None
+_WAL_LOCK = threading.Lock()
+
+
+def _wal_all():
+    global _WAL_CACHE
+    if _WAL_CACHE is None:
+        data = load_data(CLOUD_WAL_FILE, {}, expect="dict")
+        if not isinstance(data, dict):
+            data = {}
+        if not isinstance(data.get("events"), list):
+            data["events"] = []
+        _WAL_CACHE = data
+    return _WAL_CACHE
+
+
+def _wal_append(event: str, uid: str, target: str, payload: dict):
+    """Журналирование облачной операции. Безопасно вызывать откуда угодно:
+    любые ошибки глотаются (журнал не должен ломать основную работу)."""
+    try:
+        with _WAL_LOCK:
+            wal = _wal_all()
+            wal.setdefault("events", []).append({
+                "ts": time.time(),
+                "ev": str(event or "")[:10],
+                "u": str(uid or ""),
+                "t": str(target or "")[:10],
+                "rec": payload if isinstance(payload, dict) else {},
+            })
+            evs = wal["events"]
+            if len(evs) > _WAL_MAX_EVENTS:
+                wal["events"] = evs[-_WAL_MAX_EVENTS:]
+        save_data(CLOUD_WAL_FILE, _WAL_CACHE)
+    except Exception as e:
+        logger.warning(f"WAL append: {e}")
+
+
+async def _cloud_wal_reconcile(application):
+    """На старте: восстановить записи файлов, потерянные базой, но живые
+    в журнале. Файл физически лежит в канале — значит и запись обязана быть.
+    Файлы кнопок (target="btnfile") не реконслируются автоматически: их
+    реестр лежит рядом с самой кнопкой и защищён теми же бэкапами."""
+    try:
+        wal = _wal_all()
+        now = time.time()
+        evs = [e for e in (wal.get("events") or []) if isinstance(e, dict)]
+        cut = now - _WAL_TTL_SEC
+        recent = [e for e in evs if float(e.get("ts") or 0) >= cut]
+        if len(recent) != len(evs):
+            wal["events"] = recent
+            save_data(CLOUD_WAL_FILE, wal)
+        evs = recent
+        if not evs:
+            return
+        # Надгробия удалённых файлов — их НИКОГДА не воскресаем.
+        tomb = set()
+        for e in evs:
+            if e.get("ev") == "delete":
+                _r = e.get("rec") or {}
+                _rid = _r.get("id") or _r.get("fid")
+                if _rid:
+                    tomb.add(str(_rid))
+        users = load_users()
+        restored, changed_uids = 0, set()
+        for e in evs:
+            if e.get("ev") != "upload":
+                continue
+            payload = e.get("rec") or {}
+            if not isinstance(payload, dict):
+                continue
+            target = e.get("t") or ""
+            if target == "btnfile":
+                rec = payload.get("rec") or {}
+            else:
+                rec = payload
+            if not isinstance(rec, dict):
+                continue
+            rid = rec.get("id")
+            if not rid or str(rid) in tomb:
+                continue
+            if target not in ("vault", "cloud"):
+                continue
+            uid = str(e.get("u") or "")
+            u = users.get(uid)
+            if u is None:
+                continue
+            lst = u.vault_files if target == "vault" else u.cloud_files
+            if not isinstance(lst, list):
+                lst = []
+                if target == "vault":
+                    u.vault_files = lst
+                else:
+                    u.cloud_files = lst
+            if not any(isinstance(f, dict) and f.get("id") == rid for f in lst):
+                lst.append(dict(rec))
+                restored += 1
+                changed_uids.add(uid)
+        for uid in changed_uids:
+            u = users.get(uid)
+            if u is not None:
+                save_user(u)
+                try:
+                    await application.bot.send_message(
+                        chat_id=int(uid),
+                        text=("🔧 Найден и восстановлен файл в вашем облаке: "
+                              "запись о нём потерялась при сбое базы, но сам "
+                              "файл остался в хранилище. Данные целы."))
+                except Exception:
+                    pass
+        if restored:
+            logger.info(f"WAL: восстановлено записей файлов: {restored}")
+    except Exception as e:
+        logger.error(f"WAL reconcile: {e}")
+
+
 async def _storage_upload_document(context, data: bytes, filename: str, caption: str = "",
                                    channel_id=None, user=None, data_path=None,
                                    silent=False):
@@ -7448,7 +7657,10 @@ async def _storage_do_backup(context):
     отчёт). Реестр бэкапов хранится в storage_config.json (Bot API не умеет
     читать историю канала, поэтому указатели — message_id/file_id —
     сохраняем сами).
-    ВОЛНА 8: сборка архива вынесена в общий _storage_pack_payload()."""
+    ВОЛНА 8: сборка архива вынесена в общий _storage_pack_payload().
+    ВОЛНА 22.75 (M4): тот же payload дополнительно сохраняется ЛОКАЛЬНО
+    кольцом снапшотов (data/backups/local_YYYY-MM-DD.zip, хранить 10) —
+    страховка на случай, если каналы недоступны/уничтожены."""
     db_ids = get_db_channel_ids()
     if not db_ids:
         return False, ("❌ Хранилище не настроено. Подключите приватный канал: "
@@ -7461,6 +7673,28 @@ async def _storage_do_backup(context):
     classes_n = meta.get("classes", 0)
     now = _utcnow()
     today = now.strftime("%Y-%m-%d")
+    # ВОЛНА 22.75 (M4): ЛОКАЛЬНОЕ кольцо снапшотов (10 шт.) — второй контур
+    # независимости от Telegram. Атомарная запись tmp+replace.
+    try:
+        def _local_snapshot():
+            _bdir = os.path.join(os.path.dirname(str(USERS_FILE)), "backups")
+            os.makedirs(_bdir, exist_ok=True)
+            _tmpf = os.path.join(_bdir, f".local_{today}.zip.{os.getpid()}.tmp")
+            _dst = os.path.join(_bdir, f"local_{today}.zip")
+            with open(_tmpf, "wb") as _fh:
+                _fh.write(payload)
+            os.replace(_tmpf, _dst)
+            _old = sorted(
+                f for f in os.listdir(_bdir)
+                if f.startswith("local_") and f.endswith(".zip"))
+            for _f in _old[:-10]:  # держим последние 10 дней
+                try:
+                    os.remove(os.path.join(_bdir, _f))
+                except Exception:
+                    pass
+        await asyncio.to_thread(_local_snapshot)
+    except Exception as e:
+        logger.warning(f"local snapshot: {e}")
     caption = (
         f"📦 DEVORKS+ бэкап {today} • юзеров {users_n}, классов {classes_n}, "
         f"файлов {files_n} • {_fmt_bytes(len(payload))}"
@@ -7536,6 +7770,106 @@ async def _storage_auto_backup_tick(context):
         return
     ok, report = await _storage_do_backup(context)
     logger.info(f"storage auto-backup: ok={ok}; {report}")
+
+
+# ============================================================
+# === ВОЛНА 22.75 (M4): ПРОВЕРКА ЦЕЛОСТНОСТИ ОБЛАКА ===
+# ============================================================
+# Файлы облака «не исчезают»: раз в 6 ч бот проверяет небольшой срез записей
+# (круговой курсор, ~25 файлов за запуск) — живо ли сообщение-хранилище.
+# Telethon get_messages — дёшево; без Telethon — Bot API get_file.
+# БИТЫЕ записи НИКОГДА не удаляются: помечаются broken_ts, разработчику раз
+# в 7 дней уходит сводка. Ничего не прячем и не списываем молча.
+
+_CLOUD_INTEGRITY_SLICE = 25          # сколько записей проверять за запуск
+_CLOUD_INTEGRITY_INTERVAL = 6 * 3600  # каждые 6 часов
+
+
+def _cloud_iter_records():
+    """Итератор (uid, target, rec) по cloud_files/vault_files всех пользователей
+    (стабильный порядок — по отсортированному uid)."""
+    users = load_users()
+    for uid in sorted(users.keys()):
+        u = users[uid]
+        for target, attr in (("cloud", "cloud_files"), ("vault", "vault_files")):
+            lst = getattr(u, attr, None)
+            if isinstance(lst, list):
+                for rec in lst:
+                    if isinstance(rec, dict) and rec.get("msg_id"):
+                        yield uid, target, rec
+
+
+async def _cloud_integrity_tick(context):
+    """Срез проверки целостности сообщений-хранилищ (см. блок выше)."""
+    try:
+        cfg = load_storage_config()
+        recs = list(_cloud_iter_records())
+        if not recs:
+            return
+        try:
+            cursor = int(cfg.get("integrity_cursor", 0) or 0) % len(recs)
+        except (TypeError, ValueError):
+            cursor = 0
+        _slice = recs[cursor:cursor + _CLOUD_INTEGRITY_SLICE]
+        cfg["integrity_cursor"] = (cursor + len(_slice)) % len(recs)
+        save_storage_config(cfg)
+
+        broken = []
+        client = None
+        if _TELETHON_OK and BOT_TOKEN:
+            try:
+                client = await _mt_client()
+            except Exception:
+                client = None
+        for uid, target, rec in _slice:
+            ok = False
+            ch, mid = int(rec.get("channel_id") or 0), int(rec.get("msg_id") or 0)
+            if client is not None and ch and mid:
+                try:
+                    _m = await client.get_messages(ch, ids=mid)
+                    ok = _m is not None
+                except Exception:
+                    ok = False
+            elif rec.get("file_id"):
+                try:
+                    await context.bot.get_file(rec["file_id"])
+                    ok = True
+                except Exception:
+                    ok = False
+            if not ok:
+                rec["broken_ts"] = _file_ts_now()
+                broken.append((uid, rec.get("name") or rec.get("id")))
+        if broken:
+            # Помечаем битые записи в базе (НЕ удаляем!)
+            _users = load_users()
+            for uid, target, rec in _slice:
+                if rec.get("broken_ts"):
+                    _u = _users.get(uid)
+                    if _u is not None:
+                        save_user(_u)
+            # Сводка разработчику — не чаще раза в 7 дней
+            last = 0
+            try:
+                last = float(cfg.get("integrity_last_warn", 0) or 0)
+            except (TypeError, ValueError):
+                pass
+            if time.time() - last > 7 * 86400:
+                cfg["integrity_last_warn"] = time.time()
+                save_storage_config(cfg)
+                try:
+                    await context.bot.send_message(
+                        chat_id=int(DEVELOPER_ID),
+                        text=("⚠️ Проверка целостности облака: недоступны "
+                              f"{len(broken)} файл(ов) в каналах-хранилищах "
+                              "(например: "
+                              + "; ".join(str(n) for _, n in broken[:5]) + "). "
+                              "Записи ПОМЕЧЕНЫ (broken), НИЧЕГО не удалено. "
+                              "Возможно, канал-хранилище был очищен вручную — "
+                              "восстановите его содержимое из бэкапа."))
+                except Exception:
+                    pass
+    except Exception as e:
+        logger.error(f"cloud integrity: {e}")
 
 
 def _storage_restore_apply(payload: bytes, fallback_name: str = ""):
@@ -22187,6 +22521,10 @@ async def miniapp_files_delete(request):
             f for f in (getattr(user, "cloud_files", []) or [])
             if not (isinstance(f, dict) and f.get("id") == fid)
         ]
+    # ВОЛНА 22.75 (M4): НАДГРОБИЕ в WAL — пользователь удалил файл сам.
+    # Реконсиляция на старте никогда не воскресит файл с надгробием.
+    _wal_append("delete", _uid, "vault" if where == "safe" else "cloud",
+                {"id": str(rec.get("id") or fid)})
     save_user(user)
     return web.json_response({"ok": True})
 
@@ -23366,6 +23704,10 @@ async def miniapp_files_to_safe(request):
     user.vault_files = [f for f in (getattr(user, "vault_files", []) or [])
                         if isinstance(f, dict)]
     user.vault_files.append(new_rec)
+    # ВОЛНА 22.75 (M4): перенос завершён → в WAL обе операции (старая запись
+    # удалена — надгробие; новая — загрузка), чтобы реконсиляция не путала.
+    _wal_append("delete", uid, "cloud", {"id": rec.get("id")})
+    _wal_append("upload", uid, "vault", new_rec)
     # пароль запомним в веб-сессии (RAM), чтобы следующие операции не спрашивали
     if password and not plain_mode:
         sess = _miniapp_session_of(request)
@@ -23524,6 +23866,8 @@ async def miniapp_files_from_safe(request):
         "channel_id": up.get("channel_id"), "src": "web",
     }
     user.cloud_files.append(new_rec)
+    # ВОЛНА 22.75 (M4): файл достан из Сейфа → в WAL (upload).
+    _wal_append("upload", uid, "cloud", new_rec)
     save_user(user)
     logger.info(f"miniapp from_safe: файл пользователя {uid} достан из Сейфа")
     return web.json_response({"file": _miniapp_rec_out(new_rec), "ok": True})
@@ -24183,7 +24527,7 @@ async def _miniapp_encrypt_local_to_safe(user, src_path, size, name, kind,
         if not up:
             raise RuntimeError("Telegram не принял шифр — проверьте, что бот "
                                "администратор канала-хранилища.")
-        return {
+        _rec = {
             "id": _vault_gen_id(user), "kind": kind, "mime": mime,
             "ts": _file_ts_now(), "tss": datetime.now().strftime("%Y-%m-%d %H:%M"),
             "size_orig": size, "size_enc": int(up.get("size", 0) or 0),
@@ -24194,6 +24538,9 @@ async def _miniapp_encrypt_local_to_safe(user, src_path, size, name, kind,
             "cat": _vault_cat_by_kind(kind, mime), "tags": [],
             "src": "web",
         }
+        # ВОЛНА 22.75 (M4): успешная загрузка → в WAL-журнал.
+        _wal_append("upload", getattr(user, "user_id", ""), "vault", _rec)
+        return _rec
     # DVF2: потоково из локального файла (ОЗУ ~1 МБ кусок)
     if not _dvf2_disk_ok(size):
         raise RuntimeError("Мало свободного места на диске сервера.")
@@ -24253,7 +24600,7 @@ async def _miniapp_encrypt_local_to_safe(user, src_path, size, name, kind,
         if not up:
             raise RuntimeError("Telegram не принял шифр — проверьте, что бот "
                                "администратор канала-хранилища.")
-        return {
+        _rec = {
             "id": _vault_gen_id(user), "kind": kind, "mime": mime,
             "ts": _file_ts_now(), "tss": datetime.now().strftime("%Y-%m-%d %H:%M"),
             "size_orig": size, "size_enc": enc_total,
@@ -24265,6 +24612,9 @@ async def _miniapp_encrypt_local_to_safe(user, src_path, size, name, kind,
             "cat": _vault_cat_by_kind(kind, mime), "tags": [],
             "src": "web",
         }
+        # ВОЛНА 22.75 (M4): успешная загрузка → в WAL-журнал.
+        _wal_append("upload", getattr(user, "user_id", ""), "vault", _rec)
+        return _rec
     finally:
         _shutil.rmtree(job, ignore_errors=True)
 
@@ -25773,6 +26123,8 @@ async def _miniapp_upload_finalize(user, uid, upid, s, pw_raw="",
         user.cloud_files = [f for f in (getattr(user, "cloud_files", []) or [])
                             if isinstance(f, dict)]
         user.cloud_files.append(rec)
+        # ВОЛНА 22.75 (M4): успешная загрузка → в WAL-журнал.
+        _wal_append("upload", uid, "cloud", rec)
         save_user(user)
         _dup_saved(uid, name, size)   # 22.62: анти-дубль — файл сохранён
         _dup_mine = False
@@ -26244,7 +26596,7 @@ async def _miniapp_upload_bytes(user, data: bytes, name: str, mime: str):
                 pass
     if not sent:
         return None
-    return {
+    _rec = {
         "id": _cloud_gen_file_id(user),
         "name": name[:120],
         "kind": _miniapp_kind_from(mime, name),
@@ -26256,6 +26608,10 @@ async def _miniapp_upload_bytes(user, data: bytes, name: str, mime: str):
         "channel_id": sent.get("channel_id"),
         "src": "web",
     }
+    # ВОЛНА 22.75 (M4): успешная загрузка → в WAL-журнал (восстановится при
+    # потере записи; см. _cloud_wal_reconcile).
+    _wal_append("upload", getattr(user, "user_id", ""), "cloud", _rec)
+    return _rec
 
 
 def _cloud_unique_name(user, name: str) -> str:
@@ -36185,6 +36541,8 @@ async def handle_ai_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(user_conversations[user_id]) > 11:
         system_msg = user_conversations[user_id][0]
         user_conversations[user_id] = [system_msg] + user_conversations[user_id][-10:]
+    # ВОЛНА 22.75 (M2): история AI-диалога — в БД (переживает передеплой).
+    _ai_hist_save(user_id)
 
     async def _stop_animation():
         if anim_task and not anim_task.done():
@@ -36388,6 +36746,8 @@ async def handle_ai_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_conversations[user_id].append(
         {"role": "assistant", "content": ai_response}
     )
+    # ВОЛНА 22.75 (M2): сохраняем и ответ ассистента — история цельная в БД.
+    _ai_hist_save(user_id)
 
     # Останавливаем анимацию ДО подмены текста, чтобы фон не перетёр итог.
     await _stop_animation()
@@ -40645,11 +41005,21 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if button.name == message_text:
             # ВОЛНА 22.74: если к кнопке прикреплено ИЗОБРАЖЕНИЕ — сначала фото.
             _pb_photo = str(getattr(button, 'photo', '') or '')
+            _cover_ok = False
             if _pb_photo:
                 try:
                     await update.message.reply_photo(_pb_photo, caption=f"{button.name}")
+                    _cover_ok = True
                 except Exception as e:
                     logger.warning(f"personal button photo: {e}")
+            # ВОЛНА 22.75: прикреплённые файлы кнопки (шифрованные) — выдаём
+            # после текста/ссылки и фото-обложки.
+            try:
+                await _send_button_files(update, context,
+                                         getattr(button, 'files', []),
+                                         cover_sent=_cover_ok)
+            except Exception as e:
+                logger.warning(f"personal button files: {e}")
             if button.button_type == "url":
                 await update.message.reply_text(
                     f"🔗 **{button.name}**",
@@ -40672,6 +41042,12 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             else:
                 await update.message.reply_text(f"📝 {button.content}")
+            # ВОЛНА 22.75: файлы глобальной кнопки (шифрованные) — выдаются всем,
+            # кто нажмёт кнопку (прикрепляет разработчик).
+            try:
+                await _send_button_files(update, context, getattr(button, 'files', []))
+            except Exception as e:
+                logger.warning(f"global button files: {e}")
             return MAIN_MENU
 
     class_obj = get_class_by_user(user_id)
@@ -40690,6 +41066,12 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                 else:
                     await update.message.reply_text(f"📝 {custom_button.content}")
+                # ВОЛНА 22.75: файлы кнопки класса (шифрованные, прикрепил админ).
+                try:
+                    await _send_button_files(update, context,
+                                             getattr(custom_button, 'files', []))
+                except Exception as e:
+                    logger.warning(f"class button files: {e}")
                 return MAIN_MENU
 
     if message_text == "➕ Добавить ДЗ":
@@ -41862,17 +42244,25 @@ async def create_personal_button_name_handler(update: Update, context: ContextTy
 @timeout(CONVERSATION_TIMEOUT)
 async def _finish_personal_button_create(update: Update,
                                          context: ContextTypes.DEFAULT_TYPE,
-                                         photo_fid: str = ""):
+                                         photo_fid: str = "",
+                                         files=None):
     """ВОЛНА 22.74: общая финализация создания личной кнопки (после шага фото).
     Слот prepaid_buttons списывается ТОЛЬКО здесь — раньше он сгорал,
-    даже если пользователь бросил создание на шаге фото."""
+    даже если пользователь бросил создание на шаге фото.
+    ВОЛНА 22.75: принимает СПИСОК ФАЙЛОВ (шифрованные записи из шага «📎
+    файлы»), работает и из колбэка (кнопки «✅ Готово/⏭ Пропустить»)."""
     user_id = str(update.effective_user.id)
+    _chat_id = update.effective_chat.id
     personal_button = context.user_data.pop('pending_personal_button', None)
     if personal_button is None:
-        await update.message.reply_text("Сессия создания потеряна. Начните заново.")
+        await context.bot.send_message(chat_id=_chat_id,
+                                       text="Сессия создания потеряна. Начните заново.")
         return await personal_buttons_menu_from_message(update, context)
     if photo_fid:
         personal_button.photo = str(photo_fid)
+    context.user_data.pop('pb_photo_fid', None)
+    # ВОЛНА 22.75: прикреплённые файлы (шифрованные) — список записей.
+    personal_button.files = [f for f in (files or []) if isinstance(f, dict)]
 
     save_personal_button(personal_button)
 
@@ -41889,19 +42279,24 @@ async def _finish_personal_button_create(update: Update,
     button_name = personal_button.name
     photo_note = ("\n🖼 Изображение прикреплено — оно откроется при нажатии кнопки."
                   if personal_button.photo else "")
+    files_note = (f"\n📎 Файлов прикреплено: {len(personal_button.files)} (зашифрованы 🔐, "
+                  "выдаются при нажатии кнопки)"
+                  if personal_button.files else "")
     success_text = (f"✅ Личная кнопка '{button_name}' успешно создана!\n\n"
-                    f"Теперь она появится в вашем главном меню.{photo_note}")
+                    f"Теперь она появится в вашем главном меню.{photo_note}{files_note}")
 
     # Автоматически обновляем клавиатуру снизу — без повторного /start.
+    # ВОЛНА 22.75: через context.bot.send_message — работает и из колбэка.
     try:
         fresh_user = get_user(user_id) or user
-        await update.message.reply_text(
-            success_text,
+        await context.bot.send_message(
+            chat_id=_chat_id,
+            text=success_text,
             reply_markup=get_main_menu_keyboard(fresh_user),
         )
     except Exception as e:
         logger.error(f"_finish_personal_button_create: обновление клавиатуры: {e}")
-        await update.message.reply_text(success_text)
+        await context.bot.send_message(chat_id=_chat_id, text=success_text)
 
     context.user_data.pop('personal_button_type', None)
     context.user_data.pop('personal_button_name', None)
@@ -41912,14 +42307,17 @@ async def _finish_personal_button_create(update: Update,
 @timeout(CONVERSATION_TIMEOUT)
 async def personal_button_photo_handler(update: Update,
                                         context: ContextTypes.DEFAULT_TYPE):
-    """ВОЛНА 22.74: шаг «📷 изображение кнопки» — фото или /skip."""
+    """ВОЛНА 22.74: шаг «📷 изображение кнопки» — фото или /skip.
+    ВОЛНА 22.75: после фото/пропуска — шаг «📎 файлы кнопки» (любые файлы,
+    шифрование с анимацией; «⏭ Пропустить» — кнопкой)."""
     msg = update.message
     text = (msg.text or "").strip().lower()
     if msg.photo:
-        return await _finish_personal_button_create(update, context,
-                                                    photo_fid=msg.photo[-1].file_id)
+        context.user_data['pb_photo_fid'] = msg.photo[-1].file_id
+        return await _btn_files_step(update, context, "pb")
     if text in ("/skip", "скип", "пропустить", "пропуск", "-", "нет"):
-        return await _finish_personal_button_create(update, context, photo_fid="")
+        context.user_data['pb_photo_fid'] = ""
+        return await _btn_files_step(update, context, "pb")
     if text in ("/cancel", "отмена", "cancel"):
         context.user_data.pop('pending_personal_button', None)
         context.user_data.pop('personal_button_type', None)
@@ -41929,6 +42327,514 @@ async def personal_button_photo_handler(update: Update,
     await msg.reply_text(
         "📷 Пришлите ИЗОБРАЖЕНИЕ одним сообщением — или напишите «пропустить», чтобы без фото.")
     return CREATE_PB_PHOTO_WAIT
+
+
+# ============================================================
+# === ВОЛНА 22.75 (M1): ФАЙЛЫ НА КНОПКАХ — любые, шифрованные ===
+# ============================================================
+# На кнопках теперь можно держать НЕ ТОЛЬКО фото-обложку, но и ЛЮБЫЕ файлы:
+# фото, видео, музыку, голосовые, документы (до 6 шт.). Каждый файл перед
+# сохранением в канал-хранилище ШИФРУЕТСЯ (AES-256-GCM, ключ бота — тот же
+# механизм, что у базы решений: в канале лежит только шифр), а процесс
+# оформлен АНИМАЦИЕЙ («🔐 Шифрую… ▰▰▰▱▱ 30%»). Если файлы не нужны —
+# ЖМЁТСЯ КНОПКА «⏭ Пропустить» (писать слово больше не требуется). Такие
+# кнопки может создавать не только владелец личной кнопки, но и РАЗРАБОТЧИК
+# (глобальные кнопки) и АДМИН КЛАССА (кнопки класса). Файлы переживают
+# рестарт/передеплой (users/classes/global_buttons.json — в БД), а при
+# удалении кнопки её шифры стираются и из канала.
+
+_BTN_MAX_FILES = 6  # сколько файлов можно повесить на одну кнопку
+
+_BTN_KIND_STATE = {
+    "pb": CREATE_PB_FILES_WAIT,   # личная кнопка
+    "gb": CREATE_GB_FILES_WAIT,   # глобальная кнопка (разработчик)
+    "cb": CREATE_CB_FILES_WAIT,   # кнопка класса (админ класса)
+}
+
+_BTN_ANIM_FRAMES = ("🔐", "🔒", "🔏", "🔐")
+
+
+def _btn_files_kb(count: int) -> InlineKeyboardMarkup:
+    """Клавиатура шага «📎 файлы кнопки»: Готово (если есть файлы) /
+    Пропустить / Отмена — всё КНОПКАМИ, писать слова не нужно."""
+    row = [InlineKeyboardButton("⏭ Пропустить", callback_data="btnfiles_skip")]
+    if count > 0:
+        row.insert(0, InlineKeyboardButton(f"✅ Готово ({count})",
+                                           callback_data="btnfiles_done"))
+    return InlineKeyboardMarkup([
+        row,
+        [InlineKeyboardButton("❌ Отмена", callback_data="btnfiles_cancel")],
+    ])
+
+
+def _btn_files_text(kind: str, count: int) -> str:
+    who = {"pb": "личной кнопки",
+           "gb": "глобальной кнопки",
+           "cb": "кнопки класса"}.get(kind, "кнопки")
+    head = (f"📎 Шаг файлов {who}\n\n"
+            f"Пришлите файлы (фото, видео, музыка, документы) — до "
+            f"{_BTN_MAX_FILES} шт. Каждый файл будет ЗАШИФРОВАН 🔐 и будет "
+            "выдаваться всем, кто нажмёт кнопку.")
+    if count:
+        return (head + f"\n\nУже прикреплено: {count}/{_BTN_MAX_FILES} — "
+                "жмите «✅ Готово», когда закончите.")
+    return head + "\n\nФайлы не нужны? Жмите «⏭ Пропустить»."
+
+
+async def _btn_files_step(update, context, kind: str):
+    """Открыть шаг «📎 файлы кнопки» — работает и из хендлера сообщения,
+    и из колбэка. Возвращает состояние соответствующего типа кнопки."""
+    context.user_data['btn_files_kind'] = kind
+    if not isinstance(context.user_data.get('btn_pending_files'), list):
+        context.user_data['btn_pending_files'] = []
+    pend = context.user_data['btn_pending_files']
+    state = _BTN_KIND_STATE.get(kind, CREATE_PB_FILES_WAIT)
+    text = _btn_files_text(kind, len(pend))
+    kb = _btn_files_kb(len(pend))
+    if getattr(update, "message", None) is not None:
+        await update.message.reply_text(text, reply_markup=kb)
+        return state
+    q = update.callback_query
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    try:
+        await q.edit_message_text(text, reply_markup=kb)
+    except Exception:
+        await context.bot.send_message(chat_id=update.effective_chat.id,
+                                       text=text, reply_markup=kb)
+    return state
+
+
+async def _btn_encrypt_anim(context, chat_id, message_id, name: str):
+    """АНИМАЦИЯ ШИФРОВАНИЯ: крутит «секретный» спиннер и растущий
+    прогресс-бар, пока файл пакуется. Таска гасится отменой после
+    завершения шифрования (см. _button_files_media_handler)."""
+    bar_len = 10
+    for i in range(45):  # до ~30 сек, дальше просто перестаём мигать
+        frame = _BTN_ANIM_FRAMES[i % len(_BTN_ANIM_FRAMES)]
+        filled = ((i + 1) * 2) % (bar_len + 1)
+        bar = "▰" * filled + "▱" * (bar_len - filled)
+        pct = min(99, filled * 10)
+        try:
+            await context.bot.edit_message_text(
+                f"{frame} Шифрую «{name}»…\n{bar} {pct}%",
+                chat_id=chat_id, message_id=message_id)
+        except Exception:
+            return  # сообщение не редактируется — прекращаем анимацию
+        await asyncio.sleep(0.7)
+
+
+def _btn_extract_media(msg):
+    """(ftype, fid, size, mime, fname) из любого медиа-сообщения — или None."""
+    if msg.photo:
+        p = msg.photo[-1]
+        return ("photo", p.file_id, int(p.file_size or 0), "image/jpeg", "photo.jpg")
+    if msg.video:
+        v = msg.video
+        return ("video", v.file_id, int(v.file_size or 0),
+                v.mime_type or "video/mp4", v.file_name or "video.mp4")
+    if msg.audio:
+        a = msg.audio
+        return ("audio", a.file_id, int(a.file_size or 0),
+                a.mime_type or "audio/mpeg",
+                a.file_name or (a.title or "audio.mp3"))
+    if msg.voice:
+        v = msg.voice
+        return ("voice", v.file_id, int(v.file_size or 0),
+                v.mime_type or "audio/ogg", "voice.ogg")
+    if msg.video_note:
+        v = msg.video_note
+        return ("video_note", v.file_id, int(v.file_size or 0),
+                "video/mp4", "video_note.mp4")
+    if msg.animation:
+        d = msg.animation
+        return ("animation", d.file_id, int(d.file_size or 0),
+                d.mime_type or "video/mp4", d.file_name or "anim.gif")
+    if msg.document:
+        d = msg.document
+        return ("document", d.file_id, int(d.file_size or 0),
+                d.mime_type or "application/octet-stream",
+                d.file_name or "file.bin")
+    return None
+
+
+async def _btn_anim_stop(anim):
+    if anim is not None:
+        anim.cancel()
+        try:
+            await anim
+        except (asyncio.CancelledError, Exception):
+            pass
+
+
+@timeout(CONVERSATION_TIMEOUT)
+async def _button_files_media_handler(update, context):
+    """ВОЛНА 22.75 (M1): приёмник ЛЮБЫХ файлов на шаге «📎 файлы кнопки».
+    Один хендлер на все три состояния — тип кнопки берём из btn_files_kind.
+    Каждый файл: скачиваем → ШИФРУЕМ (_seal_pack, анимация) → в канал →
+    запись в btn_pending_files. Если каналов-хранилищ нет — честный фолбэк:
+    файл остаётся ссылкой Telegram БЕЗ шифрования (предупреждаем)."""
+    msg = update.message
+    kind = context.user_data.get('btn_files_kind') or "pb"
+    pend = context.user_data.get('btn_pending_files')
+    if not isinstance(pend, list):
+        pend = []
+        context.user_data['btn_pending_files'] = pend
+    state = _BTN_KIND_STATE.get(kind, CREATE_PB_FILES_WAIT)
+
+    if msg.photo or msg.video or msg.audio or msg.voice or msg.video_note \
+            or msg.animation or msg.document:
+        info = _btn_extract_media(msg)
+        if not info:
+            await msg.reply_text("⚠️ Не понял этот файл — пришлите фото, видео, "
+                                 "музыку или документ.")
+            return state
+        ftype, fid, size, mime, fname = info
+        if len(pend) >= _BTN_MAX_FILES:
+            await msg.reply_text(f"⚠️ Максимум {_BTN_MAX_FILES} файлов на кнопку — "
+                                 "жмите «✅ Готово».")
+            return state
+        if size > VAULT_MAX_FILE_BYTES:
+            await msg.reply_text("⚠️ Файл больше 20 МБ — бот не сможет его "
+                                 "перепаковать. Пришлите файл поменьше.")
+            return state
+        user = get_user(str(update.effective_user.id))
+
+        # Статус + АНИМАЦИЯ ШИФРОВАНИЯ
+        status = await msg.reply_text(f"🔐 Шифрую «{fname}»…")
+        anim = asyncio.create_task(_btn_encrypt_anim(
+            context, status.chat_id, status.message_id, fname))
+        rec = None
+        try:
+            channels = get_cloud_channel_ids()
+            if channels:
+                raw = await _vault_botapi_download(context, fid)
+                sealed = await asyncio.to_thread(_seal_pack, raw, fname, mime, "btn")
+                raw = b""
+                _up = await _storage_upload_document(
+                    context, sealed, filename=f"btn_{secrets.token_hex(6)}.dvf",
+                    caption="", user=(user if kind == "pb" else None))
+                sealed = b""
+                if not _up:
+                    raise RuntimeError("хранилище не приняло шифр")
+                rec = {
+                    "id": "btn_" + secrets.token_hex(4),
+                    "fid": str(_up.get("file_id") or ""),
+                    "ch": int(_up.get("channel_id") or 0),
+                    "mid": int(_up.get("message_id") or 0),
+                    "ftype": ftype, "name": fname[:120], "mime": mime,
+                    "size": int(size or 0), "plain": False,
+                    "cover": bool(ftype == "photo"
+                                  and not context.user_data.get('btn_cover_fid')),
+                }
+                if rec["cover"]:
+                    context.user_data['btn_cover_fid'] = fid
+                # WAL (M4): запись о файле — восстановится, даже если база откатится
+                _wal_append("upload", str(update.effective_user.id), "btnfile",
+                            {"btn_kind": kind, "rec": rec})
+            else:
+                # Хранилище не настроено — честный фолбэк: БЕЗ шифрования.
+                rec = {"id": "btn_" + secrets.token_hex(4), "fid": fid,
+                       "ch": 0, "mid": 0, "ftype": ftype, "name": fname[:120],
+                       "mime": mime, "size": int(size or 0), "plain": True,
+                       "cover": bool(ftype == "photo"
+                                     and not context.user_data.get('btn_cover_fid'))}
+                if rec["cover"]:
+                    context.user_data['btn_cover_fid'] = fid
+        except Exception as e:
+            logger.error(f"btn file encrypt: {e}")
+            await _btn_anim_stop(anim)
+            try:
+                await context.bot.edit_message_text(
+                    f"❌ Не удалось зашифровать «{fname}» ({e}). Попробуйте ещё раз.",
+                    chat_id=status.chat_id, message_id=status.message_id)
+            except Exception:
+                pass
+            return state
+        await _btn_anim_stop(anim)
+        pend.append(rec)
+        try:
+            await context.bot.edit_message_text(
+                f"✅ «{fname}» зашифрован 🔐 и прикреплён ({len(pend)}/{_BTN_MAX_FILES})."
+                + ("\n⚠️ Хранилище не настроено — файл сохранён БЕЗ шифрования "
+                   "(ссылка Telegram)." if rec.get("plain") else ""),
+                chat_id=status.chat_id, message_id=status.message_id)
+        except Exception:
+            pass
+        # Обновляем панель шага (счётчик + кнопка «✅ Готово»)
+        try:
+            await context.bot.send_message(
+                update.effective_chat.id,
+                _btn_files_text(kind, len(pend)),
+                reply_markup=_btn_files_kb(len(pend)))
+        except Exception:
+            pass
+        return state
+
+    # Текст (не команда — команды отфильтрованы фильтром) — быстрые алиасы.
+    low = (msg.text or "").strip().lower()
+    if low in ("/cancel", "отмена", "cancel"):
+        return await _btn_files_cancel(update, context)
+    if low in ("/skip", "пропустить", "пропуск", "скип"):
+        return await _btn_files_route_done(update, context, attach=False)
+    await msg.reply_text("📎 Пришлите ФАЙЛ (фото/видео/музыку/документ) — или "
+                         "воспользуйтесь кнопками под сообщением.")
+    return state
+
+
+async def _btn_files_cb_router(update, context):
+    """ВОЛНА 22.75: колбэки шага файлов — ✅ Готово / ⏭ Пропустить / ❌ Отмена."""
+    q = update.callback_query
+    data = q.data or ""
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    if data == "btnfiles_cancel":
+        return await _btn_files_cancel(update, context)
+    if data == "btnfiles_skip":
+        return await _btn_files_route_done(update, context, attach=False)
+    if data == "btnfiles_done":
+        return await _btn_files_route_done(update, context, attach=True)
+    kind = context.user_data.get('btn_files_kind') or "pb"
+    return _BTN_KIND_STATE.get(kind, CREATE_PB_FILES_WAIT)
+
+
+async def _btn_files_cleanup(context):
+    context.user_data.pop('btn_pending_files', None)
+    context.user_data.pop('btn_files_kind', None)
+    context.user_data.pop('btn_cover_fid', None)
+
+
+async def _btn_files_cancel(update, context):
+    """❌ Отмена: чистим сессию создания соответствующего типа кнопки."""
+    kind = context.user_data.get('btn_files_kind') or "pb"
+    await _btn_files_cleanup(context)
+    if kind == "pb":
+        context.user_data.pop('pending_personal_button', None)
+        context.user_data.pop('personal_button_type', None)
+        context.user_data.pop('personal_button_name', None)
+        context.user_data.pop('pb_photo_fid', None)
+    elif kind == "gb":
+        context.user_data.pop('pending_global_button', None)
+        context.user_data.pop('global_button_name', None)
+        context.user_data.pop('global_button_type', None)
+    else:
+        context.user_data.pop('pending_class_button', None)
+        context.user_data.pop('custom_button_name', None)
+        context.user_data.pop('custom_button_type', None)
+    _text = "❌ Создание кнопки отменено."
+    if update.callback_query is not None:
+        try:
+            await update.callback_query.edit_message_text(_text)
+        except Exception:
+            await context.bot.send_message(chat_id=update.effective_chat.id,
+                                           text=_text)
+    else:
+        await update.message.reply_text(_text)
+    return MAIN_MENU
+
+
+async def _btn_files_route_done(update, context, attach: bool):
+    """✅ Готово / ⏭ Пропустить → финализация кнопки нужного типа."""
+    kind = context.user_data.get('btn_files_kind') or "pb"
+    files = list(context.user_data.get('btn_pending_files') or []) if attach else []
+    await _btn_files_cleanup(context)
+    if kind == "pb":
+        return await _finish_personal_button_create(
+            update, context,
+            photo_fid=str(context.user_data.get('pb_photo_fid') or ""),
+            files=files)
+    if kind == "gb":
+        return await _finish_global_button_create(update, context, files)
+    return await _finish_class_button_create(update, context, files)
+
+
+async def _finish_global_button_create(update, context, files):
+    """ВОЛНА 22.75: финализация ГЛОБАЛЬНОЙ кнопки (разработчик) после шага
+    «📎 файлы» — сохранение + уведомление всех пользователей."""
+    user_id = str(update.effective_user.id)
+    _chat_id = update.effective_chat.id
+    if user_id != DEVELOPER_ID:
+        await context.bot.send_message(chat_id=_chat_id, text="Доступ запрещён.")
+        return MAIN_MENU
+    global_button = context.user_data.pop('pending_global_button', None)
+    if global_button is None:
+        await context.bot.send_message(chat_id=_chat_id,
+                                       text="Сессия создания потеряна. Начните заново.")
+        return await developer_panel(update, context)
+    global_button.files = [f for f in (files or []) if isinstance(f, dict)]
+
+    button_name = global_button.name
+    buttons = load_global_buttons()
+    buttons[global_button.button_id] = global_button
+    save_global_buttons(buttons)
+
+    _files_note = (f"\n📎 Файлов прикреплено: {len(global_button.files)} 🔐"
+                   if global_button.files else "")
+    users = load_users()
+    for uid, u in users.items():
+        if not u.is_blocked and uid != user_id:
+            try:
+                # Автообновление клавиатуры — не нужно нажимать /start.
+                await context.bot.send_message(
+                    chat_id=uid,
+                    text=f"🔔 Разработчик создал новую кнопку: *{button_name}*",
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=get_main_menu_keyboard(u),
+                )
+            except Exception as e:
+                logger.error(f"Ошибка уведомления {uid}: {e}")
+
+    await context.bot.send_message(
+        chat_id=_chat_id,
+        text=f"✅ Глобальная кнопка '{button_name}' создана!{_files_note}")
+
+    context.user_data.pop('global_button_name', None)
+    context.user_data.pop('global_button_type', None)
+    return await developer_panel(update, context)
+
+
+async def _finish_class_button_create(update, context, files):
+    """ВОЛНА 22.75: финализация кнопки КЛАССА (админ класса) после шага
+    «📎 файлы» — сохранение + уведомление участников класса."""
+    user_id = str(update.effective_user.id)
+    _chat_id = update.effective_chat.id
+    custom_button = context.user_data.pop('pending_class_button', None)
+    if custom_button is None:
+        await context.bot.send_message(chat_id=_chat_id,
+                                       text="Сессия создания потеряна. Начните заново.")
+        return await admin_panel(update, context)
+    custom_button.files = [f for f in (files or []) if isinstance(f, dict)]
+    class_code = custom_button.class_code or context.user_data.get('current_admin_class')
+
+    buttons = load_data(CUSTOM_BUTTONS_FILE, {}, expect="dict")
+    buttons[custom_button.button_id] = custom_button.to_dict()
+    save_data(CUSTOM_BUTTONS_FILE, buttons)
+
+    button_name = custom_button.name
+    class_obj = get_class_by_code(class_code)
+    if class_obj:
+        if custom_button.button_id not in class_obj.class_buttons:
+            class_obj.class_buttons.append(custom_button.button_id)
+        classes = load_classes()
+        classes[class_code] = class_obj
+        save_classes(classes)
+
+        button_display_name = (button_name.replace("CLASS_", "")
+                               if button_name.startswith("CLASS_") else button_name)
+        for member_id in class_obj.students + class_obj.admins:
+            if member_id != str(user_id):
+                try:
+                    # Автообновление клавиатуры — не нужно нажимать /start.
+                    member_user = get_user(member_id)
+                    kb = get_main_menu_keyboard(member_user) if member_user else None
+                    await context.bot.send_message(
+                        chat_id=member_id,
+                        text=(f"🔔 Администратор класса '{class_obj.class_name}' "
+                              f"создал новую кнопку: *{button_display_name}*"),
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=kb,
+                    )
+                except Exception as e:
+                    logger.error(f"Ошибка уведомления {member_id}: {e}")
+    else:
+        button_display_name = (button_name.replace("CLASS_", "")
+                               if button_name.startswith("CLASS_") else button_name)
+
+    _files_note2 = (f"\n📎 Файлов прикреплено: {len(custom_button.files)} 🔐"
+                    if custom_button.files else "")
+    await context.bot.send_message(
+        chat_id=_chat_id,
+        text=f"✅ Кнопка '{button_display_name}' создана!" + _files_note2)
+
+    context.user_data.pop('custom_button_type', None)
+    context.user_data.pop('custom_button_name', None)
+    return await admin_panel(update, context)
+
+
+async def _btn_send_plain_file(update, context, rec):
+    """Отправка файла-«фолбэка» (без шифра, просто file_id) по его типу."""
+    fid = rec.get("fid")
+    kind = rec.get("ftype") or "document"
+    name = str(rec.get("name") or "")
+    cap = name or None
+    msg = update.effective_message
+    if kind == "photo":
+        return await msg.reply_photo(fid, caption=cap)
+    if kind == "video":
+        return await msg.reply_video(fid, caption=cap)
+    if kind == "audio":
+        return await msg.reply_audio(fid, caption=cap)
+    if kind == "voice":
+        return await msg.reply_voice(fid, caption=cap)
+    if kind == "animation":
+        return await msg.reply_animation(fid, caption=cap)
+    return await msg.reply_document(fid, caption=cap)
+
+
+async def _send_button_files(update, context, files, cover_sent: bool = False):
+    """ВОЛНА 22.75: выдать файлы, прикреплённые к кнопке, при её нажатии.
+    Каждый шифр скачивается из канала и расшифровывается (_seal_unpack);
+    отправляется исходное имя файла. cover_sent=True — фото-обложку
+    пропускаем (она уже ушла как обложка)."""
+    recs = [f for f in (files or []) if isinstance(f, dict)]
+    if not recs:
+        return
+    target = update.effective_message
+    if target is None:
+        return
+    todo = [r for r in recs if not (cover_sent and r.get("cover"))]
+    if not todo:
+        return
+    status = None
+    try:
+        if len(todo) > 1:
+            status = await target.reply_text("🔓 Расшифровываю файлы…")
+        for _i, rec in enumerate(todo, 1):
+            try:
+                if rec.get("plain") and rec.get("fid"):
+                    await _btn_send_plain_file(update, context, rec)
+                    continue
+                container = await _vault_botapi_download(context, rec.get("fid"))
+                _meta, payload = await asyncio.to_thread(_seal_unpack, container)
+                container = b""
+                _name = str(_meta.get("n") or rec.get("name") or "file.bin")
+                await target.reply_document(document=payload, filename=_name,
+                                            caption=f"📎 {_name}")
+                payload = b""
+            except Exception as e:
+                logger.warning(f"btn files: файл {rec.get('name')} не выдан: {e}")
+                try:
+                    await target.reply_text(
+                        f"⚠️ Файл «{rec.get('name') or _i}» сейчас недоступен — "
+                        "попробуйте позже.")
+                except Exception:
+                    pass
+    finally:
+        if status is not None:
+            try:
+                await context.bot.delete_message(chat_id=status.chat_id,
+                                                 message_id=status.message_id)
+            except Exception:
+                pass
+
+
+async def _btn_delete_channel_files(context, files):
+    """ВОЛНА 22.75 (M4): при удалении кнопки стереть её шифры из канала
+    (best-effort) — чтобы хранилище не засорялось осиротевшими шифрами."""
+    for rec in (files or []):
+        if not isinstance(rec, dict):
+            continue
+        _ch, _mid = int(rec.get("ch") or 0), int(rec.get("mid") or 0)
+        if not _ch or not _mid:
+            continue
+        try:
+            await context.bot.delete_message(chat_id=_ch, message_id=_mid)
+        except Exception:
+            pass
 
 
 @timeout(CONVERSATION_TIMEOUT)
@@ -42173,6 +43079,15 @@ async def confirm_delete_personal_button(update: Update, context: ContextTypes.D
     if not user:
         user = User(user_id)
     button_id = query.data.split("_")[4]
+
+    # ВОЛНА 22.75 (M4): перед удалением — запоминаем шифры кнопки, чтобы
+    # стереть их и из канала (файлы не должны осиротевать в хранилище).
+    _btn = load_personal_buttons().get(button_id)
+    if _btn is not None:
+        try:
+            await _btn_delete_channel_files(context, getattr(_btn, 'files', []))
+        except Exception:
+            pass
 
     if delete_personal_button(button_id):
         user = get_user(user_id)
@@ -44187,8 +45102,6 @@ try:
 except Exception:  # pragma: no cover
     _sch_requests = None
 
-SCHEDMON_FILE = _data_file("schedule_monitor.json")
-# Проверка ссылок каждые 5 минут; авторассылка — не чаще 1 сообщения в день.
 SCHEDMON_CHECK_INTERVAL = 300
 SCHEDMON_MAX_AUTO_PER_DAY = 1
 SCHEDMON_MAX_TRACK_PER_CLASS = 15   # сколько ссылок может следить один класс
@@ -46113,7 +47026,8 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE,
         _classes_force_reload()
         if not is_user_class_admin(user_id):
             error_text = "❌ У вас нет прав доступа к админке."
-            await update.message.reply_text(error_text)
+            await context.bot.send_message(chat_id=update.effective_chat.id,
+                                           text=error_text)
             return MAIN_MENU
 
     user_classes = []
@@ -46130,7 +47044,8 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE,
                     user_classes.append(class_obj)
         if not user_classes:
             error_text = "❌ У вас нет прав доступа."
-            await update.message.reply_text(error_text)
+            await context.bot.send_message(chat_id=update.effective_chat.id,
+                                           text=error_text)
             return MAIN_MENU
 
     if len(user_classes) == 1:
@@ -46139,13 +47054,17 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
         text = f"👨‍💼 Админская панель класса '{class_obj.class_name}'\n\nВыберите действие:"
 
-        await update.message.reply_text(text, reply_markup=get_admin_panel_keyboard())
+        # ВОЛНА 22.75: через effective_chat — панель открывается и из колбэка
+        # (финализация кнопки класса с файлами).
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=text,
+                                       reply_markup=get_admin_panel_keyboard())
         return ADMIN_PANEL
     else:
         class_obj = user_classes[0]
         context.user_data['current_admin_class'] = class_obj.class_code
         text = f"👨‍💼 Админская панель класса '{class_obj.class_name}'\n\nВыберите действие:"
-        await update.message.reply_text(text, reply_markup=get_admin_panel_keyboard())
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=text,
+                                       reply_markup=get_admin_panel_keyboard())
         return ADMIN_PANEL
 
 @timeout(CONVERSATION_TIMEOUT)
@@ -47784,14 +48703,19 @@ async def confirm_logout_handler(update: Update, context: ContextTypes.DEFAULT_T
 
 async def developer_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
+    # ВОЛНА 22.75: панель отправляется через effective_chat — теперь её можно
+    # открыть и из колбэка (финализация глобальной кнопки с файлами).
+    _chat_id = update.effective_chat.id
 
     if user_id != DEVELOPER_ID:
-        await update.message.reply_text("Доступ запрещён.")
+        await context.bot.send_message(chat_id=_chat_id, text="Доступ запрещён.")
         return MAIN_MENU
 
     text = "🛠️ **Панель разработчика**\n\nВыберите действие:"
 
-    await update.message.reply_text(text, reply_markup=get_developer_keyboard(), parse_mode="Markdown")
+    await context.bot.send_message(chat_id=_chat_id, text=text,
+                                   reply_markup=get_developer_keyboard(),
+                                   parse_mode="Markdown")
     return DEV_PANEL
 
 # === ВОЛНА 22.13: РАСШИРЕННАЯ СТАТИСТИКА ДЛЯ РАЗРАБОТЧИКА ===
@@ -49210,30 +50134,11 @@ async def dev_global_button_url_handler(update: Update, context: ContextTypes.DE
     button_id = generate_global_button_id()
     global_button = GlobalButton(button_id, button_name, url, "url")
 
-    buttons = load_global_buttons()
-    buttons[button_id] = global_button
-    save_global_buttons(buttons)
-
-    users = load_users()
-    for uid, u in users.items():
-        if not u.is_blocked and uid != user_id:
-            try:
-                # Автообновление клавиатуры — не нужно нажимать /start.
-                await context.bot.send_message(
-                    chat_id=uid,
-                    text=f"🔔 Разработчик создал новую кнопку: *{button_name}*",
-                    parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=get_main_menu_keyboard(u),
-                )
-            except Exception as e:
-                logger.error(f"Ошибка уведомления {uid}: {e}")
-
-    await update.message.reply_text(f"✅ Глобальная кнопка '{button_name}' создана!")
-
-    context.user_data.pop('global_button_name', None)
-    context.user_data.pop('global_button_type', None)
-    context.user_data.pop('creating_global_button', None)
-    return await developer_panel(update, context)
+    # ВОЛНА 22.75: кнопка НЕ сохраняется сразу — сначала шаг «📎 файлы»
+    # (любые файлы, шифрование с анимацией; «⏭ Пропустить» — кнопкой).
+    # Файлы разрешены не только личным кнопкам: глобальные создаёт разработчик.
+    context.user_data['pending_global_button'] = global_button
+    return await _btn_files_step(update, context, "gb")
 
 @timeout(CONVERSATION_TIMEOUT)
 async def dev_global_button_content_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -49258,30 +50163,10 @@ async def dev_global_button_content_handler(update: Update, context: ContextType
     button_type = context.user_data.get('global_button_type', 'text')
     global_button = GlobalButton(button_id, button_name, content, button_type)
 
-    buttons = load_global_buttons()
-    buttons[button_id] = global_button
-    save_global_buttons(buttons)
-
-    users = load_users()
-    for uid, u in users.items():
-        if not u.is_blocked and uid != user_id:
-            try:
-                # Автообновление клавиатуры — не нужно нажимать /start.
-                await context.bot.send_message(
-                    chat_id=uid,
-                    text=f"🔔 Разработчик создал новую кнопку: *{button_name}*",
-                    parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=get_main_menu_keyboard(u),
-                )
-            except Exception as e:
-                logger.error(f"Ошибка уведомления {uid}: {e}")
-
-    await update.message.reply_text(f"✅ Глобальная кнопка '{button_name}' создана!")
-
-    context.user_data.pop('global_button_name', None)
-    context.user_data.pop('global_button_type', None)
-    context.user_data.pop('creating_global_button', None)
-    return await developer_panel(update, context)
+    # ВОЛНА 22.75: кнопка НЕ сохраняется сразу — сначала шаг «📎 файлы»
+    # (см. dev_global_button_url_handler).
+    context.user_data['pending_global_button'] = global_button
+    return await _btn_files_step(update, context, "gb")
 
 
 # ПУНКТ 3: разработчик может удалить глобальные кнопки
@@ -49328,6 +50213,11 @@ async def dev_delete_global_button_handler(update: Update, context: ContextTypes
     buttons = load_global_buttons()
     if button_id in buttons:
         button_name = buttons[button_id].name
+        # ВОЛНА 22.75 (M4): шифры файлов кнопки стираем и из канала.
+        try:
+            await _btn_delete_channel_files(context, getattr(buttons[button_id], 'files', []))
+        except Exception:
+            pass
         del buttons[button_id]
         save_global_buttons(buttons)
         await query.edit_message_text(
@@ -49927,39 +50817,11 @@ async def custom_button_url_handler(update: Update, context: ContextTypes.DEFAUL
         button_type="url"
     )
 
-    buttons = load_data(CUSTOM_BUTTONS_FILE, {}, expect="dict")
-    buttons[button_id] = custom_button.to_dict()
-    save_data(CUSTOM_BUTTONS_FILE, buttons)
-
-    class_obj = get_class_by_code(class_code)
-    if class_obj:
-        class_obj.class_buttons.append(button_id)
-        classes = load_classes()
-        classes[class_code] = class_obj
-        save_classes(classes)
-
-        button_display_name = button_name.replace("CLASS_", "") if button_name.startswith("CLASS_") else button_name
-        for member_id in class_obj.students + class_obj.admins:
-            if member_id != str(user_id):
-                try:
-                    # Автообновление клавиатуры — не нужно нажимать /start.
-                    member_user = get_user(member_id)
-                    kb = get_main_menu_keyboard(member_user) if member_user else None
-                    await context.bot.send_message(
-                        chat_id=member_id,
-                        text=f"🔔 Администратор класса '{class_obj.class_name}' создал новую кнопку: *{button_display_name}*",
-                        parse_mode=ParseMode.MARKDOWN,
-                        reply_markup=kb,
-                    )
-                except Exception as e:
-                    logger.error(f"Ошибка уведомления {member_id}: {e}")
-
-    await update.message.reply_text(f"✅ Кнопка '{button_name}' создана!")
-
-    context.user_data.pop('custom_button_type', None)
-    context.user_data.pop('custom_button_name', None)
-
-    return await admin_panel(update, context)
+    # ВОЛНА 22.75: кнопка НЕ сохраняется сразу — сначала шаг «📎 файлы»
+    # (любые файлы, шифрование с анимацией; «⏭ Пропустить» — кнопкой).
+    # Файлы на кнопках класса создаёт АДМИН КЛАССА.
+    context.user_data['pending_class_button'] = custom_button
+    return await _btn_files_step(update, context, "cb")
 
 @timeout(CONVERSATION_TIMEOUT)
 async def custom_button_content_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -49990,39 +50852,10 @@ async def custom_button_content_handler(update: Update, context: ContextTypes.DE
         button_type="text"
     )
 
-    buttons = load_data(CUSTOM_BUTTONS_FILE, {}, expect="dict")
-    buttons[button_id] = custom_button.to_dict()
-    save_data(CUSTOM_BUTTONS_FILE, buttons)
-
-    class_obj = get_class_by_code(class_code)
-    if class_obj:
-        class_obj.class_buttons.append(button_id)
-        classes = load_classes()
-        classes[class_code] = class_obj
-        save_classes(classes)
-
-        button_display_name = button_name.replace("CLASS_", "") if button_name.startswith("CLASS_") else button_name
-        for member_id in class_obj.students + class_obj.admins:
-            if member_id != str(user_id):
-                try:
-                    # Автообновление клавиатуры — не нужно нажимать /start.
-                    member_user = get_user(member_id)
-                    kb = get_main_menu_keyboard(member_user) if member_user else None
-                    await context.bot.send_message(
-                        chat_id=member_id,
-                        text=f"🔔 Администратор класса '{class_obj.class_name}' создал новую кнопку: *{button_display_name}*",
-                        parse_mode=ParseMode.MARKDOWN,
-                        reply_markup=kb,
-                    )
-                except Exception as e:
-                    logger.error(f"Ошибка уведомления {member_id}: {e}")
-
-    await update.message.reply_text(f"✅ Кнопка '{button_name}' создана!")
-
-    context.user_data.pop('custom_button_type', None)
-    context.user_data.pop('custom_button_name', None)
-
-    return await admin_panel(update, context)
+    # ВОЛНА 22.75: кнопка НЕ сохраняется сразу — сначала шаг «📎 файлы»
+    # (см. custom_button_url_handler).
+    context.user_data['pending_class_button'] = custom_button
+    return await _btn_files_step(update, context, "cb")
 
 async def admin_delete_buttons_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -50064,6 +50897,11 @@ async def admin_delete_button_handler(update: Update, context: ContextTypes.DEFA
 
     if button_id in buttons:
         button_name = buttons[button_id].get('name', 'Неизвестно')
+        # ВОЛНА 22.75 (M4): шифры файлов кнопки стираем и из канала.
+        try:
+            await _btn_delete_channel_files(context, buttons[button_id].get('files'))
+        except Exception:
+            pass
         del buttons[button_id]
         save_data(CUSTOM_BUTTONS_FILE, buttons)
 
@@ -57283,7 +58121,11 @@ async def personal_buttons_menu_from_message(update: Update, context: ContextTyp
 
     text = f"🌟 **Мои личные кнопки**\n\n📊 Количество: {buttons_count}/{user.max_personal_buttons}\n\n👇 *Выберите действие:*"
 
-    await update.message.reply_text(text, reply_markup=get_personal_buttons_keyboard(user), parse_mode="Markdown")
+    # ВОЛНА 22.75: через effective_chat — меню работает и из колбэка
+    # (финализация кнопки после шага «📎 файлы»).
+    await context.bot.send_message(chat_id=update.effective_chat.id, text=text,
+                                   reply_markup=get_personal_buttons_keyboard(user),
+                                   parse_mode="Markdown")
     return PERSONAL_BUTTON_MANAGEMENT
 
 async def cancel_anon_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -59046,8 +59888,13 @@ SOL_TTLS = (
     ("3 дня", 72),
     ("1 неделя", 168),
     ("1 месяц", 720),
-    ("не удалять", 0),
+    ("максимум (35 дней)", 0),
 )
+# ВОЛНА 22.75 (M3): ЖЁСТКИЙ ПОТОЛОК ХРАНЕНИЯ — любое решение (даже с
+# «не удалять») стирается с ботом (вместе с шифрами файлов из канала)
+# через 35 дней после публикации. Требование пользователя: «каждые 35 дней
+# решения должны удаляться с бота и должны удаляться решения».
+_SOL_HARD_MAX_AGE_H = 35 * 24
 _SOL_EXPIRE_CHECK_EVERY = 300  # чистка просроченных — раз в 5 минут
 
 _SOL_CACHE = None
@@ -59086,15 +59933,16 @@ def _sol_find_entry(sol_id):
 # === ВОЛНА 22.13: автоудаление решений ===
 
 def _sol_ttl_label(ttl_h):
-    """Читаемое имя срока хранения по часам (0 = не удалять)."""
+    """Читаемое имя срока хранения по часам (0 = максимум — 35 дней)."""
     for _lbl, _h in SOL_TTLS:
         if int(_h or 0) == int(ttl_h or 0):
             return _lbl
-    return f"{ttl_h} ч" if ttl_h else "не удалять"
+    return f"{ttl_h} ч" if ttl_h else "максимум (35 дней)"
 
 
 def _sol_apply_ttl(entry, ttl_h):
-    """Записать в решение срок хранения (expire_ts). ttl_h=0 — не удалять."""
+    """Записать в решение срок хранения (expire_ts). ttl_h=0 — максимум
+    (35 дней; потолок реализован в _sol_purge_expired по created_ts)."""
     ttl_h = int(ttl_h or 0)
     entry["ttl_h"] = ttl_h
     entry["expire_ts"] = (time.time() + ttl_h * 3600) if ttl_h > 0 else None
@@ -59135,24 +59983,42 @@ async def _sol_delete_channel_file(context, entry):
 
 async def _sol_purge_expired(context):
     """ВОЛНА 22.13: удаляет просроченные решения (любой статус) из реестра
-    и их шифры из канала. Вызывается из единого тикера раз в 5 минут."""
+    и их шифры из канала. Вызывается из единого тикера раз в 5 минут.
+    ВОЛНА 22.75 (M3): добавлен ЖЁСТКИЙ ПОТОЛОК — 35 дней с публикации
+    (_SOL_HARD_MAX_AGE_H): решение удаляется, даже если выбрано «максимум».
+    Для легаси-записей без created_ts отсчёт начинается с момента апдейта
+    (никаких внезапных массовых удалений старых записей)."""
     now = time.time()
     removed = []
+    stamped = 0
     for code, entries in _solutions_all().items():
         keep = []
         for e in entries:
             if not isinstance(e, dict):
                 continue
+            # Легаси-записи без created_ts: ставим отсчёт «сейчас» —
+            # им гарантированные 35 дней с апдейта, база не пустеет внезапно.
+            if not e.get("created_ts"):
+                e["created_ts"] = now
+                stamped += 1
             exp = e.get("expire_ts")
             if exp and float(exp) < now:
                 removed.append(e)
                 continue
+            # ЖЁСТКИЙ ПОТОЛОК 35 дней — сильнее любого TTL (в т.ч. «максимум»)
+            try:
+                if now - float(e.get("created_ts") or now) > _SOL_HARD_MAX_AGE_H * 3600:
+                    removed.append(e)
+                    continue
+            except (TypeError, ValueError):
+                pass
             keep.append(e)
         _solutions_all()[code] = keep
-    if removed:
+    if removed or stamped:
         _solutions_save()
-        for e in removed[:20]:  # не больше 20 удалений из канала за цикл
-            await _sol_delete_channel_file(context, e)
+    for e in removed[:20]:  # не больше 20 удалений из канала за цикл
+        await _sol_delete_channel_file(context, e)
+    if removed:
         logger.info(f"solutions: автоудалено просроченных решений: {len(removed)}")
 
 
@@ -59498,7 +60364,9 @@ async def sol_anon_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _rows.append([InlineKeyboardButton("❌ Отмена", callback_data="sol_cancel")])
     await query.edit_message_text(
         "⏳ ЧЕРЕЗ СКОЛЬКО УДАЛИТЬ запись из базы?\n\n"
-        "Потом это можно поменять только через старосту при модерации.",
+        "Потом это можно поменять только через старосту при модерации.\n\n"
+        "⏰ МАКСИМАЛЬНЫЙ срок хранения любого решения — 35 дней: после этого "
+        "оно удаляется автоматически вместе с файлами (волна 22.75).",
         reply_markup=InlineKeyboardMarkup(_rows))
     return SOL_WAIT_FILE
 
@@ -59611,6 +60479,9 @@ async def _sol_publish_pending(update, context, user, class_obj, pend, ttl_h):
         "status": "pending",
         "approved_by": "",
         "ts": datetime.now().strftime("%d.%m %H:%M"),
+        # ВОЛНА 22.75 (M3): эпоха публикации — по ней считается жёсткий
+        # потолок хранения 35 дней (сильнее любого выбранного TTL).
+        "created_ts": time.time(),
     }
     _sol_apply_ttl(entry, ttl_h)
     context.user_data.pop('sol_pending', None)
@@ -63157,6 +64028,41 @@ async def _post_init(application):
     except Exception as e:
         logger.error(f"poll_sched restore boot: {e}")
 
+    # === ШАГ 13 (ВОЛНА 22.75, M4): WAL-реконсиляция облака — восстановить
+    # записи файлов, потерянные базой, но живые в журнале (файл в канале
+    # остался — запись обязана быть). После этого — регистрация тика
+    # целостности (срез ~25 файлов раз в 6 ч, битовое — только помечаем).
+    try:
+        await _cloud_wal_reconcile(application)
+    except Exception as e:
+        logger.error(f"WAL reconcile boot: {e}")
+    try:
+        if application.job_queue is not None:
+            application.job_queue.run_repeating(
+                _cloud_integrity_tick,
+                interval=_CLOUD_INTEGRITY_INTERVAL,
+                first=120,
+                name="cloud_integrity",
+            )
+            logger.info("Тик целостности облака зарегистрирован (раз в 6 ч).")
+    except Exception as e:
+        logger.error(f"cloud integrity регистрация: {e}")
+
+    # === ШАГ 14 (ВОЛНА 22.75, M2): восстановление истории AI-диалогов из БД —
+    # контекст DEVORKS+ai переживает рестарт/передеплой.
+    try:
+        _ai_hist = load_data(AI_HIST_FILE, {}, expect="dict")
+        if isinstance(_ai_hist, dict):
+            _restored = 0
+            for _uid, _msgs in _ai_hist.items():
+                if isinstance(_msgs, list) and _msgs:
+                    user_conversations[str(_uid)] = _msgs
+                    _restored += 1
+            if _restored:
+                logger.info(f"История AI-диалогов восстановлена: {_restored} диалог(ов).")
+    except Exception as e:
+        logger.error(f"ai hist load: {e}")
+
     # === ВОЛНА 22.19 (C.4): кнопка меню бота → Mini App «DEVO+ Облако».
     # Ставится РОВНО ОДИН раз на старте и ТОЛЬКО если задан MINIAPP_URL (env):
     # «галочка» (кнопка веб-приложения) стоит правильно, без миганий и без
@@ -63978,6 +64884,33 @@ def main():
                 MessageHandler((filters.PHOTO | filters.TEXT) & ~filters.COMMAND,
                                personal_button_photo_handler),
                 CallbackQueryHandler(handle_callback),
+            ],
+            # ВОЛНА 22.75: шаг «📎 файлы кнопки» — ЛЮБЫЕ файлы (личные кнопки,
+            # глобальные кнопки разработчика, кнопки класса админа). Шифрование
+            # с анимацией; «⏭ Пропустить/✅ Готово» — колбэками.
+            CREATE_PB_FILES_WAIT: [
+                MessageHandler((filters.PHOTO | filters.VIDEO | filters.AUDIO
+                                | filters.VOICE | filters.VIDEO_NOTE
+                                | filters.ANIMATION | filters.Document.ALL
+                                | filters.TEXT) & ~filters.COMMAND,
+                               _button_files_media_handler),
+                CallbackQueryHandler(_btn_files_cb_router),
+            ],
+            CREATE_GB_FILES_WAIT: [
+                MessageHandler((filters.PHOTO | filters.VIDEO | filters.AUDIO
+                                | filters.VOICE | filters.VIDEO_NOTE
+                                | filters.ANIMATION | filters.Document.ALL
+                                | filters.TEXT) & ~filters.COMMAND,
+                               _button_files_media_handler),
+                CallbackQueryHandler(_btn_files_cb_router),
+            ],
+            CREATE_CB_FILES_WAIT: [
+                MessageHandler((filters.PHOTO | filters.VIDEO | filters.AUDIO
+                                | filters.VOICE | filters.VIDEO_NOTE
+                                | filters.ANIMATION | filters.Document.ALL
+                                | filters.TEXT) & ~filters.COMMAND,
+                               _button_files_media_handler),
+                CallbackQueryHandler(_btn_files_cb_router),
             ],
             MANAGE_PERSONAL_BUTTONS: [
                 CallbackQueryHandler(handle_callback),
