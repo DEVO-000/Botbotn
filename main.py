@@ -472,6 +472,9 @@ SET_WEATHER_TIME = 100
 DEV_HOLIDAY_DATE = 101
 DEV_HOLIDAY_TEXT = 102
 DEV_HOLIDAY_DELETE = 103
+# ВОЛНА 22.76: «📜 Праздники оптом» — разработчик присылает ВЕСЬ список
+# праздников одним сообщением, бот сам разбирает даты и названия.
+DEV_HOLIDAY_BULK = 164
 DEV_INSTANT_BROADCAST = 104
 # Состояние ввода времени уведомления «через сколько дней мой ДР».
 SET_BIRTHDAY_NOTIFICATION_TIME = 105
@@ -579,8 +582,9 @@ CUSTOM_BUTTON_EDIT_NAME = 157
 USER_SEARCH_WAIT = 158     # ждём поисковый запрос (панели дев/админа)
 CREATE_PB_PHOTO_WAIT = 159 # ждём фото для личной кнопки (/skip — без фото)
 BELLS_PHOTO_WAIT = 160     # ждём ФОТО расписания звонков
-# ВОЛНА 22.75 (M1): шаг «📎 файлы кнопки» — ЛЮБЫЕ файлы (фото/видео/доки/
-# музыка), каждый шифруется с анимацией; «⏭ Пропустить» — кнопкой.
+# ВОЛНА 22.75/22.76 (M1): шаг «📎 файлы кнопки» — ЛЮБЫЕ файлы (фото/видео/
+# доки/музыка) СРАЗУ ОДНИМ ШАГОМ, каждый шифруется с анимацией; завершение —
+# «✅ Готово» (без отдельного «Пропустить»).
 CREATE_PB_FILES_WAIT = 161 # файлы ЛИЧНОЙ кнопки
 CREATE_GB_FILES_WAIT = 162 # файлы ГЛОБАЛЬНОЙ кнопки (разработчик)
 CREATE_CB_FILES_WAIT = 163 # файлы кнопки КЛАССА (админ класса)
@@ -4208,7 +4212,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.75"
+BOT_BUILD = "22.76"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -4229,7 +4233,7 @@ def _default_instructions_text():
         '9. **DEVORKS+ai** — умный помощник: задайте любой вопрос и получите ответ. Всегда отвечает честно. Три режима: Обычный, 😈 Хамло и 🥰 Тепло (переключаются кнопками при входе в чат). AI принимает только ТЕКСТ — фото он не читает.\n'
         '10. **Анонимные сообщения** — отправляйте одноклассникам анонимные сообщения и отвечайте на них.\n'
         '11. **Личные и классные кнопки** — создавайте свои кнопки (ссылки/текст) и делайте меню удобным.\n'
-        '12. **🪄 AI Agent** — напишите обычным языком («русский на пятницу страница 45», «как зовут учителя по физре», «погода на завтра», «погода в Лондоне», «скрой кнопку Погода», «напиши анонимно Пете …») — бот сам выполнит. Про учителя КОНКРЕТНОГО предмета пришлёт только его, а не весь список. Управляет всем: ДЗ, учителя, звонки, таймеры, кнопки, анонимки, погода (любой город мира) и режимы ИИ.\n\n'
+        '12. **🪄 AI Agent** — напишите обычным языком («русский на пятницу страница 45», «как зовут учителя по физре», «погода на завтра», «погода в Лондоне», «скрой кнопку Погода», «напиши анонимно Пете …») — бот сам выполнит. Про учителя КОНКРЕТНОГО предмета пришлёт только его, а не весь список. Управляет ВСЕМ: ДЗ, учителя, звонки, таймеры, кнопки, анонимки, погода (любой город мира), режимы ИИ, профиль, рефералы, праздники, состав класса — а разработчик может через ИИ загружать праздники оптом, делать рассылки, менять цены, создавать глобальные кнопки, блокировать и начислять звёзды.\n\n'
         '**⚙️ НАСТРОЙКИ КНОПОК:**\n'
         '• Скрыть/показать любые кнопки\n'
         '• Переименовать кнопки\n'
@@ -6162,6 +6166,9 @@ def get_developer_keyboard():
         [InlineKeyboardButton("📝 Редактировать инструкцию", callback_data="dev_edit_instructions")],
         # === НОВОЕ: управление праздниками ===
         [InlineKeyboardButton("🎉 Назначить праздник", callback_data="dev_set_holiday")],
+        # ВОЛНА 22.76: весь список праздников одним сообщением — ИИ/парсер
+        # сам всё разберёт и применит.
+        [InlineKeyboardButton("📜 Праздники оптом (ИИ)", callback_data="dev_holiday_bulk")],
         [InlineKeyboardButton("🗑 Удалить праздник", callback_data="dev_delete_holiday")],
         # ПУНКТ (цены): кнопка изменения цен возвращена.
         # Цены автоматически подставляются в инструкцию через плейсхолдеры
@@ -37021,20 +37028,69 @@ def _automation_class_context_text(user, class_obj):
             )
     except Exception:
         pass
+    # ВОЛНА 22.76: флаг разработчика — модели нужно знать, какие dev-действия
+    # можно предлагать этому пользователю (import_holidays, broadcast…).
+    try:
+        if str(user.user_id) == str(DEVELOPER_ID):
+            lines.append("ПОЛЬЗОВАТЕЛЬ — РАЗРАБОТЧИК БОТА: ему доступны dev-действия "
+                         "(import_holidays, delete_holiday, broadcast, set_price, "
+                         "create_global_button, delete_global_button, block_user, "
+                         "unblock_user, grant_stars, show_bot_stats).")
+    except Exception:
+        pass
+    # ВОЛНА 22.76: праздники бота в контексте — модель отвечает на вопросы
+    # «когда следующий праздник?» без лишних действий.
+    try:
+        _hol = load_holidays()
+        if _hol:
+            def _hkey(kv):
+                try:
+                    d, m = kv[0].split("-")
+                    return (int(m), int(d))
+                except Exception:
+                    return (99, 99)
+            _hitems = sorted(_hol.items(), key=_hkey)
+            _hlist = []
+            for _hk, _hnames in _hitems:
+                for _hn in (_hnames or []):
+                    _hlist.append(f"{_hk} — {_hn}")
+            _shown = "; ".join(_hlist[:40])
+            _more = f" (и ещё {len(_hlist) - 40})" if len(_hlist) > 40 else ""
+            lines.append(f"Праздники бота (ежегодные, ДД-ММ): {_shown}{_more}.")
+    except Exception:
+        pass
+    # ВОЛНА 22.76: звёзды/рефералы/город — для show_profile и ответов.
+    try:
+        lines.append(f"Баланс пользователя: {int(getattr(user, 'stars_balance', 0) or 0)} звёзд.")
+        _ref = int(getattr(user, 'referrals_count', 0) or 0)
+        if _ref:
+            lines.append(f"Приглашено друзей (рефералов): {_ref}.")
+    except Exception:
+        pass
     return "\n".join(lines)
 
 
 def _automation_system_prompt(context_text, is_admin):
     admin_block = (
-        "Пользователь ЯВЛЯЕТСЯ администратором класса: ему доступны все изменяющие действия."
+        "Пользователь ЯВЛЯЕТСЯ администратором класса: ему доступны все изменяющие "
+        "действия класса."
         if is_admin
-        else "Пользователь НЕ администратор: изменяющие действия (add_homework, add_homework_many, delete_homework, delete_homework_many, replace_teachers, add_subject, remove_subject, edit_schedule, edit_bell, set_bells, set_holidays, send_class_message, schedule_class_message, delete_class_timer) ему ЗАПРЕЩЕНЫ. Если он просит именно их — верни действие \"clarify\" с вопросом-напоминанием, что менять класс может только админ."
+        else "Пользователь НЕ администратор: изменяющие действия класса (add_homework, add_homework_many, delete_homework, delete_homework_many, replace_teachers, add_subject, remove_subject, edit_schedule, edit_bell, set_bells, set_holidays, send_class_message, schedule_class_message, delete_class_timer, remove_student) ему ЗАПРЕЩЕНЫ. Если он просит именно их — верни действие \"clarify\" с вопросом-напоминанием, что менять класс может только админ."
+    )
+    # ВОЛНА 22.76: действия РАЗРАБОТЧИКА — только ему, остальным отказ.
+    dev_block = (
+        "Пользователь — РАЗРАБОТЧИК БОТА: ему доступны dev-действия "
+        "(import_holidays, delete_holiday, broadcast, set_price, "
+        "create_global_button, delete_global_button, block_user, unblock_user, "
+        "grant_stars, show_bot_stats) в полном объёме."
+        if "ПОЛЬЗОВАТЕЛЬ — РАЗРАБОТЧИК БОТА" in (context_text or "")
+        else "Пользователь НЕ разработчик: dev-действия (import_holidays, delete_holiday, broadcast, set_price, create_global_button, delete_global_button, block_user, unblock_user, grant_stars, show_bot_stats) ему ЗАПРЕЩЕНЫ — если он просит именно их, верни none с вежливым отказом («это может сделать только разработчик бота»), БЕЗ попытки выполнить."
     )
     return (
         "Ты — модуль автоматизации школьного Telegram-бота. Твоя задача: превратить "
         "запрос пользователя на русском языке в ОДИН строгий JSON-объект с действием.\n\n"
         f"КОНТЕКСТ:\n{context_text}\n\n"
-        f"{admin_block}\n\n"
+        f"{admin_block}\n{dev_block}\n\n"
         "ДОСТУПНЫЕ ДЕЙСТВИЯ (верни ровно одно):\n"
         '1) {"action":"add_homework","subject":"<предмет>","date":"ГГГГ-ММ-ДД","text":"<задание>"} — добавить домашнее задание. Используй существующее название предмета класса, если пользователь имел в виду похожий предмет ("русский" -> "Русский язык"). Относительные даты ("пятница этой недели", "завтра") переводи в конкретную дату по контексту.\n'
         '2) {"action":"delete_homework","subject":"<предмет>","date":"ГГГГ-ММ-ДД или null"} — удалить ДЗ (null = всё ДЗ предмета).\n'
@@ -37076,7 +37132,25 @@ def _automation_system_prompt(context_text, is_admin):
         '34) {"action":"show_storage"} — показать статус хранилища и список файлов ЛИЧНОГО ОБЛАКА пользователя (доступно всем). «облако», «мои файлы», «что у меня в облаке», «сколько у меня файлов» → это действие.\n'
         '35) {"action":"backup_now"} — сделать БЭКАП ВСЕЙ БАЗЫ в приватный канал-хранилище (ТОЛЬКО разработчик). «сделай бэкап», «сохрани базу», «забэкапься» → это действие.\n'
         '36) {"action":"vault_status"} — показать СТАТУС СЕЙФА: сколько файлов зашифровано и общий размер (доступно всем). Имена файлов скрыты даже тут — они зашифрованы. «сейф», «что в сейфе», «сколько зашифровано», «мой сейф» → это действие.\n'
-        '37) {"action":"cdb_sync"} — СЛИТЬ ВСЮ БАЗУ в приватный канал-БД СЕЙЧАС (закреплённый снапшот; ТОЛЬКО разработчик). «сохрани базу в канал», «соль базу в канал», «синхронизируй базу», «перенеси базу в канал» → это действие.\n\n'
+        '37) {"action":"cdb_sync"} — СЛИТЬ ВСЮ БАЗУ в приватный канал-БД СЕЙЧАС (закреплённый снапшот; ТОЛЬКО разработчик). «сохрани базу в канал», «соль базу в канал», «синхронизируй базу», «перенеси базу в канал» → это действие.\n'
+        # === ВОЛНА 22.76: ИИ управляет КАЖДОЙ функцией бота ===
+        '38) {"action":"import_holidays","items":[{"date":"ДД-ММ или ДД.ММ или ДД месяца","name":"<название>"}],"mode":"add|replace"} — ЗАГРУЗИТЬ ВЕСЬ СПИСОК ПРАЗДНИКОВ СРАЗУ (ТОЛЬКО разработчик). Когда пользователь (разработчик) присылает список праздников («вот все праздники: 1 января — Новый год, 7 января — Рождество…») — разбери КАЖДУЮ дату и название в элементы items (даты приводи к виду ДД-ММ, год отбрасывай — праздники ежегодные), ничего не теряй. mode:"add" — добавить к текущим (по умолчанию); mode:"replace" — заменить весь список, ТОЛЬКО если пользователь прямо сказал «замени/очисти и поставь». После этого бот САМ разошлёт поздравления в эти дни — сообщи это.\n'
+        '39) {"action":"delete_holiday","date":"ДД-ММ или null","name":"<название или null>"} — УДАЛИТЬ праздник (ТОЛЬКО разработчик). «удали праздник Новый год» = name:"Новый год"; «удали праздник 31-12» = date:"31-12".\n'
+        '40) {"action":"show_holidays_all"} — показать ВСЕ праздники бота с датами (доступно всем; «какие праздники есть в боте?», «список праздников»). Для вопроса «когда следующий праздник?» отвечай none по контексту праздников из КОНТЕКСТА.\n'
+        '41) {"action":"broadcast","text":"<сообщение>"} — РАССЫЛКА ВСЕМ пользователям бота (ТОЛЬКО разработчик). «разошли всем …», «объяви всем пользователям …» → это действие. Уведомление получит каждый не заблокированный пользователь.\n'
+        '42) {"action":"set_price","key":"<ключ или русское название>","value":<число>} — ИЗМЕНИТЬ ЦЕНУ/ЛИМИТ функции (ТОЛЬКО разработчик). Ключи: button_base (создание кнопки), button_increment (следующая кнопка), unblock (разблокировка), unblock_dev (разблок у разработчика), view_sender (посмотреть отправителя анонимки), anon_keep_month (хранение анонимок/мес), ai_generation (сообщение в DEVORKS+ai), cloud_max_files (лимит файлов облака). Понимай русские названия: «цена кнопки»→button_base, «цена разблокировки»→unblock, «посмотреть отправителя»→view_sender, «лимит облака»→cloud_max_files. value — целое число ≥ 0; для cloud_max_files можно -1 или слово «бесконечность»/«∞» → -1 (безлимит).\n'
+        '43) {"action":"create_global_button","name":"<название>","content":"<ссылка или текст>","type":"url|text"} — СОЗДАТЬ ГЛОБАЛЬНУЮ кнопку у ВСЕХ пользователей (ТОЛЬКО разработчик). Если содержимое не названо — clarify.\n'
+        '44) {"action":"delete_global_button","name":"<название>"} — УДАЛИТЬ глобальную кнопку (ТОЛЬКО разработчик).\n'
+        '45) {"action":"block_user","user":"<имя, @username или id>","hours":<число или null>,"reason":"<причина или null>"} — ЗАБЛОКИРОВАТЬ пользователя (ТОЛЬКО разработчик). hours:null = навсегда; hours:72 = на 3 дня («заблокируй Петю на 3 дня» → hours:72, «навсегда» → null).\n'
+        '46) {"action":"unblock_user","user":"<имя, @username или id>"} — РАЗБЛОКИРОВАТЬ пользователя (ТОЛЬКО разработчик).\n'
+        '47) {"action":"grant_stars","user":"<имя, @username или id>","amount":<целое число>} — НАЧИСЛИТЬ/СПИСАТЬ звёзды пользователю (ТОЛЬКО разработчик). «дай Васе 50 звёзд» → amount:50; «забери у Васи 10 звёзд» → amount:-10.\n'
+        '48) {"action":"show_bot_stats"} — ОБЩАЯ СТАТИСТИКА бота: пользователи, классы, блокировки, кнопки (ТОЛЬКО разработчик).\n'
+        '49) {"action":"remove_student","user":"<имя или @username>"} — ВЫГНАТЬ участника из класса (ТОЛЬКО админ класса).\n'
+        '50) {"action":"show_class_users"} — показать СОСТАВ класса: участников, админов, заблокированных (доступно всем в классе).\n'
+        '51) {"action":"set_city","city":"<город>"} — ИЗМЕНИТЬ СВОЙ город (доступно всем; меняет и время уведомлений — бот перепланирует погоду и праздники сам).\n'
+        '52) {"action":"show_profile"} — МОЙ ПРОФИЛЬ: звёзды, VIP-подписки, город, день рождения, класс (доступно всем; «мой профиль», «что у меня есть»).\n'
+        '53) {"action":"show_referrals"} — РЕФЕРАЛЫ: сколько приглашено друзей и как пригласить (доступно всем; «мои рефералы», «как пригласить друга»).\n'
+        '54) {"action":"message_developer","text":"<сообщение>"} — НАПИСАТЬ РАЗРАБОТЧИКУ бота (доступно всем; «напиши разработчику …», «сообщи разработчику …»). Если текст не дан — clarify.\n\n'
         "ПРАВИЛА:\n"
         "- Отвечай ТОЛЬКО JSON-объектом, без пояснений и markdown.\n"
         "- Не выдумывай даты: считай их строго от сегодняшней даты из контекста. «Пятница этой недели» — пятница текущей недели (даже если она уже прошла — берём ближайшую ПЯТНИЦУ ТЕКУЩЕЙ недели, а не следующую). Для «следующей недели» есть отдельная строка контекста с готовыми датами.\n"
@@ -37091,6 +37165,12 @@ def _automation_system_prompt(context_text, is_admin):
         "- КОД КЛАССА: «скажи код класса», «какой у нас код?», «покажи код» = show_class_code.\n"
         "- ХРАНИЛИЩЕ/ОБЛАКО: «облако», «мои файлы», «что в облаке» = show_storage; «сделай бэкап», «сохрани базу» = backup_now (только разработчик); «открой облако» = open_section section:\"облако\".\n"
         "- КАНАЛ-БАЗА: «соль базу в канал», «сохрани базу в канал», «перенеси базу в канал», «синхронизируй базу» = cdb_sync (только разработчик).\n"
+        # === ВОЛНА 22.76: правила новых действий ===
+        "- ПРАЗДНИКИ ОПТОМ: если разработчик присылает СПИСОК праздников («вот праздники: 1 января — Новый год, 8 марта — Женский день…») — это import_holidays со ВСЕМИ элементами в items (даты → ДД-ММ, год отбрось, ничего не теряй). Один праздник добавить/удалить — тоже import_holidays/delete_holiday. НЕ разработчику — отказ (none).\n"
+        "- БЛОКИРОВКИ И ЗВЁЗДЫ: «заблокируй Петю на 3 дня» = block_user user:\"Петя\" hours:72; «заблокируй навсегда» = hours:null; «разблокируй» = unblock_user; «дай Васе 50 звёзд» = grant_stars amount:50. Все — ТОЛЬКО разработчик.\n"
+        "- ЦЕНЫ: «поставь цену кнопки 30» = set_price key:\"button_base\" value:30; «лимит облака бесконечность» = set_price key:\"cloud_max_files\" value:-1. ТОЛЬКО разработчик.\n"
+        "- РАССЫЛКА: «объяви всем…», «разошли всем пользователям…» = broadcast (ТОЛЬКО разработчик); сообщение КЛАССУ от админа — это send_class_message, а не broadcast.\n"
+        "- ПРОФИЛЬ: «мой профиль», «сколько у меня звёзд и что активно» = show_profile; «мои рефералы», «как пригласить друга» = show_referrals; «сменить город на Сочи» = set_city city:\"Сочи\"; «напиши разработчику …» = message_developer.\n"
         "- УЧИТЕЛЯ ТОЧНО: на вопрос про учителя КОНКРЕТНОГО предмета отвечай show_teachers с subject/subjects ТОЛЬКО этих предметов — не вываливай весь список. «Пост в мой канал» больше НЕВОЗМОЖЕН — на такие просьбы отвечайте none.\n"
         "- СЕЙФ: «сейф», «что в сейфе», «сколько зашифровано» = vault_status; «открой сейф», «положи в сейф» = open_section section:\"сейф\" (дальше пользователь работает кнопками — пароль через автоматизацию НЕ вводится). НЕ проси пароль в чате AI Agent!\n"
         "- Даты только в формате ГГГГ-ММ-ДД, время — ЧЧ:ММ (24-часовое).\n"
@@ -37312,6 +37392,67 @@ def _automation_resolve_when(action, local_now):
         return ("", "", False, None, [],
                 f"Время {date_str} {time_str} уже прошло — назовите будущее.")
     return (date_str, time_str, False, None, [], None)
+
+
+# === ВОЛНА 22.76: ИИ управляет КАЖДОЙ функцией бота — хелперы ===
+
+_PRICE_KEY_ALIASES = {
+    "button_base": "button_base",
+    "button_increment": "button_increment",
+    "unblock": "unblock",
+    "unblock_dev": "unblock_dev",
+    "view_sender": "view_sender",
+    "anon_keep_month": "anon_keep_month",
+    "ai_generation": "ai_generation",
+    "cloud_max_files": "cloud_max_files",
+    # Русские алиасы → ключи цен.
+    "кнопка": "button_base", "кнопки": "button_base",
+    "создание кнопки": "button_base", "цена кнопки": "button_base",
+    "следующая кнопка": "button_increment",
+    "разблок": "unblock", "разблокировка": "unblock",
+    "разблокировка у админа": "unblock",
+    "разблок у разработчика": "unblock_dev",
+    "отправитель": "view_sender", "отправитель анонимки": "view_sender",
+    "посмотреть отправителя": "view_sender",
+    "анонимки": "anon_keep_month", "хранение анонимок": "anon_keep_month",
+    "генерация": "ai_generation", "генерация ии": "ai_generation",
+    "сообщение ии": "ai_generation",
+    "облако": "cloud_max_files", "лимит облака": "cloud_max_files",
+    "место в облаке": "cloud_max_files",
+}
+
+
+def _automation_find_user(query_str):
+    """Найти пользователя по id / @username / имени (без регистра).
+    Возвращает (user, как_найдено) или (None, None)."""
+    q = str(query_str or "").strip()
+    if not q:
+        return None, None
+    users = load_users()
+    if q.isdigit():
+        u = users.get(q)
+        if u is not None:
+            return u, f"id {q}"
+    low = q.lower().lstrip("@")
+    for uid, u in users.items():
+        uname = str(getattr(u, "username", "") or "").lower().lstrip("@")
+        if uname and uname == low:
+            return u, f"@{uname}"
+    # Точное имя → начало имени.
+    for uid, u in users.items():
+        if str(getattr(u, "first_name", "") or "").strip().lower() == low:
+            return u, str(getattr(u, "first_name", "") or "")
+    for uid, u in users.items():
+        fn = str(getattr(u, "first_name", "") or "").strip().lower()
+        if fn and fn.startswith(low):
+            return u, str(getattr(u, "first_name", "") or "")
+    return None, None
+
+
+def _automation_user_label(u, uid=""):
+    name = str(getattr(u, "first_name", "") or f"User {uid}")
+    uname = str(getattr(u, "username", "") or "")
+    return f"{name} (@{uname})" if uname else name
 
 
 async def _automation_execute_action(update, context, user, class_obj, action):
@@ -38207,6 +38348,466 @@ async def _automation_execute_action(update, context, user, class_obj, action):
         q = (action.get("question") or "Уточните, пожалуйста, ваш запрос.").strip()
         return f"❓ {q}", False  # False — диалог продолжается, ничего не «завершено»
 
+    # ==========================================================
+    # === ВОЛНА 22.76: НОВЫЕ ДЕЙСТВИЯ — ИИ управляет всем    ===
+    # ==========================================================
+    is_dev = (user_id == str(DEVELOPER_ID))
+
+    if name == "import_holidays":
+        # «Праздники оптом» через ИИ: разработчик присылает список — модель
+        # вернула items [{date, name}], здесь приводим даты к ДД-ММ и пишем
+        # в holidays.json (уведомления подхватит единый тикер сам).
+        if not is_dev:
+            return "🚫 Загружать праздники может только разработчик бота.", True
+        raw_items = action.get("items")
+        if not isinstance(raw_items, list) or not raw_items:
+            return ("❓ Не распознал ни одного праздника. Перечислите строками: "
+                    "«1 января — Новый год», «8 марта — Женский день»…", False)
+        replace = str(action.get("mode") or "add").lower() == "replace"
+        if replace:
+            holidays = {}
+        else:
+            holidays = load_holidays()
+        added, skipped = 0, 0
+        for it in raw_items:
+            if not isinstance(it, dict):
+                skipped += 1
+                continue
+            key = _normalize_holiday_key(it.get("date"))
+            hname = str(it.get("name") or "").strip()[:80]
+            if not key or not hname:
+                skipped += 1
+                continue
+            existing = [str(x).strip().lower() for x in holidays.get(key, [])]
+            if hname.lower() in existing:
+                skipped += 1
+                continue
+            holidays.setdefault(key, []).append(hname)
+            added += 1
+        save_holidays(holidays)
+        total = sum(len(v) for v in load_holidays().values())
+        rep = (f"🎉 Праздники загружены: добавлено {added} шт."
+               + (f", пропущено (дубли/мусор) {skipped}" if skipped else "")
+               + f". Всего праздников в боте: {total}."
+               + ("\n♻️ Прежний список был заменён." if replace else "")
+               + "\n🔔 Поздравления пользователям придут автоматически в день "
+                 "праздника (у кого включены уведомления о праздниках).")
+        return rep, True
+
+    if name == "delete_holiday":
+        if not is_dev:
+            return "🚫 Удалять праздники может только разработчик бота.", True
+        holidays = load_holidays()
+        key = _normalize_holiday_key(action.get("date")) if action.get("date") else None
+        hname = str(action.get("name") or "").strip().lower()
+        removed = 0
+        if key:
+            bucket = holidays.get(key, [])
+            before = len(bucket)
+            if hname:
+                bucket = [x for x in bucket if str(x).strip().lower() != hname]
+            else:
+                bucket = []
+            removed = before - len(bucket)
+            if bucket:
+                holidays[key] = bucket
+            else:
+                holidays.pop(key, None)
+        elif hname:
+            for k in list(holidays.keys()):
+                bucket = holidays.get(k, [])
+                kept = [x for x in bucket if str(x).strip().lower() != hname]
+                removed += len(bucket) - len(kept)
+                if kept:
+                    holidays[k] = kept
+                else:
+                    holidays.pop(k, None)
+        else:
+            return ("❓ Скажите, ЧТО удалить: дату («удали праздник 31-12») "
+                    "или название («удали праздник Новый год»).", False)
+        if removed:
+            save_holidays(holidays)
+            return f"🗑 Удалено праздников: {removed}.", True
+        return "🤔 Такой праздник не найден. Посмотреть все: «список праздников».", False
+
+    if name == "show_holidays_all":
+        holidays = load_holidays()
+        if not holidays:
+            return "📅 Список праздников бота пуст.", True
+        def _hk(kv):
+            try:
+                d, m = kv[0].split("-")
+                return (int(m), int(d))
+            except Exception:
+                return (99, 99)
+        lines = ["🎉 Праздники бота (ежегодные):"]
+        for k, names in sorted(holidays.items(), key=_hk):
+            for n in (names or []):
+                lines.append(f"• {k} — {n}")
+        lines.append("Поздравления приходят автоматически, если включены "
+                     "уведомления о праздниках (⚙️ Настройки).")
+        return "\n".join(lines), True
+
+    if name == "broadcast":
+        if not is_dev:
+            return "🚫 Рассылка всем пользователям — только для разработчика.", True
+        text = (action.get("text") or "").strip()
+        if not text:
+            return "❓ Что разослать? Напишите текст объявления.", False
+        rejected = await reject_if_forbidden_chars(update, text, AI_AUTOMATION)
+        if rejected is not None:
+            return None, False
+        users = load_users()
+        sent_count = 0
+        for uid_t, u_t in users.items():
+            if getattr(u_t, "is_blocked", False):
+                continue
+            try:
+                await context.bot.send_message(
+                    chat_id=uid_t,
+                    text=f"📢 **Сообщение от разработчика:**\n\n{text}",
+                    parse_mode=ParseMode.MARKDOWN)
+                sent_count += 1
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                _ra = getattr(e, "retry_after", None)
+                if _ra:
+                    await asyncio.sleep(min(float(_ra) + 0.5, 60))
+                    try:
+                        await context.bot.send_message(
+                            chat_id=uid_t,
+                            text=f"📢 **Сообщение от разработчика:**\n\n{text}",
+                            parse_mode=ParseMode.MARKDOWN)
+                        sent_count += 1
+                    except Exception as e2:
+                        logger.error(f"AI broadcast {uid_t}: {e2}")
+                else:
+                    logger.error(f"AI broadcast {uid_t}: {e}")
+            await asyncio.sleep(0.05)
+        return f"📢 Рассылка отправлена {sent_count} пользователям.", True
+
+    if name == "set_price":
+        if not is_dev:
+            return "🚫 Менять цены может только разработчик бота.", True
+        raw_key = str(action.get("key") or "").strip().lower()
+        pkey = _PRICE_KEY_ALIASES.get(raw_key)
+        if not pkey:
+            for alias, pk in _PRICE_KEY_ALIASES.items():
+                if alias and (raw_key in alias or alias in raw_key):
+                    pkey = pk
+                    break
+        if not pkey:
+            return ("❓ Не понял, какую цену менять. Доступны: создание кнопки, "
+                    "следующая кнопка, разблокировка, разблок у разработчика, "
+                    "посмотреть отправителя, хранение анонимок, сообщение в ИИ, "
+                    "лимит облака.", False)
+        val_raw = action.get("value")
+        if isinstance(val_raw, str):
+            v = val_raw.strip().lower().replace("∞", "-1")
+            val = int(v) if re.fullmatch(r"-?\d+", v) else None
+        else:
+            try:
+                val = int(val_raw)
+            except (TypeError, ValueError):
+                val = None
+        if val is None:
+            return "❓ Укажите число (например 30). Для лимита облака можно «∞».", False
+        if val < 0 and pkey != "cloud_max_files":
+            return "❓ Цена не может быть отрицательной (лимит облака может: -1 = ∞).", False
+        prices = load_prices()
+        prices[pkey] = val
+        if not save_prices(prices):
+            return "❌ Не удалось сохранить цены в базу — проверьте хранилище.", True
+        reload_prices()
+        note = " (∞ — безлимит)" if (pkey == "cloud_max_files" and val == -1) else ""
+        return f"💰 Цена «{pkey}» изменена на {val}{note}. Действует мгновенно во всех модулях.", True
+
+    if name == "create_global_button":
+        if not is_dev:
+            return "🚫 Создавать глобальные кнопки может только разработчик.", True
+        bname = (action.get("name") or "").strip()
+        bcontent = (action.get("content") or "").strip()
+        btype = str(action.get("type") or ("url" if bcontent.startswith("http") else "text")).lower()
+        if btype not in ("url", "text"):
+            btype = "text"
+        if not bname:
+            return "❓ Как назвать кнопку? Укажите название.", False
+        if not bcontent:
+            return f"❓ Что должно открывать/содержать кнопка «{bname}»? Пришлите ссылку или текст.", False
+        rejected = await reject_if_forbidden_chars(update, bname, AI_AUTOMATION)
+        if rejected is not None:
+            return None, False
+        buttons = load_global_buttons()
+        if any(str(b.name).strip().lower() == bname.lower() for b in buttons.values()):
+            return f"⚠️ Глобальная кнопка «{bname}» уже существует — удалите её сначала.", False
+        gb = GlobalButton(button_id=generate_global_button_id(),
+                          name=bname, content=bcontent, button_type=btype)
+        buttons[gb.button_id] = gb
+        save_global_buttons(buttons)
+        # Автообновление клавиатур у всех пользователей (как в панели).
+        users = load_users()
+        for uid_t, u_t in users.items():
+            if uid_t == user_id or getattr(u_t, "is_blocked", False):
+                continue
+            try:
+                await context.bot.send_message(
+                    chat_id=uid_t,
+                    text=f"🔔 Разработчик создал новую кнопку: *{bname}*",
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=get_main_menu_keyboard(u_t))
+                await asyncio.sleep(0.05)
+            except Exception:
+                pass
+        return (f"✅ Глобальная кнопка «{bname}» создана и разослана всем "
+                "пользователям.", True)
+
+    if name == "delete_global_button":
+        if not is_dev:
+            return "🚫 Удалять глобальные кнопки может только разработчик.", True
+        bname = (action.get("name") or "").strip().lower()
+        if not bname:
+            return "❓ Какую глобальную кнопку удалить? Назовите название.", False
+        buttons = load_global_buttons()
+        target_id = None
+        for bid, b in buttons.items():
+            if str(b.name).strip().lower() == bname:
+                target_id = bid
+                break
+        if not target_id:
+            return f"🤔 Глобальная кнопка «{action.get('name')}» не найдена.", False
+        gone = buttons.pop(target_id)
+        save_global_buttons(buttons)
+        try:
+            await _btn_delete_channel_files(context, getattr(gone, "files", []) or [])
+        except Exception:
+            pass
+        # Клавиатуры пользователей обновятся при следующем /start — честно говорим.
+        return f"🗑 Глобальная кнопка «{gone.name}» удалена (и её файлы из хранилища).", True
+
+    if name == "block_user":
+        if not is_dev:
+            return "🚫 Блокировать пользователей может только разработчик.", True
+        tu, how = _automation_find_user(action.get("user"))
+        if tu is None:
+            return ("❓ Пользователь не найден. Укажите @username, имя или id "
+                    "пользователя бота.", False)
+        tuid = str(getattr(tu, "user_id", "") or "")
+        if tuid == str(DEVELOPER_ID):
+            return "🚫 Разработчика нельзя заблокировать.", True
+        hours = action.get("hours")
+        try:
+            hours = None if hours in (None, "", "null") else max(0.5, float(hours))
+        except (TypeError, ValueError):
+            hours = None
+        ok = block_user(tuid, blocked_by=user_id, unblock_price=0,
+                        until_hours=hours)
+        if not ok:
+            return "⚠️ Не удалось заблокировать (проверьте защиту от самоблокировки).", True
+        # Мгновенно сообщаем пользователю о блокировке (best-effort).
+        try:
+            await context.bot.send_message(
+                chat_id=tuid,
+                text=("🚫 Вы заблокированы разработчиком бота"
+                      + (f" на {int(hours)} ч." if hours else " навсегда") + "."))
+        except Exception:
+            pass
+        dur = f"на {int(hours)} ч." if hours else "НАВСЕГДА"
+        return f"🚫 Пользователь {_automation_user_label(tu, tuid)} заблокирован {dur}. Синхронизировано по всем классам в БД.", True
+
+    if name == "unblock_user":
+        if not is_dev:
+            return "🚫 Разблокировать может только разработчик.", True
+        tu, how = _automation_find_user(action.get("user"))
+        if tu is None:
+            return ("❓ Пользователь не найден. Укажите @username, имя или id "
+                    "пользователя бота.", False)
+        tuid = str(getattr(tu, "user_id", "") or "")
+        unblock_user(tuid)
+        try:
+            await context.bot.send_message(
+                chat_id=tuid, text="✅ Вы разблокированы разработчиком бота!")
+        except Exception:
+            pass
+        return f"✅ Пользователь {_automation_user_label(tu, tuid)} разблокирован (по всем классам тоже).", True
+
+    if name == "grant_stars":
+        if not is_dev:
+            return "🚫 Начислять звёзды может только разработчик.", True
+        tu, how = _automation_find_user(action.get("user"))
+        if tu is None:
+            return ("❓ Пользователь не найден. Укажите @username, имя или id "
+                    "пользователя бота.", False)
+        tuid = str(getattr(tu, "user_id", "") or "")
+        try:
+            amount = int(action.get("amount"))
+        except (TypeError, ValueError):
+            return "❓ Укажите ЦЕЛОЕ число звёзд (можно с минусом).", False
+        if amount == 0:
+            return "❓ Ноль не допускается.", False
+        if abs(amount) > 100000:
+            return "❓ Слишком большая сумма (>100000). Уменьшите.", False
+        try:
+            add_stars_transaction(
+                tuid, amount,
+                f"Начисление через ИИ-агента ({'+' if amount > 0 else ''}{amount}⭐)")
+        except Exception as e:
+            logger.error(f"AI grant_stars: {e}")
+            return "⚠️ Не удалось начислить звёзды — попробуйте позже.", True
+        sign = "+" if amount > 0 else ""
+        return (f"⭐ Пользователю {_automation_user_label(tu, tuid)} "
+                f"начислено {sign}{amount}⭐ (новый баланс: "
+                f"{int(getattr(tu, 'stars_balance', 0) or 0) + amount}).", True)
+
+    if name == "show_bot_stats":
+        if not is_dev:
+            return "🚫 Статистика бота — только для разработчика.", True
+        users = load_users()
+        classes = load_classes()
+        blocked_n = sum(1 for u_t in users.values()
+                        if getattr(u_t, "is_blocked", False))
+        buttons_n = len(load_global_buttons())
+        hol_n = sum(len(v) for v in load_holidays().values())
+        ch_n = len(get_cloud_channel_ids())
+        return ("\n".join([
+            "📊 Статистика бота:",
+            f"• пользователей: {len(users)} (заблокировано {blocked_n});",
+            f"• классов: {len(classes)};",
+            f"• глобальных кнопок: {buttons_n};",
+            f"• праздников в базе: {hol_n};",
+            f"• каналов-хранилищ: {ch_n}.",
+        ]), True)
+
+    if name == "remove_student":
+        if not class_obj:
+            return "🚫 Вы не состоите в классе — удалять некого.", True
+        if not is_admin:
+            return "🚫 Удалять участников класса может только админ класса.", True
+        tu, how = _automation_find_user(action.get("user"))
+        if tu is None:
+            return ("❓ Участник не найден. Укажите @username или имя "
+                    "участника вашего класса.", False)
+        tuid = str(getattr(tu, "user_id", "") or "")
+        if tuid not in (class_obj.students or []):
+            return f"🤔 {how} не состоит в вашем классе.", False
+        if tuid == user_id:
+            return "🚫 Себя удалить нельзя — класс без админа останется.", True
+        if tuid == str(DEVELOPER_ID):
+            return "🚫 Разработчика нельзя удалить из класса.", True
+        class_obj.students.remove(tuid)
+        if tuid in (class_obj.admins or []):
+            class_obj.admins.remove(tuid)
+        classes = load_classes()
+        classes[class_obj.class_code] = class_obj
+        save_classes(classes)
+        try:
+            _log_admin_action(user_id, class_obj.class_code,
+                              "Участник удалён (ИИ)",
+                              f"{_automation_user_label(tu, tuid)}")
+        except Exception:
+            pass
+        try:
+            await context.bot.send_message(
+                chat_id=tuid,
+                text=f"👋 Вас удалили из класса «{class_obj.class_name}».")
+        except Exception:
+            pass
+        return (f"✅ {_automation_user_label(tu, tuid)} удалён из класса "
+                f"{class_obj.class_name}.", True)
+
+    if name == "show_class_users":
+        if not class_obj:
+            return "🚫 Вы не состоите в классе.", True
+        users = load_users()
+        lines = [f"👥 Класс {class_obj.class_name} — состав:"]
+        admins = list(class_obj.admins or [])
+        students = [s for s in (class_obj.students or []) if s not in admins]
+        blocked = [str(b) for b in (getattr(class_obj, "blocked_users", None) or [])]
+        for uid_t in admins:
+            u_t = users.get(uid_t)
+            lines.append(f"• 👑 {_automation_user_label(u_t, uid_t)} — админ")
+        for uid_t in students:
+            u_t = users.get(uid_t)
+            mark = " 🚫заблокирован" if uid_t in blocked else ""
+            lines.append(f"• {_automation_user_label(u_t, uid_t)}{mark}")
+        lines.append(f"Всего: {len(class_obj.students or [])} чел.")
+        return "\n".join(lines), True
+
+    if name == "set_city":
+        city = (action.get("city") or "").strip()
+        if not city:
+            return "❓ Напишите город: «сменить город на Сочи».", False
+        user.city = city[:60]
+        save_user(user)
+        # Перепланируем погоду/праздники/ДР под новый город и часовой пояс.
+        try:
+            schedule_user_weather_job(context.application, user)
+            schedule_user_holiday_job(context.application, user)
+            schedule_user_birthday_job(context.application, user)
+        except Exception as e:
+            logger.error(f"AI set_city reschedule: {e}")
+        return (f"🏙 Город изменён на {user.city}. Прогноз погоды и праздники "
+                "перепланированы под ваш часовой пояс.", True)
+
+    if name == "show_profile":
+        subs = getattr(user, "subscriptions", {}) or {}
+        vip_lines = []
+        now = _utcnow()
+        for key, raw_val in sorted(subs.items()):
+            until = _parse_sub_until(raw_val)
+            if until is None or until <= now:
+                continue
+            vip_lines.append(f"• {_sub_display_name(key, raw_val)} — до {_fmt_sub_until(until)}")
+        cls_line = class_obj.class_name if class_obj else "нет"
+        birthday = str(getattr(user, "date", "") or "не указан")
+        lines = [
+            "👤 Ваш профиль:",
+            f"• звёзды: {int(getattr(user, 'stars_balance', 0) or 0)}⭐;",
+            f"• класс: {cls_line};",
+            f"• город: {getattr(user, 'city', '') or 'не указан'};",
+            f"• день рождения: {birthday};",
+            f"• рефералов: {int(getattr(user, 'referrals_count', 0) or 0)}.",
+        ]
+        lines.append("• VIP-подписки: " + ("; ".join(vip_lines) if vip_lines else "нет активных."))
+        lines.append("Меню: «⚖️ Правовая информация» и всё остальное — на месте.")
+        return "\n".join(lines), True
+
+    if name == "show_referrals":
+        ref_n = int(getattr(user, "referrals_count", 0) or 0)
+        try:
+            _bot_uname = context.bot.username
+        except Exception:
+            _bot_uname = ""
+        ref_link = (f"https://t.me/{_bot_uname}?start=ref_{user.user_id}"
+                    if _bot_uname else "ссылка появится в «⭐ Звезды» → «🤝 Пригласить друга»")
+        return ("\n".join([
+            "🤝 Ваши рефералы:",
+            f"• приглашено друзей: {ref_n};",
+            "• за каждого друга, который зарегистрируется по вашей ссылке, "
+            "начисляются звёзды автоматически;",
+            f"• ваша ссылка-приглашение: {ref_link}",
+            "Поделиться: кнопка «⭐ Звезды» → «🤝 Пригласить друга».",
+        ]), True)
+
+    if name == "message_developer":
+        text = (action.get("text") or "").strip()
+        if not text:
+            return ("❓ Что передать разработчику? Напишите сообщение "
+                    "целиком.", False)
+        rejected = await reject_if_forbidden_chars(update, text, AI_AUTOMATION)
+        if rejected is not None:
+            return None, False
+        try:
+            await context.bot.send_message(
+                chat_id=int(DEVELOPER_ID),
+                text=(f"📨 Сообщение от пользователя "
+                      f"{_automation_user_label(user, user.user_id)} "
+                      f"(id {user.user_id}):\n\n{text}"))
+        except Exception:
+            return ("⚠️ Не удалось доставить сообщение разработчику — "
+                    "попробуйте позже или через «💬 Написать админу».", True)
+        return "📨 Сообщение отправлено разработчику — он ответит, когда увидит.", True
+
     # --- Изменяющие действия (только админ класса) ---
     if name in {
         "add_homework", "add_homework_many", "delete_homework",
@@ -38695,6 +39296,15 @@ def _automation_help_text():
         "• «Мои VIP-подписки» — что активно и до когда\n"
         "• «Сейф» / «Что в сейфе» — шифрованное хранилище (файлы под вашим паролем)\n"
         "• «Соль базу в канал» (только разработчик) — синхронизация базы с каналом-БД\n"
+        # === ВОЛНА 22.76: ИИ управляет КАЖДОЙ функцией ===
+        "• «Мой профиль» — звёзды, VIP, город, класс; «Мои рефералы» — друзья и ссылка\n"
+        "• «Смени мой город на Сочи» / «Напиши разработчику: не работает кнопка»\n"
+        "• «Состав класса» — участники, админы, заблокированные (для админа: «выгони Петю»)\n"
+        "• «Какие праздники есть в боте?» — весь список праздников\n"
+        "• РАЗРАБОТЧИКУ: «вот все праздники: 1 января — Новый год, …» — загрузит ВЕСЬ список сам;\n"
+        "  «разошли всем …», «поставь цену кнопки 30», «лимит облака бесконечность»,\n"
+        "  «создай глобальную кнопку …», «заблокируй Петю на 3 дня», «дай Васе 50 звёзд»,\n"
+        "  «статистика бота» — ИИ управляет КАЖДОЙ функцией бота\n"
         "• Общий вопрос («какая сейчас погода в мире?») — просто отвечу\n\n"
         "🎙 Голос работает ВЕЗДЕ: голосовое сообщение в любом разделе бот\n"
         "расшифровывает и выполняет как обычный текст.\n"
@@ -42307,26 +42917,32 @@ async def _finish_personal_button_create(update: Update,
 @timeout(CONVERSATION_TIMEOUT)
 async def personal_button_photo_handler(update: Update,
                                         context: ContextTypes.DEFAULT_TYPE):
-    """ВОЛНА 22.74: шаг «📷 изображение кнопки» — фото или /skip.
-    ВОЛНА 22.75: после фото/пропуска — шаг «📎 файлы кнопки» (любые файлы,
-    шифрование с анимацией; «⏭ Пропустить» — кнопкой)."""
+    """ЛЕГАСО-хендлер шага «📷 изображение кнопки» (ВОЛНА 22.74).
+    ВОЛНА 22.76: шаг объединён с «📎 файлы» — состояние больше не
+    возвращается из флоу, но хендлер оставлен для устойчивости: если куда-то
+    и попадёт — просто перенаправит в единый шаг файлов (фото станет
+    обложкой и первым файлом)."""
     msg = update.message
     text = (msg.text or "").strip().lower()
     if msg.photo:
-        context.user_data['pb_photo_fid'] = msg.photo[-1].file_id
-        return await _btn_files_step(update, context, "pb")
-    if text in ("/skip", "скип", "пропустить", "пропуск", "-", "нет"):
-        context.user_data['pb_photo_fid'] = ""
-        return await _btn_files_step(update, context, "pb")
+        context.user_data.setdefault('btn_pending_files', [])
+        pend = context.user_data['btn_pending_files']
+        if not isinstance(pend, list):
+            pend = []
+            context.user_data['btn_pending_files'] = pend
+        if not context.user_data.get('btn_cover_fid'):
+            context.user_data['btn_cover_fid'] = msg.photo[-1].file_id
+        if len(pend) < _BTN_MAX_FILES:
+            p = msg.photo[-1]
+            pend.append({"id": "btn_" + secrets.token_hex(4),
+                         "fid": p.file_id, "ch": 0, "mid": 0,
+                         "ftype": "photo", "name": "photo.jpg",
+                         "mime": "image/jpeg", "size": int(p.file_size or 0),
+                         "plain": True,
+                         "cover": context.user_data.get('btn_cover_fid') == p.file_id})
     if text in ("/cancel", "отмена", "cancel"):
-        context.user_data.pop('pending_personal_button', None)
-        context.user_data.pop('personal_button_type', None)
-        context.user_data.pop('personal_button_name', None)
-        await msg.reply_text("❌ Создание кнопки отменено.")
-        return MAIN_MENU
-    await msg.reply_text(
-        "📷 Пришлите ИЗОБРАЖЕНИЕ одним сообщением — или напишите «пропустить», чтобы без фото.")
-    return CREATE_PB_PHOTO_WAIT
+        return await _btn_files_cancel(update, context)
+    return await _btn_files_step(update, context, "pb")
 
 
 # ============================================================
@@ -42337,7 +42953,9 @@ async def personal_button_photo_handler(update: Update,
 # сохранением в канал-хранилище ШИФРУЕТСЯ (AES-256-GCM, ключ бота — тот же
 # механизм, что у базы решений: в канале лежит только шифр), а процесс
 # оформлен АНИМАЦИЕЙ («🔐 Шифрую… ▰▰▰▱▱ 30%»). Если файлы не нужны —
-# ЖМЁТСЯ КНОПКА «⏭ Пропустить» (писать слово больше не требуется). Такие
+# ЖМЁТСЯ КНОПКА «✅ Готово» (писать слова не нужно; файлы присылают СРАЗУ —
+# фото/видео/любой файл одним сообщением, отдельного «Пропустить» нет).
+# Такие
 # кнопки может создавать не только владелец личной кнопки, но и РАЗРАБОТЧИК
 # (глобальные кнопки) и АДМИН КЛАССА (кнопки класса). Файлы переживают
 # рестарт/передеплой (users/classes/global_buttons.json — в БД), а при
@@ -42355,14 +42973,14 @@ _BTN_ANIM_FRAMES = ("🔐", "🔒", "🔏", "🔐")
 
 
 def _btn_files_kb(count: int) -> InlineKeyboardMarkup:
-    """Клавиатура шага «📎 файлы кнопки»: Готово (если есть файлы) /
-    Пропустить / Отмена — всё КНОПКАМИ, писать слова не нужно."""
-    row = [InlineKeyboardButton("⏭ Пропустить", callback_data="btnfiles_skip")]
-    if count > 0:
-        row.insert(0, InlineKeyboardButton(f"✅ Готово ({count})",
-                                           callback_data="btnfiles_done"))
+    """Клавиатура шага «📎 файлы кнопки» (ВОЛНА 22.76): «✅ Готово» — ВСЕГДА
+    (с файлами или без них — отдельная «⏭ Пропустить» больше не нужна:
+    файлы присылают СРАЗУ, тем же сообщением) + «❌ Отмена». Всё КНОПКАМИ,
+    писать слова не нужно."""
+    label = (f"✅ Готово ({count})" if count > 0
+             else "✅ Готово — без файлов")
     return InlineKeyboardMarkup([
-        row,
+        [InlineKeyboardButton(label, callback_data="btnfiles_done")],
         [InlineKeyboardButton("❌ Отмена", callback_data="btnfiles_cancel")],
     ])
 
@@ -42372,13 +42990,14 @@ def _btn_files_text(kind: str, count: int) -> str:
            "gb": "глобальной кнопки",
            "cb": "кнопки класса"}.get(kind, "кнопки")
     head = (f"📎 Шаг файлов {who}\n\n"
-            f"Пришлите файлы (фото, видео, музыка, документы) — до "
-            f"{_BTN_MAX_FILES} шт. Каждый файл будет ЗАШИФРОВАН 🔐 и будет "
+            f"Пришлите ФОТО, ВИДЕО или ФАЙЛ сразу — можно несколько (до "
+            f"{_BTN_MAX_FILES} шт.), можно целым альбомом. Первое фото станет "
+            "обложкой кнопки. Каждый файл будет ЗАШИФРОВАН 🔐 и будет "
             "выдаваться всем, кто нажмёт кнопку.")
     if count:
         return (head + f"\n\nУже прикреплено: {count}/{_BTN_MAX_FILES} — "
                 "жмите «✅ Готово», когда закончите.")
-    return head + "\n\nФайлы не нужны? Жмите «⏭ Пропустить»."
+    return head + "\n\nФайлы не нужны? Жмите «✅ Готово» — кнопка создастся без файлов."
 
 
 async def _btn_files_step(update, context, kind: str):
@@ -42577,15 +43196,21 @@ async def _button_files_media_handler(update, context):
     low = (msg.text or "").strip().lower()
     if low in ("/cancel", "отмена", "cancel"):
         return await _btn_files_cancel(update, context)
-    if low in ("/skip", "пропустить", "пропуск", "скип"):
-        return await _btn_files_route_done(update, context, attach=False)
-    await msg.reply_text("📎 Пришлите ФАЙЛ (фото/видео/музыку/документ) — или "
-                         "воспользуйтесь кнопками под сообщением.")
+    if low in ("/skip", "пропустить", "пропуск", "скип", "готово", "done",
+               "✅", "всё", "все", "/done"):
+        # ВОЛНА 22.76: «пропустить» — легаси-алиас; теперь завершение —
+        # «готово» (файлы не обязательны).
+        return await _btn_files_route_done(update, context, attach=True)
+    await msg.reply_text("📎 Пришлите ФОТО/ВИДЕО/ФАЙЛ сообщением — или жмите "
+                         "«✅ Готово» под этим сообщением.")
     return state
 
 
 async def _btn_files_cb_router(update, context):
-    """ВОЛНА 22.75: колбэки шага файлов — ✅ Готово / ⏭ Пропустить / ❌ Отмена."""
+    """Резервный роутер колбэков шага файлов (Готово/Отмена). Основной путь —
+    ВОЛНА 22.76: маршруты btnfiles_* живут в handle_callback, потому что
+    entry_points (allow_reentry=True) перехватывают колбэки раньше
+    хендлеров состояния. Здесь оставляем совместимость."""
     q = update.callback_query
     data = q.data or ""
     try:
@@ -42864,13 +43489,11 @@ async def create_personal_button_url_handler(update: Update, context: ContextTyp
         button_type="url"
     )
 
-    # ВОЛНА 22.74: кнопка не сохраняется сразу — сначала шаг «📷 фото»
-    # (можно «пропустить»). Слот prepaid списывается только при финализации.
+    # ВОЛНА 22.76: отдельный шаг «📷 фото» УДАЛЁН — фото/видео/файлы шлют
+    # СРАЗУ одним сообщением на шаге файлов (первое фото станет обложкой).
+    # Слот prepaid списывается только при финализации (как раньше).
     context.user_data['pending_personal_button'] = personal_button
-    await update.message.reply_text(
-        "📷 Пришлите ИЗОБРАЖЕНИЕ для кнопки (оно будет открываться при её нажатии)\n"
-        "или напишите «пропустить» — создать без изображения.")
-    return CREATE_PB_PHOTO_WAIT
+    return await _btn_files_step(update, context, "pb")
 
 @timeout(CONVERSATION_TIMEOUT)
 async def create_personal_button_content_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -42900,12 +43523,9 @@ async def create_personal_button_content_handler(update: Update, context: Contex
         button_type="text"
     )
 
-    # ВОЛНА 22.74: кнопка не сохраняется сразу — сначала шаг «📷 фото».
+    # ВОЛНА 22.76: шаг «📷 фото» объединён с шагом файлов — файлы шлют СРАЗУ.
     context.user_data['pending_personal_button'] = personal_button
-    await update.message.reply_text(
-        "📷 Пришлите ИЗОБРАЖЕНИЕ для кнопки (оно будет открываться при её нажатии)\n"
-        "или напишите «пропустить» — создать без изображения.")
-    return CREATE_PB_PHOTO_WAIT
+    return await _btn_files_step(update, context, "pb")
 
 @timeout(CONVERSATION_TIMEOUT)
 async def manage_personal_buttons_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -50135,7 +50755,7 @@ async def dev_global_button_url_handler(update: Update, context: ContextTypes.DE
     global_button = GlobalButton(button_id, button_name, url, "url")
 
     # ВОЛНА 22.75: кнопка НЕ сохраняется сразу — сначала шаг «📎 файлы»
-    # (любые файлы, шифрование с анимацией; «⏭ Пропустить» — кнопкой).
+    # (любые файлы СРАЗУ, шифрование с анимацией; завершение — «✅ Готово»).
     # Файлы разрешены не только личным кнопкам: глобальные создаёт разработчик.
     context.user_data['pending_global_button'] = global_button
     return await _btn_files_step(update, context, "gb")
@@ -50818,7 +51438,7 @@ async def custom_button_url_handler(update: Update, context: ContextTypes.DEFAUL
     )
 
     # ВОЛНА 22.75: кнопка НЕ сохраняется сразу — сначала шаг «📎 файлы»
-    # (любые файлы, шифрование с анимацией; «⏭ Пропустить» — кнопкой).
+    # (любые файлы СРАЗУ, шифрование с анимацией; завершение — «✅ Готово»).
     # Файлы на кнопках класса создаёт АДМИН КЛАССА.
     context.user_data['pending_class_button'] = custom_button
     return await _btn_files_step(update, context, "cb")
@@ -56890,6 +57510,27 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if isinstance(data, str) and (data.startswith("usrch_c_")
                                   or data.startswith("usrch_u_")):
         return await user_search_start(update, context)
+    # ВОЛНА 22.76 (ИСПРАВЛЕНИЕ «отмена не работает»): колбэки шага «📎 файлы
+    # кнопки» маршрутизируем ЗДЕСЬ, в центральном роутере. Причина:
+    # ConversationHandler с allow_reentry=True проверяет entry_points РАНЬШЕ
+    # хендлеров состояния (подтверждено исходником PTB 21.6 check_update), а в
+    # entry_points стоит безпаттерновый CallbackQueryHandler(handle_callback)
+    # — он перехватывал btnfiles_* ДО _btn_files_cb_router, маршрута не
+    # находил, и «❌ Отмена / ✅ Готово» молча ничего не делали.
+    if data in ("btnfiles_cancel", "btnfiles_done", "btnfiles_skip"):
+        # Гасим спиннер сразу: дальше общего query.answer() не будет
+        # (маршруты ниже завершают обработку раньше него).
+        try:
+            await query.answer()
+        except Exception:
+            pass
+    if data == "btnfiles_cancel":
+        return await _btn_files_cancel(update, context)
+    if data == "btnfiles_done":
+        return await _btn_files_route_done(update, context, attach=True)
+    if data == "btnfiles_skip":
+        # Легаси-кнопка из сообщений волны 22.75 — работает как «Готово».
+        return await _btn_files_route_done(update, context, attach=False)
     if data in ("dev_poll", "admin_poll"):
         _cb_uid = str(query.from_user.id)
         _cb_ok = (_cb_uid == DEVELOPER_ID if data == "dev_poll"
@@ -56931,7 +57572,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _cb_uid = str(query.from_user.id)
     if _cb_uid != DEVELOPER_ID and data not in (
             "open_support_chat", "check_subscription", "unblock_self",
-            "cancel_action"):
+            "cancel_action", "btnfiles_cancel"):
         _cb_user = get_user(_cb_uid)
         if _age_gate_violation(_cb_user):
             await _send_age_block(update, context)
@@ -57255,6 +57896,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # === НОВОЕ: разработчик — праздники и быстрая рассылка ===
     elif data == "dev_set_holiday":
         return await dev_set_holiday_start(update, context)
+    elif data == "dev_holiday_bulk":
+        # ВОЛНА 22.76: «📜 Праздники оптом».
+        return await dev_holiday_bulk_start(update, context)
+    elif data in ("dev_holbulk_add", "dev_holbulk_replace"):
+        # ВОЛНА 22.76: применить разобранный список праздников.
+        return await _dev_holiday_bulk_apply(
+            update, context, replace=(data == "dev_holbulk_replace"))
     elif data == "dev_delete_holiday":
         return await dev_delete_holiday_start(update, context)
     elif data.startswith("dev_del_hol_"):
@@ -59734,6 +60382,274 @@ async def dev_holiday_text_handler(update: Update, context: ContextTypes.DEFAULT
         f"включены уведомления о праздниках.",
         reply_markup=get_developer_keyboard()
     )
+    return DEV_PANEL
+
+
+# ============================================================
+# === ВОЛНА 22.76: «📜 ПРАЗДНИКИ ОПТОМ» — весь список сразу ===
+# ============================================================
+# Разработчик присылает ОДНИМ сообщением весь список праздников в ЛЮБОМ
+# разумном формате («1 января — Новый год», «08.03 Женский день», «5 октября:
+# День учителя», «Новый год 31-12»…) — бот сам разбирает даты и названия,
+# показывает превью и применяет: ДОБАВИТЬ к текущим или ЗАМЕНИТЬ всё.
+# Парсер ЛОКАЛЬНЫЙ (работает всегда, даже без DEEPSEEK_API_KEY), а в
+# 🪄 AI Agent то же самое умеет действие import_holidays.
+
+_MONTH_WORDS = {
+    "январ": 1, "феврал": 2, "март": 3, "апрел": 4, "ма": 5, "май": 5,
+    "июн": 6, "июл": 7, "август": 8, "сентябр": 9, "октябр": 10,
+    "ноябр": 11, "декабр": 12,
+}
+
+
+def _month_from_word(word):
+    """«января»/«январь»/«янв» → 1..12 или None."""
+    w = (word or "").strip().lower()
+    for pref, num in _MONTH_WORDS.items():
+        if w.startswith(pref):
+            return num
+    return None
+
+
+def _valid_day_month(d, m):
+    try:
+        d, m = int(d), int(m)
+    except (TypeError, ValueError):
+        return None
+    if not (1 <= m <= 12 and 1 <= d <= 31):
+        return None
+    # Мягкая проверка реальности даты (30/31 февраля отсекаем).
+    import calendar
+    if d > calendar.monthrange(2000, m)[1]:
+        return None
+    return f"{d:02d}-{m:02d}"
+
+
+def _normalize_holiday_key(raw):
+    """Привести дату праздника к ключу «ДД-ММ» (ежегодный). Понимает
+    ДД-ММ, ДД.ММ, ДД.ММ.ГГГГ, ГГГГ-ММ-ДД, «5 октября». None — не распознано."""
+    s = str(raw or "").strip().lower().replace(",", ".").replace("-", ".")
+    # ГГГГ-ММ-ДД → после замены «-» на «.»: 2026.05.10
+    m = re.fullmatch(r"(\d{4})[.](\d{1,2})[.](\d{1,2})", s)
+    if m:
+        return _valid_day_month(m.group(3), m.group(2))
+    m = re.fullmatch(r"(\d{1,2})[.](\d{1,2})(?:[.]\d{2,4})?", s)
+    if m:
+        return _valid_day_month(m.group(1), m.group(2))
+    # «5 октября», «5 октября 2026»
+    m = re.fullmatch(r"(\d{1,2})\s+([а-яё]+)(?:\s+\d{4})?", s)
+    if m:
+        mm = _month_from_word(m.group(2))
+        if mm:
+            return _valid_day_month(m.group(1), mm)
+    return None
+
+
+_HOL_BULK_SEP = r"\s*[—–:;)\](]+|\s+-\s+|\s+$"
+
+
+def _parse_holidays_bulk(text):
+    """Разобрать свободный текст со списком праздников → [(ключ ДД-ММ, имя)].
+    Понимает по строке (и по «;» внутри строки) форматы:
+      1 января — Новый год | 08.03 Женский день | 31-12: Канун НГ
+      5 октября: День учителя | Новый год — 1 января | 2026-03-08 Восьмое марта
+    Строки-заголовки/мусор молча пропускаются. Даты «31-02» отбрасываются."""
+    out = []
+    seen = set()
+    if not text:
+        return out
+    segments = []
+    for line in str(text).splitlines():
+        for part in line.split(";"):
+            part = part.strip()
+            if part:
+                segments.append(part)
+    for seg in segments:
+        seg = seg.strip().lstrip("-•*· ").strip()
+        if not seg or len(seg) < 3:
+            continue
+        # Формат «ГГГГ-ММ-ДД Имя» / «ДД.ММ(.ГГГГ) Имя» / «ДД-ММ Имя»
+        m = re.match(r"^\d{4}[-.]\d{1,2}[-.]\d{1,2}\s*(.*)$", seg)
+        if m:
+            key = _normalize_holiday_key(seg[:10])
+            name = m.group(1).strip()
+            if key and name:
+                out.append((key, name))
+            continue
+        m = re.match(r"^(\d{1,2})\s*[-./]\s*(\d{1,2})(?:\s*[-./]\s*\d{2,4})?"
+                     r"\s*(?:[—–:;\])]+\s*|-\s+|\s+)(.+)$", seg)
+        if m:
+            key = _valid_day_month(m.group(1), m.group(2))
+            name = m.group(3).strip()
+            if key and name:
+                out.append((key, name))
+            continue
+        # «5 октября — Имя» / «5 октября Имя»
+        m = re.match(r"^(\d{1,2})\s+([а-яё]+)\s*(?:[—–:;\])]+\s*|-\s+|\s+)(.+)$",
+                     seg, re.IGNORECASE)
+        if m:
+            mm = _month_from_word(m.group(2))
+            if mm:
+                key = _valid_day_month(m.group(1), mm)
+                name = m.group(3).strip()
+                if key and name:
+                    out.append((key, name))
+                    continue
+        # «Имя — 5 октября» / «Имя 9 мая» (разделитель не обязателен)
+        m = re.match(r"^(.+?)\s*(?:[—–:;\])]+\s*|-\s+|\s+)"
+                     r"(\d{1,2})\s+([а-яё]+)\s*(?:\d{4})?\s*$", seg, re.IGNORECASE)
+        if m:
+            mm = _month_from_word(m.group(3))
+            if mm:
+                key = _valid_day_month(m.group(2), mm)
+                name = m.group(1).strip()
+                if key and name:
+                    out.append((key, name))
+                    continue
+        m = re.match(r"^(.+?)\s*(?:[—–:;\])]+\s*|-\s+|\s+)"
+                     r"(\d{1,2}\s*[-./]\s*\d{1,2}(?:\s*[-./]\s*\d{2,4})?)\s*$", seg)
+        if m:
+            key = _normalize_holiday_key(m.group(2))
+            name = m.group(1).strip()
+            if key and name:
+                out.append((key, name))
+            continue
+    # Дедуп внутри списка.
+    dedup = []
+    for key, name in out:
+        low = (key, name.strip().lower())
+        if low in seen:
+            continue
+        seen.add(low)
+        name = name.strip()[:80]
+        if name:
+            dedup.append((key, name))
+    return dedup
+
+
+async def dev_holiday_bulk_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.76: «📜 Праздники оптом» — попросить у разработчика список."""
+    query = update.callback_query
+    if str(query.from_user.id) != str(DEVELOPER_ID):
+        try:
+            await query.answer("🚫 Только для разработчика.", show_alert=True)
+        except Exception:
+            pass
+        return MAIN_MENU
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    context.user_data.pop('dev_holiday_bulk_items', None)
+    text = (
+        "📜 ПРИШЛИТЕ ВСЕ ПРАЗДНИКИ ОДНИМ СООБЩЕНИЕМ — бот сам всё сделает.\n\n"
+        "Понимает любой формат, по одному празднику в строке (или через «;»):\n"
+        "• 1 января — Новый год\n"
+        "• 08.03 Международный женский день\n"
+        "• 5 октября: День учителя\n"
+        "• 31-12 Канун Нового года\n"
+        "• Новый год — 1 января\n"
+        "• 2026-03-08 Восьмое марта\n\n"
+        "После разбора покажу превью: сможете ДОБАВИТЬ праздники к текущим "
+        "или ЗАМЕНИТЬ весь список. Год не важен — праздники повторяются "
+        "ежегодно. Все пользователи с включёнными уведомлениями получат "
+        "поздравления автоматически (планировщик подхватит сам)."
+    )
+    try:
+        await query.edit_message_text(text, reply_markup=get_cancel_keyboard())
+    except Exception:
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=text)
+    return DEV_HOLIDAY_BULK
+
+
+@timeout(CONVERSATION_TIMEOUT)
+async def dev_holiday_bulk_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.76: разобрать присланный список — показать превью."""
+    if str(update.effective_user.id) != str(DEVELOPER_ID):
+        await update.message.reply_text("🚫 Только для разработчика.")
+        return MAIN_MENU
+    raw = (update.message.text or "").strip()
+    items = _parse_holidays_bulk(raw)
+    if not items:
+        await update.message.reply_text(
+            "🤔 Не распознал ни одной даты. Пришлите список строками вида\n"
+            "• 1 января — Новый год\n• 08.03 Женский день\n• 5 октября: День учителя\n"
+            "или жмите «❌ Отмена».",
+            reply_markup=get_cancel_keyboard())
+        return DEV_HOLIDAY_BULK
+    context.user_data['dev_holiday_bulk_items'] = items
+
+    # Превью (первые 30 строк) в календарном порядке.
+    def _k(item):
+        d, mth = item[0].split("-")
+        return (int(mth), int(d))
+    items_sorted = sorted(items, key=_k)
+    preview_lines = [f"📅 {k} — {n}" for k, n in items_sorted[:30]]
+    more = len(items_sorted) - len(preview_lines)
+    if more > 0:
+        preview_lines.append(f"…и ещё {more} шт.")
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"➕ Добавить к текущим ({len(items)})",
+                              callback_data="dev_holbulk_add")],
+        [InlineKeyboardButton(f"♻️ Заменить все ({len(items)})",
+                              callback_data="dev_holbulk_replace")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="cancel_action")],
+    ])
+    await update.message.reply_text(
+        f"🤖 Готово — распознал {len(items)} праздников:\n\n"
+        + "\n".join(preview_lines)
+        + "\n\nПрименить: ДОБАВИТЬ к текущим или ЗАМЕНИТЬ весь список?",
+        reply_markup=kb)
+    return DEV_HOLIDAY_BULK
+
+
+async def _dev_holiday_bulk_apply(update, context, replace: bool):
+    """Применить разобранный список: добавить к текущим или заменить всё."""
+    query = update.callback_query
+    if str(query.from_user.id) != str(DEVELOPER_ID):
+        try:
+            await query.answer("🚫 Только для разработчика.", show_alert=True)
+        except Exception:
+            pass
+        return MAIN_MENU
+    items = context.user_data.pop('dev_holiday_bulk_items', None)
+    if not items:
+        try:
+            await query.answer("Список потерян — пришлите заново.", show_alert=True)
+        except Exception:
+            pass
+        return await developer_panel(update, context)
+    holidays = {} if replace else load_holidays()
+    added, dup = 0, 0
+    for key, name in items:
+        existing = [str(x).strip().lower() for x in holidays.get(key, [])]
+        if name.strip().lower() in existing:
+            dup += 1
+            continue
+        holidays.setdefault(key, []).append(name)
+        added += 1
+    save_holidays(holidays)
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    total = sum(len(v) for v in load_holidays().values())
+    mode_word = "список ЗАМЕНЁН" if replace else "добавлены к текущим"
+    text = (f"✅ Праздники {mode_word}: добавлено {added} шт."
+            + (f", пропущено дубликатов {dup}" if dup else "")
+            + f".\n📅 Всего праздников в боте: {total}.\n\n"
+            "Поздравления пользователям придут автоматически в день "
+            "праздника (у кого включены уведомления о праздниках).")
+    try:
+        await query.edit_message_text(text)
+    except Exception:
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=text)
+    try:
+        await context.bot.send_message(chat_id=update.effective_chat.id,
+                                       text="🛠️ Панель разработчика:",
+                                       reply_markup=get_developer_keyboard())
+    except Exception:
+        pass
     return DEV_PANEL
 
 
@@ -64885,9 +65801,11 @@ def main():
                                personal_button_photo_handler),
                 CallbackQueryHandler(handle_callback),
             ],
-            # ВОЛНА 22.75: шаг «📎 файлы кнопки» — ЛЮБЫЕ файлы (личные кнопки,
-            # глобальные кнопки разработчика, кнопки класса админа). Шифрование
-            # с анимацией; «⏭ Пропустить/✅ Готово» — колбэками.
+            # ВОЛНА 22.75/22.76: шаг «📎 файлы кнопки» — ЛЮБЫЕ файлы СРАЗУ
+            # (личные кнопки, глобальные кнопки разработчика, кнопки класса
+            # админа). Шифрование с анимацией; «✅ Готово/❌ Отмена» —
+            # колбэками (основные маршруты — в handle_callback, см. волну
+            # 22.76: без них «Отмена» не работала).
             CREATE_PB_FILES_WAIT: [
                 MessageHandler((filters.PHOTO | filters.VIDEO | filters.AUDIO
                                 | filters.VOICE | filters.VIDEO_NOTE
@@ -65104,6 +66022,11 @@ def main():
                 CallbackQueryHandler(handle_callback),
             ],
             DEV_HOLIDAY_DELETE: [
+                CallbackQueryHandler(handle_callback),
+            ],
+            # ВОЛНА 22.76: «📜 Праздники оптом» — список одним сообщением.
+            DEV_HOLIDAY_BULK: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, dev_holiday_bulk_handler),
                 CallbackQueryHandler(handle_callback),
             ],
             DEV_INSTANT_BROADCAST: [
