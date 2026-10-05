@@ -4552,7 +4552,10 @@ async function loadFiles(silent, quiet) {
        просто появляются на местах, плавно и без рывков */
     const _sig = ALL_FILES.length + '|'
       + ALL_FILES.map(function (f) {
-          return f.id + ':' + f.ts + ':' + f.name + ':' + f.size;
+          /* 22.77: + kind и vault/облако — смена типа или перенос в Сейф
+             тоже перерисовывает список (синхронизация с ботом) */
+          return f.id + ':' + f.ts + ':' + f.name + ':' + f.size + ':' +
+            (f.kind || '') + ':' + (f.vault ? 'v' : 'c');
         }).join('|');
 
     if (_sig !== LAST_FILES_SIG) {
@@ -8134,7 +8137,9 @@ async function prestreamInitAll(files) {
             body: JSON.stringify({
               name: String(f.uploadName || f.name || 'file.bin').slice(0, 120),
               size: +f.size || 0,
-              mime: f.type || '',
+              /* 22.77: если браузер не дал mime (часто на Android) — догадываемся
+                 по расширению, чтобы тип (фото/видео/музыка) распознался ПРАВИЛЬНО */
+              mime: f.type || guessMime(f.uploadName || f.name || ''),
               password: f._uploadPw || '',
               hold: !!f._preHold
             })
