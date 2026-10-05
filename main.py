@@ -475,6 +475,7 @@ DEV_HOLIDAY_DELETE = 103
 # ВОЛНА 22.76: «📜 Праздники оптом» — разработчик присылает ВЕСЬ список
 # праздников одним сообщением, бот сам разбирает даты и названия.
 DEV_HOLIDAY_BULK = 164
+VAZHNO_WAIT = 165          # ВОЛНА 22.77: «❗ Важное» — текст + файлы одним потоком
 DEV_INSTANT_BROADCAST = 104
 # Состояние ввода времени уведомления «через сколько дней мой ДР».
 SET_BIRTHDAY_NOTIFICATION_TIME = 105
@@ -615,13 +616,14 @@ _QUICK_SKIP_STATES = frozenset({VAULT_REN_WAIT, VAULT_LABEL_WAIT,
                                 VAULT_MYCLOUD_WAIT,
                                 # ВОЛНА 22.74: поисковый запрос в панелях —
                                 # тоже не команда.
-                                USER_SEARCH_WAIT, CREATE_PB_PHOTO_WAIT,
+                                USER_SEARCH_WAIT,
                                 BELLS_PHOTO_WAIT,
-                                # ВОЛНА 22.75: на шаге файлов кнопки тексты —
-                                # не команды (пользователь может прислать
-                                # подпись/комментарий — просто подскажем).
-                                CREATE_PB_FILES_WAIT, CREATE_GB_FILES_WAIT,
-                                CREATE_CB_FILES_WAIT,
+                                # ВОЛНА 22.77: CREATE_PB_PHOTO_WAIT и шаги файлов
+                                # кнопок (CREATE_PB/GB/CB_FILES_WAIT) БОЛЬШЕ НЕ
+                                # в скипе — «загрузка не глушит бота»: кнопки
+                                # меню и «отмена» текстом работают и там.
+                                # Свободный текст там всё равно не данные
+                                # (только алиасы «готово/отмена»).
                                 # ВОЛНА 22.29: пароль/время/даты — не команды.
                                 WEB_PW_ENTER, WEB_PW_ENTER_OLD,
                                 DND_WAIT_TIME, SICK_WAIT_FROM, SICK_WAIT_TO})
@@ -3234,6 +3236,12 @@ class Class:
         # «📅 Сегодня» / «📅 Завтра» (чтобы расписание с сайта ставилось
         # автоматически). Тоггл — админ-панель → «🌐 Расписание с сайтов».
         self.sched_web_auto = True
+        # ВОЛНА 22.77: «❗ ВАЖНОЕ» — доска важных постов класса. Админ пишет
+        # текст и/или прикрепляет фото/видео/любые файлы (каждый файл
+        # ШИФРУЕТСЯ _seal_pack и живёт в канале-хранилище). Ученики открывают
+        # «📋 Ещё» → «❗ Важное» и видят всё; удалять может только админ.
+        # [{"id", "ts", "by", "name", "text", "files": [rec…]}]
+        self.important = []
 
     def to_dict(self):
         return {
@@ -3272,6 +3280,8 @@ class Class:
             'schedule_web': getattr(self, 'schedule_web', None),
             # ВОЛНА 22.73: авто-применение расписания с сайта в Сегодня/Завтра
             'sched_web_auto': bool(getattr(self, 'sched_web_auto', True)),
+            # ВОЛНА 22.77: доска «❗ Важное» (текст + шифрованные файлы)
+            'important': list(getattr(self, 'important', []) or []),
         }
 
     @classmethod
@@ -3319,6 +3329,9 @@ class Class:
                 # Расписание» переигрывает файл без перекачки с сайта.
                 'file_id': str(class_obj.schedule_web.get('file_id') or '')[:200],
                 'file_kind': str(class_obj.schedule_web.get('file_kind') or '')[:16],
+                # ВОЛНА 22.77: день, на который расписание
+                'day': str(class_obj.schedule_web.get('day') or '')[:10],
+                'day_label': str(class_obj.schedule_web.get('day_label') or '')[:60],
             }
             if not (class_obj.schedule_web['text']
                     or class_obj.schedule_web['name']):
@@ -3326,6 +3339,10 @@ class Class:
         # ВОЛНА 22.73: тоггл авто-применения к Сегодня/Завтра — по умолчанию ВКЛ.
         if not isinstance(getattr(class_obj, 'sched_web_auto', None), bool):
             class_obj.sched_web_auto = True
+        # ВОЛНА 22.77: «❗ Важное» — старые классы без поля не падают.
+        imp = getattr(class_obj, 'important', None)
+        class_obj.important = [it for it in (imp if isinstance(imp, list) else [])
+                               if isinstance(it, dict)][-_VAZHNO_MAX_ITEMS:]
         return class_obj
 
 
@@ -4212,7 +4229,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.76"
+BOT_BUILD = "22.77"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -5007,9 +5024,12 @@ def _web_schedule_section(class_obj):
         return (None, None)
     _host = str(_web.get("host") or "").strip()
     _when = str(_web.get("ts") or "").strip()
+    _day_label = str(_web.get("day_label") or "").strip()  # ВОЛНА 22.77
     _head = "🌐 Расписание с сайтов"
     if _host:
         _head += f" ({_host})"
+    if _day_label:
+        _head += f" — 🗓 на: {_day_label}"
     if _when:
         _head += f" — обновлено {_when}"
     _wtext = str(_web.get("text") or "").strip()
@@ -8761,6 +8781,25 @@ def get_cloud_menu_keyboard(user=None):
     return InlineKeyboardMarkup(rows)
 
 
+_MINIAPP_KIND_EMOJI = {
+    "photo": "📷", "video": "🎬", "audio": "🎵", "document": "📎",
+}
+
+
+def _miniapp_kind_emoji(rec):
+    """Эмодзи типа файла для бото-клавиатур (ВОЛНА 22.77): бот и мини-апп
+    показывают ОДИН И ТОТ ЖЕ тип — меньше ощущения «не синхронизировано»."""
+    try:
+        k = str(rec.get("kind") or "")
+        if k == "voice":
+            k = "audio"
+        if k not in _MINIAPP_KIND_EMOJI:
+            k = _miniapp_kind_from(rec.get("mime"), rec.get("name"))
+        return _MINIAPP_KIND_EMOJI.get(k, "📎")
+    except Exception:
+        return "📎"
+
+
 def get_cloud_files_keyboard(user):
     """ВОЛНА 8/9: по файлу — ряд [📥 имя], под ним [📦 ZIP] [🔐] [✏️] [🗑].
     📦 — бот сам заворачивает файл в ZIP (LZMA, без потерь),
@@ -8768,11 +8807,15 @@ def get_cloud_files_keyboard(user):
     ✏️ — переименовать (подпись можно задать и при загрузке)."""
     files = [f for f in (getattr(user, "cloud_files", []) or []) if isinstance(f, dict)]
     kb = []
-    for rec in files[:15]:
-        name = str(rec.get("name") or "файл")
+    # ВОЛНА 22.77: 15 → 25 — «файлы не синхронизируются»: в боте было видно
+    # только первые 15 файлов, в мини-аппе — все. Теперь почти всегда поровну.
+    for rec in files[:25]:
+        name = str(rec.get("name") or "").strip() or "(без имени)"
         size = _fmt_bytes(rec.get("size", 0))
         label = f"{name[:34]} ({size})"
-        kb.append([InlineKeyboardButton(f"📥 {label}", callback_data=f"cloud_get_{rec.get('id')}")])
+        kb.append([InlineKeyboardButton(
+            f"📥 {_miniapp_kind_emoji(rec)} {label}",
+            callback_data=f"cloud_get_{rec.get('id')}")])
         kb.append([
             InlineKeyboardButton("📦 ZIP", callback_data=f"cloud_zip_{rec.get('id')}"),
             InlineKeyboardButton("🔐", callback_data=f"cloud_mv_{rec.get('id')}"),
@@ -8787,15 +8830,26 @@ def get_cloud_files_keyboard(user):
 
 def _cloud_files_text(user):
     files = [f for f in (getattr(user, "cloud_files", []) or []) if isinstance(f, dict)]
+    # ВОЛНА 22.77: показываем и содержимое Сейфа — «синхронизация» бота и
+    # мини-аппа раньше выглядела сломанной: мини-апп показывает ОБА списка,
+    # а бот — только незашифрованные.
+    _vault_cnt = len([f for f in (getattr(user, "vault_files", []) or [])
+                      if isinstance(f, dict)])
     if not files:
-        return ("📁 Незашифрованных файлов нет — всё в Сейфе 👍\n\n"
-                "Новые файлы загружайте так: ☁️ Облако → 📤 Загрузить в Сейф.")
+        _head = ("📁 Незашифрованных файлов нет — всё в Сейфе 👍\n\n"
+                 "Новые файлы загружайте так: ☁️ Облако → 📤 Загрузить в Сейф.")
+        if _vault_cnt:
+            _head += f"\n\n🔒 В Сейфе сейчас: {_vault_cnt} файл(ов)."
+        return _head
     limit = get_price('cloud_max_files', 50)
     total = sum(int(f.get("size", 0) or 0) for f in files)
     shown = files[:30]
     # ВОЛНА 22.33: заголовок без слова «СТАРЫЕ» — раздел общий и для файлов
     # прежних версий, и для загрузок из мини-аппа (режим «без шифра»).
     lines = [f"📁 ФАЙЛЫ БЕЗ ШИФРА ({len(files)}/{_limit_str(limit)} • {_fmt_bytes(total)}):", ""]
+    if _vault_cnt:
+        lines.append(f"🔒 В Сейфе (шифрованные): {_vault_cnt} — видны и в мини-аппе.")
+        lines.append("")
     for rec in shown:
         # ВОЛНА 22.21: 🔒 — файл отмечен в Веб-облаке (Mini App) как Vault
         # (отдельная папка просмотра, НЕ шифрование Сейфа).
@@ -8938,8 +8992,8 @@ async def cloud_upload_receive(update: Update, context: ContextTypes.DEFAULT_TYP
         await msg.reply_text(
             "☁️ Отправьте именно ФАЙЛ: документ, фото, видео или аудио. "
             "Можно сразу НЕСКОЛЬКО файлов или альбом — я соберу всё пачкой. "
-            "Чтобы выйти — нажмите «⬅️ Назад в меню»."
-        )
+            "Чтобы выйти — нажмите «⬅️ Назад в меню».",
+            reply_markup=_upl_cancel_kb())  # ВОЛНА 22.77: «Отмена» снизу
         return CLOUD_UPLOAD_WAIT
     # ВОЛНА 22.36: честная подсказка про качество (раз за разом спрашивали,
     # «почему съедается качество»): Telegram сжимает медиа ещё НА ТЕЛЕФОНЕ,
@@ -10221,6 +10275,18 @@ def _miniapp_rec_out(rec):
     _kind = str(rec.get("kind") or "document")
     if _kind == "voice":
         _kind = "audio"
+    # ВОЛНА 22.77: ЛЕЧЕНИЕ старых записей — если файл записан как «document»,
+    # но по mime/имени это фото/видео/музыка — показываем правильный тип.
+    # («неправильно распознаются фото/видео/файлы и музыка»): раньше kind
+    # намертво запоминался при загрузке и старые файлы навсегда оставались
+    # «документами», даже если загрузились до расширения таблицы типов.
+    if _kind == "document":
+        try:
+            _healed = _miniapp_kind_from(rec.get("mime"), rec.get("name"))
+            if _healed != "document":
+                _kind = _healed
+        except Exception:
+            pass
     return {
         "id": str(rec.get("id") or ""),
         "name": str(rec.get("name") or "файл"),
@@ -14982,7 +15048,10 @@ async function loadFiles(silent, quiet) {
        просто появляются на местах, плавно и без рывков */
     const _sig = ALL_FILES.length + '|'
       + ALL_FILES.map(function (f) {
-          return f.id + ':' + f.ts + ':' + f.name + ':' + f.size;
+          /* 22.77: + kind и vault/облако — смена типа или перенос в Сейф
+             тоже перерисовывает список (синхронизация с ботом) */
+          return f.id + ':' + f.ts + ':' + f.name + ':' + f.size + ':' +
+            (f.kind || '') + ':' + (f.vault ? 'v' : 'c');
         }).join('|');
 
     if (_sig !== LAST_FILES_SIG) {
@@ -18564,7 +18633,9 @@ async function prestreamInitAll(files) {
             body: JSON.stringify({
               name: String(f.uploadName || f.name || 'file.bin').slice(0, 120),
               size: +f.size || 0,
-              mime: f.type || '',
+              /* 22.77: если браузер не дал mime (часто на Android) — догадываемся
+                 по расширению, чтобы тип (фото/видео/музыка) распознался ПРАВИЛЬНО */
+              mime: f.type || guessMime(f.uploadName || f.name || ''),
               password: f._uploadPw || '',
               hold: !!f._preHold
             })
@@ -22165,6 +22236,7 @@ safeIcons();
 
 </body>
 </html>
+
 """
 # --- MINIAPP_EMBED_END ---
 
@@ -30327,11 +30399,16 @@ def get_vault_files_keyboard(user):
     files = [f for f in (getattr(user, "vault_files", []) or []) if isinstance(f, dict)]
     kb = []
     for idx, rec in enumerate(files[:20], start=1):
-        label = str(rec.get("label") or "").strip()
+        # ВОЛНА 22.77: подпись не теряется — label → name (plain-режим) →
+        # эмодзи типа + «Файл #N». Раньше файлы без подписи выглядели
+        # безымянными («файлы не называются»). Теперь и эмодзи типа —
+        # как в мини-аппе.
+        label = str(rec.get("label") or rec.get("name") or "").strip()
+        _emo = _miniapp_kind_emoji(rec)
         if label:
-            title = f"{label[:30]} • {_fmt_bytes(rec.get('size_orig', 0))}"
+            title = f"{_emo} {label[:30]} • {_fmt_bytes(rec.get('size_orig', 0))}"
         else:
-            title = (f"Файл #{idx} • {_fmt_bytes(rec.get('size_orig', 0))} • "
+            title = (f"{_emo} Файл #{idx} • {_fmt_bytes(rec.get('size_orig', 0))} • "
                      f"{_rec_ts_display(rec)[:10]}")
         kb.append([
             InlineKeyboardButton(f"📥 {title}", callback_data=f"vault_get_{rec.get('id')}"),
@@ -36287,8 +36364,8 @@ async def dev_storage_restore_file_start(update: Update, context: ContextTypes.D
         "• одиночный json-файл данных (users.json и т. п.).\n\n"
         "Файл лежит в приватном канале — скачайте его оттуда и пришлите сюда.\n\n"
         "ℹ️ Снапшоты devorks_db_snapshot_… сюда присылать не нужно: отправьте\n"
-        "их просто в чат — бот сам предложит восстановление и закрепит в канале."
-    )
+        "их просто в чат — бот сам предложит восстановление и закрепит в канале.",
+        reply_markup=_upl_cancel_kb())  # ВОЛНА 22.77: «Отмена» снизу
     return DEV_STORAGE_RESTORE
 
 
@@ -42301,6 +42378,8 @@ def _more_menu_kb(user, context):
     # ВОЛНА 22.30: полный список дежурных и быстрый доступ к «Я болел(а)».
     rows.append([InlineKeyboardButton("🕐 Дежурные", callback_data="duty_list"),
                  InlineKeyboardButton("🤒 Я болел(а)", callback_data="more_sick")])
+    # ВОЛНА 22.77: «❗ Важное» — доска важных постов класса (шифрованные файлы).
+    rows.append([InlineKeyboardButton("❗ Важное", callback_data="vazhno_menu")])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_to_main")])
     context.user_data["more_map"] = more_map
     return InlineKeyboardMarkup(rows), len(hidden)
@@ -42322,7 +42401,8 @@ def _more_menu_text(hidden_count: int) -> str:
         )
     text += ("🎂 ДР одноклассников — все дни рождения от ближайшего к позднему.\n"
              "🕐 Дежурные — кто дежурит сегодня и полная очередь на дни вперёд.\n"
-             "🤒 Я болел(а) — пришлём всё ДЗ и объявления за дни болезни.")
+             "🤒 Я болел(а) — пришлём всё ДЗ и объявления за дни болезни.\n"
+             "❗ Важное — всё важное от админа: текст, фото, видео и файлы.")
     return text
 
 
@@ -43460,6 +43540,470 @@ async def _btn_delete_channel_files(context, files):
             await context.bot.delete_message(chat_id=_ch, message_id=_mid)
         except Exception:
             pass
+
+
+# === ВОЛНА 22.77: «❗ ВАЖНОЕ» — доска важных постов класса ===============
+# Находится в кнопке «📋 Ещё». Админ публикует ТЕКСТ и/или ФОТО/ВИДЕО/ЛЮБЫЕ
+# ФАЙЛЫ (каждый файл шифруется _seal_pack и складывается в канал-хранилище),
+# ученики открывают ленту и смотрят всё. Удаление — только админ.
+_VAZHNO_MAX_FILES = 6      # файлов на один пост
+_VAZHNO_MAX_ITEMS = 100    # постов в ленте класса (старые вытесняются)
+_VAZHNO_KIND_STATE = VAZHNO_WAIT
+
+
+def _vazhno_class_of(update, context, user):
+    """Класс для «Важного»: у админа — current_admin_class, у ученика — его класс."""
+    code = context.user_data.get('current_admin_class')
+    if not code and user is not None:
+        code = getattr(user, 'class_code', None)
+    return str(code or ""), get_class_by_code(code) if code else None
+
+
+def _vazhno_is_admin(user_id, class_code):
+    return bool(class_code) and is_admin_of_class(user_id, class_code)
+
+
+def _vazhno_title_of(item):
+    t = str((item or {}).get("text") or "").strip()
+    return (t[:60] + "…") if len(t) > 60 else (t or "📄 Без текста")
+
+
+def _vazhno_list_kb(class_obj, is_admin: bool):
+    items = [it for it in (getattr(class_obj, "important", []) or [])
+             if isinstance(it, dict)]
+    kb = []
+    if is_admin:
+        kb.append([InlineKeyboardButton("➕ Добавить важное",
+                                        callback_data="vazhno_add")])
+    for it in reversed(items[-12:]):
+        kb.append([InlineKeyboardButton(
+            f"❗ {_vazhno_title_of(it)[:52]}",
+            callback_data=f"vazhno_view_{it.get('id')}")])
+    if not kb:
+        kb.append([InlineKeyboardButton("Пока пусто", callback_data="no_action")])
+    kb.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_to_main")])
+    return InlineKeyboardMarkup(kb)
+
+
+def _vazhno_list_text(class_obj, is_admin: bool) -> str:
+    items = [it for it in (getattr(class_obj, "important", []) or [])
+             if isinstance(it, dict)]
+    head = (f"❗ <b>Важное</b> — класс {class_obj.class_name}\n\n"
+            f"Всего постов: {len(items)}.\n"
+            "Здесь всё важное от админа: текст, фото, видео и файлы "
+            "(файлы хранятся зашифрованными 🔐).")
+    if is_admin:
+        head += ("\n\n➕ <b>Добавить важное</b> — пришлите текст и/или файлы "
+                 f"(до {_VAZHNO_MAX_FILES} шт., каждый будет зашифрован), "
+                 "затем «✅ Опубликовать». Пост сразу придёт классу.")
+    return head
+
+
+async def vazhno_menu_cb(update, context):
+    """Лента «❗ Важное» (из «📋 Ещё»)."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    user = get_user(str(query.from_user.id))
+    if not user:
+        return MAIN_MENU
+    code, class_obj = _vazhno_class_of(update, context, user)
+    if class_obj is None:
+        try:
+            await query.edit_message_text("Вы не состоите в классе.")
+        except Exception:
+            pass
+        return MAIN_MENU
+    is_admin = _vazhno_is_admin(str(query.from_user.id), code)
+    try:
+        await query.edit_message_text(
+            _vazhno_list_text(class_obj, is_admin),
+            reply_markup=_vazhno_list_kb(class_obj, is_admin),
+            parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
+    return MAIN_MENU
+
+
+async def vazhno_add_cb(update, context):
+    """Админ начал новый пост «Важного» → состояние VAZHNO_WAIT."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    user_id = str(query.from_user.id)
+    code, class_obj = _vazhno_class_of(update, context, get_user(user_id))
+    if class_obj is None or not _vazhno_is_admin(user_id, code):
+        try:
+            await query.answer("Только админ класса может добавлять важное.",
+                               show_alert=True)
+        except Exception:
+            pass
+        return MAIN_MENU
+    context.user_data['vazhno_buf'] = {"text": "", "files": []}
+    text = (f"❗ <b>Новое важное</b> (класс {class_obj.class_name})\n\n"
+            "Пришлите ТЕКСТ и/или сразу ФОТО/ВИДЕО/ФАЙЛЫ — можно несколько "
+            f"(до {_VAZHNO_MAX_FILES}), можно альбомом. Каждый файл будет "
+            "ЗАШИФРОВАН 🔐.\n\nЗакончили — жмите «✅ Опубликовать», "
+            "передумали — «❌ Отмена».")
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Опубликовать", callback_data="vazhno_pub")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="vazhno_cancel")],
+    ])
+    try:
+        await query.edit_message_text(text, reply_markup=kb,
+                                      parse_mode=ParseMode.HTML)
+    except Exception:
+        await context.bot.send_message(chat_id=update.effective_chat.id,
+                                       text=text, reply_markup=kb,
+                                       parse_mode=ParseMode.HTML)
+    return VAZHNO_WAIT
+
+
+@timeout(CONVERSATION_TIMEOUT)
+async def vazhno_receive(update, context):
+    """Приём текста и ЛЮБЫХ файлов поста «Важное» (один поток, файлы шифруются)."""
+    msg = update.message
+    user_id = str(update.effective_user.id)
+    code, class_obj = _vazhno_class_of(update, context, get_user(user_id))
+    if class_obj is None or not _vazhno_is_admin(user_id, code):
+        try:
+            if msg is not None:
+                await msg.reply_text("Только админ класса может добавлять важное.")
+        except Exception:
+            pass
+        return MAIN_MENU
+    buf = context.user_data.get('vazhno_buf')
+    if not isinstance(buf, dict):
+        buf = {"text": "", "files": []}
+        context.user_data['vazhno_buf'] = buf
+
+    if msg is None:
+        return VAZHNO_WAIT
+
+    # --- текст (или подпись к первому файлу) ---
+    if msg.text and not (msg.photo or msg.video or msg.audio or msg.voice
+                         or msg.video_note or msg.animation or msg.document):
+        add = msg.text.strip()
+        if add:
+            rejected = await reject_if_forbidden_chars(update, add, VAZHNO_WAIT)
+            if rejected is not None:
+                return rejected
+            buf["text"] = ((buf["text"] + "\n" + add).strip())[:3000]
+        _vazhno_step_hint(update, context, buf)
+        return VAZHNO_WAIT
+
+    # --- файл ---
+    info = _btn_extract_media(msg)
+    if not info:
+        await msg.reply_text("⚠️ Не понял это вложение — пришлите фото, видео, "
+                             "музыку или документ.")
+        return VAZHNO_WAIT
+    ftype, fid, size, mime, fname = info
+    files = buf.setdefault("files", [])
+    if len(files) >= _VAZHNO_MAX_FILES:
+        await msg.reply_text(f"⚠️ Максимум {_VAZHNO_MAX_FILES} файлов на пост — "
+                             "жмите «✅ Опубликовать».")
+        return VAZHNO_WAIT
+    if size > VAULT_MAX_FILE_BYTES:
+        await msg.reply_text("⚠️ Файл больше 20 МБ — пришлите поменьше.")
+        return VAZHNO_WAIT
+    if msg.caption and not buf["text"]:
+        buf["text"] = msg.caption.strip()[:3000]
+
+    status = await msg.reply_text(f"🔐 Шифрую «{fname}»…")
+    anim = asyncio.create_task(_btn_encrypt_anim(
+        context, status.chat_id, status.message_id, fname))
+    try:
+        channels = get_cloud_channel_ids()
+        if channels:
+            raw = await _vault_botapi_download(context, fid)
+            sealed = await asyncio.to_thread(_seal_pack, raw, fname, mime,
+                                             "vazhno")
+            raw = b""
+            _up = await _storage_upload_document(
+                context, sealed, filename=f"vazhno_{secrets.token_hex(6)}.dvf",
+                caption="", user=None)
+            sealed = b""
+            if not _up:
+                raise RuntimeError("хранилище не приняло шифр")
+            rec = {"id": "vz_" + secrets.token_hex(4),
+                   "fid": str(_up.get("file_id") or ""),
+                   "ch": int(_up.get("channel_id") or 0),
+                   "mid": int(_up.get("message_id") or 0),
+                   "ftype": ftype, "name": fname[:120], "mime": mime,
+                   "size": int(size or 0), "plain": False}
+            _wal_append("upload", user_id, "vazhnofile", {"rec": rec})
+        else:
+            rec = {"id": "vz_" + secrets.token_hex(4), "fid": fid,
+                   "ch": 0, "mid": 0, "ftype": ftype, "name": fname[:120],
+                   "mime": mime, "size": int(size or 0), "plain": True}
+    except Exception as e:
+        logger.error(f"vazhno file encrypt: {e}")
+        await _btn_anim_stop(anim)
+        try:
+            await context.bot.edit_message_text(
+                f"❌ Не удалось зашифровать «{fname}» ({e}). Попробуйте ещё раз.",
+                chat_id=status.chat_id, message_id=status.message_id)
+        except Exception:
+            pass
+        return VAZHNO_WAIT
+    await _btn_anim_stop(anim)
+    files.append(rec)
+    try:
+        await context.bot.edit_message_text(
+            f"✅ «{fname}» зашифрован 🔐 и прикреплён "
+            f"({len(files)}/{_VAZHNO_MAX_FILES}).",
+            chat_id=status.chat_id, message_id=status.message_id)
+    except Exception:
+        pass
+    _vazhno_step_hint(update, context, buf)
+    return VAZHNO_WAIT
+
+
+def _vazhno_step_hint(update, context, buf):
+    """Обновлённая панель шага (счётчик файлов + кнопки)."""
+    n = len(buf.get("files") or [])
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"✅ Опубликовать" + (f" ({n})" if n else ""),
+            callback_data="vazhno_pub")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="vazhno_cancel")],
+    ])
+    txt = (f"❗ Пост «Важное»: файлов {n}/{_VAZHNO_MAX_FILES}."
+           + ("\n📝 Текст: " + (buf.get("text") or "")[:200] if buf.get("text")
+              else "\n📝 Текста пока нет — можно прислать сообщением."))
+    txt += "\n\n«✅ Опубликовать» — отправить классу, «❌ Отмена» — отменить."
+    try:
+        return context.bot.send_message(
+            chat_id=update.effective_chat.id, text=txt, reply_markup=kb)
+    except Exception:
+        return None
+
+
+async def vazhno_publish_cb(update, context):
+    """✅ Опубликовать: сохранить пост (шифры уже в канале) + уведомить класс."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    user_id = str(query.from_user.id)
+    user = get_user(user_id)
+    code, class_obj = _vazhno_class_of(update, context, user)
+    if class_obj is None or not _vazhno_is_admin(user_id, code):
+        try:
+            await query.answer("Только админ класса может публиковать важное.",
+                               show_alert=True)
+        except Exception:
+            pass
+        return MAIN_MENU
+    buf = context.user_data.get('vazhno_buf')
+    if not isinstance(buf, dict):
+        buf = {"text": "", "files": []}
+    text = str(buf.get("text") or "").strip()
+    files = [f for f in (buf.get("files") or []) if isinstance(f, dict)]
+    if not text and not files:
+        try:
+            await query.answer("Добавьте текст или хотя бы один файл.",
+                               show_alert=True)
+        except Exception:
+            pass
+        return VAZHNO_WAIT
+    admin_name = (getattr(user, 'name', '') or ''
+                  or getattr(query.from_user, 'first_name', '') or 'Админ')
+    item = {"id": "vazh_" + secrets.token_hex(4),
+            "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "by": user_id, "name": str(admin_name)[:60],
+            "text": text[:3000], "files": files}
+    imp = [it for it in (getattr(class_obj, 'important', []) or [])
+           if isinstance(it, dict)]
+    imp.append(item)
+    class_obj.important = imp[-_VAZHNO_MAX_ITEMS:]
+    save_class(class_obj)
+    context.user_data.pop('vazhno_buf', None)
+
+    # Короткий пинг классу (файлы не рассылаем — они в ленте, шифрованные)
+    ping = (f"❗ <b>ВАЖНОЕ</b> от {admin_name}\n\n{text[:500]}"
+            + ("\n\n📎 Файлы — в «📋 Ещё» → «❗ Важное»." if files else ""))
+    for sid in (class_obj.students or []):
+        if str(sid) == user_id or str(sid) in (class_obj.blocked_users or []):
+            continue
+        try:
+            await context.bot.send_message(chat_id=int(sid), text=ping,
+                                           parse_mode=ParseMode.HTML)
+        except Exception:
+            continue
+    try:
+        await query.edit_message_text(
+            "✅ Опубликовано в «❗ Важное» и отправлено классу.")
+    except Exception:
+        pass
+    return MAIN_MENU
+
+
+async def vazhno_cancel_cb(update, context):
+    """❌ Отмена создания поста «Важное»."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    buf = context.user_data.pop('vazhno_buf', None)
+    # Шифры уже в канале — чистим их (best-effort), чтобы не копить мусор.
+    if isinstance(buf, dict):
+        await _btn_delete_channel_files(context, buf.get("files") or [])
+    _text = "❌ Создание «Важного» отменено."
+    try:
+        await query.edit_message_text(_text)
+    except Exception:
+        try:
+            await context.bot.send_message(chat_id=update.effective_chat.id,
+                                           text=_text)
+        except Exception:
+            pass
+    return MAIN_MENU
+
+
+async def _vazhno_send_files(update, context, files):
+    """Выдать файлы поста «Важное»: шифр из канала → _seal_unpack → отправка."""
+    target = update.effective_message
+    if target is None:
+        return
+    todo = [f for f in (files or []) if isinstance(f, dict)]
+    if not todo:
+        return
+    status = None
+    try:
+        if len(todo) > 1:
+            status = await target.reply_text("🔓 Расшифровываю файлы…")
+        for rec in todo:
+            try:
+                if rec.get("plain") and rec.get("fid"):
+                    await _btn_send_plain_file(update, context, rec)
+                    continue
+                container = await _vault_botapi_download(context, rec.get("fid"))
+                _meta, payload = await asyncio.to_thread(_seal_unpack, container)
+                container = b""
+                _name = str(_meta.get("n") or rec.get("name") or "file.bin")
+                await target.reply_document(document=payload, filename=_name,
+                                            caption=f"📎 {_name}")
+                payload = b""
+            except Exception as e:
+                logger.warning(f"vazhno file send: {e}")
+                try:
+                    await target.reply_text(
+                        f"⚠️ Файл «{rec.get('name') or '?'}» сейчас недоступен.")
+                except Exception:
+                    pass
+    finally:
+        if status is not None:
+            try:
+                await context.bot.delete_message(chat_id=status.chat_id,
+                                                 message_id=status.message_id)
+            except Exception:
+                pass
+
+
+async def vazhno_view_cb(update, context):
+    """Просмотр поста «Важное»: текст + расшифрованные файлы."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    user = get_user(str(query.from_user.id))
+    if not user:
+        return MAIN_MENU
+    code, class_obj = _vazhno_class_of(update, context, user)
+    if class_obj is None:
+        return MAIN_MENU
+    _vid = query.data[len("vazhno_view_"):]
+    item = next((it for it in (getattr(class_obj, 'important', []) or [])
+                 if isinstance(it, dict) and str(it.get('id')) == _vid), None)
+    if item is None:
+        try:
+            await query.answer("Пост уже удалён.", show_alert=True)
+        except Exception:
+            pass
+        return await vazhno_menu_cb(update, context)
+    is_admin = _vazhno_is_admin(str(query.from_user.id), code)
+    txt = (f"❗ <b>Важное</b>\n"
+           f"👤 {item.get('name') or 'Админ'} • {item.get('ts') or ''}\n\n"
+           + (item.get('text') or "(без текста)")
+           + (f"\n\n📎 Файлов: {len(item.get('files') or [])} (сейчас пришлю)"
+              if item.get('files') else ""))
+    kb_rows = []
+    if is_admin:
+        kb_rows.append([InlineKeyboardButton(
+            "🗑 Удалить пост", callback_data=f"vazhno_del_{item.get('id')}")])
+    kb_rows.append([InlineKeyboardButton("⬅️ К списку",
+                                         callback_data="vazhno_menu")])
+    try:
+        await query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(kb_rows),
+                                      parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
+    if item.get('files'):
+        await _vazhno_send_files(update, context, item.get('files'))
+    return MAIN_MENU
+
+
+async def vazhno_del_cb(update, context):
+    """Запрос удаления поста (админ) — подтверждение."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    user_id = str(query.from_user.id)
+    code, class_obj = _vazhno_class_of(update, context, get_user(user_id))
+    if class_obj is None or not _vazhno_is_admin(user_id, code):
+        return MAIN_MENU
+    _vid = query.data[len("vazhno_del_"):]
+    try:
+        await query.edit_message_text(
+            "❗ Удалить этот пост «Важного» навсегда (вместе с шифрами файлов)?",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🗑 Да, удалить",
+                                     callback_data=f"vazhno_del_ok_{_vid}")],
+                [InlineKeyboardButton("⬅️ Нет", callback_data="vazhno_menu")]]))
+    except Exception:
+        pass
+    return MAIN_MENU
+
+
+async def vazhno_del_ok_cb(update, context):
+    """Подтверждённое удаление поста + шифров из канала."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    user_id = str(query.from_user.id)
+    code, class_obj = _vazhno_class_of(update, context, get_user(user_id))
+    if class_obj is None or not _vazhno_is_admin(user_id, code):
+        return MAIN_MENU
+    _vid = query.data[len("vazhno_del_ok_"):]
+    _old = [it for it in (getattr(class_obj, 'important', []) or [])
+            if isinstance(it, dict)]
+    _victim = next((it for it in _old if str(it.get('id')) == _vid), None)
+    imp = [it for it in _old if str(it.get('id')) != _vid]
+    removed = len(_old) - len(imp)
+    class_obj.important = imp
+    save_class(class_obj)
+    # Шифры удалённого поста стираем из канала (best-effort, M4-паттерн).
+    if _victim is not None:
+        await _btn_delete_channel_files(context, _victim.get('files') or [])
+    try:
+        await query.edit_message_text(
+            "🗑 Пост удалён." if removed else "Пост уже был удалён.")
+    except Exception:
+        pass
+    return await vazhno_menu_cb(update, context)
 
 
 @timeout(CONVERSATION_TIMEOUT)
@@ -45723,7 +46267,10 @@ except Exception:  # pragma: no cover
     _sch_requests = None
 
 SCHEDMON_CHECK_INTERVAL = 300
-SCHEDMON_MAX_AUTO_PER_DAY = 1
+# ВОЛНА 22.77: 1 → 3 — «автоматически прислать сообщение, если расписание
+# изменится»: три автоотправки в день на ссылку (при частых правках расписания
+# класс не должен оставаться без свежей версии до завтра).
+SCHEDMON_MAX_AUTO_PER_DAY = 3
 SCHEDMON_MAX_TRACK_PER_CLASS = 15   # сколько ссылок может следить один класс
 SCHEDMON_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
@@ -45748,7 +46295,9 @@ SCHEDMON_DEEPSEEK_PROMPT = (
 # Ключи записи ссылки в состоянии (нормализация при загрузке).
 SCHEDMON_INFO_KEYS = ("chat", "h", "ch", "title", "errors", "files", "sig",
                       "sch", "sent", "cand", "sel", "day", "nday",
-                      "next_check", "added_by", "added_ts")
+                      "next_check", "added_by", "added_ts",
+                      # ВОЛНА 22.77: на какой день это расписание
+                      "sched_day", "sched_label")
 
 _SCHMON_TLS = threading.local()
 
@@ -46171,6 +46720,88 @@ def _schmon_today():
     return time.strftime("%Y-%m-%d", time.localtime())
 
 
+# === ВОЛНА 22.77: «НА КАКОЙ ДЕНЬ ЭТО РАСПИСАНИЕ?» ===
+# Локальный парсер (работает БЕЗ ИИ): даты ДД.ММ / ДД.ММ.ГГГГ / «5 октября»,
+# дни недели словами, «сегодня/завтра». Если на странице есть ИИ-путь
+# (DeepSeek), он по-прежнему достаёт ТЕКСТ расписания — а дата определяется
+# этим парсером из этого текста. Возвращает ("ГГГГ-ММ-ДД", "человеческая метка").
+_SCHMON_RU_MONTHS = {
+    "января": 1, "февраля": 2, "марта": 3, "апреля": 4, "мая": 5, "июня": 6,
+    "июля": 7, "августа": 8, "сентября": 9, "октября": 10, "ноября": 11,
+    "декабря": 12,
+}
+_SCHMON_RU_WDAYS = {
+    "понедельник": 0, "понедельника": 0, "вторник": 1, "вторника": 1,
+    "среда": 2, "среду": 2, "среды": 2, "четверг": 3, "четверга": 3,
+    "пятница": 4, "пятницу": 4, "пятницы": 4, "суббота": 5, "субботу": 5,
+    "субботы": 5, "воскресенье": 6, "воскресенье": 6, "воскресенья": 6,
+}
+
+
+def _schmon_detect_day(text):
+    """Пытается понять, на какую дату расписание. ("", "") — не удалось."""
+    t = re.sub(r"\s+", " ", (text or "")[:8000]).lower()
+    if not t:
+        return ("", "")
+    now = datetime.now()
+    wd_names = ("понедельник", "вторник", "среда", "четверг", "пятница",
+                "суббота", "воскресенье")
+
+    def _mk(d):
+        label = f"{wd_names[d.weekday()]}, {d.strftime('%d.%m')}"
+        return (d.strftime("%Y-%m-%d"), label)
+
+    m = re.search(r"(\d{1,2})[./\\-](\d{1,2})[./\\-](\d{4})", t)
+    if not m:
+        m = re.search(r"(\d{4})-(\d{1,2})-(\d{1,2})", t)
+    if m:
+        try:
+            if len(m.group(1)) == 4:
+                d = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+            else:
+                d = datetime(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+            if 2000 <= d.year <= now.year + 1:
+                return _mk(d)
+        except ValueError:
+            pass
+    m = re.search(r"(\d{1,2})\s+([а-яё]+)(?:\s+(\d{4}))?", t)
+    if m and m.group(2) in _SCHMON_RU_MONTHS:
+        try:
+            y = int(m.group(3)) if m.group(3) else now.year
+            d = datetime(y, _SCHMON_RU_MONTHS[m.group(2)], int(m.group(1)))
+            if d < now - timedelta(days=200) and not m.group(3):
+                d = datetime(y + 1, _SCHMON_RU_MONTHS[m.group(2)],
+                             int(m.group(1)))
+            return _mk(d)
+        except ValueError:
+            pass
+    m = re.search(r"(\d{1,2})[./\\-](\d{1,2})(?!\d)", t)
+    if m:
+        try:
+            d = datetime(now.year, int(m.group(2)), int(m.group(1)))
+            if d < now - timedelta(days=1):
+                d = datetime(now.year + 1, int(m.group(2)), int(m.group(1)))
+            return _mk(d)
+        except ValueError:
+            pass
+    if re.search(r"на завтра|на завтрашний|расписание на завтра", t):
+        return _mk(now + timedelta(days=1))
+    if re.search(r"на сегодня|расписание на сегодня", t):
+        return _mk(now)
+    m = re.search(r"([а-яё]+)", t)
+    idx = 0
+    for w, _v in _SCHMON_RU_WDAYS.items():
+        if re.search(r"\b" + w + r"\b", t):
+            idx = _SCHMON_RU_WDAYS[w]
+            break
+    else:
+        return ("", "")
+    delta = (idx - now.weekday()) % 7
+    if delta == 0:
+        delta = 7
+    return _mk(now + timedelta(days=delta))
+
+
 def _schmon_next_midnight_ts():
     lt = time.localtime()
     secs_today = lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec
@@ -46485,9 +47116,12 @@ class _SchmonResult:
         return self.ok
 
 
-async def schmon_send_item(bot, chat_id, src_url, data, name, host):
+async def schmon_send_item(bot, chat_id, src_url, data, name, host,
+                           day_label=""):
     """Отправить один источник расписания: картинку — фото, документ — файлом.
-    ВОЛНА 22.68: возвращает _SchmonResult (truthy как раньше) с file_id."""
+    ВОЛНА 22.68: возвращает _SchmonResult (truthy как раньше) с file_id.
+    ВОЛНА 22.77: + день, на который расписание (day_label) — в подписи."""
+    _dayline = ("\n🗓 Расписание на: %s" % day_label) if day_label else ""
     try:
         if (schmon_image_kind(src_url) or schmon_image_kind(name)):
             if len(data) < SCHEDMON_MIN_IMAGE_BYTES:
@@ -46497,7 +47131,7 @@ async def schmon_send_item(bot, chat_id, src_url, data, name, host):
                     m = await bot.send_photo(
                         chat_id=chat_id,
                         photo=InputFile(data, filename=name or "photo.jpg"),
-                        caption=("🖼 Расписание\n%s" % host)[:1024])
+                        caption=("🖼 Расписание\n%s%s" % (host, _dayline))[:1024])
                     _fid = ""
                     try:
                         _fid = (m.photo[-1].file_id if getattr(m, "photo", None)
@@ -46510,7 +47144,7 @@ async def schmon_send_item(bot, chat_id, src_url, data, name, host):
             m = await bot.send_document(
                 chat_id=chat_id,
                 document=InputFile(data, filename=name or "image.jpg"),
-                caption=("🖼 Расписание\n%s" % host)[:1024])
+                caption=("🖼 Расписание\n%s%s" % (host, _dayline))[:1024])
             _fid = ""
             try:
                 _fid = getattr(getattr(m, "document", None), "file_id", "") or ""
@@ -46520,7 +47154,7 @@ async def schmon_send_item(bot, chat_id, src_url, data, name, host):
         m = await bot.send_document(
             chat_id=chat_id,
             document=InputFile(data, filename=name or "file.pdf"),
-            caption=("📄 %s\n%s" % (name, host))[:1024])
+            caption=("📄 %s\n%s%s" % (name, host, _dayline))[:1024])
         _fid = ""
         try:
             _fid = getattr(getattr(m, "document", None), "file_id", "") or ""
@@ -46626,6 +47260,9 @@ def _schmon_store_web(class_obj, url, info, text="", kind="text", name="",
             "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
             "file_id": str(file_id or "")[:200],
             "file_kind": str(file_kind or "")[:16],
+            # ВОЛНА 22.77: на какой день это расписание (для Сегодня/Завтра)
+            "day": str((info or {}).get("sched_day") or "")[:10],
+            "day_label": str((info or {}).get("sched_label") or "")[:60],
         }
         save_class(class_obj)
     except Exception as e:
@@ -46670,13 +47307,15 @@ async def schmon_notify(app, class_code, url, info, new_files=(),
             info["next_check"] = _schmon_next_midnight_ts()
             return False
         host = schmon_host_of(url)
+        _day_label = str(info.get("sched_label") or "")  # ВОЛНА 22.77
         sent_any = False
         # ВОЛНА 22.68: file_id первой успешной отправки — для кнопки «📅
         # Расписание» (переигрывает файл классу без перекачки).
         _first_res = None
         if notif_on:
             for chat_id in recipients:
-                _res = await schmon_send_item(bot, chat_id, f, data, name, host)
+                _res = await schmon_send_item(bot, chat_id, f, data, name,
+                                              host, _day_label)
                 if _res:
                     sent_any = True
                     # getattr: у файла может не быть file_id (старые заглушки),
@@ -46710,7 +47349,12 @@ async def schmon_notify(app, class_code, url, info, new_files=(),
         if notif_on and schmon_daily_quota_left(info) <= 0:
             info["next_check"] = _schmon_next_midnight_ts()
             return False
-        head = "📅 Расписание обновилось\n%s\n\n" % schmon_host_of(url)
+        # ВОЛНА 22.77: в шапке — на какой день расписание (если удалось понять).
+        _dlabel = str(info.get("sched_label") or "").strip()
+        head = "📅 Расписание обновилось\n%s\n" % schmon_host_of(url)
+        if _dlabel:
+            head += "🗓 Расписание на: %s\n" % _dlabel
+        head += "\n"
         sent_any = False
         if notif_on:
             for chat_id in recipients:
@@ -46821,6 +47465,18 @@ async def schmon_check_url(app, class_code, url, info):
                          "files": files_now})
             schmon_merge_info(class_code, url, info)
             return False
+
+        # ВОЛНА 22.77: «на какой день это расписание?» — локальный парсер
+        # (работает и без ИИ; DeepSeek-текст расписания тоже участвует).
+        try:
+            _sday, _slabel = _schmon_detect_day(sch_text or "")
+            if not _sday:
+                _sday, _slabel = _schmon_detect_day(
+                    schmon_page_title(html_text))
+        except Exception:
+            _sday, _slabel = "", ""
+        info["sched_day"] = _sday
+        info["sched_label"] = _slabel
 
         if await schmon_notify(app, class_code, url, info, new_files, sch_text):
             upd = {"h": h, "ch": ch,
@@ -52106,25 +52762,41 @@ _HW_MEDIA_LABELS = {
     "video": "🎬 видео",
     "audio": "🎵 аудио",
     "voice": "🎤 голосовое",
+    # ВОЛНА 22.77: кружочки и GIF тоже можно в ДЗ
+    "video_note": "⭕️ видеокружок",
+    "animation": "🎞 GIF",
 }
 
 
 def _extract_media_ref(message):
-    """Достаёт из сообщения ссылку на вложение (file_id). None — медиа нет."""
+    """Достаёт из сообщения ссылку на вложение (file_id). None — медиа нет.
+    ВОЛНА 22.77: +video_note/animation и размер (для лимита 20 МБ)."""
     if getattr(message, "photo", None):
         # photo — список размеров; берём самый большой (последний).
-        return {"type": "photo", "file_id": message.photo[-1].file_id}
+        return {"type": "photo", "file_id": message.photo[-1].file_id,
+                "size": int(message.photo[-1].file_size or 0)}
     if getattr(message, "document", None):
         return {"type": "document", "file_id": message.document.file_id,
-                "name": (message.document.file_name or "файл")[:80]}
+                "name": (message.document.file_name or "файл")[:80],
+                "size": int(message.document.file_size or 0)}
     if getattr(message, "video", None):
         return {"type": "video", "file_id": message.video.file_id,
-                "name": (message.video.file_name or "видео")[:80]}
+                "name": (message.video.file_name or "видео")[:80],
+                "size": int(message.video.file_size or 0)}
     if getattr(message, "audio", None):
         return {"type": "audio", "file_id": message.audio.file_id,
-                "name": (message.audio.file_name or "аудио")[:80]}
+                "name": (message.audio.file_name or "аудио")[:80],
+                "size": int(message.audio.file_size or 0)}
     if getattr(message, "voice", None):
-        return {"type": "voice", "file_id": message.voice.file_id}
+        return {"type": "voice", "file_id": message.voice.file_id,
+                "size": int(message.voice.file_size or 0)}
+    if getattr(message, "video_note", None):
+        return {"type": "video_note", "file_id": message.video_note.file_id,
+                "size": int(message.video_note.file_size or 0)}
+    if getattr(message, "animation", None):
+        return {"type": "animation", "file_id": message.animation.file_id,
+                "name": (message.animation.file_name or "gif.mp4")[:80],
+                "size": int(message.animation.file_size or 0)}
     return None
 
 
@@ -52155,6 +52827,8 @@ def _hw_media_confirm_kb():
 async def _send_homework_media(context, chat_id, media_list, max_send=10):
     """Пересылает вложения пункта ДЗ в чат (не более max_send за раз).
 
+    ВОЛНА 22.77: шифрованные вложения (sealed) скачиваются из канала,
+    расшифровываются (_seal_unpack) и отправляются с исходным именем.
     Возвращает (отправлено, сорвалось). Ошибки по одному файлу не роняют
     остальные: Telegram иногда забывает file_id очень старых сообщений —
     тогда файл пропускается, но список ДЗ остаётся честным."""
@@ -52165,7 +52839,36 @@ async def _send_homework_media(context, chat_id, media_list, max_send=10):
         if not fid:
             continue
         try:
-            if mtype == "photo":
+            if m.get("sealed"):
+                # Шифрованное вложение: скачали → расшифровали → отправили.
+                container = await _vault_botapi_download(context, fid)
+                _meta, payload = await asyncio.to_thread(_seal_unpack, container)
+                container = b""
+                _name = str(_meta.get("n") or m.get("name") or "файл")
+                _mt = str(m.get("type") or "document")
+                if _mt == "photo":
+                    await context.bot.send_photo(
+                        chat_id=chat_id, photo=InputFile(payload, _name))
+                elif _mt == "video":
+                    await context.bot.send_video(
+                        chat_id=chat_id, video=InputFile(payload, _name),
+                        filename=_name)
+                elif _mt == "audio":
+                    await context.bot.send_audio(
+                        chat_id=chat_id, audio=InputFile(payload, _name),
+                        filename=_name)
+                elif _mt == "voice":
+                    await context.bot.send_voice(chat_id=chat_id, voice=payload)
+                elif _mt == "animation":
+                    await context.bot.send_animation(
+                        chat_id=chat_id, animation=InputFile(payload, _name),
+                        filename=_name)
+                else:  # document/video_note и будущие типы
+                    await context.bot.send_document(
+                        chat_id=chat_id, document=InputFile(payload, _name),
+                        filename=_name)
+                payload = b""
+            elif mtype == "photo":
                 await context.bot.send_photo(chat_id=chat_id, photo=fid)
             elif mtype == "video":
                 await context.bot.send_video(chat_id=chat_id, video=fid)
@@ -52173,6 +52876,12 @@ async def _send_homework_media(context, chat_id, media_list, max_send=10):
                 await context.bot.send_audio(chat_id=chat_id, audio=fid)
             elif mtype == "voice":
                 await context.bot.send_voice(chat_id=chat_id, voice=fid)
+            elif mtype == "video_note":
+                await context.bot.send_video_note(chat_id=chat_id,
+                                                  video_note=fid)
+            elif mtype == "animation":
+                await context.bot.send_animation(chat_id=chat_id,
+                                                 animation=fid)
             else:  # document — дефолт (в т.ч. неизвестные будущие типы)
                 await context.bot.send_document(chat_id=chat_id, document=fid)
             sent += 1
@@ -52206,7 +52915,9 @@ async def homework_media_receive(update: Update, context: ContextTypes.DEFAULT_T
     media = _extract_media_ref(update.message)
     if media is None:
         await update.message.reply_text(
-            "Пришлите фото или файл — либо напишите задание текстом.")
+            "Пришлите фото, видео, музыку, кружок, GIF или файл — можно "
+            "МНОГО подряд (до 10, каждый будет зашифрован 🔐) — либо "
+            "напишите задание текстом.")
         return None
 
     buffer = context.user_data.setdefault('hw_media_buffer', [])
@@ -52215,6 +52926,12 @@ async def homework_media_receive(update: Update, context: ContextTypes.DEFAULT_T
             f"⚠️ Лимит вложений на одно ДЗ — {_HW_MEDIA_MAX_FILES}. "
             "Нажмите «✅ Готово», чтобы сохранить.",
             reply_markup=_hw_media_confirm_kb())
+        return None
+    # ВОЛНА 22.77: файлы ДЗ шифруются (переупаковка), потолок — как у кнопок.
+    if int(media.get("size") or 0) > VAULT_MAX_FILE_BYTES:
+        await update.message.reply_text(
+            "⚠️ Файл больше 20 МБ — бот не сможет его зашифровать. "
+            "Пришлите файл поменьше.")
         return None
 
     # Подпись к первому вложению (если админ не задал описание текстом) —
@@ -52270,12 +52987,55 @@ async def hw_media_done_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
     if subject not in class_obj.homework:
         class_obj.homework[subject] = []
+    # === ВОЛНА 22.77: ВСЁ, что летит в ДЗ, ШИФРУЕТСЯ ===
+    # Каждое вложение буфера скачиваем по file_id, пакуем в шифр (_seal_pack,
+    # kind="hw") и льём в канал-хранилище. В записи остаётся ТОЛЬКО шифр.
+    # Оригинальный file_id держим как запасной путь (если шифр не собрался).
+    enc_buffer = []
+    for m in buffer:
+        if not isinstance(m, dict) or not m.get("file_id"):
+            continue
+        if m.get("sealed"):
+            enc_buffer.append(m)
+            continue
+        _mt = str(m.get("type") or "document")
+        _fname = (m.get("name") or {"photo": "фото.jpg",
+                                    "video": "видео.mp4",
+                                    "voice": "голос.ogg",
+                                    "video_note": "кружок.mp4",
+                                    "animation": "gif.mp4"}.get(_mt, "файл"))
+        _mime = {"photo": "image/jpeg", "video": "video/mp4",
+                 "voice": "audio/ogg", "video_note": "video/mp4",
+                 "animation": "video/mp4"}.get(_mt, "application/octet-stream")
+        try:
+            raw = await _vault_botapi_download(context, m["file_id"])
+            sealed = await asyncio.to_thread(_seal_pack, raw, _fname, _mime, "hw")
+            raw = b""
+            _up = await _storage_upload_document(
+                context, sealed,
+                filename=f"hw_{secrets.token_hex(6)}.dvf", caption="", user=None)
+            sealed = b""
+            if not _up:
+                raise RuntimeError("хранилище не приняло шифр")
+            enc_buffer.append({
+                "type": _mt, "sealed": True,
+                "file_id": str(_up.get("file_id") or ""),
+                "ch": int(_up.get("channel_id") or 0),
+                "mid": int(_up.get("message_id") or 0),
+                "name": _fname[:80], "mime": _mime,
+                "size": int(m.get("size") or 0)})
+            _wal_append("upload", user_id, "hwfile", {
+                "fid": str(_up.get("file_id") or ""), "name": _fname[:80]})
+        except Exception as e:
+            logger.warning(f"hw media seal ({_fname}): {e}")
+            # Честный фолбэк: исходный file_id (без переупаковки) — ДЗ не теряем.
+            enc_buffer.append(m)
     class_obj.homework[subject].append({
         'text': context.user_data.get('hw_media_desc', '') or '',
         'date': date_str,
         'added_by': user_id,
         'added_at': datetime.now().strftime("%Y-%m-%d %H:%M"),
-        'media': list(buffer),
+        'media': enc_buffer,
     })
     classes = load_classes()
     classes[class_code] = class_obj
@@ -52296,7 +53056,8 @@ async def hw_media_done_handler(update: Update, context: ContextTypes.DEFAULT_TY
     ])
     text = (f"✅ Домашнее задание с вложениями добавлено!\n\n"
             f"📅 Дата: {date_str}\n📚 Предмет: {subject}\n"
-            f"📎 Вложения: {_media_summary_line(media_snapshot)}")
+            f"📎 Вложения: {_media_summary_line(media_snapshot)}\n"
+            "🔒 Все вложения зашифрованы (хранятся только в виде шифров)")
     if desc:
         text += f"\n📝 Описание: {desc}"
     try:
@@ -57517,7 +58278,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # entry_points стоит безпаттерновый CallbackQueryHandler(handle_callback)
     # — он перехватывал btnfiles_* ДО _btn_files_cb_router, маршрута не
     # находил, и «❌ Отмена / ✅ Готово» молча ничего не делали.
-    if data in ("btnfiles_cancel", "btnfiles_done", "btnfiles_skip"):
+    if data in ("btnfiles_cancel", "btnfiles_done", "btnfiles_skip", "upl_cancel"):
         # Гасим спиннер сразу: дальше общего query.answer() не будет
         # (маршруты ниже завершают обработку раньше него).
         try:
@@ -57531,6 +58292,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "btnfiles_skip":
         # Легаси-кнопка из сообщений волны 22.75 — работает как «Готово».
         return await _btn_files_route_done(update, context, attach=False)
+    if data == "upl_cancel":
+        # ВОЛНА 22.77: универсальная «❌ Отмена» ЛЮБОЙ загрузки — чистит все
+        # временные буферы всех флоу приёма файлов и возвращает в меню.
+        return await _upl_cancel_cmd(update, context)
     if data in ("dev_poll", "admin_poll"):
         _cb_uid = str(query.from_user.id)
         _cb_ok = (_cb_uid == DEVELOPER_ID if data == "dev_poll"
@@ -58588,6 +59353,21 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await cancel_anon_reply_handler(update, context)
     elif data == "cancel_anon":
         return await cancel_anon_handler(update, context)
+    elif data == "vazhno_menu":
+        # === ВОЛНА 22.77: «❗ Важное» (в «📋 Ещё») ===
+        return await vazhno_menu_cb(update, context)
+    elif data == "vazhno_add":
+        return await vazhno_add_cb(update, context)
+    elif data == "vazhno_pub":
+        return await vazhno_publish_cb(update, context)
+    elif data == "vazhno_cancel":
+        return await vazhno_cancel_cb(update, context)
+    elif data.startswith("vazhno_del_ok_"):
+        return await vazhno_del_ok_cb(update, context)
+    elif data.startswith("vazhno_view_"):
+        return await vazhno_view_cb(update, context)
+    elif data.startswith("vazhno_del_"):
+        return await vazhno_del_cb(update, context)
     elif data == "cancel_action":
         return await cancel_action_handler(update, context)
     elif data == "no_action":
@@ -58736,6 +59516,60 @@ async def back_to_personal_buttons(update: Update, context: ContextTypes.DEFAULT
 
     await query.edit_message_text(text, reply_markup=get_personal_buttons_keyboard(user), parse_mode="Markdown")
     return PERSONAL_BUTTON_MANAGEMENT
+
+# === ВОЛНА 22.77: ЗАГРУЗКА НЕ ГЛУШИТ БОТА ===
+# Пока пользователь грузит файлы (Сейф, облако, ДЗ, решения, кнопки…), бот
+# обязан отвечать на команды/кнопки и давать «❌ Отмена» снизу любого приглашения.
+_UPLOAD_TEMP_KEYS = (
+    # буферы ДЗ, таймеров и прочих диалогов (как в cancel_action_handler)
+    'timer_date', 'timer_time', 'homework_date', 'homework_subject',
+    'awaiting_hw_text', 'awaiting_hw_custom_date', 'renaming_button',
+    'anon_target', 'quick_admin_class', 'broadcast_text',
+    'hw_media_buffer', 'hw_media_desc',
+    # шаг «📎 файлы кнопки» (волны 22.75/22.76)
+    'btn_pending_files', 'btn_files_kind', 'btn_cover_fid',
+    'pending_personal_button', 'personal_button_type', 'personal_button_name',
+    'pb_photo_fid', 'pending_global_button', 'global_button_name',
+    'global_button_type', 'pending_class_button', 'custom_button_name',
+    'custom_button_type',
+    # решения, пачки облака, Сейф, «❗ Важное»
+    'sol_pending', 'cloud_batch', 'vault_put_mode', 'vazhno_buf',
+)
+
+
+def _upl_cancel_kb():
+    """Кнопка «❌ Отмена» для приглашений загрузки (универсальная)."""
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("❌ Отмена", callback_data="upl_cancel")]])
+
+
+async def _upl_cancel_cmd(update, context):
+    """ВОЛНА 22.77: универсальная отмена ЛЮБОЙ загрузки. Чистит ВСЕ
+    временные буферы (по списку _UPLOAD_TEMP_KEYS) и возвращает в меню.
+    Вызывается из handle_callback — то есть работает в ЛЮБОМ состоянии
+    (entry_points с allow_reentry перехватывают колбэки раньше хендлеров)."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    user_id = str(query.from_user.id)
+    user = get_user(user_id)
+    if not user:
+        user = User(user_id)
+    for _key in _UPLOAD_TEMP_KEYS:
+        context.user_data.pop(_key, None)
+    _text = "🛑 Загрузка прервана — ничего не сохранено."
+    try:
+        await query.edit_message_text(_text)
+    except Exception:
+        try:
+            await context.bot.send_message(chat_id=update.effective_chat.id,
+                                           text=_text)
+        except Exception:
+            pass
+    return await show_main_menu(update, context, user)
+
 
 async def cancel_action_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -65669,9 +66503,11 @@ def main():
                 # между добавлением нового предмета, кастомной даты и текстом ДЗ.
                 MessageHandler(filters.TEXT & ~filters.COMMAND, add_homework_date_handler),
                 # ВОЛНА 22.4: вложения ДЗ — фото/файлы/видео/аудио/голос.
+                # ВОЛНА 22.77: + кружки и GIF.
                 MessageHandler(
                     filters.PHOTO | filters.Document.ALL | filters.VIDEO
-                    | filters.AUDIO | filters.VOICE,
+                    | filters.AUDIO | filters.VOICE | filters.VIDEO_NOTE
+                    | filters.ANIMATION,
                     homework_media_receive),
                 CallbackQueryHandler(handle_callback),
             ],
@@ -65691,9 +66527,11 @@ def main():
             QUICK_ADD_HOMEWORK: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, save_homework_handler),
                 # ВОЛНА 22.4: вложения ДЗ работают и в быстром потоке.
+                # ВОЛНА 22.77: + кружки и GIF.
                 MessageHandler(
                     filters.PHOTO | filters.Document.ALL | filters.VIDEO
-                    | filters.AUDIO | filters.VOICE,
+                    | filters.AUDIO | filters.VOICE | filters.VIDEO_NOTE
+                    | filters.ANIMATION,
                     homework_media_receive),
                 CallbackQueryHandler(handle_callback),
             ],
@@ -66029,6 +66867,16 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, dev_holiday_bulk_handler),
                 CallbackQueryHandler(handle_callback),
             ],
+            # === ВОЛНА 22.77: «❗ Важное» — текст + файлы одним потоком ===
+            VAZHNO_WAIT: [
+                MessageHandler(
+                    (filters.PHOTO | filters.VIDEO | filters.AUDIO
+                     | filters.VOICE | filters.VIDEO_NOTE
+                     | filters.ANIMATION | filters.Document.ALL) & ~filters.COMMAND,
+                    vazhno_receive),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, vazhno_receive),
+                CallbackQueryHandler(handle_callback),
+            ],
             DEV_INSTANT_BROADCAST: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, dev_instant_broadcast_handler),
                 CallbackQueryHandler(handle_callback),
@@ -66243,6 +67091,51 @@ def main():
         logger.info(f"Глобальная отмена инжектирована в {_n} состояний.")
     except Exception as e:
         logger.error(f"Не удалось инжектировать глобальную отмену: {e}")
+
+    # === ВОЛНА 22.77: «идёт загрузка — но бот отвечает» ===
+    # В каждое состояние приёма файлов ДОБАВЛЯЕТСЯ (последним) текстовый
+    # хендлер: если свободный текст никто не понял — бот ОТВЕЧАЕТ подсказкой
+    # с кнопкой «❌ Отмена», а не молчит. Команды /start и /cancel работают
+    # через entry/fallback, кнопки меню — через инжекты выше и entry
+    # handle_callback, «отмена» текстом — через глобальную отмену.
+    def _inject_upload_busy(states_dict):
+        _busy_states = (SEND_CLASS_MESSAGE, ADD_HOMEWORK,
+                        QUICK_ADD_HOMEWORK, SOL_WAIT_FILE,
+                        CLOUD_UPLOAD_WAIT, VAULT_PUT_WAIT,
+                        EDIT_SCHEDULE_CONTENT, DEV_STORAGE_RESTORE,
+                        BELLS_PHOTO_WAIT, CREATE_PB_PHOTO_WAIT,
+                        CREATE_PB_FILES_WAIT, CREATE_GB_FILES_WAIT,
+                        CREATE_CB_FILES_WAIT)
+        _n = 0
+        for _st in _busy_states:
+            _handlers = states_dict.get(_st)
+            if not _handlers:
+                continue
+
+            def _mk_busy(_state):
+                async def _upload_busy_reply_h(update, context):
+                    try:
+                        await update.message.reply_text(
+                            "⚠️ Сейчас идёт загрузка файлов — бот принимает "
+                            "только файлы. Кнопки меню работают: просто "
+                            "нажмите нужную. Закончили — жмите «✅ Готово», "
+                            "передумали — «❌ Отмена».",
+                            reply_markup=_upl_cancel_kb())
+                    except Exception:
+                        pass
+                    return _state
+                return _upload_busy_reply_h
+
+            _handlers.append(MessageHandler(
+                filters.TEXT & ~filters.COMMAND, _mk_busy(_st)))
+            _n += 1
+        return _n
+
+    try:
+        _bn = _inject_upload_busy(conv_handler.states)
+        logger.info(f"ВОЛНА 22.77: busy-ответы инжектированы в {_bn} состояний.")
+    except Exception as e:
+        logger.error(f"Не удалось инжектировать busy-ответы: {e}")
 
     # ВОЛНА 15: файл базы (devorks_db_snapshot_…), отправленный боту В ЛИЧКУ, —
     # перехват ДО ConversationHandler (та же группа 0, порядок решает): снапшот
