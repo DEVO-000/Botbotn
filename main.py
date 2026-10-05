@@ -3648,20 +3648,47 @@ def save_class(class_obj):
     classes[class_obj.class_code] = class_obj
     return save_classes(classes)
 
+def _gb_normalize_map(mapping):
+    """ВОЛНА 22.78: приводит карту глобальных кнопок К ОБЪЕКТАМ GlobalButton
+    в любом случае.
+
+    Жалоба: «разработчик хочет удалить глобальную кнопку — выдаёт ошибку и
+    просит нажать /start». Причина: после восстановления зеркала БД из канала
+    / снапшота в кэше могли оказаться СЫРЫЕ СЛОВАРИ вместо объектов — первый
+    же доступ к .name в списке удаления падал AttributeError, и весь флоу
+    уезжал в error_handler («Попробуйте ещё раз или нажмите /start»).
+    Теперь любая карта (объекты, dict, мусор) приводится к объектам:
+    dict → GlobalButton.from_dict, битые/чужие записи честно пропускаются с
+    логом (без падения), флоу удаления работает всегда."""
+    out = {}
+    for _bid, _b in (mapping or {}).items():
+        if isinstance(_b, GlobalButton):
+            out[_bid] = _b
+        elif isinstance(_b, dict):
+            try:
+                out[_bid] = GlobalButton.from_dict(_b)
+            except Exception as e:
+                logger.error(
+                    f"Глобальная кнопка {_bid}: запись повреждена и "
+                    f"пропущена ({e})")
+        else:
+            logger.error(
+                f"Глобальная кнопка {_bid}: неизвестный формат "
+                f"({type(_b).__name__}) — запись пропущена")
+    return out
+
+
 def load_global_buttons():
     global _global_buttons_cache
     current_time = time.time()
 
     if 'global_buttons' in _cache_last_update and current_time - _cache_last_update.get('global_buttons', 0) < CACHE_TTL:
-        return _global_buttons_cache
+        # 22.78: даже кэш нормализуем — защита от сырых dict в кэше.
+        return _gb_normalize_map(_global_buttons_cache)
 
     data = load_data(GLOBAL_BUTTONS_FILE, {}, expect="dict")
-    buttons = {}
-    for button_id, button_data in data.items():
-        try:
-            buttons[button_id] = GlobalButton.from_dict(button_data)
-        except Exception as e:
-            logger.error(f"Ошибка при загрузке глобальной кнопки {button_id}: {e}")
+    # 22.78: dict → объекты; битые записи пропускаются (раньше — падение).
+    buttons = _gb_normalize_map(data)
 
     _global_buttons_cache = buttons
     _cache_last_update['global_buttons'] = current_time
@@ -3669,8 +3696,10 @@ def load_global_buttons():
 
 def save_global_buttons(buttons):
     global _global_buttons_cache
-    _global_buttons_cache = buttons
-    data = {button_id: button.to_dict() for button_id, button in buttons.items()}
+    # 22.78: в кэш и на диск уходят только нормализованные объекты —
+    # никакой код больше не может положить сырые dict в кэш кнопок.
+    _global_buttons_cache = _gb_normalize_map(buttons)
+    data = {button_id: button.to_dict() for button_id, button in _global_buttons_cache.items()}
     return save_data(GLOBAL_BUTTONS_FILE, data)
 
 # ВОЛНА 22.49: TTL-кэш списка заблокированных (60 с, как load_users).
@@ -4229,7 +4258,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.77"
+BOT_BUILD = "22.78"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -5121,9 +5150,9 @@ async def _send_day_schedule_screen(update, context, class_obj, day_name,
         except Exception as e:
             logger.warning(f"schedule_web file re-send (day screen): {e}")
 
-    # Вложения ДЗ — в обоих вариантах.
+    # Вложения ДЗ — в обоих вариантах (22.78: с анимацией загрузки).
     for _m_list in _iter_assignment_media(homework):
-        await _send_homework_media(context, update.effective_chat.id, _m_list)
+        await _hw_media_with_progress(context, update.effective_chat.id, _m_list)
 
 
 def check_class_limit(class_code):
@@ -42149,8 +42178,9 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if buf.strip():
                     await update.message.reply_text(buf, parse_mode="Markdown")
             # ВОЛНА 22.4: досылаем вложения ВСЕХ пунктов ДЗ после текста.
+            # ВОЛНА 22.78: выдача с анимацией загрузки (статус + спиннер).
             for _m_list in _iter_assignment_media(class_obj.homework):
-                await _send_homework_media(context, update.effective_chat.id, _m_list)
+                await _hw_media_with_progress(context, update.effective_chat.id, _m_list)
         else:
             await update.message.reply_text("Вы не состоите в классе.")
         return MAIN_MENU
@@ -51446,18 +51476,26 @@ async def dev_global_button_content_handler(update: Update, context: ContextType
 
 
 # ПУНКТ 3: разработчик может удалить глобальные кнопки
+# ВОЛНА 22.78: флоу переписан безопасно. Раньше любая мелочь (устаревший
+# колбэк «Query is too old» при занятом цикле, сырые dict в кэше после
+# восстановления БД, BadRequest при edit) обрывала ветку — разработчик
+# видел «Попробуйте ещё раз или нажмите /start». Теперь: answer/edit через
+# безопасные обёртки, кнопки всегда объекты, битая запись не роняет список.
 async def dev_delete_global_button_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    # 22.78: безопасный answer — «Query is too old» больше не ломает панель.
+    await _safe_cb_answer(query)
 
     user_id = str(query.from_user.id)
     if user_id != DEVELOPER_ID:
-        await query.edit_message_text("Доступ запрещён.", reply_markup=get_developer_keyboard())
+        await _dev_safe_edit(query, "Доступ запрещён.",
+                             reply_markup=get_developer_keyboard())
         return DEV_PANEL
 
     buttons = load_global_buttons()
     if not buttons:
-        await query.edit_message_text(
+        await _dev_safe_edit(
+            query,
             "ℹ️ Нет глобальных кнопок для удаления.",
             reply_markup=get_developer_keyboard()
         )
@@ -51465,10 +51503,14 @@ async def dev_delete_global_button_start(update: Update, context: ContextTypes.D
 
     keyboard = []
     for bid, btn in buttons.items():
-        keyboard.append([InlineKeyboardButton(f"🗑️ {btn.name}", callback_data=f"dev_del_global_{bid}")])
+        # 22.78: имя всегда строкой, обрезаем до разумной длины кнопки.
+        _bname = str(getattr(btn, "name", "") or "Без названия")[:50]
+        keyboard.append([InlineKeyboardButton(f"🗑️ {_bname}",
+                                              callback_data=f"dev_del_global_{bid}")])
     keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel_action")])
 
-    await query.edit_message_text(
+    await _dev_safe_edit(
+        query,
         "🗑️ **Удаление глобальной кнопки**\n\nВыберите кнопку для удаления:",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown"
@@ -51478,31 +51520,39 @@ async def dev_delete_global_button_start(update: Update, context: ContextTypes.D
 
 async def dev_delete_global_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await _safe_cb_answer(query)
 
     user_id = str(query.from_user.id)
     if user_id != DEVELOPER_ID:
-        await query.edit_message_text("Доступ запрещён.", reply_markup=get_developer_keyboard())
+        await _dev_safe_edit(query, "Доступ запрещён.",
+                             reply_markup=get_developer_keyboard())
         return DEV_PANEL
 
     button_id = query.data.replace("dev_del_global_", "")
     buttons = load_global_buttons()
-    if button_id in buttons:
-        button_name = buttons[button_id].name
+    target = buttons.get(button_id)
+    if target is not None:
+        button_name = str(getattr(target, "name", "") or "Без названия")
         # ВОЛНА 22.75 (M4): шифры файлов кнопки стираем и из канала.
         try:
-            await _btn_delete_channel_files(context, getattr(buttons[button_id], 'files', []))
+            await _btn_delete_channel_files(context, getattr(target, 'files', []) or [])
         except Exception:
             pass
-        del buttons[button_id]
+        buttons.pop(button_id, None)
         save_global_buttons(buttons)
-        await query.edit_message_text(
-            f"✅ Глобальная кнопка '{button_name}' удалена!",
+        await _dev_safe_edit(
+            query,
+            f"✅ Глобальная кнопка '{button_name}' удалена!\n\n"
+            "Кнопка сразу пропала из меню всех пользователей.",
             reply_markup=get_developer_keyboard()
         )
     else:
-        await query.edit_message_text(
-            "Кнопка не найдена.",
+        # 22.78: честная ситуация «уже удалена» вместо ошибки.
+        await _dev_safe_edit(
+            query,
+            "ℹ️ Кнопка не найдена — скорее всего, она уже удалена.\n"
+            "Откройте «🗑️ Удалить глобальную кнопку» заново, чтобы увидеть "
+            "актуальный список.",
             reply_markup=get_developer_keyboard()
         )
     return DEV_PANEL
@@ -52891,6 +52941,84 @@ async def _send_homework_media(context, chat_id, media_list, max_send=10):
     return sent, failed
 
 
+# ВОЛНА 22.78: кадры спиннера для анимации загрузки вложений ДЗ.
+_HW_SPIN_FRAMES = ("🕐", "🕑", "🕒", "🕓", "🕔", "🕕", "🕖", "🕗", "🕘")
+
+
+async def _hw_media_with_progress(context, chat_id, media_list, max_send=10):
+    """ВОЛНА 22.78: выдача вложений ДЗ с АНИМАЦИЕЙ ЗАГРУЗКИ.
+
+    Жалоба: «если пользователь нажал на домашнее задание и там файлы —
+    должна быть анимация загрузки». Раньше бот просто молчал, пока
+    шифрованные вложения качаются из канала-хранилища и расшифровываются
+    (иногда десятки секунд) — выглядело как «бот завис».
+
+    Теперь перед выдачей ставится живой статус-сообщение:
+      🕑 Загружаю вложения ДЗ… 2/5
+      📦 Файл 3/5: Моя_работа.docx
+    Спиннер крутится (кадр меняется на каждом файле), счётчик растёт,
+    для шифрованных файлов видна пометка «скачиваю из хранилища и
+    расшифровываю». В конце — «✅ Вложения ДЗ загружены: 5/5», и статус
+    аккуратно удаляется через несколько секунд. Ошибки одного файла не
+    роняют ни выдачу, ни анимацию."""
+    files = [m for m in (media_list or [])
+             if isinstance(m, dict) and m.get("file_id")][:max_send]
+    if not files:
+        return 0, 0
+    total = len(files)
+
+    status = None
+    try:
+        status = await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"{_HW_SPIN_FRAMES[0]} Загружаю вложения ДЗ… 0/{total}")
+    except Exception:
+        status = None
+
+    sent = failed = 0
+    for _i, _m in enumerate(files, 1):
+        if status is not None:
+            _label = (str(_m.get("name") or "").strip() or "файл")[:40]
+            _phase = ("⬇️ Скачиваю из хранилища и расшифровываю 🔐"
+                      if _m.get("sealed") else "📦 Отправляю")
+            try:
+                await status.edit_text(
+                    f"{_HW_SPIN_FRAMES[_i % len(_HW_SPIN_FRAMES)]} "
+                    f"Загружаю вложения ДЗ… {_i - 1}/{total}\n"
+                    f"{_phase} · файл {_i}/{total}: {_label}")
+            except Exception:
+                pass
+        try:
+            _s, _f = await _send_homework_media(context, chat_id, [_m],
+                                                max_send=1)
+        except Exception:
+            _s, _f = 0, 1
+        sent += _s
+        failed += _f
+
+    if status is not None:
+        try:
+            await status.edit_text(
+                f"✅ Вложения ДЗ загружены: {sent}/{total}"
+                + (f" · не удалось: {failed}" if failed else ""))
+        except Exception:
+            pass
+
+        async def _hw_status_late_delete():
+            try:
+                await asyncio.sleep(6)
+                await status.delete()
+            except Exception:
+                pass
+
+        try:
+            asyncio.create_task(_hw_status_late_delete())
+        except Exception:
+            pass
+
+    return sent, failed
+
+
 def _clear_hw_media_context(context):
     """Стирает буфер вложений ДЗ из user_data (после сохранения/отмены)."""
     context.user_data.pop('hw_media_buffer', None)
@@ -53066,8 +53194,9 @@ async def hw_media_done_handler(update: Update, context: ContextTypes.DEFAULT_TY
         # «message is not modified» и прочие мелочи — не роняем подтверждение.
         await update.effective_chat.send_message(text, reply_markup=keyboard)
 
-    # Показываем вложения сразу — админ видит ровно то, что получит класс.
-    await _send_homework_media(context, update.effective_chat.id, media_snapshot)
+    # Показываем вложения сразу — админ видит ровно то, что получит класс
+    # (22.78: с анимацией загрузки, т.к. вложения только что зашифрованы).
+    await _hw_media_with_progress(context, update.effective_chat.id, media_snapshot)
     return MANAGE_HOMEWORK
 
 async def delete_homework_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -53227,8 +53356,9 @@ async def view_homework_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
     await query.edit_message_text(homework_text, parse_mode="Markdown", reply_markup=get_back_button_keyboard())
     # ВОЛНА 22.4: досылаем вложения пунктов ДЗ (админ видит то же, что и класс).
+    # ВОЛНА 22.78: выдача с анимацией загрузки.
     for _m_list in _iter_assignment_media(class_obj.homework):
-        await _send_homework_media(context, update.effective_chat.id, _m_list)
+        await _hw_media_with_progress(context, update.effective_chat.id, _m_list)
     return MANAGE_HOMEWORK
 
 async def quick_homework_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -58250,6 +58380,39 @@ async def _safe_cb_answer(query, text=None, show_alert=False):
         pass
 
 
+async def _dev_safe_edit(query, text, reply_markup=None, parse_mode=None):
+    """ВОЛНА 22.78: безопасное редактирование текста панели.
+
+    Любой BadRequest больше не обрывает ветку панелей: «Message is not
+    modified» — молча игнорируем; «Can't parse entities» — повторяем БЕЗ
+    Markdown; прочее (устаревшее сообщение, медиа без текста) — досылаем
+    текст НОВЫМ сообщением в тот же чат. Итог: разработчик всегда видит
+    результат действия, а не «Попробуйте ещё раз или нажмите /start»."""
+    try:
+        await query.edit_message_text(text, reply_markup=reply_markup,
+                                      parse_mode=parse_mode)
+        return
+    except TGBadRequest as _e:
+        _s = str(_e).lower()
+        if "not modified" in _s:
+            return
+        if "parse" in _s or "entities" in _s:
+            try:
+                await query.edit_message_text(text, reply_markup=reply_markup)
+                return
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # Фолбэк: сообщение могло устареть/быть медиа — шлём отдельным сообщением.
+    try:
+        _chat = getattr(query.message, "chat", None)
+        if _chat is not None:
+            await _chat.send_message(text, reply_markup=reply_markup)
+    except Exception:
+        pass
+
+
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     # ВОЛНА 22.13: отметка дневной активности (для статистики).
@@ -58318,7 +58481,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return MAIN_MENU
         _cb_pf["sent"] = True
 
-    await query.answer()
+    # ВОЛНА 22.78: ответ на колбэк — БЕЗОПАСНЫЙ. Когда бот занят (идёт
+    # загрузка файла, медленная сеть, очередь обновлений), нажатие кнопки
+    # доходит с задержкой и Telegram отвечает на answer() ошибкой «Query is
+    # too old and response timeout expired or query id is invalid» — ветка
+    # падала, и пользователь вместо результата получал «Попробуйте ещё раз
+    # или нажмите /start» (жалоба: «хочу удалить глобальную кнопку — выдаёт
+    # ошибку и press start»). Спиннер не критичен: edit_message_text
+    # работает и без свежего answer — обработка продолжается как обычно.
+    try:
+        await query.answer()
+    except Exception:
+        pass
 
     # Обязательная подписка на канал: не пускаем пользователя никуда, пока
     # он не подписан. Исключение — сама кнопка проверки подписки и кнопка
