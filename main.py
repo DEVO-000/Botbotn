@@ -617,13 +617,10 @@ _QUICK_SKIP_STATES = frozenset({VAULT_REN_WAIT, VAULT_LABEL_WAIT,
                                 # ВОЛНА 22.74: поисковый запрос в панелях —
                                 # тоже не команда.
                                 USER_SEARCH_WAIT,
-                                BELLS_PHOTO_WAIT,
-                                # ВОЛНА 22.77: CREATE_PB_PHOTO_WAIT и шаги файлов
-                                # кнопок (CREATE_PB/GB/CB_FILES_WAIT) БОЛЬШЕ НЕ
-                                # в скипе — «загрузка не глушит бота»: кнопки
-                                # меню и «отмена» текстом работают и там.
-                                # Свободный текст там всё равно не данные
-                                # (только алиасы «готово/отмена»).
+                                # ВОЛНА 22.79: BELLS_PHOTO_WAIT УБРАН из скипа —
+                                # «загрузка не глушит бота»: кнопки меню работают
+                                # и во время загрузки фото звонков.
+                                # Свободный текст там всё равно не данные.
                                 # ВОЛНА 22.29: пароль/время/даты — не команды.
                                 WEB_PW_ENTER, WEB_PW_ENTER_OLD,
                                 DND_WAIT_TIME, SICK_WAIT_FROM, SICK_WAIT_TO})
@@ -3480,6 +3477,78 @@ def load_users():
     return users
 
 _users_save_lock = threading.RLock()
+
+# === ВОЛНА 22.79: СИНХРОНИЗАЦИЯ ФАЙЛОВ МИНИ-АПП ↔ БОТ ===
+# «Иногда файлы в мини-апп и в боте не синхронизируются»: save_user пишет
+# запись юзера ЦЕЛИКОМ. Параллельные загрузки (мини-апп + чат) читают юзера
+# одновременно, каждый добавляет СВОЙ файл в СВОЙ список и пишет целиком —
+# вторая запись затирала первый файл. Лечение: в save_users списки
+# cloud_files/vault_files мержатся ПО ЗАПИСЯМ (по id), а надгробия ниже
+# не дают мержу воскресить файл, удалённый в параллельном потоке.
+_CLOUD_TOMBSTONES = {}       # uid -> {file_id: ts}
+_CLOUD_TOMB_TTL = 900.0      # 15 минут — с запасом больше любого ретрая
+
+
+def _cloud_tombstone_add(uid, fid):
+    """Пометить файл удалённым (не воскресать из параллельных merge)."""
+    if not fid:
+        return
+    ent = _CLOUD_TOMBSTONES.setdefault(str(uid), {})
+    if len(ent) > 200:
+        now = time.time()
+        for k in [k for k, ts in ent.items() if now - ts > _CLOUD_TOMB_TTL]:
+            ent.pop(k, None)
+        if len(ent) > 200:
+            ent.clear()
+    ent[str(fid)] = time.time()
+
+
+def _cloud_tombstone_has(uid, fid):
+    ent = _CLOUD_TOMBSTONES.get(str(uid))
+    if not ent or not fid:
+        return False
+    ts = ent.get(str(fid))
+    if ts is None:
+        return False
+    if time.time() - ts > _CLOUD_TOMB_TTL:
+        ent.pop(str(fid), None)
+        return False
+    return True
+
+
+def _merge_user_file_lists(new_list, old_list, uid):
+    """Союз списков cloud_files/vault_files по полю id.
+    primary = свежесохранённый список вызывающего (его порядок и его
+    изменения), secondary = параллельно изменённый список с диска:
+    записи, которых в primary нет, ДОБАВЛЯЮТСЯ в конец (кроме удалённых —
+    надгробия). Так ни чат, ни мини-апп не теряют файлы друг друга."""
+    try:
+        seen = set()
+        out = []
+        for rec in (new_list or []):
+            if not isinstance(rec, dict):
+                continue
+            rid = str(rec.get("id") or "")
+            key = rid or f"_anon_{len(out)}"
+            if rid and rid in seen:
+                continue          # дубль внутри списка — чистим заодно
+            if rid and _cloud_tombstone_has(uid, rid):
+                continue          # удалён в параллельном потоке — не воскресаем
+            seen.add(key)
+            out.append(rec)
+        for rec in (old_list or []):
+            if not isinstance(rec, dict):
+                continue
+            rid = str(rec.get("id") or "")
+            if not rid or rid in seen:
+                continue
+            if _cloud_tombstone_has(uid, rid):
+                continue
+            seen.add(rid)
+            out.append(rec)
+        return out
+    except Exception:
+        return new_list
 # Недавно удалённые пользователи (uid → ts): параллельная «полная» запись
 # save_users не должна их воскресить. TTL 10 мин, реестр подрезается.
 _recently_removed_users = {}
@@ -3523,6 +3592,18 @@ def save_users(users):
             # load_data вернёт {} — в этом случае мержить НЕЧЕГО, но и
             # затирать чужие записи нечем; сохраняем как есть.
             if isinstance(fresh, dict) and fresh:
+                # ВОЛНА 22.79: списки файлов (облако/Сейф) мержим ПО ЗАПИСЯМ —
+                # параллельные загрузки из мини-аппа и чата больше не теряют
+                # файлы друг друга (жалоба «не синхронизируются»).
+                for _uid, _new in data.items():
+                    _old = fresh.get(_uid)
+                    if not (isinstance(_old, dict) and isinstance(_new, dict)):
+                        continue
+                    for _lk in ("cloud_files", "vault_files"):
+                        _nl = _new.get(_lk)
+                        _ol = _old.get(_lk)
+                        if isinstance(_nl, list) and isinstance(_ol, list) and _ol:
+                            _new[_lk] = _merge_user_file_lists(_nl, _ol, _uid)
                 fresh.update(data)
                 data = fresh
         except Exception as e:
@@ -4258,7 +4339,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.78"
+BOT_BUILD = "22.79"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -8681,6 +8762,7 @@ def _cloud_item_from_message(msg):
     return {
         "kind": kind,
         "file_id": att.file_id,
+        "fuid": str(getattr(att, "file_unique_id", "") or ""),
         "size": int(getattr(att, "file_size", 0) or 0),
         "mime": str(getattr(att, "mime_type", "") or ""),
         "name": _cloud_display_name(msg, att, kind),
@@ -9095,6 +9177,18 @@ async def _cloud_upload_items(update: Update, context: ContextTypes.DEFAULT_TYPE
             # ВОЛНА 8: не просто отказ — кнопка «отправить в канал самому».
             skipped_big.append(item)
             continue
+        # ВОЛНА 22.79: анти-дубль облака — тот же файл (file_unique_id),
+        # отправленный повторно во время загрузки, не создаёт вторую запись.
+        _cl_fuid = str(item.get("fuid") or "")
+        if _cl_fuid and (_upload_recent_dup(user_id, _cl_fuid)
+                         or any(isinstance(f, dict) and f.get("fuid") == _cl_fuid
+                                for f in files)
+                         or _cloud_recent_dup(user, item["name"],
+                                              item["size"]) is not None):
+            await msg.reply_text(
+                f"⏳ «{item['name'][:40]}» уже в облаке — дубль пропущен.")
+            continue
+        _upload_recent_mark(user_id, _cl_fuid)
         channel_id = cloud_ids[_rr % len(cloud_ids)]
         kind = item["kind"]
         name = item["name"]
@@ -9129,6 +9223,7 @@ async def _cloud_upload_items(update: Update, context: ContextTypes.DEFAULT_TYPE
             "file_id": new_file_id,
             "size": item["size"],
             "mime": item.get("mime", ""),
+            "fuid": str(item.get("fuid") or ""),
             "ts": _file_ts_now(), "tss": datetime.now().strftime("%Y-%m-%d %H:%M"),
             # ВОЛНА 7: в каком именно канале лежит файл (каналов несколько).
             "channel_id": channel_id,
@@ -9951,6 +10046,7 @@ async def cloud_del_yes_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f for f in (getattr(user, "cloud_files", []) or [])
         if not (isinstance(f, dict) and f.get("id") == fid)
     ]
+    _cloud_tombstone_add(user.user_id, fid)   # 22.79: не воскреснет в merge
     save_user(user)
     note = "" if deleted_from_channel else (
         " Удалено из списка; само сообщение в канале стереть не удалось — "
@@ -10284,6 +10380,32 @@ def _rec_ts_display(rec):
     return _ts_human(v)
 
 
+def _miniapp_friendly_name(kind, mime="", ts=None):
+    """ВОЛНА 22.79: честное имя по типу, когда реальное имя потеряно
+    (Android не дал имя файла, фото из чата и т. п.) — «файлы не называются
+    в мини-апп» больше не про пустые карточки."""
+    _ts = ""
+    try:
+        if isinstance(ts, (int, float)) and ts:
+            _ts = datetime.fromtimestamp(int(ts)).strftime("%d.%m %H:%M")
+        elif isinstance(ts, str) and ts[:10].count("-") == 2:
+            _ts = ts[:10].replace("-", ".")
+    except Exception:
+        _ts = ""
+    _ts = _ts or datetime.now().strftime("%d.%m %H:%M")
+    k = str(kind or "document")
+    m = (mime or "").lower()
+    if k == "photo" or m.startswith("image/"):
+        return f"Фото {_ts}.jpg"
+    if k == "video" or m.startswith("video/"):
+        return f"Видео {_ts}.mp4"
+    if k == "audio" or m.startswith("audio/"):
+        return f"Аудио {_ts}.mp3"
+    if k == "voice":
+        return f"Голосовое {_ts}.ogg"
+    return f"Файл {_ts}"
+
+
 def _miniapp_rec_out(rec):
     """Запись cloud_files → JSON для мини-аппа (те же поля, что были в макете:
     id/name/kind/size/ts/vault).
@@ -10309,16 +10431,23 @@ def _miniapp_rec_out(rec):
     # («неправильно распознаются фото/видео/файлы и музыка»): раньше kind
     # намертво запоминался при загрузке и старые файлы навсегда оставались
     # «документами», даже если загрузились до расширения таблицы типов.
+    _m = str(rec.get("mime") or "")
+    _n = str(rec.get("name") or "")
     if _kind == "document":
         try:
-            _healed = _miniapp_kind_from(rec.get("mime"), rec.get("name"))
+            _healed = _miniapp_kind_from(_m, _n)
             if _healed != "document":
                 _kind = _healed
         except Exception:
             pass
+    # ВОЛНА 22.79: ЛЕЧЕНИЕ наоборот — тип есть, а ИМЕНИ нет (Android дал
+    # пустое имя / «file.bin»): строим честное «Фото 07.10 14:32.jpg».
+    if (not _n.strip() or _n.lower() in ("file.bin", "файл", "blob", "file",
+                                         "document")) and _kind != "document":
+        _n = _miniapp_friendly_name(_kind, _m, rec.get("ts"))
     return {
         "id": str(rec.get("id") or ""),
-        "name": str(rec.get("name") or "файл"),
+        "name": str(_n or "файл"),
         "kind": _kind,
         "size": int(rec.get("size") or 0),
         "ts": _ts,
@@ -10341,6 +10470,20 @@ def _miniapp_safe_rec_out(idx, rec):
         name = str(rec.get("name") or label or f"Файл #{idx}")
     else:
         name = label if label else f"Файл #{idx}"
+    # ВОЛНА 22.79: у записи Сейфа без подписи имя строим по типу, если он
+    # известен («Фото 07.10 14:32.jpg» вместо безликого «Файл #N»), и ЛЕЧИМ
+    # тип по mime — старые записи Сейфа тоже показывались «документами».
+    _vk = str(rec.get("kind") or "document")
+    _vm = str(rec.get("mime") or "")
+    if _vk == "document":
+        try:
+            _healed = _miniapp_kind_from(_vm, name)
+            if _healed != "document":
+                _vk = _healed
+        except Exception:
+            pass
+    if not label and _vk != "document":
+        name = _miniapp_friendly_name(_vk, _vm, rec.get("ts"))
     _ts = rec.get("ts")
     if isinstance(_ts, (int, float)) and not isinstance(_ts, bool):
         pass  # ВОЛНА 22.36: epoch — отдаём число, клиент покажет локальное время
@@ -10349,7 +10492,7 @@ def _miniapp_safe_rec_out(idx, rec):
     return {
         "id": "v_" + str(rec.get("id") or ""),
         "name": name,
-        "kind": str(rec.get("kind") or "document"),
+        "kind": _vk,   # ВОЛНА 22.79: вылеченный тип (mime/имя)
         "size": int(rec.get("size_orig") or 0),
         "ts": _ts,
         "vault": True,
@@ -15957,6 +16100,7 @@ function guessMime(name) {
     webp: 'image/webp', bmp: 'image/bmp', svg: 'image/svg+xml', heic: 'image/heic', heif: 'image/heif',
     mp4: 'video/mp4', mov: 'video/quicktime', webm: 'video/webm', mkv: 'video/x-matroska', avi: 'video/x-msvideo', '3gp': 'video/3gpp',
     mp3: 'audio/mpeg', wav: 'audio/wav', ogg: 'audio/ogg', oga: 'audio/ogg', m4a: 'audio/mp4', aac: 'audio/aac', flac: 'audio/flac',
+    opus: 'audio/ogg', m4b: 'audio/mp4', amr: 'audio/amr', mid: 'audio/midi', midi: 'audio/midi', weba: 'audio/webm', wma: 'audio/x-ms-wma',
     pdf: 'application/pdf', zip: 'application/zip', rar: 'application/vnd.rar', '7z': 'application/x-7z-compressed',
     txt: 'text/plain', csv: 'text/csv', json: 'application/json',
     doc: 'application/msword',
@@ -18052,8 +18196,136 @@ function addMoreUploadFiles() {
    следующем открытии облака, прогресс — в панели передач. Никаких
    переключателей, панелей «поделиться» и переходов в чат. */
 
-function uploadFiles(fileList) {
+/* ═══ ВОЛНА 22.79: СНИФФИНГ ФОРМАТА ПО МАГИЧЕСКИМ БАЙТАМ ═══
+   На Android WebView файлы из галереи часто приходят с пустым type и
+   безымянными («blob») — фото/видео/музыка становились «документом»,
+   а файлы назывались «file.bin». Первые байты честно говорят, что это:
+   JPEG/PNG/GIF/WEBP/BMP/HEIC, MP4/MOV/WEBM/AVI, MP3/WAV/OGG/FLAC/M4A,
+   PDF/ZIP. Плюс дружелюбное имя по типу — «Фото 07.10 14:32.jpg». */
+function devoSniffMime(b) {
+  if (!b || !b.length) return '';
+  const ascii = (off, s) => {
+    for (let i = 0; i < s.length; i++) {
+      if (b[off + i] !== s.charCodeAt(i)) return false;
+    }
+    return true;
+  };
+  if (b.length >= 3 && b[0] === 0xFF && b[1] === 0xD8 && b[2] === 0xFF) return 'image/jpeg';
+  if (b.length >= 4 && b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4E && b[3] === 0x47) return 'image/png';
+  if (b.length >= 6 && ascii(0, 'GIF8')) return 'image/gif';
+  if (b.length >= 12 && ascii(0, 'RIFF') && ascii(8, 'WEBP')) return 'image/webp';
+  if (b.length >= 12 && ascii(0, 'RIFF') && ascii(8, 'AVI ')) return 'video/x-msvideo';
+  if (b.length >= 12 && ascii(0, 'RIFF') && ascii(8, 'WAVE')) return 'audio/wav';
+  if (b.length >= 2 && b[0] === 0x42 && b[1] === 0x4D) return 'image/bmp';
+  if (b.length >= 12 && ascii(4, 'ftyp')) {
+    const brand = String.fromCharCode(b[8] || 0, b[9] || 0, b[10] || 0, b[11] || 0).toLowerCase();
+    if (brand.indexOf('qt') === 0) return 'video/quicktime';
+    if (brand.indexOf('m4a') === 0 || brand.indexOf('m4b') === 0) return 'audio/mp4';
+    if (brand.indexOf('heic') === 0 || brand.indexOf('heix') === 0 ||
+        brand.indexOf('mif1') === 0 || brand.indexOf('heif') === 0) return 'image/heic';
+    return 'video/mp4';
+  }
+  if (b.length >= 4 && b[0] === 0x1A && b[1] === 0x45 && b[2] === 0xDF && b[3] === 0xA3) return 'video/webm';
+  if (b.length >= 4 && ascii(0, 'fLaC')) return 'audio/flac';
+  if (b.length >= 4 && ascii(0, 'OggS')) return 'audio/ogg';
+  if (b.length >= 3 && ascii(0, 'ID3')) return 'audio/mpeg';
+  if (b.length >= 2 && b[0] === 0xFF && (b[1] & 0xE0) === 0xE0) return 'audio/mpeg';
+  if (b.length >= 4 && b[0] === 0x25 && b[1] === 0x50 && b[2] === 0x44 && b[3] === 0x46) return 'application/pdf';
+  if (b.length >= 4 && b[0] === 0x50 && b[1] === 0x4B && (b[2] === 3 || b[2] === 5 || b[2] === 7)) return 'application/zip';
+  return '';
+}
+
+function devoMimeExt(mime) {
+  return ({
+    'image/jpeg': '.jpg', 'image/png': '.png', 'image/gif': '.gif',
+    'image/webp': '.webp', 'image/bmp': '.bmp', 'image/heic': '.heic',
+    'video/mp4': '.mp4', 'video/quicktime': '.mov', 'video/webm': '.webm',
+    'video/x-msvideo': '.avi',
+    'audio/mpeg': '.mp3', 'audio/wav': '.wav', 'audio/ogg': '.ogg',
+    'audio/flac': '.flac', 'audio/mp4': '.m4a',
+    'application/pdf': '.pdf', 'application/zip': '.zip'
+  })[String(mime || '')] || '';
+}
+
+function devoFriendlyName(mime) {
+  const d = new Date();
+  const p = (x) => String(x).padStart(2, '0');
+  const ts = p(d.getDate()) + '.' + p(d.getMonth() + 1) + ' ' +
+    p(d.getHours()) + ':' + p(d.getMinutes());
+  const m = String(mime || '');
+  let base = 'Файл';
+  let ext = devoMimeExt(m);
+
+  if (m.indexOf('image/') === 0) { base = 'Фото'; ext = ext || '.jpg'; }
+  else if (m.indexOf('video/') === 0) { base = 'Видео'; ext = ext || '.mp4'; }
+  else if (m.indexOf('audio/') === 0) { base = 'Аудио'; ext = ext || '.mp3'; }
+  else if (m === 'application/pdf') { base = 'Документ'; ext = '.pdf'; }
+
+  return base + ' ' + ts + ext;
+}
+
+async function devoFixFile(f) {
+  /* Возвращает файл с исправленными type/name (или исходный, если всё ок).
+     File.type — геттер прототипа, поэтому при изменениях создаём новый
+     File/Blob с тем же содержимым (slice не теряет байты). */
+  try {
+    if (!f || !(+f.size)) return f;
+    let head = null;
+
+    try { head = new Uint8Array(await f.slice(0, 24).arrayBuffer()); } catch (eH) { head = null; }
+
+    const sniffed = head ? devoSniffMime(head) : '';
+    const curType = (String(f.type || '') === 'application/octet-stream')
+      ? '' : String(f.type || '');
+    const mime = sniffed || curType;
+    const name = String(f.name || '');
+    let newName = name;
+    let needNew = false;
+
+    if (!name || name === 'blob') {
+      newName = devoFriendlyName(mime);
+      needNew = true;
+    } else if (!/\.[a-z0-9]{1,8}$/i.test(name)) {
+      const ext = devoMimeExt(mime);
+      if (ext) { newName = name + ext; needNew = true; }
+    }
+
+    if (mime && mime !== curType) needNew = true;
+    if (!needNew) return f;
+
+    const type = mime || 'application/octet-stream';
+    const keepName = newName || name || 'file';
+
+    try {
+      return new File([f], keepName, {
+        type: type,
+        lastModified: f.lastModified || Date.now()
+      });
+    } catch (eF) {
+      try {
+        const nb = new Blob([f], { type: type });
+        nb.name = keepName;
+        nb.lastModified = f.lastModified || Date.now();
+        return nb;
+      } catch (eB) { return f; }
+    }
+  } catch (e) { return f; }
+}
+
+async function uploadFiles(fileList) {
   let files = Array.from(fileList);
+
+  if (!files.length) return;
+
+  /* ═══ ВОЛНА 22.79: ТИП И ИМЯ ЧИНЯТСЯ СРАЗУ ПРИ ВЫБОРЕ ═══
+     На Android WebView часто отдаёт файлы без mime (type='') и с
+     безымянным name («blob», без расширения) — фото/видео/музыка
+     превращались в «документ», а файлы назывались «file.bin». Читаем
+     первые байты и распознаём формат по магической сигнатуре, имя
+     достраиваем честным «Фото 07.10 14:32.jpg». */
+  try {
+    files = await Promise.all(files.map((f) => devoFixFile(f)));
+  } catch (eFix) { /* чиним, как получилось */ }
 
   if (!files.length) return;
 
@@ -22629,6 +22901,9 @@ async def miniapp_files_delete(request):
             f for f in (getattr(user, "cloud_files", []) or [])
             if not (isinstance(f, dict) and f.get("id") == fid)
         ]
+    # ВОЛНА 22.79: надгробие в памяти — параллельный merge-save не вернёт
+    # файл (синхронизация мини-апп ↔ бот).
+    _cloud_tombstone_add(_uid, str(rec.get("id") or fid))
     # ВОЛНА 22.75 (M4): НАДГРОБИЕ в WAL — пользователь удалил файл сам.
     # Реконсиляция на старте никогда не воскресит файл с надгробием.
     _wal_append("delete", _uid, "vault" if where == "safe" else "cloud",
@@ -35662,6 +35937,7 @@ async def vault_del_yes_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f for f in (getattr(user, "vault_files", []) or [])
         if not (isinstance(f, dict) and f.get("id") == vid)
     ]
+    _cloud_tombstone_add(user.user_id, vid)   # 22.79: не воскреснет в merge
     save_user(user)
     try:
         await query.edit_message_text(
@@ -43221,6 +43497,15 @@ async def _button_files_media_handler(update, context):
                                  "музыку или документ.")
             return state
         ftype, fid, size, mime, fname = info
+        # ВОЛНА 22.79: повторная отправка того же файла во время загрузки
+        # больше не создаёт дубль в списке кнопки.
+        _fuid = _media_fuid(msg)
+        if _upload_recent_dup(update.effective_user.id, _fuid) or any(
+                isinstance(p, dict) and p.get("fuid") == _fuid for p in pend):
+            await msg.reply_text("⏳ Этот файл уже принят — он появится в "
+                                 "списке ниже. Дублировать не нужно.")
+            return state
+        _upload_recent_mark(update.effective_user.id, _fuid)
         if len(pend) >= _BTN_MAX_FILES:
             await msg.reply_text(f"⚠️ Максимум {_BTN_MAX_FILES} файлов на кнопку — "
                                  "жмите «✅ Готово».")
@@ -43255,6 +43540,7 @@ async def _button_files_media_handler(update, context):
                     "mid": int(_up.get("message_id") or 0),
                     "ftype": ftype, "name": fname[:120], "mime": mime,
                     "size": int(size or 0), "plain": False,
+                    "fuid": _fuid,
                     "cover": bool(ftype == "photo"
                                   and not context.user_data.get('btn_cover_fid')),
                 }
@@ -43268,6 +43554,7 @@ async def _button_files_media_handler(update, context):
                 rec = {"id": "btn_" + secrets.token_hex(4), "fid": fid,
                        "ch": 0, "mid": 0, "ftype": ftype, "name": fname[:120],
                        "mime": mime, "size": int(size or 0), "plain": True,
+                       "fuid": _fuid,
                        "cover": bool(ftype == "photo"
                                      and not context.user_data.get('btn_cover_fid'))}
                 if rec["cover"]:
@@ -43733,6 +44020,13 @@ async def vazhno_receive(update, context):
                              "музыку или документ.")
         return VAZHNO_WAIT
     ftype, fid, size, mime, fname = info
+    # ВОЛНА 22.79: анти-дубль для поста «Важное».
+    _fuid = _media_fuid(msg)
+    if _upload_recent_dup(update.effective_user.id, _fuid):
+        await msg.reply_text("⏳ Этот файл уже принят в пост — дождитесь "
+                             "шифрования, дубль не нужен.")
+        return VAZHNO_WAIT
+    _upload_recent_mark(update.effective_user.id, _fuid)
     files = buf.setdefault("files", [])
     if len(files) >= _VAZHNO_MAX_FILES:
         await msg.reply_text(f"⚠️ Максимум {_VAZHNO_MAX_FILES} файлов на пост — "
@@ -43765,12 +44059,13 @@ async def vazhno_receive(update, context):
                    "ch": int(_up.get("channel_id") or 0),
                    "mid": int(_up.get("message_id") or 0),
                    "ftype": ftype, "name": fname[:120], "mime": mime,
-                   "size": int(size or 0), "plain": False}
+                   "size": int(size or 0), "plain": False, "fuid": _fuid}
             _wal_append("upload", user_id, "vazhnofile", {"rec": rec})
         else:
             rec = {"id": "vz_" + secrets.token_hex(4), "fid": fid,
                    "ch": 0, "mid": 0, "ftype": ftype, "name": fname[:120],
-                   "mime": mime, "size": int(size or 0), "plain": True}
+                   "mime": mime, "size": int(size or 0), "plain": True,
+                   "fuid": _fuid}
     except Exception as e:
         logger.error(f"vazhno file encrypt: {e}")
         await _btn_anim_stop(anim)
@@ -46301,6 +46596,9 @@ SCHEDMON_CHECK_INTERVAL = 300
 # изменится»: три автоотправки в день на ссылку (при частых правках расписания
 # класс не должен оставаться без свежей версии до завтра).
 SCHEDMON_MAX_AUTO_PER_DAY = 3
+# ВОЛНА 22.79: ключи, которые админ задаёт вручную — их пустота в памяти
+# фонового монитора НЕ означает «админ сбросил» (защита от затирания).
+_SCHMON_ADMIN_KEYS = ("sel", "cand", "chat", "added_by", "added_ts")
 SCHEDMON_MAX_TRACK_PER_CLASS = 15   # сколько ссылок может следить один класс
 SCHEDMON_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
@@ -46415,13 +46713,26 @@ def schmon_new_info():
 
 def schmon_merge_info(class_code, url, info):
     """Сохранить ОДНУ ссылку, не затирая изменения админов: читаем свежее
-    состояние, подменяем только эту ссылку (если её не удалили) и пишем."""
+    состояние, подменяем только эту ссылку (если её не удалили) и пишем.
+    ВОЛНА 22.79: ключи ВЫБОРА АДМИНА (sel/cand/chat/added_*) больше не
+    затираются пустотой из устаревшей копии фонового монитора. Раньше гонка
+    «админ выбрал источники, пока монитор качал страницу» приводила к тому,
+    что выбор стирался, ссылка навсегда уходила в «тихий режим» (has_cand,
+    sel пуст) — и бот переставал замечать изменения расписания."""
     try:
         state = schmon_load()
         urls = schmon_class_urls(state, class_code)
         if url not in urls:
             return False   # админ уже удалил ссылку — не возвращаем её
-        urls[url] = {k: info.get(k, urls[url].get(k)) for k in SCHEDMON_INFO_KEYS}
+        old = urls[url]
+        merged = {}
+        for k in SCHEDMON_INFO_KEYS:
+            v = info.get(k, old.get(k))
+            # Пустое значение в памяти = «не знаю»: оставляем свежее с диска.
+            if k in _SCHMON_ADMIN_KEYS and old.get(k) and not v:
+                v = old.get(k)
+            merged[k] = v
+        urls[url] = merged
         return schmon_save(state)
     except Exception as e:
         logger.error(f"schmon_merge_info: {e}")
@@ -47471,7 +47782,16 @@ async def schmon_check_url(app, class_code, url, info):
         new_files = [f for f in new_files if _schmon_norm_src(f) in sel_norm]
         allow_text = "TEXT" in sel
     elif has_cand:
-        new_files, allow_text = [], False  # админ ещё не выбрал — молчим
+        # ВОЛНА 22.79: авто-лечение «забытого» выбора. Раньше ссылка, для
+        # которой админ так и не ткнул источник в меню кандидатов, МОЛЧАЛА
+        # ВЕЧНО (изменения не рассылались и не замечались). Через час после
+        # добавления переводим её в автоматический режим: текст + новые файлы.
+        if not info.get("sel") and (
+                int(info.get("added_ts") or 0)
+                < time.time() - 3600):
+            allow_text = True
+        else:
+            new_files, allow_text = [], False  # админ ещё не выбрал — молчим
     else:
         allow_text = True  # состояние без меню выбора — как раньше
 
@@ -47493,6 +47813,27 @@ async def schmon_check_url(app, class_code, url, info):
             info.update({"h": h, "ch": ch,
                          "title": schmon_page_title(html_text),
                          "files": files_now})
+            # ВОЛНА 22.79: «слепая зона». Страница изменилась, но ни один
+            # источник не распознан — раньше бот молча обновлял хэши и
+            # «не видел» изменение. Теперь раз в сутки честно сообщаем
+            # админу (НЕ классу, квота не тратится) — он проверит ссылку.
+            if allow_text and page_changed:
+                _blind = "blind:" + _schmon_today()
+                if not schmon_was_sent(info, _blind):
+                    schmon_mark_sent(info, _blind)
+                    _admin = str(info.get("chat") or info.get("added_by") or "")
+                    if _admin.isdigit():
+                        try:
+                            await schmon_send_text(
+                                app.bot, int(_admin),
+                                "👀 Страница %s (%s) изменилась, но я не смог "
+                                "распознать, что именно. Загляните в «🌐 Расписание "
+                                "с сайтов» → «🔍 Проверить сейчас»: если это "
+                                "обновилось расписание — выберите источники, "
+                                "и класс начнёт получать уведомления."
+                                % (schmon_host_of(url)[:60], url[:80]))
+                        except Exception:
+                            pass
             schmon_merge_info(class_code, url, info)
             return False
 
@@ -48481,6 +48822,14 @@ async def send_class_message_media_handler(update: Update,
 
     msg = update.message
     caption = (msg.caption or "").strip()
+    # ВОЛНА 22.79: анти-дубль рассылки — тот же файл, отправленный повторно
+    # во время медленной отправки, больше не улетит классу дважды.
+    _cm_fuid = _media_fuid(msg)
+    if _upload_recent_dup(user_id, _cm_fuid):
+        await msg.reply_text("⏳ Это уведомление с файлом уже отправляется — "
+                            "дубль пропущен.")
+        return await admin_panel(update, context)
+    _upload_recent_mark(user_id, _cm_fuid)
     header = f"📢 Уведомление от администратора класса {class_obj.class_name}:"
     full_caption = (header + ("\n\n" + caption if caption else ""))[:1024]
 
@@ -52820,31 +53169,39 @@ _HW_MEDIA_LABELS = {
 
 def _extract_media_ref(message):
     """Достаёт из сообщения ссылку на вложение (file_id). None — медиа нет.
-    ВОЛНА 22.77: +video_note/animation и размер (для лимита 20 МБ)."""
+    ВОЛНА 22.77: +video_note/animation и размер (для лимита 20 МБ).
+    ВОЛНА 22.79: +fuid (file_unique_id) — анти-дубль вложений."""
     if getattr(message, "photo", None):
         # photo — список размеров; берём самый большой (последний).
         return {"type": "photo", "file_id": message.photo[-1].file_id,
+                "fuid": str(getattr(message.photo[-1], "file_unique_id", "") or ""),
                 "size": int(message.photo[-1].file_size or 0)}
     if getattr(message, "document", None):
         return {"type": "document", "file_id": message.document.file_id,
+                "fuid": str(getattr(message.document, "file_unique_id", "") or ""),
                 "name": (message.document.file_name or "файл")[:80],
                 "size": int(message.document.file_size or 0)}
     if getattr(message, "video", None):
         return {"type": "video", "file_id": message.video.file_id,
+                "fuid": str(getattr(message.video, "file_unique_id", "") or ""),
                 "name": (message.video.file_name or "видео")[:80],
                 "size": int(message.video.file_size or 0)}
     if getattr(message, "audio", None):
         return {"type": "audio", "file_id": message.audio.file_id,
+                "fuid": str(getattr(message.audio, "file_unique_id", "") or ""),
                 "name": (message.audio.file_name or "аудио")[:80],
                 "size": int(message.audio.file_size or 0)}
     if getattr(message, "voice", None):
         return {"type": "voice", "file_id": message.voice.file_id,
+                "fuid": str(getattr(message.voice, "file_unique_id", "") or ""),
                 "size": int(message.voice.file_size or 0)}
     if getattr(message, "video_note", None):
         return {"type": "video_note", "file_id": message.video_note.file_id,
+                "fuid": str(getattr(message.video_note, "file_unique_id", "") or ""),
                 "size": int(message.video_note.file_size or 0)}
     if getattr(message, "animation", None):
         return {"type": "animation", "file_id": message.animation.file_id,
+                "fuid": str(getattr(message.animation, "file_unique_id", "") or ""),
                 "name": (message.animation.file_name or "gif.mp4")[:80],
                 "size": int(message.animation.file_size or 0)}
     return None
@@ -53045,7 +53402,8 @@ async def homework_media_receive(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text(
             "Пришлите фото, видео, музыку, кружок, GIF или файл — можно "
             "МНОГО подряд (до 10, каждый будет зашифрован 🔐) — либо "
-            "напишите задание текстом.")
+            "напишите задание текстом.",
+            reply_markup=_upl_cancel_kb())  # ВОЛНА 22.79: «Отмена» снизу
         return None
 
     buffer = context.user_data.setdefault('hw_media_buffer', [])
@@ -53055,6 +53413,17 @@ async def homework_media_receive(update: Update, context: ContextTypes.DEFAULT_T
             "Нажмите «✅ Готово», чтобы сохранить.",
             reply_markup=_hw_media_confirm_kb())
         return None
+    # ВОЛНА 22.79: анти-дубль вложений ДЗ (повторная отправка во время
+    # загрузки больше не создаёт вторую копию).
+    _hfuid = str(media.get("fuid") or "")
+    if _hfuid and (_upload_recent_dup(user_id, _hfuid)
+                   or any(isinstance(m, dict) and m.get("fuid") == _hfuid
+                          for m in buffer)):
+        await update.message.reply_text(
+            "⏳ Это вложение уже принято — дождитесь «✅ Готово», "
+            "дубль не нужен.")
+        return None
+    _upload_recent_mark(user_id, _hfuid)
     # ВОЛНА 22.77: файлы ДЗ шифруются (переупаковка), потолок — как у кнопок.
     if int(media.get("size") or 0) > VAULT_MAX_FILE_BYTES:
         await update.message.reply_text(
@@ -59711,6 +60080,54 @@ _UPLOAD_TEMP_KEYS = (
 )
 
 
+# === ВОЛНА 22.79: АНТИ-ДУБЛЬ ЗАГРУЖАЮЩИХСЯ ФАЙЛОВ ===
+# «Иногда загружающиеся файлы могут дублироваться»: пользователь во время
+# медленной загрузки отправлял тот же файл ещё раз (или Telegram повторял
+# апдейт) — второй приёмник честно сохранял ВТОРУЮ копию. Реестр ниже держит
+# file_unique_id недавних приёмов: повтор в окне TTL вежливо отклоняется.
+_UPLOAD_RECENT = {}          # uid -> {file_unique_id: ts}
+_UPLOAD_RECENT_TTL = 150.0   # в полёте + сразу после (секунды)
+
+
+def _media_fuid(msg):
+    """file_unique_id из любого медиа-сообщения ('' — медиа нет)."""
+    att = None
+    if getattr(msg, "photo", None):
+        att = msg.photo[-1]
+    else:
+        for _nm in ("document", "video", "audio", "voice",
+                    "video_note", "animation"):
+            att = getattr(msg, _nm, None)
+            if att is not None:
+                break
+    if att is None:
+        return ""
+    return str(getattr(att, "file_unique_id", "") or "")
+
+
+def _upload_recent_dup(uid, fuid):
+    """True — файл с таким file_unique_id уже принимается/принят недавно."""
+    if not fuid:
+        return False
+    now = time.time()
+    ent = _UPLOAD_RECENT.get(str(uid))
+    if ent:
+        for k in [k for k, ts in ent.items()
+                  if now - ts > _UPLOAD_RECENT_TTL]:
+            ent.pop(k, None)
+    return bool(ent and fuid in ent)
+
+
+def _upload_recent_mark(uid, fuid):
+    """Пометить файл как принятый (анти-дубль окно)."""
+    if not fuid:
+        return
+    ent = _UPLOAD_RECENT.setdefault(str(uid), {})
+    if len(ent) > 80:
+        ent.clear()
+    ent[fuid] = time.time()
+
+
 def _upl_cancel_kb():
     """Кнопка «❌ Отмена» для приглашений загрузки (универсальная)."""
     return InlineKeyboardMarkup(
@@ -62131,12 +62548,22 @@ async def sol_file_receive(update: Update,
             "«✅ Далее» под прошлым сообщением, чтобы опубликовать эти, "
             "а остальные пришлите отдельной записью базы.")
         return SOL_WAIT_FILE
+    # ВОЛНА 22.79: анти-дубль файлов решения.
+    _sfuid = _media_fuid(msg)
+    if _sfuid and (_upload_recent_dup(update.effective_user.id, _sfuid)
+                   or any(isinstance(f, dict) and f.get("fuid") == _sfuid
+                          for f in files)):
+        await msg.reply_text("⏳ Этот файл уже добавлен к решению — "
+                             "дубль не нужен.")
+        return SOL_WAIT_FILE
+    _upload_recent_mark(update.effective_user.id, _sfuid)
     files.append({
         "ftype": _ftype,
         "fid": _fid,
         "mime": _mime,
         "fname": _fname,
         "size": _size,
+        "fuid": _sfuid,
     })
     pend["files"] = files
     pend["ch"] = int(msg.chat_id)
@@ -67279,7 +67706,10 @@ def main():
                         EDIT_SCHEDULE_CONTENT, DEV_STORAGE_RESTORE,
                         BELLS_PHOTO_WAIT, CREATE_PB_PHOTO_WAIT,
                         CREATE_PB_FILES_WAIT, CREATE_GB_FILES_WAIT,
-                        CREATE_CB_FILES_WAIT)
+                        CREATE_CB_FILES_WAIT,
+                        # ВОЛНА 22.79: «❗ Важное» тоже принимает файлы —
+                        # свободный текст там получает busy-подсказку.
+                        VAZHNO_WAIT)
         _n = 0
         for _st in _busy_states:
             _handlers = states_dict.get(_st)
