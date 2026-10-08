@@ -2546,6 +2546,11 @@ class User:
         # скорость анимации, звук, свой цвет) — переживают очистку кэша и
         # смену устройства; localStorage остаётся мгновенным кэшем.
         self.miniapp_settings = {}
+        # ВОЛНА 22.81: списки нового мини-аппа (папки/альбомы, избранное,
+        # описания к файлам, удалённые демо-файлы) — ТОЖЕ В БАЗЕ. Новый
+        # клиент (index-5.html) держал их только в localStorage телефона:
+        # смена устройства/очистка кэша теряли их безвозвратно.
+        self.miniapp_lists = {}
         # ВОЛНА 22.40: бот ждёт от админа список дежурных («свой график»).
         # {"mode": "ai"|"dates", "ts": epoch} или None. ПЕРСИСТЕНТЕН: после
         # рестарта сервера FSM-состояние терялось, и присланный список имён
@@ -2796,6 +2801,10 @@ class User:
             'miniapp_settings': (getattr(self, 'miniapp_settings', None)
                                  if isinstance(getattr(self, 'miniapp_settings', None), dict)
                                  else {}),
+            # ВОЛНА 22.81: папки/избранное/описания мини-аппа (переживают смену телефона)
+            'miniapp_lists': (getattr(self, 'miniapp_lists', None)
+                              if isinstance(getattr(self, 'miniapp_lists', None), dict)
+                              else {}),
             # ВОЛНА 22.40: ожидаемый список дежурных (переживает рестарт)
             'duty_pending': getattr(self, 'duty_pending', None),
             # ВОЛНА 22.41: ожидаемый ввод таймера классу (переживает рестарт)
@@ -2922,6 +2931,9 @@ class User:
         # ВОЛНА 22.37: настройки мини-аппа в базе (старые записи без поля).
         if not hasattr(user, 'miniapp_settings') or not isinstance(user.miniapp_settings, dict):
             user.miniapp_settings = {}
+        # ВОЛНА 22.81: списки мини-аппа в базе (старые записи без поля).
+        if not hasattr(user, 'miniapp_lists') or not isinstance(user.miniapp_lists, dict):
+            user.miniapp_lists = {}
         # ВОЛНА 22.40: флаг «ждём список дежурных» (старые записи без поля).
         if not hasattr(user, 'duty_pending') or not isinstance(user.duty_pending, dict):
             user.duty_pending = None
@@ -3516,15 +3528,31 @@ def _cloud_tombstone_has(uid, fid):
     return True
 
 
+def _merge_rec_rv(rec):
+    """ВОЛНА 22.80: ревизия записи файла (rv). Увеличивается при
+    переименовании/переносе; нужна merge-логике, чтобы передержанная
+    копия параллельного save_user не откатывала свежие изменения."""
+    try:
+        return int(rec.get("rv") or 0)
+    except Exception:
+        return 0
+
+
 def _merge_user_file_lists(new_list, old_list, uid):
     """Союз списков cloud_files/vault_files по полю id.
     primary = свежесохранённый список вызывающего (его порядок и его
     изменения), secondary = параллельно изменённый список с диска:
     записи, которых в primary нет, ДОБАВЛЯЮТСЯ в конец (кроме удалённых —
-    надгробия). Так ни чат, ни мини-апп не теряют файлы друг друга."""
+    надгробия). Так ни чат, ни мини-апп не теряют файлы друг друга.
+    ВОЛНА 22.80: коллизия id (запись есть у ОБОИХ) — побеждает запись
+    с БОЛЬШИМ rv. Раньше версия вызывающего побеждала всегда: параллельная
+    корутина с передержанным юзером молча откатывала переименование
+    («в мини-апп название файла не изменяется» — переименовал, через пару
+    секунд имя вернулось)."""
     try:
         seen = set()
         out = []
+        _pos = {}                       # id → индекс в out (для rv-апгрейда)
         for rec in (new_list or []):
             if not isinstance(rec, dict):
                 continue
@@ -3535,14 +3563,23 @@ def _merge_user_file_lists(new_list, old_list, uid):
             if rid and _cloud_tombstone_has(uid, rid):
                 continue          # удалён в параллельном потоке — не воскресаем
             seen.add(key)
+            if rid:
+                _pos[rid] = len(out)
             out.append(rec)
         for rec in (old_list or []):
             if not isinstance(rec, dict):
                 continue
             rid = str(rec.get("id") or "")
-            if not rid or rid in seen:
+            if not rid:
                 continue
             if _cloud_tombstone_has(uid, rid):
+                continue
+            if rid in seen:
+                # ВОЛНА 22.80: запись с диска СВЕЖЕЕ (rv выше) — берём её,
+                # сохраняя позицию вызывающего в списке.
+                _i = _pos.get(rid)
+                if _i is not None and _merge_rec_rv(rec) > _merge_rec_rv(out[_i]):
+                    out[_i] = rec
                 continue
             seen.add(rid)
             out.append(rec)
@@ -4339,7 +4376,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.79"
+BOT_BUILD = "22.81"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -10710,6 +10747,9 @@ MINIAPP_HTML = r"""
     function _noop() {}
 
     var _hf = {
+      /* 22.71: метка заглушки — haptic() по ней понимает, что нативной
+         гаптики нет, и в браузере вызывает navigator.vibrate */
+      __stub: true,
       impactOccurred: _noop,
       notificationOccurred: _noop,
       selectionChanged: _noop
@@ -10851,6 +10891,10 @@ if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.
   --blob-2: #9333ea;
   --overlay-bg: rgba(10, 12, 18, 0.55);
 }
+
+/* 22.70: бело-голубая тема «sky» УБРАНА по просьбе пользователя.
+   У старых пользователей значение 'sky' из localStorage/базы мягко
+   мигрирует на светлую тему (см. applyTheme и стартовый код ниже). */
 
 [data-theme="custom"] {
   --bg-color: var(--custom-bg1, #4f46e5);
@@ -11059,21 +11103,227 @@ body.modal-open {
    offscreen-карточки не рендерятся, оценка высоты одной карточки точна —
    скроллбар не прыгает (контейнерная оценка 500px давала скачки при прокрутке) */
 .file-card {
-  background: var(--card-bg);
-  border: 1px solid var(--border-color);
+  /* ВОЛНА свайп: статья — прозрачный контейнер с clip; визуал карточки
+     (фон/рамка/паддинг) перенесён на .swipe-body, чтобы при свайпе влево
+     позади «выезжала» красная шторка удаления */
   border-radius: 20px;
+  overflow: hidden;
   cursor: pointer;
-  padding: 12px 14px;
   transition: transform 0.18s var(--ease-spring);
   contain: layout style;
   content-visibility: auto;
   contain-intrinsic-size: auto 72px;
-  touch-action: manipulation;
+  /* pan-y: вертикаль оставляем браузеру (скролл), горизонталь — свайпу */
+  touch-action: pan-y;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
 }
 
-.file-card:active {
+/* Тело карточки — то, что двигается пальцем. По умолчанию медленный
+   упругий возврат после свайпа / press-эффект как раньше */
+.swipe-body {
+  position: relative;
+  z-index: 1;
+  background: var(--card-bg);
+  border: 1px solid var(--border-color);
+  border-radius: 20px;
+  padding: 12px 14px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  transition:
+    transform 0.55s var(--ease-spring),
+    background 0.3s var(--ease-smooth);
+  will-change: transform;
+}
+
+.file-card:not(.swiping):active .swipe-body {
   transform: scale(0.97);
   background: var(--card-active);
+}
+
+/* ═══ ВОЛНА: КРАСНАЯ ШТОРКА «УДАЛИТЬ» ПОД СВАЙПОМ ═══
+   Проявляется пропорционально прогрессу свайпа (--p: 0…1, ставит JS):
+   иконка растёт, подпись проступает — сразу видно, что означает жест.
+   Порог пройден (--p=1, класс armed) — иконка «взводится» импульсом */
+.swipe-del {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  padding: 0 20px;
+  gap: 10px;
+  background: linear-gradient(100deg, #fb7185 0%, #f87171 45%, #ef4444 100%);
+  color: #fff;
+  border-radius: 20px;
+  opacity: var(--p, 0);
+  pointer-events: none;
+  overflow: hidden;
+}
+
+.swipe-del .sd-label {
+  font-weight: 800;
+  font-size: 13px;
+  letter-spacing: 0.02em;
+  transform: translateX(calc(var(--p, 0) * 10px - 10px));
+}
+
+.swipe-del .sd-ico {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  border-radius: 9999px;
+  background: rgba(255, 255, 255, 0.22);
+  transform: scale(calc(0.55 + var(--p, 0) * 0.45));
+}
+
+.swipe-del .sd-ico svg {
+  width: 18px;
+  height: 18px;
+}
+
+.file-card.armed .swipe-del .sd-ico {
+  animation: sdArmed 0.55s var(--ease-spring);
+}
+
+@keyframes sdArmed {
+  0%   { transform: scale(1); }
+  40%  { transform: scale(1.3) rotate(-10deg); }
+  100% { transform: scale(1); }
+}
+
+.file-card.swiping {
+  cursor: grabbing;
+}
+
+html.low-end .file-card.armed .swipe-del .sd-ico,
+html.low-end .album-card.album-born,
+html.low-end .check-pop {
+  animation: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .file-card.armed .swipe-del .sd-ico,
+  .album-card.album-born,
+  .check-pop {
+    animation: none;
+  }
+}
+
+/* ═══ ВОЛНА: ПАПКИ/АЛЬБОМЫ ═══ */
+
+/* Появление папки после создания — мягкий «спринг-поп» */
+@keyframes albumPop {
+  0%   { transform: scale(0.55); opacity: 0; }
+  55%  { transform: scale(1.06); opacity: 1; }
+  100% { transform: scale(1); opacity: 1; }
+}
+
+.album-card.album-born {
+  animation: albumPop 0.65s var(--ease-ultra) both;
+}
+
+/* 22.70: иконка-папка — ЦВЕТ КНОПОК темы (var(--btn-bg)),
+   как попросил пользователь: папки такие же, как кнопки */
+.album-card .album-ico {
+  background: var(--btn-bg);
+  color: var(--btn-text);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.16);
+  box-shadow: 0 4px 14px color-mix(in srgb, var(--btn-bg) 35%, transparent);
+}
+
+/* Шапка открытой папки: назад + имя + счётчик + действия */
+.album-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: var(--card-bg);
+  border: 1px solid var(--border-color);
+  border-radius: 20px;
+  padding: 10px 12px;
+  cursor: default;
+}
+
+.album-header .ah-back {
+  flex-shrink: 0;
+  width: 38px;
+  height: 38px;
+  border-radius: 9999px;
+  border: 1px solid var(--border-color);
+  background: var(--card-bg);
+  color: var(--text-color);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: transform 0.35s var(--ease-spring), background 0.3s var(--ease-smooth);
+}
+
+.album-header .ah-back:active {
+  transform: scale(0.85);
+  background: var(--card-active);
+}
+
+.album-header .ah-icon {
+  flex-shrink: 0;
+  width: 42px;
+  height: 42px;
+  border-radius: 13px;
+  background: var(--btn-bg);
+  color: var(--btn-text);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.16);
+  box-shadow: 0 4px 14px color-mix(in srgb, var(--btn-bg) 35%, transparent);
+}
+
+/* Чекбокс выбора: мягкий «поп» при входе в режим выбора зажатием */
+@keyframes checkIn {
+  0%   { transform: scale(0); }
+  60%  { transform: scale(1.3); }
+  100% { transform: scale(1); }
+}
+
+.check-pop {
+  animation: checkIn 0.42s var(--ease-spring) both;
+}
+
+/* Строка существующей папки в окне «Создать папку» */
+.album-pick {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 11px 12px;
+  border: 1px solid var(--border-color);
+  border-radius: 14px;
+  background: var(--card-bg);
+  color: var(--text-color);
+  cursor: pointer;
+  transition: transform 0.35s var(--ease-spring), background 0.3s var(--ease-smooth);
+}
+
+.album-pick:active {
+  transform: scale(0.97);
+  background: var(--card-active);
+}
+
+.album-pick .ap-ico {
+  flex-shrink: 0;
+  width: 34px;
+  height: 34px;
+  border-radius: 10px;
+  background: var(--btn-bg);
+  color: var(--btn-text);
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
 
 /* Старые WebView (Telegram на слабых телефонах): content-visibility:auto
@@ -11165,6 +11415,158 @@ html.low-end .fade-soft-in {
   display: flex;
   align-items: center;
   justify-content: center;
+}
+
+/* ═══ ВОЛНА: ИЗБРАННОЕ + ОПИСАНИЕ + ПОДТВЕРЖДЕНИЕ УДАЛЕНИЯ ═══
+   Медленные плавные анимации на существующих переменных --ease-*  */
+
+/* Карточка: position:relative для абсолютных элементов */
+.file-card {
+  position: relative;
+}
+
+/* Звёздочка «Избранное» — только иконка, без фона-кнопки
+   (важно: !important, т.к. .action-btn объявлен ниже по файлу) */
+.fav-toggle {
+  background: transparent !important;
+  color: var(--subtext-color) !important;
+  transition: 
+    transform 0.35s var(--ease-spring),
+    color 0.4s var(--ease-smooth);
+}
+
+.fav-toggle:active {
+  transform: scale(0.82);
+}
+
+.fav-toggle svg {
+  transition: 
+    stroke 0.4s var(--ease-smooth),
+    fill 0.4s var(--ease-smooth);
+}
+
+/* Активная звезда — сама заливается жёлтым, без круглой кнопки */
+.fav-toggle.active {
+  background: transparent !important;
+  color: #facc15 !important;
+}
+
+.fav-toggle.active svg {
+  stroke: #facc15 !important;
+  fill: #facc15 !important;
+}
+
+/* Медленный плавный спринг звёздочки при добавлении в избранное */
+@keyframes starPop {
+  0%   { transform: scale(1) rotate(0deg); }
+  30%  { transform: scale(1.4) rotate(14deg); }
+  55%  { transform: scale(0.88) rotate(-5deg); }
+  80%  { transform: scale(1.06) rotate(2deg); }
+  100% { transform: scale(1) rotate(0deg); }
+}
+
+.fav-toggle.pop {
+  animation: starPop 0.7s var(--ease-ultra);
+}
+
+html.low-end .fav-toggle.pop {
+  animation: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .fav-toggle.pop { animation: none; }
+}
+
+/* Описание-превью под именем файла — медленное плавное проявление */
+.file-desc {
+  margin-top: 5px;
+  font-size: 12px;
+  font-weight: 600;
+  font-style: italic;
+  color: var(--subtext-color);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+  opacity: 0;
+  transform: translateY(-3px);
+  transition: 
+    opacity 0.55s var(--ease-smooth),
+    transform 0.55s var(--ease-smooth);
+}
+
+.file-desc.shown {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+/* Модалка подтверждения удаления — медленное плавное появление содержимого */
+.confirm-icon {
+  width: 60px;
+  height: 60px;
+  border-radius: 50%;
+  background: rgba(239, 68, 68, 0.13);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0 auto 14px;
+  color: #ef4444;
+  animation: softReveal 0.55s var(--ease-smooth) both;
+}
+
+.confirm-icon svg {
+  width: 28px;
+  height: 28px;
+}
+
+.confirm-title {
+  font-weight: 900;
+  font-size: 19px;
+  text-align: center;
+  margin-bottom: 6px;
+  animation: softReveal 0.55s var(--ease-smooth) both;
+  animation-delay: 0.08s;
+}
+
+.confirm-text {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--subtext-color);
+  text-align: center;
+  line-height: 1.55;
+  margin-bottom: 20px;
+  animation: softReveal 0.55s var(--ease-smooth) both;
+  animation-delay: 0.16s;
+}
+
+.confirm-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  animation: softReveal 0.55s var(--ease-smooth) both;
+  animation-delay: 0.24s;
+}
+
+.confirm-btn-danger {
+  background: #ef4444 !important;
+  color: #fff !important;
+  border-color: #ef4444 !important;
+}
+
+html.low-end .confirm-icon,
+html.low-end .confirm-title,
+html.low-end .confirm-text,
+html.low-end .confirm-actions {
+  animation: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .confirm-icon,
+  .confirm-title,
+  .confirm-text,
+  .confirm-actions {
+    animation: none;
+  }
 }
 
 .action-btn {
@@ -11864,7 +12266,9 @@ html.low-end .fade-soft-in {
   opacity: 1;
 }
 
-/* Selection bar */
+/* Selection bar — 22.70: панель стала двухэтажной (сверху счётчик
+   и «Готово», снизу — действия + широкая кнопка «Удалить всё»),
+   поэтому из «пилюли» 9999px превращаемся в мягкую карточку 28px */
 #selectionBar {
   position: fixed;
   bottom: calc(20px + env(safe-area-inset-bottom));
@@ -11872,10 +12276,10 @@ html.low-end .fade-soft-in {
   z-index: 60;
   display: flex;
   width: clamp(300px, 88%, 440px);
-  padding: 6px 6px 6px 12px;
+  padding: 7px 7px 7px 12px;
   background: var(--card-bg);
   border: 1px solid var(--border-color);
-  border-radius: 9999px;
+  border-radius: 28px;
   box-shadow: 0 14px 40px rgba(0, 0, 0, 0.22), 0 4px 12px rgba(0, 0, 0, 0.08);
   opacity: 0;
   pointer-events: none;
@@ -11894,6 +12298,22 @@ html.low-end .fade-soft-in {
 }
 
 #selectionBar .sel-inner {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+}
+
+/* 22.70: верхняя строка — счётчик выбранных + «Готово» */
+#selectionBar .sel-top {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+}
+
+/* 22.70: нижняя строка — иконки действий + «Удалить всё» */
+#selectionBar .sel-actions {
   display: flex;
   align-items: center;
   gap: 4px;
@@ -11952,6 +12372,24 @@ html.low-end .fade-soft-in {
 #selectionBar .sel-btn.danger {
   color: #ef4444;
   border-color: rgba(239, 68, 68, 0.3);
+}
+
+/* 22.70: «Удалить всё» — заполненная красная кнопка во всю оставшуюся
+   ширину нижней строки; работает и в корне, и внутри папки */
+#selectionBar .sel-btn.danger-all {
+  flex: 1 1 auto;
+  width: auto;
+  min-width: 0;
+  margin-left: 8px;
+  padding: 0 10px;
+  gap: 6px;
+  background: #ef4444;
+  border-color: #ef4444;
+  color: #ffffff;
+  font-weight: 800;
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
 }
 
 #selectionBar .sel-btn.done {
@@ -13390,6 +13828,11 @@ body.vp-lock {
       <input type="text" id="modalInputName" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;margin-top:4px;outline:none;font-size:15px">
     </div>
 
+    <div style="margin-bottom:14px">
+      <label style="font-size:11px;font-weight:800;color:var(--subtext-color);text-transform:uppercase;letter-spacing:0.04em">Описание</label>
+      <textarea id="modalInputDesc" rows="3" placeholder="Добавьте заметку к файлу..." style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:600;margin-top:4px;outline:none;font-size:14px;resize:vertical;min-height:78px;transition:border-color 0.3s var(--ease-smooth)" onfocus="this.style.borderColor='var(--btn-bg)'" onblur="this.style.borderColor='var(--border-color)'"></textarea>
+    </div>
+
     <div style="display:flex;flex-direction:column;gap:8px">
       <button class="sound-item-btn" onclick="viewCurrentFile()">
         <span>Посмотреть файл</span>
@@ -13399,6 +13842,11 @@ body.vp-lock {
       <button class="sound-item-btn" onclick="saveFileName()">
         <span>Сохранить имя</span>
         <i data-lucide="check" style="width:18px;height:18px"></i>
+      </button>
+
+      <button class="sound-item-btn" onclick="saveCurrentDescription()">
+        <span>Сохранить описание</span>
+        <i data-lucide="square-pen" style="width:18px;height:18px"></i>
       </button>
 
       <button class="sound-item-btn" id="modalToSafeBtn" onclick="toSafeCurrentFile()">
@@ -13421,9 +13869,107 @@ body.vp-lock {
         <i data-lucide="send" style="width:18px;height:18px"></i>
       </button>
 
-      <button class="sound-item-btn" style="color:#ef4444" onclick="deleteCurrentFile()">
+      <button class="sound-item-btn" style="color:#ef4444" onclick="confirmDeleteCurrentFile()">
         <span>Удалить файл</span>
         <i data-lucide="trash-2" style="width:18px;height:18px;stroke:#ef4444"></i>
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ ОКНО ПОДТВЕРЖДЕНИЯ УДАЛЕНИЯ (медленные плавные анимации) ═══ -->
+<div id="confirmDeleteModal" class="modal-overlay" onclick="closeConfirmDelete(event)">
+  <div class="modal-card" onclick="event.stopPropagation()">
+    <div class="sheet-handle-area">
+      <div class="sheet-handle"></div>
+    </div>
+
+    <div class="confirm-icon">
+      <i data-lucide="trash-2"></i>
+    </div>
+
+    <h3 class="confirm-title">Удалить?</h3>
+    <p class="confirm-text" id="confirmDeleteText">Это действие нельзя отменить. Файл будет удалён безвозвратно.</p>
+
+    <div class="confirm-actions">
+      <button class="sound-item-btn confirm-btn-danger" onclick="executeConfirmedDelete()">
+        <span>Удалить</span>
+        <i data-lucide="trash-2" style="width:18px;height:18px;stroke:#fff"></i>
+      </button>
+
+      <button class="sound-item-btn" onclick="closeConfirmDelete()">
+        <span>Отмена</span>
+        <i data-lucide="x" style="width:18px;height:18px"></i>
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ ВОЛНА: ОКНО «СОЗДАТЬ ПАПКУ» ═══
+     Из выбранных файлов: имя новой папки + список существующих
+     (можно сразу переместить выбранные в готовую папку) -->
+<div id="albumCreateModal" class="modal-overlay" onclick="closeAlbumCreateModal(event)">
+  <div class="modal-card" onclick="event.stopPropagation()">
+    <div class="sheet-handle-area">
+      <div class="sheet-handle"></div>
+    </div>
+
+    <h3 style="font-weight:900;font-size:20px;margin-bottom:4px">Папка из выбранных файлов</h3>
+    <p id="albumCreateInfo" style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:14px"></p>
+
+    <div style="margin-bottom:14px">
+      <label style="font-size:11px;font-weight:800;color:var(--subtext-color);text-transform:uppercase;letter-spacing:0.04em">Название папки</label>
+      <input type="text" id="albumNameInput" maxlength="60" placeholder="Например: Фото с отпуска" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;margin-top:4px;outline:none;font-size:15px;transition:border-color 0.3s var(--ease-smooth)" onfocus="this.style.borderColor='var(--btn-bg)'" onblur="this.style.borderColor='var(--border-color)'">
+    </div>
+
+    <div id="albumPickWrap" style="display:none;margin-bottom:14px">
+      <label style="font-size:11px;font-weight:800;color:var(--subtext-color);text-transform:uppercase;letter-spacing:0.04em">Или переместить в существующую</label>
+      <div id="albumPickList" style="display:flex;flex-direction:column;gap:8px;margin-top:6px;max-height:180px;overflow-y:auto"></div>
+    </div>
+
+    <div style="display:flex;flex-direction:column;gap:8px">
+      <button class="sound-item-btn" onclick="createAlbumFromSelection()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
+        <span>Создать папку</span>
+        <i data-lucide="folder-plus" style="width:18px;height:18px;stroke:var(--btn-text)"></i>
+      </button>
+
+      <button class="sound-item-btn" onclick="closeAlbumCreateModal()">
+        <span>Отмена</span>
+        <i data-lucide="x" style="width:18px;height:18px"></i>
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ ВОЛНА: ОКНО ДЕЙСТВИЙ С ПАПКОЙ (переименовать / удалить) ═══ -->
+<div id="albumModal" class="modal-overlay" onclick="closeAlbumModal(event)">
+  <div class="modal-card" onclick="event.stopPropagation()">
+    <div class="sheet-handle-area">
+      <div class="sheet-handle"></div>
+    </div>
+
+    <h3 style="font-weight:900;font-size:20px;margin-bottom:4px">Действия с папкой</h3>
+    <p id="albumModalName" style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:14px;word-break:break-all"></p>
+
+    <div style="margin-bottom:14px">
+      <label style="font-size:11px;font-weight:800;color:var(--subtext-color);text-transform:uppercase;letter-spacing:0.04em">Название папки</label>
+      <input type="text" id="albumModalInput" maxlength="60" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;margin-top:4px;outline:none;font-size:15px;transition:border-color 0.3s var(--ease-smooth)" onfocus="this.style.borderColor='var(--btn-bg)'" onblur="this.style.borderColor='var(--border-color)'">
+    </div>
+
+    <div style="display:flex;flex-direction:column;gap:8px">
+      <button class="sound-item-btn" onclick="renameAlbumFromModal()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
+        <span>Переименовать</span>
+        <i data-lucide="check" style="width:18px;height:18px;stroke:var(--btn-text)"></i>
+      </button>
+
+      <button class="sound-item-btn" onclick="deleteAlbumFromModal()">
+        <span>Удалить папку — файлы останутся</span>
+        <i data-lucide="trash-2" style="width:18px;height:18px;stroke:#ef4444"></i>
+      </button>
+
+      <button class="sound-item-btn" onclick="closeAlbumModal()">
+        <span>Закрыть</span>
+        <i data-lucide="x" style="width:18px;height:18px"></i>
       </button>
     </div>
   </div>
@@ -13770,6 +14316,18 @@ body.vp-lock {
           </div>
         </button>
 
+        <!-- 22.70: ВИБРАЦИЯ — отклик при действиях (Android + iOS),
+             отключается одним тапом, состояние синхронизируется с базой -->
+        <button class="settings-item" onclick="toggleHaptics()">
+          <div class="settings-item-icon">
+            <i id="hapticsIcon" data-lucide="vibrate" style="width:18px;height:18px"></i>
+          </div>
+          <div class="settings-item-label">
+            Вибрация
+            <small id="hapticsLabel">Включена</small>
+          </div>
+        </button>
+
         <button class="settings-item" onclick="toggleSettingsSubmenu('themeSubmenu')">
           <div class="settings-item-icon">
             <i id="themeIcon" data-lucide="sun" style="width:18px;height:18px"></i>
@@ -13928,7 +14486,7 @@ body.vp-lock {
 
   <div class="search-box" style="margin-bottom:12px">
     <i data-lucide="search" style="position:absolute;left:14px;top:50%;transform:translateY(-50%);width:18px;height:18px;color:var(--text-color);opacity:.5"></i>
-    <input type="text" id="searchInput" placeholder="Поиск файлов..." oninput="onSearch()">
+    <input type="text" id="searchInput" placeholder="Поиск по имени и описанию..." oninput="onSearch()">
     <button id="clearSearch" class="action-btn" style="position:absolute;right:6px;top:50%;width:26px;height:26px" onclick="clearSearch()">
       <i data-lucide="x" style="width:14px;height:14px"></i>
     </button>
@@ -13936,6 +14494,9 @@ body.vp-lock {
 
   <div class="filters-scroll-wrap">
     <button class="chip active" data-filter="all" onclick="setFilter('all')">Все</button>
+    <button class="chip" data-filter="favorite" onclick="setFilter('favorite')" title="Избранное">
+      <i data-lucide="star" style="width:16px;height:16px"></i>
+    </button>
     <button class="chip" data-filter="photo" onclick="setFilter('photo')">
       <i data-lucide="image" style="width:16px;height:16px"></i>
     </button>
@@ -14044,16 +14605,26 @@ body.vp-lock {
 
 <div id="selectionBar">
   <div class="sel-inner">
-    <div class="sel-count" id="selCount">
-      <i data-lucide="check" style="width:12px;height:12px"></i>
-      <span id="selCountNum">0</span>
+    <div class="sel-top">
+      <div class="sel-count" id="selCount">
+        <i data-lucide="check" style="width:12px;height:12px"></i>
+        <span id="selCountNum">0</span>
+      </div>
+
+      <button class="sel-btn done" onclick="toggleSelectMode()">Готово</button>
     </div>
 
-    <button class="sel-btn" onclick="downloadSelected()" title="Скачать"><i data-lucide="download" style="width:17px;height:17px"></i></button>
-    <button class="sel-btn" onclick="zipSelected()" title="В ZIP"><i data-lucide="package" style="width:17px;height:17px"></i></button>
-    <button class="sel-btn hidden" id="unzipBtn" onclick="unzipSelected()" title="Распаковать"><i data-lucide="folder-open" style="width:17px;height:17px"></i></button>
-    <button class="sel-btn danger" onclick="deleteSelected()" title="Удалить"><i data-lucide="trash-2" style="width:17px;height:17px"></i></button>
-    <button class="sel-btn done" onclick="toggleSelectMode()">Готово</button>
+    <div class="sel-actions">
+      <button class="sel-btn" onclick="downloadSelected()" title="Скачать"><i data-lucide="download" style="width:17px;height:17px"></i></button>
+      <button class="sel-btn" onclick="zipSelected()" title="В ZIP"><i data-lucide="package" style="width:17px;height:17px"></i></button>
+      <button class="sel-btn hidden" id="unzipBtn" onclick="unzipSelected()" title="Распаковать"><i data-lucide="folder-open" style="width:17px;height:17px"></i></button>
+      <button class="sel-btn" onclick="openAlbumCreateModal(event)" title="Создать папку"><i data-lucide="folder-plus" style="width:17px;height:17px"></i></button>
+      <button class="sel-btn danger" onclick="confirmDeleteSelected()" title="Удалить выбранное"><i data-lucide="trash-2" style="width:17px;height:17px"></i></button>
+      <button class="sel-btn danger-all" onclick="deleteAllVisible()" title="Удалить все файлы на этом экране">
+        <i data-lucide="trash-2" style="width:14px;height:14px"></i>
+        <span>Удалить всё</span>
+      </button>
+    </div>
   </div>
 </div>
 
@@ -14087,7 +14658,116 @@ if (tg) {
   tg.expand();
 }
 
+/* ═══ 22.71: ВИБРАЦИЯ (Android + iOS) ═══
+   Три среды:
+   • Мобильное приложение Telegram (iOS/Android) — нативная гаптика
+     HapticFeedback, работает на обеих системах.
+   • Обычный браузер — navigator.vibrate (Vibration API): Android
+     (Chrome, Firefox, Samsung, Яндекс — нужен HTTPS или локальный
+     файл). На iOS Safari и всех браузерах iOS Apple вообще не
+     реализует Vibration API — веб-страница там не может вибрировать
+     ничем, это ограничение системы, а не приложения.
+   • Десктоп — вибрации нет (нет мотора), вызовы безвредны.
+
+   22.71 ФИКС «нет вибрации в браузерах»: раньше в Telegram-ветке стоял
+   ранний return — а вне Telegram Telegram-объект подменяется ЗАГЛУШКОЙ
+   с пустыми методами: они «успешно» вызывались и гасили вызов ДО
+   navigator.vibrate. Теперь заглушка помечена флагом __stub, нативная
+   гаптика используется только настоящим клиентом, а во всех остальных
+   средах вызов доходит до navigator.vibrate. Полностью отключается
+   в Настройках → «Вибрация» (ключ devo_haptics_enabled, синхронизируется
+   с базой, по умолчанию ВКЛЮЧЕНА). */
+let hapticsEnabled = localStorage.getItem('devo_haptics_enabled') !== 'false';
+
+/* Шаблоны вибрации браузера: короткий тик — лёгкие действия,
+   «двойной тап» — успех, резкая двойная — ошибка. Миллисекунды
+   подобраны заметными для вибромоторов Android (8мс почти не
+   чувствуются — старые значения были слишком короткими). */
+const VIB_PATTERNS = {
+  light: 15,
+  select: 12,
+  medium: 30,
+  heavy: 50,
+  warning: [60],
+  success: [30, 60, 30],
+  error: [80, 50, 80]
+};
+
+function haptic(kind) {
+  if (!hapticsEnabled) return;
+
+  const hf = tg && tg.HapticFeedback;
+  const realTg = !!(hf && !hf.__stub);
+
+  /* 1) Настоящий Telegram-клиент → нативная гаптика (iOS + Android) */
+  try {
+    if (realTg) {
+      if ((kind === 'success' || kind === 'error' || kind === 'warning') &&
+          hf.notificationOccurred) {
+        hf.notificationOccurred(kind);
+      } else if (kind === 'select' && hf.selectionChanged) {
+        hf.selectionChanged();
+      } else if (hf.impactOccurred) {
+        hf.impactOccurred(
+          kind === 'light' ? 'light' : kind === 'heavy' ? 'heavy' : 'medium'
+        );
+      }
+    }
+  } catch (e) {}
+
+  /* 2) Мобильное приложение Telegram уже завибрировало нативно —
+     не дублируем. Во всех остальных средах (обычный браузер,
+     Telegram Web, десктоп) доходим до Vibration API, если платформа
+     его умеет — 22.71 ФИКС: раньше return выше не пускал сюда. */
+  if (realTg && (tg.platform === 'android' || tg.platform === 'ios')) return;
+
+  try {
+    if (typeof navigator.vibrate === 'function') {
+      navigator.vibrate(VIB_PATTERNS[kind] || VIB_PATTERNS.medium);
+    }
+  } catch (e) {}
+}
+
+/* Обновляем строку в Настройках (иконка + подпись).
+   22.71: если вибрация на этой платформе невозможна (iOS Safari вне
+   Telegram — нет ни нативной гаптики, ни Vibration API), честно
+   пишем «Недоступна в этом браузере» вместо молчаливой тишины. */
+function updateHapticsUi() {
+  const realTg = !!(tg && tg.HapticFeedback && !tg.HapticFeedback.__stub);
+  const supported = realTg || typeof navigator.vibrate === 'function';
+
+  const lbl = document.getElementById('hapticsLabel');
+  if (lbl) {
+    lbl.textContent = !supported
+      ? 'Недоступна в этом браузере'
+      : (hapticsEnabled ? 'Включена' : 'Выключена');
+  }
+
+  const ico = document.getElementById('hapticsIcon');
+  if (ico) {
+    ico.setAttribute('data-lucide',
+      (supported && hapticsEnabled) ? 'vibrate' : 'vibrate-off');
+    safeIcons();
+  }
+}
+
+function toggleHaptics() {
+  hapticsEnabled = !hapticsEnabled;
+  safeSet('devo_haptics_enabled', hapticsEnabled ? 'true' : 'false');
+  settingsChanged(); /* 22.39: настройки живут в базе */
+  updateHapticsUi();
+
+  /* сразу чувствуем, что включили */
+  if (hapticsEnabled) haptic('medium');
+}
+
 let currentTheme = localStorage.getItem('devo_theme') || 'system';
+
+/* 22.70: убрали бело-голубую — сохранённую тему 'sky' переводим на светлую */
+if (currentTheme === 'sky') {
+  currentTheme = 'light';
+  safeSet('devo_theme', 'light');
+}
 let blobsEnabled = localStorage.getItem('devo_blobs_enabled') !== 'false';
 let blobIdleSpeed = localStorage.getItem('devo_blob_speed') || '5';
 
@@ -14192,6 +14872,10 @@ function toggleSettingsSubmenu(id) {
 let themeBootApplied = false;
 
 function applyTheme(theme) {
+  /* 22.70: бело-голубая тема убрана — сохранённое 'sky' (localStorage
+     или база настроек) мягко превращается в светлую тему */
+  if (theme === 'sky') theme = 'light';
+
   currentTheme = theme;
   safeSet('devo_theme', theme);
   settingsChanged(); /* 22.39: настройки живут в базе */
@@ -14207,14 +14891,16 @@ function applyTheme(theme) {
   const domUpdate = () => {
     document.documentElement.setAttribute(
       'data-theme',
-      theme === 'custom' ? 'custom' : (isDark ? 'dark' : 'light')
+      theme === 'custom' ? 'custom'
+        : (isDark ? 'dark' : 'light')
     );
 
     const iconEl = document.getElementById('themeIcon');
     if (iconEl) {
       iconEl.setAttribute(
         'data-lucide',
-        theme === 'custom' ? 'palette' : (isDark ? 'moon' : 'sun')
+        theme === 'custom' ? 'palette'
+          : (isDark ? 'moon' : 'sun')
       );
       safeIcons();
     }
@@ -14300,6 +14986,8 @@ function initCustomColors() {
 
 function toggleBlobs() {
   blobsEnabled = !blobsEnabled;
+
+  haptic('light'); /* 22.70: тик переключателя */
   safeSet('devo_blobs_enabled', blobsEnabled);
   settingsChanged(); /* 22.39: настройки живут в базе */
   updateBlobsVisibility();
@@ -14455,6 +15143,7 @@ function changeBlobSpeed(val) {
 }
 
 function setTheme(theme) {
+  haptic('select'); /* 22.70: тик при смене темы */
   applyTheme(theme);
 }
 
@@ -14781,6 +15470,9 @@ function filesCacheBoot() {
   if (typeof d.plain === 'boolean') STORAGE_ENCRYPTED = !d.plain;
   else if (ALL_FILES.some((f) => f.vault && !f.plain)) STORAGE_ENCRYPTED = true;
 
+  /* ВОЛНА: подмешиваем тестовые файлы в кэш */
+  try { injectTestFiles(); } catch (e) {}
+
   try { renderAll({}); } catch (e) {}
   /* 22.65: панель передач тоже оживает из кэша (недогруженное/ждёт пароль) */
   try { srvPendingApply(d.pending); } catch (e) {}
@@ -14788,6 +15480,14 @@ function filesCacheBoot() {
 
   return ALL_FILES.length > 0;
 }
+
+/* ВОЛНА 22.80: фаза загрузки страницы. 401 в ПЕРВЫЙ запрос при старте =
+   initData свежий (Telegram даёт его при каждом запуске мини-аппа) —
+   перезагрузка страницы не поможет, окно входа показываем СРАЗУ, без
+   лишней перезагрузки («после обновления бота окно входа появляется
+   не сразу»). Флаг снимается первым успешным ответом API — дальше
+   работает прежняя логика тихой перезагрузки для длинных сессий. */
+let BOOT_NOT_SYNCED = true;
 
 function authHeaders(extra) {
   const h = Object.assign({ 'Cache-Control': 'no-store' }, extra || {});
@@ -14825,18 +15525,23 @@ async function apiJson(url, options) {
          восстанавливается сама. Флаг в sessionStorage страхует от
          циклической перезагрузки; на любом УСПЕШНОМ ответе снимается. */
       if (IS_TELEGRAM && tg && tg.initData) {
-        let reloaded = false;
-        try {
-          reloaded = sessionStorage.getItem('dv_relogin') === '1';
-        } catch (e) {}
-        if (!reloaded) {
-          try { sessionStorage.setItem('dv_relogin', '1'); } catch (e) {}
-          /* 22.66: кэш файлов НЕ чистим — после перезагрузки тот же
-             пользователь увидит свой список мгновенно, без пустоты */
-          location.reload();
-        } else {
-          filesCacheClear();
+        if (BOOT_NOT_SYNCED) {
+          /* 22.80: старта — initData свежий, перезагрузка не поможет */
           openLoginModal();
+        } else {
+          let reloaded = false;
+          try {
+            reloaded = sessionStorage.getItem('dv_relogin') === '1';
+          } catch (e) {}
+          if (!reloaded) {
+            try { sessionStorage.setItem('dv_relogin', '1'); } catch (e) {}
+            /* 22.66: кэш файлов НЕ чистим — после перезагрузки тот же
+               пользователь увидит свой список мгновенно, без пустоты */
+            location.reload();
+          } else {
+            filesCacheClear();
+            openLoginModal();
+          }
         }
       } else {
         filesCacheClear();
@@ -14849,6 +15554,7 @@ async function apiJson(url, options) {
 
   /* успех — снимаем страховку от циклической перезагрузки */
   try { sessionStorage.removeItem('dv_relogin'); } catch (e) {}
+  BOOT_NOT_SYNCED = false;   /* 22.80: сессия подтверждена — дальше старая логика */
 
   return data;
 }
@@ -14966,6 +15672,8 @@ let selectedIds = new Set();
 function toggleSelectMode() {
   selectMode = !selectMode;
 
+  haptic(selectMode ? 'medium' : 'light'); /* 22.70: вход/выход из выбора */
+
   if (!selectMode) selectedIds.clear();
 
   const bar = document.getElementById('selectionBar');
@@ -14976,6 +15684,22 @@ function toggleSelectMode() {
 
   updateSelCount();
   renderAll();
+}
+
+/* ВОЛНА: вход в режим выбора ДОЛГИМ НАЖАТИЕМ — с первым выбранным файлом.
+   Чекбоксы мягко «вспыхивают» (check-pop), панель действий выезжает */
+function enterSelectMode(initialId, opts) {
+  if (selectMode) return;
+
+  selectMode = true;
+  selectedIds.clear();
+  if (initialId != null) selectedIds.add(initialId);
+
+  const bar = document.getElementById('selectionBar');
+  if (bar) bar.classList.add('visible');
+
+  updateSelCount();
+  renderAll({ selAnim: !opts || opts.selAnim !== false });
 }
 
 function updateSelCount() {
@@ -15008,6 +15732,8 @@ function updateSelCount() {
 function toggleFileSelection(e, id) {
   if (e) e.stopPropagation();
 
+  haptic('select'); /* 22.70: тихий тик выбора */
+
   if (selectedIds.has(id)) selectedIds.delete(id);
   else selectedIds.add(id);
 
@@ -15039,6 +15765,8 @@ async function zipSelected() {
         ts: data.file.ts || '',
         vault: !!data.file.vault
       });
+
+      haptic('success'); /* 22.70: архив готов */
 
       renderAll({ animate: true });
 
@@ -15114,37 +15842,8 @@ function animateCardsOut(ids) {
   return found;
 }
 
-async function deleteSelected() {
-  if (!selectedIds.size) {
-    showToast('Сначала выберите файлы');
-    return;
-  }
-
-  const ids = [...selectedIds];
-
-  showToast('🗑 Удаляю ' + ids.length + '…');
-
-  /* 22.56: карточки выбранных файлов мягко «улетают» ДО перерисовки */
-  const animated = animateCardsOut(ids);
-
-  if (animated) await new Promise((r) => setTimeout(r, 210));
-
-  let ok = 0;
-
-  for (const id of ids) {
-    try {
-      await apiJson('/api/files/' + encodeURIComponent(id), { method: 'DELETE' });
-      ALL_FILES = ALL_FILES.filter((x) => x.id !== id);
-      ok++;
-    } catch (e) {}
-  }
-
-  selectedIds.clear();
-  updateSelCount();
-  renderAll();
-
-  showToast(ok === ids.length ? '✅ Удалено: ' + ok : 'Удалено ' + ok + ' из ' + ids.length);
-}
+/* Удаление выбранных файлов перенесено в единый диалог подтверждения —
+   см. confirmDeleteSelected + executeConfirmedDelete (новый блок ниже). */
 
 let ALL_FILES = [];
 let listLoading = false;
@@ -15171,6 +15870,9 @@ async function loadFiles(silent, quiet) {
     const data = await apiJson('/api/files');
 
     ALL_FILES = (data.files || []).map(filesMapAll);
+
+    /* ВОЛНА: подмешиваем тестовые файлы в реальный список */
+    try { injectTestFiles(); } catch (e) {}
 
     CONN.bot = String(data.bot || CONN.bot || '');
     CONN.build = String(data.build || CONN.build || '');
@@ -15388,12 +16090,22 @@ const TOAST_ICON_MAP = {
   '⚠': 'alert-triangle',
   '📲': 'share',
   '✨': 'sparkles',
-  '🎉': 'party-popper'
+  '🎉': 'party-popper',
+  '⭐': 'star',
+  '📝': 'square-pen'
 };
 
-const TOAST_EMOJI_RE = /(📦|🗂|🗑|✅|🔒|🔐|🔓|📥|📤|📂|⏹|⚙️|⚙|⚠️|⚠|📲|✨|🎉)/g;
+const TOAST_EMOJI_RE = /(📦|🗂|🗑|✅|🔒|🔐|🔓|📥|📤|📂|⏹|⚙️|⚙|⚠️|⚠|📲|✨|🎉|⭐|📝)/g;
 
 function showToast(text) {
+  /* ═══ ВОЛНА: НИЖНИЕ УВЕДОМЛЕНИЯ УБРАНЫ ПО ПРОСЬБЕ ═══
+     Тосты («в избранном», «файлы добавлены» и т.д.) больше не показываются —
+     действия видны прямо на экране (звезда, чекбокс, анимации карточек).
+     Сообщение остаётся в консоли для отладки. Хотите вернуть — удалите
+     этот ранний return. */
+  try { if (window.console && console.log) console.log('[devo]', text); } catch (e) {}
+  return;
+
   const c = document.getElementById('toastContainer');
 
   const t = document.createElement('div');
@@ -15573,15 +16285,42 @@ function iconFor(kind) {
 }
 
 function applyFilters() {
-  let list = [...ALL_FILES];
+  let list;
 
-  /* 22.39: файлы Сейфа видны и в фильтрах по типу — «Музыка не пустая»
-     (плейлист и галерея собираются из тех же карточек) */
-  if (FILTER !== 'all') list = list.filter((f) => f.kind === FILTER);
+  if (ALBUM_VIEW) {
+    /* Внутри папки — только её файлы (фильтры/поиск дальше сужают) */
+    const album = ALBUM_MAP[ALBUM_VIEW];
+    const ids = new Set((album && album.fileIds) || []);
+    list = ALL_FILES.filter((f) => ids.has(String(f.id)));
+  } else {
+    list = [...ALL_FILES];
+
+    /* Корень «Все»: файлы, лежащие в папках, НЕ дублируются —
+       как в нормальных файловых менеджерах. Поиск и фильтры типов
+       по-прежнему видят ВСЁ, чтобы файл не «терялся» */
+    if (FILTER === 'all' && !SEARCH.trim()) {
+      const inAlbums = collectAlbumFileIds();
+      if (inAlbums.size) list = list.filter((f) => !inAlbums.has(String(f.id)));
+    }
+  }
+
+  /* ВОЛНА: фильтр «Избранное» — звёздочка в строке фильтров */
+  if (FILTER === 'favorite') {
+    list = list.filter((f) => isFavorite(String(f.id)));
+  } else if (FILTER !== 'all') {
+    /* 22.39: файлы Сейфа видны и в фильтрах по типу — «Музыка не пустая»
+       (плейлист и галерея собираются из тех же карточек) */
+    list = list.filter((f) => f.kind === FILTER);
+  }
 
   if (SEARCH.trim()) {
     const q = SEARCH.trim().toLowerCase();
-    list = list.filter((f) => (f.name || '').toLowerCase().includes(q));
+
+    /* ВОЛНА: поиск ищет и по ИМЕНИ, и по ОПИСАНИЮ файла */
+    list = list.filter((f) =>
+      (f.name || '').toLowerCase().includes(q) ||
+      (getDescription(String(f.id)) || '').toLowerCase().includes(q)
+    );
   }
 
   const [key, dir] = SORT.split('-');
@@ -15626,10 +16365,92 @@ function renderStats(list) {
 
   const shown = (list || applyFilters()).length;
 
+  /* ВОЛНА: внутри папки счётчик показывает её содержимое */
+  if (ALBUM_VIEW) {
+    document.getElementById('filesCount').textContent =
+      shown + ' ' + pluralFiles(shown) + ' в папке';
+    return;
+  }
+
   document.getElementById('filesCount').textContent =
     shown === ALL_FILES.length
       ? `${ALL_FILES.length} файлов`
       : `${shown} из ${ALL_FILES.length}`;
+}
+
+/* Русская плюрализация: 1 файл / 2 файла / 5 файлов */
+function pluralFiles(n) {
+  const m10 = n % 10;
+  const m100 = n % 100;
+  if (m10 === 1 && m100 !== 11) return 'файл';
+  if (m10 >= 2 && m10 <= 4 && (m100 < 10 || m100 >= 20)) return 'файла';
+  return 'файлов';
+}
+
+/* ═══ ВОЛНА: КАРТОЧКА ПАПКИ ═══
+   Папка — настоящая сущность: своя карточка с синей иконкой-папкой,
+   счётчиком файлов и шевроном. Открывается как папка (см. openAlbum) */
+function albumCardHtml(al, animate, idx, bornId) {
+  const cnt = (al.fileIds || []).length;
+  const born = bornId && bornId === al.id;
+  const aid = escapeHtml(String(al.id));
+  const cls = `file-card album-card${animate ? ' card-enter' : ''}${born ? ' album-born' : ''}`;
+  const style = animate ? `--i:${Math.min(idx, 12)};` : '';
+
+  return `
+    <article class="${cls}" data-album-id="${aid}" style="${style}" onclick="openAlbum('${aid}')">
+      <div class="swipe-body album-body">
+        <div class="icon-wrap album-ico" style="flex-shrink:0">
+          <i data-lucide="folder" style="width:22px;height:22px"></i>
+        </div>
+
+        <div style="flex:1;min-width:0">
+          <p style="font-weight:800;font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">
+            ${escapeHtml(al.name || 'Папка')}
+          </p>
+
+          <p style="font-weight:600;font-size:12px;color:var(--subtext-color);margin-top:2px">
+            ${cnt === 0 ? 'пусто' : cnt + ' ' + pluralFiles(cnt)}
+          </p>
+        </div>
+
+        <i data-lucide="chevron-right" style="width:18px;height:18px;color:var(--subtext-color);flex-shrink:0;opacity:.7"></i>
+      </div>
+    </article>
+  `;
+}
+
+/* ═══ ВОЛНА: ШАПКА ОТКРЫТОЙ ПАПКИ ═══
+   Кнопка «назад» + имя + счётчик + действия (переименовать/удалить) */
+function albumHeaderHtml(al, animate) {
+  const aid = escapeHtml(String(al.id));
+  const cnt = (al.fileIds || []).length;
+
+  return `
+    <div class="album-header${animate ? ' fade-soft-in' : ''}">
+      <button class="ah-back" onclick="closeAlbum()" title="Назад ко всем файлам">
+        <i data-lucide="chevron-left" style="width:20px;height:20px"></i>
+      </button>
+
+      <div class="ah-icon">
+        <i data-lucide="folder" style="width:22px;height:22px"></i>
+      </div>
+
+      <div style="flex:1;min-width:0">
+        <p style="font-weight:800;font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">
+          ${escapeHtml(al.name || 'Папка')}
+        </p>
+
+        <p style="font-weight:600;font-size:12px;color:var(--subtext-color);margin-top:1px">
+          ${cnt} ${pluralFiles(cnt)}
+        </p>
+      </div>
+
+      <button class="action-btn" onclick="openAlbumActions(event,'${aid}')" title="Действия с папкой">
+        <i data-lucide="more-vertical" style="width:16px;height:16px"></i>
+      </button>
+    </div>
+  `;
 }
 
 function renderFiles(files, opts) {
@@ -15643,7 +16464,25 @@ function renderFiles(files, opts) {
      важнее декораций, там каждый кадр на счету). */
   const animate = !!(opts && opts.animate) && !LOW_END && !REDUCED_MOTION;
 
-  if (!files.length) {
+  /* ВОЛНА: чекбоксы «вспыхивают» при входе в выбор долгим нажатием */
+  const selAnim = !!(opts && opts.selAnim) && !LOW_END && !REDUCED_MOTION;
+
+  /* ВОЛНА: id только что созданной папки — её карточка рождается с поп-анимацией */
+  const bornAlbum = opts && opts.bornAlbum;
+
+  /* ── ПАПКИ: шапка внутри открытой, карточки — в корне «Все» ── */
+  let headerHtml = '';
+  let albumsHtml = '';
+
+  if (ALBUM_VIEW) {
+    const album = ALBUM_MAP[ALBUM_VIEW];
+    if (album) headerHtml = albumHeaderHtml(album, animate);
+  } else if (FILTER === 'all' && !SEARCH.trim()) {
+    const albums = Object.values(ALBUM_MAP).sort((a, b) => (b.ts || 0) - (a.ts || 0));
+    albumsHtml = albums.map((al, i) => albumCardHtml(al, animate, i, bornAlbum)).join('');
+  }
+
+  if (!files.length && !albumsHtml && !headerHtml) {
     list.innerHTML = '';
 
     /* ВОЛНА 22.56: пустое состояние больше не «выскакивает» — мягко проявляется */
@@ -15660,7 +16499,11 @@ function renderFiles(files, opts) {
 
   empty.style.display = 'none';
 
-  list.innerHTML = files.map((f, idx) => {
+  const emptyAlbumNote = (ALBUM_VIEW && !files.length)
+    ? `<p style="font-weight:600;font-size:13px;color:var(--subtext-color);text-align:center;padding:18px 0 6px">Папка пуста</p>`
+    : '';
+
+  list.innerHTML = headerHtml + albumsHtml + files.map((f, idx) => {
     const sel = selectMode && selectedIds.has(f.id);
 
     /* 22.49: id экранируется — раньше подставлялся в inline-атрибут raw:
@@ -15673,45 +16516,68 @@ function renderFiles(files, opts) {
 
     /* ВОЛНА 22.56: индекс стаггера (кап 12) для волны появления карточек */
     const enterAttrs = animate
-      ? ` card-enter" data-id="${fid}" style="--i:${Math.min(idx, 12)};`
-      : `" data-id="${fid}" style="`;
+      ? ` card-enter" data-id="${fid}" style="--i:${Math.min(idx, 12)};${sel ? 'outline:2px solid var(--btn-text);outline-offset:-2px' : ''}`
+      : `" data-id="${fid}" style="${sel ? 'outline:2px solid var(--btn-text);outline-offset:-2px' : ''}`;
 
     const checkHtml = selectMode ? `
-      <div onclick="toggleFileSelection(event,'${fid}')" style="flex-shrink:0;width:24px;height:24px;border-radius:8px;display:flex;align-items:center;justify-content:center;border:2px solid ${sel ? 'var(--btn-text)' : 'var(--border-color)'};background:${sel ? 'var(--btn-text)' : 'transparent'};transition:transform .15s var(--ease-spring)">
+      <div class="file-check${selAnim ? ' check-pop' : ''}" onclick="toggleFileSelection(event,'${fid}')" style="flex-shrink:0;width:24px;height:24px;border-radius:8px;display:flex;align-items:center;justify-content:center;border:2px solid ${sel ? 'var(--btn-text)' : 'var(--border-color)'};background:${sel ? 'var(--btn-text)' : 'transparent'};transition:transform .15s var(--ease-spring)">
         ${sel ? '<i data-lucide="check" style="width:14px;height:14px;stroke:var(--card-bg)"></i>' : ''}
       </div>
     ` : '';
 
+    /* ВОЛНА: звёздочка «Избранное» + кнопка действий — плавная анимация */
+    const favStar = isFavorite(String(f.id));
+
     const actionsHtml = selectMode ? '' : `
       <div style="display:flex;gap:4px;flex-shrink:0" onclick="event.stopPropagation()">
+        <button class="action-btn fav-toggle${favStar ? ' active' : ''}" data-fid="${fid}" onclick="toggleFavorite('${fid}')" title="${favStar ? 'Убрать из избранного' : 'В избранное'}">
+          <i data-lucide="star" style="width:16px;height:16px"></i>
+        </button>
         <button class="action-btn" onclick="openEditModal('${fid}')" title="Редактировать">
           <i data-lucide="more-vertical" style="width:16px;height:16px"></i>
         </button>
       </div>
     `;
 
+    /* ВОЛНА: превью описания — плавное появление под размером/датой */
+    const _desc = getDescription(String(f.id));
+    const descHtml = _desc
+      ? `<p class="file-desc shown">${escapeHtml(_desc)}</p>`
+      : '';
+
+    /* ВОЛНА свайп: swipe-del — красная шторка удаления, проявляется по
+       прогрессу свайпа; swipe-body — двигающееся содержимое карточки */
     return `
-      <article class="file-card${enterAttrs}display:flex;align-items:center;gap:12px;${sel ? 'outline:2px solid var(--btn-text);outline-offset:-2px' : ''}" onclick="${cardAction}">
-        ${checkHtml}
-
-        <div class="icon-wrap" style="flex-shrink:0">
-          <i data-lucide="${(f.vault && !f.plain) ? 'lock' : iconFor(f.kind)}" style="width:20px;height:20px"></i>
+      <article class="file-card${enterAttrs}" onclick="${cardAction}">
+        <div class="swipe-del">
+          <span class="sd-label">Удалить</span>
+          <span class="sd-ico"><i data-lucide="trash-2" style="width:18px;height:18px"></i></span>
         </div>
 
-        <div style="flex:1;min-width:0">
-          <p style="font-weight:800;font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">
-            ${escapeHtml(f.name || 'файл')}
-          </p>
+        <div class="swipe-body">
+          ${checkHtml}
 
-          <p style="font-weight:600;font-size:12px;color:var(--subtext-color);margin-top:2px">
-            ${fmtSize(f.size)} · ${fmtDateTime(f.ts)}
-          </p>
+          <div class="icon-wrap" style="flex-shrink:0">
+            <i data-lucide="${(f.vault && !f.plain) ? 'lock' : iconFor(f.kind)}" style="width:20px;height:20px"></i>
+          </div>
+
+          <div style="flex:1;min-width:0">
+            <p style="font-weight:800;font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">
+              ${escapeHtml(f.name || 'файл')}
+            </p>
+
+            <p style="font-weight:600;font-size:12px;color:var(--subtext-color);margin-top:2px">
+              ${fmtSize(f.size)} · ${fmtDateTime(f.ts)}
+            </p>
+
+            ${descHtml}
+          </div>
+
+          ${actionsHtml}
         </div>
-
-        ${actionsHtml}
       </article>
     `;
-  }).join('');
+  }).join('') + emptyAlbumNote;
 
   safeIcons();
 }
@@ -15725,6 +16591,231 @@ function escapeHtml(s) {
     "'": '&#39;'
   }[c]));
 }
+
+/* ═══ ВОЛНА: СВАЙП-ВЛЕВО УДАЛЕНИЕ + ДОЛГОЕ НАЖАТИЕ → ВЫБОР ФАЙЛОВ ═══
+   Оба жеста живут на одном делегированном слушателе #filesList (карточки
+   перерисовываются — delegation надёжнее прямых слушателей).
+
+   СВАЙП ВЛЕВО: карточка едет за пальцем, позади плавно проявляется
+   красная шторка «Удалить» (иконка растёт по прогрессу --p). Довели до
+   порога (armed) — иконка «взводится» импульсом; отпустили — карточка
+   мягко уезжает влево и открывается окно подтверждения. Не довели —
+   медленный упругий возврат на место.
+
+   ДОЛГОЕ НАЖАТИЕ (480мс без движения): вход в режим выбора файлов —
+   сразу с этой карточкой выбранной; чекбоксы «вспыхивают», снизу
+   выезжает панель (скачать / ZIP / создать папку / удалить).
+
+   Вертикаль остаётся браузеру (touch-action: pan-y) — скролл списка
+   не ломается. pointer-events: работают и палец, и мышь. */
+(function initFileGestures() {
+  if (!window.PointerEvent) return; /* старые WebView: жесты просто выключены */
+
+  const list = document.getElementById('filesList');
+  if (!list) return;
+
+  const HOLD_MS = 480;      /* сколько держать до входа в выбор */
+  const SWIPE_ARM = 96;     /* px свайпа до «взведения» удаления */
+
+  let swipe = null;         /* активный свайп */
+  let hold = null;          /* активное долгое нажатие */
+  let suppressClickUntil = 0;
+
+  function fileCardFromEvent(e) {
+    if (!e.target || !e.target.closest) return null;
+    return e.target.closest('.file-card[data-id]');
+  }
+
+  /* 22.70: гаптика теперь глобальная (haptic() выше) — уважает
+     выключатель «Вибрация» в Настройках */
+
+  function cancelHold() {
+    if (hold) {
+      clearTimeout(hold.timer);
+      hold = null;
+    }
+  }
+
+  /* Долгое нажатие сработало: мягкий вход в выбор с этой карточкой */
+  function onHoldDone() {
+    if (!hold) return;
+
+    const card = hold.card;
+    const id = hold.id;
+    hold = null;
+
+    if (swipe && swipe.mode === 'swipe') return;
+    if (!card || !card.isConnected) return;
+
+    /* пришедший следом click не должен открыть файл/снять выбор */
+    suppressClickUntil = Date.now() + 650;
+
+    haptic('medium');
+
+    if (!selectMode) {
+      enterSelectMode(id);
+    } else {
+      /* уже в режиме выбора — зажатие просто отмечает карточку */
+      if (selectedIds.has(id)) selectedIds.delete(id);
+      else selectedIds.add(id);
+
+      updateSelCount();
+      renderFiles(applyFilters());
+    }
+  }
+
+  /* Возврат карточки на место — медленный упругий спринг */
+  function restoreCard(card) {
+    if (!card || !card.isConnected) return;
+
+    const body = card.querySelector('.swipe-body');
+    if (body) {
+      body.style.transition = 'transform 0.55s var(--ease-spring)';
+      body.style.transform = 'translateX(0)';
+      body.style.opacity = '';
+    }
+
+    card.style.setProperty('--p', '0');
+    card.classList.remove('swiping', 'armed');
+
+    setTimeout(() => {
+      if (body) {
+        body.style.transition = '';
+        body.style.transform = '';
+      }
+    }, 600);
+  }
+
+  function releaseSwipe(commitIfArmed) {
+    cancelHold();
+    if (!swipe) return;
+
+    const s = swipe;
+    swipe = null;
+
+    if (s.mode !== 'swipe') return;
+
+    /* жест был — пришедший click гасим */
+    suppressClickUntil = Date.now() + 650;
+
+    if (commitIfArmed && s.armed) {
+      /* «Взведено»: карточка мягко уезжает влево и открываем подтверждение */
+      haptic('heavy');
+
+      const body = s.body;
+      s.card.classList.remove('armed');
+
+      if (body) {
+        body.style.transition = 'transform 0.4s var(--ease-smooth), opacity 0.4s var(--ease-smooth)';
+        body.style.transform = 'translateX(-102%)';
+        body.style.opacity = '0.2';
+      }
+
+      setTimeout(() => {
+        confirmDeleteSwiped(s.id);
+
+        /* под окном подтверждения карточка возвращается на место:
+           подтвердят — «улетит» через animateCardsOut, отменят — стоит как ништо */
+        setTimeout(() => restoreCard(s.card), 650);
+      }, 230);
+    } else {
+      /* не довели / отменили — медленный упругий возврат */
+      restoreCard(s.card);
+    }
+  }
+
+  list.addEventListener('pointerdown', (e) => {
+    if (e.button !== undefined && e.button !== 0) return;
+    if (selectMode) return; /* в режиме выбора живут тапы, не жесты */
+
+    const card = fileCardFromEvent(e);
+    if (!card) return;
+    if (card.classList.contains('swiping')) return;
+
+    swipe = {
+      card: card,
+      body: card.querySelector('.swipe-body'),
+      id: card.dataset.id,
+      x: e.clientX,
+      y: e.clientY,
+      w: card.offsetWidth || 320,
+      mode: 'idle',
+      armed: false
+    };
+
+    hold = {
+      card: card,
+      id: card.dataset.id,
+      timer: setTimeout(onHoldDone, HOLD_MS)
+    };
+  });
+
+  list.addEventListener('pointermove', (e) => {
+    if (!swipe) return;
+
+    const dx = e.clientX - swipe.x;
+    const dy = e.clientY - swipe.y;
+
+    if (swipe.mode === 'idle') {
+      if (Math.abs(dx) < 12 && Math.abs(dy) < 12) return;
+
+      cancelHold(); /* любое движение снимает долгое нажатие */
+
+      if (dx < 0 && Math.abs(dx) > Math.abs(dy) * 1.4) {
+        /* явный горизонтальный жест влево — начинаем свайп */
+        swipe.mode = 'swipe';
+        swipe.card.classList.add('swiping');
+        try { list.setPointerCapture(e.pointerId); } catch (err) {}
+      } else {
+        /* вертикаль (скролл) или движение вправо — свайп не наш, отпускаем */
+        swipe = null;
+      }
+      return;
+    }
+
+    /* режим свайпа: карточка следует за пальцем с резистом за порогом */
+    let t = Math.max(dx, -swipe.w);
+    if (t < -SWIPE_ARM) t = -SWIPE_ARM - (Math.abs(t) - SWIPE_ARM) * 0.22;
+
+    if (swipe.body) {
+      swipe.body.style.transition = 'none';
+      swipe.body.style.transform = 'translateX(' + t + 'px)';
+    }
+
+    /* прогресс шторки: 0…1 — иконка растёт, подпись проступает */
+    const p = Math.min(1, Math.abs(Math.min(t, 0)) / SWIPE_ARM);
+    swipe.card.style.setProperty('--p', p.toFixed(3));
+
+    const wasArmed = swipe.armed;
+    swipe.armed = p >= 1;
+
+    if (swipe.armed && !wasArmed) {
+      haptic('light');
+      swipe.card.classList.add('armed');
+    } else if (!swipe.armed && wasArmed) {
+      swipe.card.classList.remove('armed');
+    }
+  });
+
+  list.addEventListener('pointerup', () => releaseSwipe(true));
+  list.addEventListener('pointercancel', () => releaseSwipe(false));
+
+  /* После жеста/зажатия пришедший click не должен открывать файл */
+  list.addEventListener('click', (e) => {
+    if (Date.now() < suppressClickUntil) {
+      e.stopPropagation();
+      e.preventDefault();
+    }
+  }, true);
+
+  /* Долгое нажатие на Android открывает системное меню выделения — гасим
+     его на карточках, чтобы жест оставался нашим */
+  list.addEventListener('contextmenu', (e) => {
+    if (e.target && e.target.closest && e.target.closest('.file-card')) {
+      e.preventDefault();
+    }
+  });
+})();
 
 let touchStartY = 0;
 let touchCurrentY = 0;
@@ -15787,6 +16878,10 @@ function openEditModal(id) {
 
   document.getElementById('modalFileName').textContent = f.name;
   document.getElementById('modalInputName').value = f.name;
+
+  /* ВОЛНА: подгружаем описание файла в textarea */
+  const _descEl = document.getElementById('modalInputDesc');
+  if (_descEl) _descEl.value = getDescription(String(id));
 
   const inSafe = !!f.vault;
 
@@ -17097,6 +18192,8 @@ async function downloadSelected() {
     return;
   }
 
+  haptic('light'); /* 22.70: старт скачивания */
+
   if (selectedIds.size === 1) {
     const f = ALL_FILES.find((x) => x.id === [...selectedIds][0]);
 
@@ -17265,32 +18362,8 @@ async function openFileViewer(id) {
   }
 }
 
-async function deleteCurrentFile() {
-  if (!activeEditingFileId) return;
-
-  const id = activeEditingFileId;
-
-  /* 22.56: карточка мягко «улетает» до перерисовки списка */
-  const animated = animateCardsOut([id]);
-
-  if (animated) {
-    closeEditModal();
-    await new Promise((r) => setTimeout(r, 210));
-  }
-
-  try {
-    await apiJson('/api/files/' + encodeURIComponent(id), { method: 'DELETE' });
-
-    ALL_FILES = ALL_FILES.filter((x) => x.id !== id);
-
-    renderAll();
-    showToast('🗑 Удалено');
-  } catch (e) {
-    showToast('Не удалось: ' + e.message);
-  }
-
-  closeEditModal();
-}
+/* Удаление текущего файла перенесено в единый диалог подтверждения —
+   см. confirmDeleteCurrentFile + executeConfirmedDelete (новый блок ниже). */
 
 function onSearch() {
   SEARCH = document.getElementById('searchInput').value;
@@ -19976,9 +21049,19 @@ if (blobSpeedInput) blobSpeedInput.value = blobIdleSpeed;
 const speedLabel = document.getElementById('speedValueLabel');
 if (speedLabel) speedLabel.textContent = blobIdleSpeed + 'x';
 
+/* ВОЛНА: ПАПКИ — состояние объявлено ДО загрузочного рендера списка
+   (renderCall ниже по коду): иначе TDZ-доступ к ALBUM_MAP обрывал
+   весь скрипт ещё на старте. Функции — ниже, объявления хойстятся */
+const ALBUMS_KEY = 'devo_albums';
+const ALBUM_DEMO_KEY = 'devo_demo_album_done';
+let ALBUM_MAP = {};   /* id -> { id, name, ts, fileIds: [String] } */
+let ALBUM_VIEW = null;
+try { loadAlbums(); } catch (e) {}
+
 initCustomColors();
 applyTheme(currentTheme);
 updateBlobsVisibility();
+updateHapticsUi(); /* 22.70: строка «Вибрация» в настройках */
 startBlobAnimation();
 renderSoundMenu();
 updateSoundLabel();
@@ -19987,6 +21070,7 @@ renderAll({ animate: true });
 detectStorageMode();
 updateDevRecBanner(false);
 pullSettingsApply(); /* 22.39: подтянуть настройки из базы */
+pullListsApply();     /* 22.81: подтянуть папки/избранное/описания из базы */
 
 /* ─── 22.39: НАСТРОЙКИ В БАЗЕ (переживают очистку кэша/смену телефона) ─── */
 
@@ -20001,6 +21085,7 @@ async function pushSettingsToServer() {
   try {
     const s = {
       theme: localStorage.getItem('devo_theme') || 'system',
+      haptics: localStorage.getItem('devo_haptics_enabled') !== 'false',
       blobs: localStorage.getItem('devo_blobs_enabled') !== 'false',
       blob_speed: localStorage.getItem('devo_blob_speed') || '5',
       sound: localStorage.getItem('devo_sound_id') || '1',
@@ -20057,6 +21142,17 @@ async function pullSettingsApply() {
       if (localStorage.getItem('devo_blobs_enabled') !== want) {
         safeSet('devo_blobs_enabled', want);
         dirty = true;
+      }
+    }
+
+    /* 22.70: вибрация тоже живёт в базе — переживает смену телефона */
+    if (typeof s.haptics === 'boolean') {
+      const wantH = s.haptics ? 'true' : 'false';
+
+      if (localStorage.getItem('devo_haptics_enabled') !== wantH) {
+        safeSet('devo_haptics_enabled', wantH);
+        hapticsEnabled = wantH === 'true';
+        updateHapticsUi();
       }
     }
 
@@ -22448,6 +23544,828 @@ setTimeout(() => {
   requestAnimationFrame(() => requestAnimationFrame(() => w.remove()));
 }, 150);
 
+/* ══════════════════════════════════════════════════════════════════
+   ВОЛНА: ИЗБРАННОЕ + ОПИСАНИЕ + ТЕСТОВЫЕ ФАЙЛЫ + ПОДТВЕРЖДЕНИЕ УДАЛЕНИЯ
+   ══════════════════════════════════════════════════════════════════
+   — Избранное: звёздочка на карточке + фильтр «Избранное» (localStorage)
+   — Описание: textarea в окне действий + превью под именем (localStorage)
+   — Тестовые файлы: 8 штук с разными типами для демонстрации всех фич
+   — Удаление: окно подтверждения с медленными плавными анимациями
+   Все анимации используют существующие --ease-* переменные проекта. */
+
+const FAVS_KEY = 'devo_favorites';
+const DESCS_KEY = 'devo_descriptions';
+const TEST_DELETED_KEY = 'devo_test_deleted';
+
+let FAV_SET = new Set();
+let DESC_MAP = {};
+let TEST_DELETED = new Set();
+
+function loadFavorites() {
+  try {
+    const a = JSON.parse(localStorage.getItem(FAVS_KEY) || '[]');
+    FAV_SET = new Set(Array.isArray(a) ? a : []);
+  } catch (e) { FAV_SET = new Set(); }
+}
+
+function loadDescriptions() {
+  try {
+    DESC_MAP = JSON.parse(localStorage.getItem(DESCS_KEY) || '{}') || {};
+  } catch (e) { DESC_MAP = {}; }
+}
+
+function loadTestDeleted() {
+  try {
+    const a = JSON.parse(localStorage.getItem(TEST_DELETED_KEY) || '[]');
+    TEST_DELETED = new Set(Array.isArray(a) ? a : []);
+  } catch (e) { TEST_DELETED = new Set(); }
+}
+
+function saveTestDeleted() {
+  try { localStorage.setItem(TEST_DELETED_KEY, JSON.stringify([...TEST_DELETED])); } catch (e) {}
+  listsPushSoon('test_deleted');
+}
+
+function saveFavorites() {
+  try { localStorage.setItem(FAVS_KEY, JSON.stringify([...FAV_SET])); } catch (e) {}
+  listsPushSoon('favorites');
+}
+
+function saveDescriptions() {
+  try { localStorage.setItem(DESCS_KEY, JSON.stringify(DESC_MAP)); } catch (e) {}
+  listsPushSoon('descriptions');
+}
+
+function isFavorite(id) {
+  return FAV_SET.has(String(id));
+}
+
+function getDescription(id) {
+  return DESC_MAP[String(id)] || '';
+}
+
+/* Инициализируем состояние ИЗБРАННОГО, ОПИСАНИЙ и удалённых тестовых —
+   чтобы applyFilters, renderFiles и injectTestFiles видели корректные данные */
+try {
+  loadFavorites();
+  loadDescriptions();
+  loadTestDeleted();
+  loadAlbums();
+} catch (e) {}
+
+/* ═══ ВОЛНА: ПАПКИ/АЛЬБОМЫ — НАСТОЯЩИЕ, КАК ВЕЗДЕ ═══
+   Папка — отдельная сущность (id, имя, ts, список файлов), а не «файлы,
+   одинаково называющиеся». В корне — карточка папки со счётчиком;
+   тап открывает содержимое; выбранные файлы можно сложить в папку
+   (новую или существующую). Папки хранятся в localStorage — как
+   избранное и описания.
+   Состояние (ALBUM_MAP/ALBUM_VIEW + ключи) объявлено ВЫШЕ — до
+   загрузочного renderAll, иначе TDZ обрывал скрипт на старте. */
+
+function loadAlbums() {
+  try {
+    const a = JSON.parse(localStorage.getItem(ALBUMS_KEY) || '{}');
+    ALBUM_MAP = (a && typeof a === 'object' && !Array.isArray(a)) ? a : {};
+  } catch (e) { ALBUM_MAP = {}; }
+}
+
+function saveAlbums() {
+  try { localStorage.setItem(ALBUMS_KEY, JSON.stringify(ALBUM_MAP)); } catch (e) {}
+  listsPushSoon('albums');
+}
+
+/* ═══ ВОЛНА 22.81: ПАПКИ / ИЗБРАННОЕ / ОПИСАНИЯ — СИНХРОНИЗАЦИЯ С БОТОМ ═══
+   Эти списки больше не живут только в localStorage телефона: бот хранит их
+   в своей базе (user.miniapp_lists) — смена устройства, очистка кэша и
+   переустановка больше ничего не теряют. localStorage остаётся мгновенным
+   кэшем: каждое изменение подталкивается на сервер с дебаунсом 1,2 с
+   (как настройки 22.39), а при старте состояние подтягивается с сервера
+   и объединяется с локальным (union). */
+var _listsPushT = {};        /* раздел -> таймер дебаунса */
+var _listsDirty = {};        /* раздел -> true (ждёт отправки) */
+var _listsSyncing = false;   /* защита от эхо-цикла при подтяжке */
+var _listsPullDone = false;
+
+function listsPushSoon(section) {
+  if (_listsSyncing) return;      /* во время подтяжки не эхоим */
+
+  _listsDirty[section] = true;
+
+  clearTimeout(_listsPushT[section]);
+  _listsPushT[section] = setTimeout(listsPushFlush, 1200);
+}
+
+async function listsPushFlush() {
+  const body = {};
+
+  for (const k in _listsDirty) {
+    if (!_listsDirty[k]) continue;
+
+    if (k === 'favorites') body.favorites = [...FAV_SET].map(String);
+    else if (k === 'descriptions') body.descriptions = DESC_MAP;
+    else if (k === 'albums') body.albums = ALBUM_MAP;
+    else if (k === 'test_deleted') body.test_deleted = [...TEST_DELETED].map(String);
+
+    _listsDirty[k] = false;
+  }
+
+  if (!Object.keys(body).length) return;
+
+  /* страховка от гигантских тел (сервер всё равно режет лимитами) */
+  try {
+    if (JSON.stringify(body).length > 400 * 1024) return;
+  } catch (e) { return; }
+
+  try {
+    const d = await apiJson('/api/lists', {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify(body)
+    });
+
+    _listsPullDone = true;   /* сервер подтвердил — флаг «есть связь» */
+  } catch (e) {
+    /* сеть моргнула — разделы снова помечаются грязными и уйдут с
+       следующим изменением/таймером */
+    for (const k in body) {
+      if (k === 'favorites' || k === 'albums' ||
+          k === 'descriptions' || k === 'test_deleted') {
+        _listsDirty[k] = true;
+      }
+    }
+  }
+}
+
+async function pullListsApply() {
+  if (_listsPullDone) return;
+
+  try {
+    const d = await apiJson('/api/lists', { headers: authHeaders() });
+    const ls = (d && d.lists) || {};
+
+    _listsPullDone = true;
+    _listsSyncing = true;   /* слияние не должно эхом улетать обратно */
+
+    let dirty = false;
+
+    /* избранное — union (id строки) */
+    const favSrv = Array.isArray(ls.favorites) ? ls.favorites : [];
+    const favBefore = FAV_SET.size;
+    favSrv.forEach((x) => FAV_SET.add(String(x)));
+    if (FAV_SET.size !== favBefore) { dirty = true; }
+
+    /* описания — union, непустое сильнее пустого */
+    const descSrv = (ls.descriptions && typeof ls.descriptions === 'object' &&
+                     !Array.isArray(ls.descriptions)) ? ls.descriptions : {};
+    for (const k in descSrv) {
+      const v = String(descSrv[k] || '');
+      if (DESC_MAP[k] == null || (!DESC_MAP[k] && v)) {
+        if (DESC_MAP[k] !== v) { DESC_MAP[k] = v; dirty = true; }
+      }
+    }
+
+    /* удалённые демо — union (не воскрешаем удалённое на других устройствах) */
+    const tdSrv = Array.isArray(ls.test_deleted) ? ls.test_deleted : [];
+    const tdBefore = TEST_DELETED.size;
+    tdSrv.forEach((x) => TEST_DELETED.add(String(x)));
+    if (TEST_DELETED.size !== tdBefore) { dirty = true; }
+
+    /* папки — по id: недостающие приезжают с сервера; конфликт —
+       fileIds union, имя у более свежей копии, ts максимум */
+    const albSrv = (ls.albums && typeof ls.albums === 'object' &&
+                    !Array.isArray(ls.albums)) ? ls.albums : {};
+    for (const aid in albSrv) {
+      const srv = albSrv[aid];
+      if (!srv || typeof srv !== 'object') continue;
+
+      const cur = ALBUM_MAP[aid];
+      const sIds = (Array.isArray(srv.fileIds) ? srv.fileIds : []).map(String);
+      const sTs = +srv.ts || 0;
+
+      if (!cur) {
+        ALBUM_MAP[aid] = {
+          id: aid,
+          name: String(srv.name || 'Папка'),
+          ts: sTs,
+          fileIds: sIds
+        };
+        dirty = true;
+        continue;
+      }
+
+      const cIds = (Array.isArray(cur.fileIds) ? cur.fileIds : []).map(String);
+      const cTs = +cur.ts || 0;
+      const merged = cIds.concat(sIds.filter((x) => cIds.indexOf(x) < 0));
+
+      ALBUM_MAP[aid] = {
+        id: aid,
+        name: String((sTs >= cTs ? (srv.name || cur.name) : (cur.name || srv.name)) || 'Папка'),
+        ts: Math.max(cTs, sTs),
+        fileIds: merged
+      };
+      dirty = true;
+    }
+
+    if (dirty) {
+      /* сохраняем локально (без эха) и перерисовываем список */
+      try { localStorage.setItem(FAVS_KEY, JSON.stringify([...FAV_SET])); } catch (e) {}
+      try { localStorage.setItem(DESCS_KEY, JSON.stringify(DESC_MAP)); } catch (e) {}
+      try { localStorage.setItem(TEST_DELETED_KEY, JSON.stringify([...TEST_DELETED])); } catch (e) {}
+      try { localStorage.setItem(ALBUMS_KEY, JSON.stringify(ALBUM_MAP)); } catch (e) {}
+
+      /* демо-файлы, удалённые на другом устройстве, убираем из текущего
+         списка — иначе они висели бы до следующей синхронизации */
+      if (TEST_DELETED.size) {
+        ALL_FILES = ALL_FILES.filter((f) => !(f && f.test && TEST_DELETED.has(String(f.id))));
+      }
+
+      if (typeof injectTestFiles === 'function') {
+        try { injectTestFiles(); } catch (e) {}
+      }
+      if (typeof renderAll === 'function') {
+        try { renderAll(); } catch (e) {}
+      }
+    }
+  } catch (e) {
+    /* нет связи/не вошли — живём на localStorage, подтянем при следующем старте */
+  } finally {
+    _listsSyncing = false;
+  }
+}
+
+/* Все id файлов, лежащих хоть в одной папке */
+function collectAlbumFileIds() {
+  const s = new Set();
+  for (const id in ALBUM_MAP) {
+    (ALBUM_MAP[id].fileIds || []).forEach((x) => s.add(String(x)));
+  }
+  return s;
+}
+
+function albumIdNew() {
+  return 'alb_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 7);
+}
+
+/* Убирает файл из всех папок (вызывается при удалении файла) */
+function removeFileFromAlbums(sid) {
+  let dirty = false;
+  for (const id in ALBUM_MAP) {
+    const arr = ALBUM_MAP[id].fileIds || [];
+    const i = arr.indexOf(String(sid));
+    if (i >= 0) {
+      arr.splice(i, 1);
+      dirty = true;
+    }
+  }
+  if (dirty) saveAlbums();
+}
+
+/* ── Открытие / выход ── */
+
+function openAlbum(albumId) {
+  const album = ALBUM_MAP[String(albumId)];
+  if (!album) return;
+
+  haptic('light'); /* 22.70: открыли папку */
+
+  ALBUM_VIEW = String(albumId);
+
+  /* входим всегда в «Все» — фильтры не переносятся из корня */
+  FILTER = 'all';
+  SEARCH = '';
+
+  const si = document.getElementById('searchInput');
+  if (si) si.value = '';
+  const cs = document.getElementById('clearSearch');
+  if (cs) cs.classList.remove('shown');
+
+  document.querySelectorAll('.chip[data-filter]').forEach((b) => {
+    b.classList.toggle('active', b.dataset.filter === 'all');
+  });
+
+  renderAll({ animate: true });
+}
+
+function closeAlbum() {
+  ALBUM_VIEW = null;
+
+  haptic('light'); /* 22.70: вышли из папки */
+
+  renderAll({ animate: true });
+}
+
+/* ── Окно «Создать папку» из выбранных файлов ── */
+
+function openAlbumCreateModal(e) {
+  if (e) e.stopPropagation();
+
+  if (!selectedIds.size) {
+    /* без выбранных файлов папку не из чего собирать */
+    return;
+  }
+
+  const ids = [...selectedIds];
+  const info = document.getElementById('albumCreateInfo');
+  if (info) {
+    info.textContent = ids.length === 1
+      ? '1 файл попадёт в новую папку'
+      : ids.length + ' файлов попадут в новую папку';
+  }
+
+  const inp = document.getElementById('albumNameInput');
+  if (inp) inp.value = '';
+
+  /* список существующих папок — можно сразу разложить выбранные туда */
+  const wrap = document.getElementById('albumPickWrap');
+  const box = document.getElementById('albumPickList');
+
+  if (wrap && box) {
+    const albums = Object.values(ALBUM_MAP).sort((a, b) => (b.ts || 0) - (a.ts || 0));
+
+    if (albums.length) {
+      box.innerHTML = albums.map((al) => {
+        const aid = escapeHtml(String(al.id));
+        return `
+          <button class="album-pick" onclick="moveSelectionToAlbum('${aid}')">
+            <span class="ap-ico"><i data-lucide="folder" style="width:17px;height:17px"></i></span>
+            <span style="flex:1;min-width:0;font-weight:700;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escapeHtml(al.name || 'Папка')}</span>
+            <span style="font-weight:700;font-size:12px;color:var(--subtext-color);flex-shrink:0">${(al.fileIds || []).length}</span>
+          </button>
+        `;
+      }).join('');
+      wrap.style.display = '';
+    } else {
+      wrap.style.display = 'none';
+    }
+  }
+
+  openModalEl('albumCreateModal');
+
+  setTimeout(() => {
+    try { if (inp) inp.focus(); } catch (e2) {}
+  }, 380);
+}
+
+function closeAlbumCreateModal(e) {
+  if (e) e.stopPropagation();
+  closeModalEl('albumCreateModal');
+}
+
+/* Общий финал: вышли из выбора, карточки «улетают», рождается папка */
+function finishAlbumAction(ids, albumId) {
+  closeModalEl('albumCreateModal');
+
+  selectMode = false;
+  selectedIds.clear();
+
+  const bar = document.getElementById('selectionBar');
+  if (bar) bar.classList.remove('visible');
+  updateSelCount();
+
+  if (ALBUM_VIEW) ALBUM_VIEW = null;
+
+  const animated = animateCardsOut(ids);
+  setTimeout(() => {
+    renderAll({ animate: true, bornAlbum: albumId });
+  }, animated ? 230 : 0);
+}
+
+/* Перемещает файлы в папку: добавляет в целевую и УБИРАЕТ из остальных —
+   файл живёт в одной папке, как в нормальных файловых менеджерах */
+function moveFileIdsToAlbum(ids, albumId) {
+  ids.forEach(function (sid) {
+    for (const aid in ALBUM_MAP) {
+      if (aid === albumId) continue;
+
+      const arr = ALBUM_MAP[aid].fileIds || [];
+      const i = arr.indexOf(sid);
+      if (i >= 0) arr.splice(i, 1);
+    }
+
+    const dst = ALBUM_MAP[albumId].fileIds || (ALBUM_MAP[albumId].fileIds = []);
+    if (dst.indexOf(sid) < 0) dst.push(sid);
+  });
+
+  saveAlbums();
+}
+
+function createAlbumFromSelection() {
+  if (!selectedIds.size) return;
+
+  const inp = document.getElementById('albumNameInput');
+  const name = ((inp && inp.value) || '').trim() || ('Папка ' + (Object.keys(ALBUM_MAP).length + 1));
+
+  const ids = [...selectedIds].map(String);
+
+  const album = {
+    id: albumIdNew(),
+    name: name,
+    ts: Date.now(),
+    fileIds: []
+  };
+
+  ALBUM_MAP[album.id] = album;
+  moveFileIdsToAlbum(ids, album.id);
+
+  haptic('success'); /* 22.70: папка создана */
+
+  finishAlbumAction(ids, album.id);
+}
+
+function moveSelectionToAlbum(albumId) {
+  const album = ALBUM_MAP[String(albumId)];
+  if (!album || !selectedIds.size) return;
+
+  const ids = [...selectedIds].map(String);
+
+  moveFileIdsToAlbum(ids, String(albumId));
+  album.ts = Date.now();
+  saveAlbums();
+
+  haptic('success'); /* 22.70: файлы разложены по папке */
+
+  finishAlbumAction(ids, album.id);
+}
+
+/* ── Окно действий с папкой: переименовать / удалить ── */
+
+let activeAlbumId = null;
+
+function openAlbumActions(e, albumId) {
+  if (e) e.stopPropagation();
+
+  const album = ALBUM_MAP[String(albumId)];
+  if (!album) return;
+
+  activeAlbumId = String(albumId);
+
+  const nameEl = document.getElementById('albumModalName');
+  if (nameEl) nameEl.textContent = '«' + (album.name || 'Папка') + '» — ' + (album.fileIds || []).length + ' ' + pluralFiles((album.fileIds || []).length);
+
+  const inp = document.getElementById('albumModalInput');
+  if (inp) inp.value = album.name || '';
+
+  openModalEl('albumModal');
+
+  setTimeout(() => {
+    try { if (inp) inp.focus(); } catch (e2) {}
+  }, 380);
+}
+
+function closeAlbumModal(e) {
+  if (e) e.stopPropagation();
+  closeModalEl('albumModal');
+}
+
+function renameAlbumFromModal() {
+  const album = ALBUM_MAP[activeAlbumId];
+  if (!album) return;
+
+  const inp = document.getElementById('albumModalInput');
+  const name = ((inp && inp.value) || '').trim();
+  if (!name) return;
+
+  album.name = name;
+  saveAlbums();
+
+  closeModalEl('albumModal');
+
+  /* мягкая перерисовка без волны — только новые имя/счётчик */
+  renderAll();
+}
+
+function deleteAlbumFromModal() {
+  const id = activeAlbumId;
+  if (!id || !ALBUM_MAP[id]) return;
+
+  delete ALBUM_MAP[id];
+  saveAlbums();
+
+  haptic('success'); /* 22.70: папка удалена */
+
+  closeModalEl('albumModal');
+
+  /* файлы НЕ удаляются — просто возвращаются в корень */
+  if (ALBUM_VIEW === id) ALBUM_VIEW = null;
+
+  renderAll({ animate: true });
+}
+
+/* Тестовые файлы: 8 разных типов с предзаполненными избранным и описаниями */
+const TEST_FILES = [
+  { id: 'test_1', name: 'Закат на море.jpg', kind: 'photo', size: 2453678, ts: Date.now() - 86400000 * 2, fav: true, desc: 'Закат с прошлого отпуска — очень красивый вид' },
+  { id: 'test_2', name: 'Прогулка по парку.mp4', kind: 'video', size: 47832145, ts: Date.now() - 86400000 * 5, fav: false, desc: 'Видео с прогулки на выходных' },
+  { id: 'test_3', name: 'Любимая песня.mp3', kind: 'audio', size: 8421547, ts: Date.now() - 86400000 * 7, fav: true, desc: '' },
+  { id: 'test_4', name: 'Презентация проекта.pdf', kind: 'document', size: 1452369, ts: Date.now() - 86400000 * 1, fav: false, desc: 'Финальная версия для встречи' },
+  { id: 'test_5', name: 'Семейное фото.png', kind: 'photo', size: 5234789, ts: Date.now() - 86400000 * 10, fav: true, desc: 'С дня рождения мамы' },
+  { id: 'test_6', name: 'Конспект лекции.txt', kind: 'document', size: 12453, ts: Date.now() - 86400000 * 3, fav: false, desc: '' },
+  { id: 'test_7', name: 'Утренняя пробежка.mp3', kind: 'audio', size: 6234123, ts: Date.now() - 86400000 * 4, fav: false, desc: 'Подкаст для бега' },
+  { id: 'test_8', name: 'Городской пейзаж.jpg', kind: 'photo', size: 3456789, ts: Date.now() - 86400000 * 6, fav: false, desc: '' }
+];
+
+/* Подмешивает тестовые файлы в ALL_FILES (идемпотентно: не дублирует).
+   Также предзаполняет избранное/описания для тестовых файлов,
+   если их там ещё нет — чтобы при первом запуске пользователь сразу
+   видел демо-данные с избранным и описаниями.
+   Удалённые пользователем тестовые файлы НЕ восстанавливаются. */
+function injectTestFiles() {
+  /* ВОЛНА: демо-папка — создаётся ОДИН раз при первом запуске,
+     чтобы фича «настоящих папок» была видна сразу. Пользователь удалил —
+     больше не возвращается */
+  try {
+    if (!localStorage.getItem(ALBUM_DEMO_KEY)) {
+      safeSet(ALBUM_DEMO_KEY, '1');
+
+      if (!Object.keys(ALBUM_MAP).length) {
+        ALBUM_MAP['alb_demo'] = {
+          id: 'alb_demo',
+          name: 'Фото',
+          ts: Date.now() - 86400000,
+          fileIds: ['test_1', 'test_5']
+        };
+        saveAlbums();
+      }
+    }
+  } catch (e) {}
+
+  try {
+    let needFavSave = false;
+    let needDescSave = false;
+
+    TEST_FILES.forEach(function (tf) {
+      if (TEST_DELETED.has(tf.id)) return;
+
+      if (tf.fav && !FAV_SET.has(tf.id)) {
+        FAV_SET.add(tf.id);
+        needFavSave = true;
+      }
+      if (tf.desc && !DESC_MAP[tf.id]) {
+        DESC_MAP[tf.id] = tf.desc;
+        needDescSave = true;
+      }
+    });
+
+    if (needFavSave) saveFavorites();
+    if (needDescSave) saveDescriptions();
+  } catch (e) {}
+
+  const existingIds = new Set(ALL_FILES.map((f) => String(f.id)));
+
+  TEST_FILES.forEach(function (tf) {
+    if (TEST_DELETED.has(tf.id)) return;
+    if (!existingIds.has(tf.id)) {
+      ALL_FILES.push({
+        id: tf.id,
+        name: tf.name,
+        kind: tf.kind,
+        size: tf.size,
+        ts: String(tf.ts),
+        vault: false,
+        safe: false,
+        plain: false,
+        src: 'test',
+        test: true
+      });
+    }
+  });
+}
+
+/* Переключение избранного — с медленной плавной анимацией звёздочки */
+function toggleFavorite(id) {
+  id = String(id);
+  const was = FAV_SET.has(id);
+
+  haptic('light'); /* 22.70: лёгкий отклик на звёздочку */
+
+  if (was) FAV_SET.delete(id);
+  else FAV_SET.add(id);
+
+  saveFavorites();
+
+  if (FILTER === 'favorite') {
+    /* В режиме фильтра «Избранное» — мягко перерисовываем список
+       (убранное из избранного «уезжает», добавленное — въезжает) */
+    renderAll({ animate: true });
+  } else {
+    /* В обычном режиме — обновляем только кнопку без перерисовки */
+    document.querySelectorAll('.fav-toggle').forEach(function (b) {
+      if (b.getAttribute('data-fid') === id) {
+        b.classList.toggle('active', !was);
+
+        if (!was) {
+          /* Медленный плавный спринг-поп звёздочки */
+          b.classList.remove('pop');
+          void b.offsetWidth;
+          b.classList.add('pop');
+        }
+      }
+    });
+  }
+
+  showToast(!was ? '⭐ В избранном' : 'Убрано из избранного');
+}
+
+/* Сохранение описания из окна действий файла */
+function saveCurrentDescription() {
+  if (!activeEditingFileId) return;
+
+  const id = String(activeEditingFileId);
+  const el = document.getElementById('modalInputDesc');
+  const text = el ? el.value : '';
+
+  if (text.trim()) {
+    DESC_MAP[id] = text.trim();
+  } else {
+    delete DESC_MAP[id];
+  }
+
+  saveDescriptions();
+
+  haptic('success'); /* 22.70: описание сохранено */
+
+  /* Обновляем превью на карточке без полной перерисовки — мягко проявляем */
+  const card = document.querySelector('.file-card[data-id="' + id + '"]');
+  if (card) {
+    let descEl = card.querySelector('.file-desc');
+
+    if (text.trim()) {
+      if (!descEl) {
+        const info = card.querySelector('div[style*="flex:1"]');
+        if (info) {
+          descEl = document.createElement('p');
+          descEl.className = 'file-desc';
+          info.appendChild(descEl);
+        }
+      }
+
+      if (descEl) {
+        descEl.textContent = text.trim();
+        /* Снимаем shown, форсим reflow, добавляем shown — мягкое проявление */
+        descEl.classList.remove('shown');
+        void descEl.offsetWidth;
+        descEl.classList.add('shown');
+      }
+    } else if (descEl) {
+      descEl.classList.remove('shown');
+      /* После анимации opacity→0 — убираем из DOM */
+      setTimeout(function () { if (descEl) descEl.remove(); }, 550);
+    }
+  }
+
+  showToast('📝 Описание сохранено');
+}
+
+/* ═══ ПОДТВЕРЖДЕНИЕ УДАЛЕНИЯ ═══
+   Удаление одного файла или группы сперва открывает окно подтверждения
+   с медленным плавным появлением иконки/текста/кнопок. Само удаление
+   выполняет executeConfirmedDelete — единая точка для обоих сценариев. */
+
+let PENDING_DELETE = null; /* { ids: [...], isBulk: bool } */
+
+/* ВОЛНА: удаление по СВАЙПУ ВЛЕВО — карточка уехала влево и открылось
+   то же окно подтверждения, что и у кнопки «Удалить» (единая точка входа) */
+function confirmDeleteSwiped(id) {
+  const f = ALL_FILES.find((x) => String(x.id) === String(id));
+  if (!f) return;
+
+  PENDING_DELETE = { ids: [String(id)], isBulk: false };
+
+  const txt = document.getElementById('confirmDeleteText');
+  if (txt) txt.textContent = '«' + (f.name || 'файл') + '» будет удалён безвозвратно. Это действие нельзя отменить.';
+
+  haptic('warning'); /* 22.70: свайп доведён до удаления */
+
+  openModalEl('confirmDeleteModal');
+}
+
+function confirmDeleteCurrentFile() {
+  if (!activeEditingFileId) return;
+
+  const id = activeEditingFileId;
+  const f = ALL_FILES.find((x) => x.id === id);
+  if (!f) return;
+
+  PENDING_DELETE = { ids: [id], isBulk: false };
+
+  const txt = document.getElementById('confirmDeleteText');
+  if (txt) txt.textContent = '«' + (f.name || 'файл') + '» будет удалён безвозвратно. Это действие нельзя отменить.';
+
+  /* Закрываем окно действий, затем мягко открываем подтверждение */
+  haptic('warning'); /* 22.70: серьёзный шаг — предупреждение */
+  closeEditModal();
+  setTimeout(function () { openModalEl('confirmDeleteModal'); }, 280);
+}
+
+function confirmDeleteSelected() {
+  if (!selectedIds.size) {
+    showToast('Сначала выберите файлы');
+    return;
+  }
+
+  const ids = [...selectedIds];
+  PENDING_DELETE = { ids: ids, isBulk: true };
+
+  const txt = document.getElementById('confirmDeleteText');
+  if (txt) {
+    if (ids.length === 1) {
+      const f = ALL_FILES.find((x) => x.id === ids[0]);
+      txt.textContent = '«' + (f && f.name || 'файл') + '» будет удалён безвозвратно. Это действие нельзя отменить.';
+    } else {
+      txt.textContent = ids.length + ' файлов будут удалены безвозвратно. Это действие нельзя отменить.';
+    }
+  }
+
+  haptic('warning'); /* 22.70: серьёзный шаг — предупреждение */
+
+  openModalEl('confirmDeleteModal');
+}
+
+/* ═══ 22.70: «УДАЛИТЬ ВСЁ» — кнопка в нижней панели выбора ═══
+   Работает и в корне, и внутри папки: выбирает ВСЕ файлы текущего
+   экрана (в папке — все её файлы; при поиске — все найденные) и
+   открывает привычное окно подтверждения. Чекбоксы успевают
+   «попнуть», потом мягко всплывает подтверждение */
+function deleteAllVisible() {
+  const ids = applyFilters().map((f) => String(f.id));
+
+  if (!ids.length) {
+    showToast('Нет файлов для удаления');
+    return;
+  }
+
+  selectedIds.clear();
+  ids.forEach((id) => selectedIds.add(id));
+
+  haptic('medium'); /* 22.70: отклик на нажатие кнопки */
+
+  updateSelCount();
+  renderFiles(applyFilters());
+
+  /* короткая пауза — чекбоксы красиво «попнули», счётчик пульснул */
+  setTimeout(confirmDeleteSelected, 260);
+}
+
+function closeConfirmDelete(e) {
+  if (e) e.stopPropagation();
+
+  closeModalEl('confirmDeleteModal');
+  PENDING_DELETE = null;
+}
+
+async function executeConfirmedDelete() {
+  if (!PENDING_DELETE) return;
+
+  const ids = PENDING_DELETE.ids || [];
+  const isBulk = !!PENDING_DELETE.isBulk;
+
+  closeModalEl('confirmDeleteModal');
+
+  showToast('🗑 Удаляю ' + ids.length + '…');
+
+  /* 22.56: карточки мягко «улетают» ДО перерисовки списка */
+  const animated = animateCardsOut(ids);
+  if (animated) await new Promise((r) => setTimeout(r, 210));
+
+  let ok = 0;
+
+  for (const id of ids) {
+    const fileObj = ALL_FILES.find((x) => x.id === id);
+    const isTest = !!(fileObj && fileObj.test);
+
+    try {
+      /* Тестовые файлы не имеют бэкенда — удаляем локально,
+         и запоминаем удаление, чтобы файл не появился снова при синхронизации */
+      if (!isTest) {
+        await apiJson('/api/files/' + encodeURIComponent(id), { method: 'DELETE' });
+      } else {
+        TEST_DELETED.add(String(id));
+        saveTestDeleted();
+      }
+
+      ALL_FILES = ALL_FILES.filter((x) => x.id !== id);
+
+      /* Чистим избранное, описания и ПАПКИ удалённого файла */
+      if (FAV_SET.has(id)) { FAV_SET.delete(id); saveFavorites(); }
+      if (DESC_MAP[id]) { delete DESC_MAP[id]; saveDescriptions(); }
+      removeFileFromAlbums(String(id));
+
+      ok++;
+    } catch (e) {}
+  }
+
+  if (isBulk) {
+    selectedIds.clear();
+    updateSelCount();
+  }
+
+  renderAll();
+
+  haptic(ok ? 'success' : 'error'); /* 22.70: результат удаления */
+
+  showToast(ok === ids.length ? '✅ Удалено: ' + ok : 'Удалено ' + ok + ' из ' + ids.length);
+  PENDING_DELETE = null;
+}
+
 /* ═══ ВОЛНА 22.60: ТИХИЙ СТАРТ ═══
    Пользователь: «убери начальные уведомления — не удалось подключиться
    к облаку и HTTP 500». Причина: сервер бота просыпается (бесплатный
@@ -22531,6 +24449,17 @@ if (!IS_TELEGRAM) {
 } else {
   quietStart();
 }
+
+/* ВОЛНА: если старт не подгрузил файлы (нет кэша / нет связи / нет токена) —
+   подмешиваем тестовые файлы, чтобы пользователь сразу увидел
+   избранное, описания и подтверждение удаления в действии.
+   Повторный вызов injectTestFiles безопасен — функция идемпотентна. */
+try {
+  injectTestFiles();
+  if (!ALL_FILES.length || LAST_ERR) {
+    renderAll({ animate: true });
+  }
+} catch (e) {}
 
 safeIcons();
 </script>
@@ -22659,8 +24588,12 @@ self.addEventListener('fetch', function (e) {
   var url = new URL(req.url);
   if (mustPassThrough(req, url)) return;
 
-  /* 1) Навигация по мини-аппу: мгновенно из кэша (офлайн, холодный сервер,
-        ре-старт без мигания), свежая версия — в фоне. */
+  /* 1) Навигация по мини-аппу: ВОЛНА 22.80 — сначала сеть с коротким
+        таймаутом (1,5 с), чтобы после обновления бота пользователь СРАЗУ
+        получал новую версию приложения (раньше из кэша отдавалась старая,
+        и новая доходила только со следующего запуска — окно входа
+        «не сразу»). Сервер спит/оффлайн → мгновенно отдаём кэш, свежая
+        версия догружается в фоне. */
   if (req.mode === 'navigate') {
     e.respondWith((async function () {
       var cache = await caches.open(CACHE);
@@ -22677,8 +24610,15 @@ self.addEventListener('fetch', function (e) {
         }
         return resp;
       }).catch(function () { return null; });
+      var fresh = null;
+      try {
+        fresh = await Promise.race([network, new Promise(function (res) {
+          setTimeout(function () { res(null); }, 1500);
+        })]);
+      } catch (err) {}
+      if (fresh && fresh.ok) return fresh;
       if (cached) { e.waitUntil(network); return cached; }
-      var fresh = await network;
+      fresh = await network;
       return fresh || new Response(
         '<!doctype html><meta charset="utf-8"><body style="background:#0e0f13;color:#fff;font-family:sans-serif;display:grid;place-items:center;height:100vh">Оффлайн — откройте приложение, когда появится сеть</body>',
         {status: 503, headers: {'Content-Type': 'text/html; charset=utf-8'}});
@@ -22852,6 +24792,10 @@ async def miniapp_files_patch(request):
             rec["label"] = new_name[:120]
         else:
             rec["name"] = new_name[:120]
+        # ВОЛНА 22.80: ревизия +1 — параллельный merge-save с передержанной
+        # копией юзера больше не откатит новое имя («название файла
+        # не изменяется»).
+        rec["rv"] = int(rec.get("rv") or 0) + 1
     if "vault" in body and where == "cloud":
         # совместимость со старым клиентом: флаг больше ни на что не влияет
         rec["va"] = bool(body.get("vault"))
@@ -23744,6 +25688,185 @@ async def miniapp_settings_post(request):
     user.miniapp_settings = st
     save_user(user)
     return web.json_response({"ok": True, "settings": st})
+
+
+# --- ВОЛНА 22.81: ПАПКИ / ИЗБРАННОЕ / ОПИСАНИЯ — СИНХРОНИЗАЦИЯ С БАЗОЙ ---
+# Новый мини-апп (index-5.html) принёс настоящие папки, избранное (звёздочки),
+# описания к файлам и «удалённые демо-файлы» — но хранил их ТОЛЬКО в
+# localStorage телефона: смена устройства/очистка кэша/переустановка теряли
+# их безвозвратно (та же жалоба, что была с настройками — волна 22.37).
+# Теперь бот хранит их в user.miniapp_lists: клиент шлёт АКТУАЛЬНОЕ
+# состояние раздела (замена целиком, дебаунс 1,2 с), при старте — подтягивает
+# и объединяет с локальным (union). localStorage остаётся мгновенным кэшем.
+
+# ограничения (защита базы от раздувания)
+_LISTS_MAX = {
+    "albums": 300,          # папок на пользователя
+    "album_files": 500,     # файлов в одной папке
+    "favorites": 2000,      # id в избранном
+    "descriptions": 2000,   # описаний
+    "test_deleted": 500,    # удалённых демо-файлов
+    "desc_len": 2000,       # символов в одном описании
+    "id_len": 60,           # символов в одном id
+    "name_len": 120,        # символов в имени папки
+}
+
+
+def _miniapp_lists_norm(user):
+    """Читает user.miniapp_lists, гарантируя правильные типы разделов."""
+    st = getattr(user, "miniapp_lists", None)
+    if not isinstance(st, dict):
+        st = {}
+    if not isinstance(st.get("albums"), dict):
+        st["albums"] = {}
+    if not isinstance(st.get("descriptions"), dict):
+        st["descriptions"] = {}
+    if not isinstance(st.get("favorites"), list):
+        st["favorites"] = []
+    if not isinstance(st.get("test_deleted"), list):
+        st["test_deleted"] = []
+    return st
+
+
+def _lists_clean_ids(seq, limit):
+    """Список id → строки, обрезка, дедуп с сохранением порядка, лимит."""
+    out = []
+    seen = set()
+    for x in (seq or [])[:limit * 2]:
+        s = str(x or "")[:_LISTS_MAX["id_len"]]
+        if s and s not in seen:
+            seen.add(s)
+            out.append(s)
+            if len(out) >= limit:
+                break
+    return out
+
+
+def _miniapp_lists_sanitize(st):
+    """Приводит разделы к безопасным размерам/типам (после замены клиентом)."""
+    albums = st.get("albums") or {}
+    clean = {}
+    for aid, alb in list(albums.items())[:_LISTS_MAX["albums"]]:
+        if not isinstance(aid, str) or not aid:
+            continue
+        if not isinstance(alb, dict):
+            continue
+        try:
+            ts = float(alb.get("ts") or 0)
+        except (TypeError, ValueError):
+            ts = 0.0
+        clean[aid[:_LISTS_MAX["id_len"]]] = {
+            "id": aid[:_LISTS_MAX["id_len"]],
+            "name": str(alb.get("name") or "Папка")[:_LISTS_MAX["name_len"]],
+            "ts": ts,
+            "fileIds": _lists_clean_ids(alb.get("fileIds"),
+                                        _LISTS_MAX["album_files"]),
+        }
+    st["albums"] = clean
+    st["favorites"] = _lists_clean_ids(st.get("favorites"),
+                                       _LISTS_MAX["favorites"])
+    desc = {}
+    for k, v in list((st.get("descriptions") or {}).items())[:_LISTS_MAX["descriptions"]]:
+        if not isinstance(k, str) or not k:
+            continue
+        desc[k[:_LISTS_MAX["id_len"]]] = str(v or "")[:_LISTS_MAX["desc_len"]]
+    st["descriptions"] = desc
+    st["test_deleted"] = _lists_clean_ids(st.get("test_deleted"),
+                                          _LISTS_MAX["test_deleted"])
+    return st
+
+
+def _lists_merge_into_local(base, srv):
+    """Серверное состояние → словарь объединения для клиента (те же правила,
+    что на клиенте в pullListsApply): union по id, у папок — fileIds union,
+    имя/время от более свежей копии, у описаний непустое сильнее пустого."""
+    merged = {
+        "favorites": sorted(set(map(str, base.get("favorites") or [])) |
+                            set(map(str, srv.get("favorites") or []))),
+        "test_deleted": sorted(set(map(str, base.get("test_deleted") or [])) |
+                               set(map(str, srv.get("test_deleted") or []))),
+    }
+    desc = dict(base.get("descriptions") or {})
+    for k, v in (srv.get("descriptions") or {}).items():
+        if k not in desc or (not desc.get(k) and v):
+            desc[k] = v
+    merged["descriptions"] = desc
+    albums = dict(base.get("albums") or {})
+    for aid, alb in (srv.get("albums") or {}).items():
+        cur = albums.get(aid)
+        if not isinstance(cur, dict):
+            albums[aid] = alb
+            continue
+        try:
+            s_ts = float(alb.get("ts") or 0)
+        except (TypeError, ValueError):
+            s_ts = 0.0
+        try:
+            c_ts = float(cur.get("ts") or 0)
+        except (TypeError, ValueError):
+            c_ts = 0.0
+        c_ids = list(cur.get("fileIds") or [])
+        s_ids = list(alb.get("fileIds") or [])
+        albums[aid] = {
+            "id": aid,
+            "name": (alb.get("name") or cur.get("name") or "Папка")
+            if s_ts >= c_ts else (cur.get("name") or alb.get("name") or "Папка"),
+            "ts": max(s_ts, c_ts),
+            "fileIds": list(dict.fromkeys(c_ids + s_ids)),
+        }
+    merged["albums"] = albums
+    return merged
+
+
+async def miniapp_lists_get(request):
+    """ВОЛНА 22.81: GET /api/lists — папки/избранное/описания пользователя
+    из базы (переживают смену телефона/очистку кэша — как настройки 22.37)."""
+    user, uid, err = await _api_get_user_any(request)
+    if err is not None:
+        return err
+    st = _miniapp_lists_sanitize(_miniapp_lists_norm(user))
+    return web.json_response({"lists": st, "build": BOT_BUILD})
+
+
+async def miniapp_lists_post(request):
+    """ВОЛНА 22.81: POST /api/lists — клиент прислал АКТУАЛЬНОЕ состояние
+    одного или нескольких разделов (favorites/albums/descriptions/test_deleted,
+    любой непустой набор). Присланный раздел ЗАМЕНЯЕТ хранимый (последний
+    писатель прав — удаления доходят), затем санитизация размеров.
+    Ответ — полное объединённое состояние (клиент сверяется)."""
+    user, uid, err = await _api_get_user_any(request)
+    if err is not None:
+        return err
+    if request.content_length and request.content_length > 512 * 1024:
+        return _miniapp_err(413, "too_big", "Слишком большой список.")
+    try:
+        body = await request.json()
+    except Exception:
+        return _miniapp_err(400, "bad_json", "Ожидался JSON.")
+    if not isinstance(body, dict) or not body:
+        return _miniapp_err(400, "bad_lists", "Ожидался непустой словарь списков.")
+    st = _miniapp_lists_norm(user)
+    accepted = False
+    if isinstance(body.get("albums"), dict):
+        st["albums"] = body["albums"]
+        accepted = True
+    if isinstance(body.get("descriptions"), dict):
+        st["descriptions"] = body["descriptions"]
+        accepted = True
+    if isinstance(body.get("favorites"), list):
+        st["favorites"] = body["favorites"]
+        accepted = True
+    if isinstance(body.get("test_deleted"), list):
+        st["test_deleted"] = body["test_deleted"]
+        accepted = True
+    if not accepted:
+        return _miniapp_err(400, "bad_lists",
+                            "Нет известных разделов (albums/descriptions/"
+                            "favorites/test_deleted).")
+    st = _miniapp_lists_sanitize(st)
+    user.miniapp_lists = st
+    save_user(user)
+    return web.json_response({"ok": True, "lists": st})
 
 
 async def miniapp_safe_status(request):
@@ -27208,6 +29331,9 @@ def mount_miniapp_routes(app):
     # ВОЛНА 22.37: настройки мини-аппа в базе (тема/звук/блобы/цвет)
     app.router.add_get("/api/settings", miniapp_settings_get)
     app.router.add_post("/api/settings", miniapp_settings_post)
+    # ВОЛНА 22.81: списки мини-аппа (папки/избранное/описания) в базе
+    app.router.add_get("/api/lists", miniapp_lists_get)
+    app.router.add_post("/api/lists", miniapp_lists_post)
     app.router.add_post("/api/safe/unlock", miniapp_safe_unlock)
     app.router.add_post("/api/safe/lock", miniapp_safe_lock)
     app.router.add_post("/api/files/{fid}/to_safe", miniapp_files_to_safe)
@@ -27229,6 +29355,9 @@ def mount_miniapp_routes(app):
     app.router.add_post("/api/upload/rename", miniapp_upload_rename)
     # ВОЛНА 22.23: «Моё облако» в мини-аппе (статус/подключить/отключить канал)
     app.router.add_get("/api/storage", miniapp_storage_get)
+    # ВОЛНА 22.81: фолбэк-алиас нового клиента (detectStorageMode пробует
+    # /api/storage, /api/storage/settings, /api/storage/plain по очереди)
+    app.router.add_get("/api/storage/settings", miniapp_storage_get)
     app.router.add_post("/api/storage/connect", miniapp_storage_connect)
     app.router.add_post("/api/storage/disconnect", miniapp_storage_disconnect)
     # ВОЛНА 22.25: режим «файлы БЕЗ шифрования» для личного канала
@@ -27512,6 +29641,8 @@ async def cloud_rename_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return MAIN_MENU
     old = rec.get("name", "?")
     rec["name"] = text[:120]
+    # ВОЛНА 22.80: ревизия +1 — merge-save не откатит имя (см. _merge_user_file_lists)
+    rec["rv"] = int(rec.get("rv") or 0) + 1
     save_user(user)
     # ВОЛНА 22.48: файл переименовывается и В КАНАЛЕ ПОЛЬЗОВАТЕЛЯ —
     # подпись сообщения-хранилища догоняет новое имя (best-effort).
@@ -28543,11 +30674,24 @@ def _web_check_password(user, password: str) -> bool:
 
 
 # === ВОЛНА 22.29: ВЕБ-СЕССИИ (Bearer-токены для /api/*) ===
-# Живут В ПАМЯТИ процесса: рестарт сервера сбрасывает сессии — пользователю
-# нужно просто войти заново (пароль остаётся). TTL — 30 дней.
+# ВОЛНА 22.80: раньше жили только в ОЗУ (рестарт = всем заново входить);
+# теперь сохраняются на диск (web_sessions.json) и восстанавливаются при
+# старте — после обновления бота вход в веб-облако НЕ сбрасывается.
+# TTL — 30 дней.
 _WEB_SESSIONS = {}
 WEB_SESSION_TTL = 30 * 24 * 3600   # 30 дней, сек
 WEB_SESSIONS_MAX = 10000           # капа словаря (при превышении чистим просрочку)
+
+# ВОЛНА 22.80: веб-сессии переживают рестарт/обновление бота. Раньше они
+# жили только в ОЗУ: после каждого деплоя пользователь веб-облака
+# вынужден входить заново, а окно входа появлялось только после подъёма
+# сервера («после обновления бота в мини-апп не сразу появляется окно
+# чтобы войти»). Теперь токены хранятся на диске и восстанавливаются
+# при старте. Пароль Сейфа (vault_pw) осознанно НЕ сохраняется — он
+# остаётся RAM-only по дизайну zero-knowledge; мини-апп спросит его
+# заново при первом обращении к Сейфу (это уже умеет).
+_WEB_SESSIONS_FILE = _data_file("web_sessions.json")
+_web_sessions_lock = threading.Lock()
 
 # ВОЛНА 22.49: epoch на пользователя — смена/удаление веб-пароля мгновенно
 # инвалидирует ВСЕ его сессии (раньше украденный Bearer-токен оставался жив
@@ -28559,6 +30703,78 @@ def _web_invalidate_sessions(user_id) -> None:
     """Убивает все веб-сессии пользователя (смена/удаление пароля)."""
     uid = str(user_id)
     _WEB_SESSIONS_EPOCH[uid] = int(_WEB_SESSIONS_EPOCH.get(uid, 0)) + 1
+    # ВОЛНА 22.80: инвалидация тоже переживает рестарт
+    _web_sessions_save()
+
+
+def _web_sessions_save():
+    """ВОЛНА 22.80: сохранить веб-сессии на диск (best-effort, без vault_pw)."""
+    try:
+        with _web_sessions_lock:
+            payload = {
+                "sessions": {
+                    t: {k: v for k, v in rec.items() if k != "vault_pw"}
+                    for t, rec in _WEB_SESSIONS.items() if isinstance(rec, dict)
+                },
+                "epoch": dict(_WEB_SESSIONS_EPOCH),
+            }
+            _ensure_parent_dir(_WEB_SESSIONS_FILE)
+            tmp = (f"{_WEB_SESSIONS_FILE}.{os.getpid()}."
+                   f"{threading.get_ident()}.tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False)
+            os.replace(tmp, _WEB_SESSIONS_FILE)
+    except Exception as e:
+        logger.warning(f"web sessions save: {e}")
+
+
+def _web_sessions_prune():
+    """ВОЛНА 22.80: убрать просроченные сессии из памяти."""
+    _now = time.time()
+    for _t in [t for t, r in _WEB_SESSIONS.items()
+               if not isinstance(r, dict)
+               or float(r.get("expires", 0) or 0) <= _now]:
+        _WEB_SESSIONS.pop(_t, None)
+
+
+def _web_sessions_restore():
+    """ВОЛНА 22.80: при старте сервера прочитать сессии с диска.
+    Просроченные и битые записи выбрасываются, файл перезаписывается
+    начисто. Возвращает число восстановленных сессий."""
+    n = 0
+    try:
+        with open(_WEB_SESSIONS_FILE, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        if isinstance(payload, dict):
+            _now = time.time()
+            for _t, _rec in (payload.get("sessions") or {}).items():
+                if not isinstance(_t, str) or not isinstance(_rec, dict):
+                    continue
+                try:
+                    _exp = float(_rec.get("expires", 0) or 0)
+                except Exception:
+                    continue
+                if _exp <= _now:
+                    continue
+                if not str(_rec.get("user_id") or ""):
+                    continue
+                _WEB_SESSIONS[_t] = dict(_rec)  # vault_pw НЕ восстанавливается
+                n += 1
+            _ep = payload.get("epoch")
+            if isinstance(_ep, dict):
+                for _k, _v in _ep.items():
+                    try:
+                        _WEB_SESSIONS_EPOCH[str(_k)] = int(_v)
+                    except Exception:
+                        pass
+        _web_sessions_prune()
+        if _WEB_SESSIONS:
+            _web_sessions_save()   # перезапись начисто (без просрочки)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        logger.warning(f"web sessions restore: {e}")
+    return n
 
 
 def _web_create_session(user_id) -> str:
@@ -28582,6 +30798,8 @@ def _web_create_session(user_id) -> str:
         "created": _now,
         "epoch": int(_WEB_SESSIONS_EPOCH.get(str(user_id), 0)),
     }
+    # ВОЛНА 22.80: сессия переживает рестарт — сразу на диск
+    _web_sessions_save()
     return token
 
 
@@ -35173,6 +37391,8 @@ async def vault_ren_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("Файл не найден (уже удалён?).")
         return MAIN_MENU
     rec["label"] = text[:80]
+    # ВОЛНА 22.80: ревизия +1 — merge-save не откатит подпись
+    rec["rv"] = int(rec.get("rv") or 0) + 1
     user.vault_files = [
         f for f in (getattr(user, "vault_files", []) or []) if isinstance(f, dict)
     ]
@@ -66201,6 +68421,18 @@ async def _post_init(application):
     except Exception as e2:
         logger.error(f"Не удалось восстановить карту завершённых загрузок: {e2}")
 
+    # === ВОЛНА 22.80: веб-сессии — с диска. ===
+    # После обновления бота вход в веб-облако НЕ сбрасывается (раньше
+    # токены умирали вместе с процессом — «после обновления в мини-апп
+    # не сразу появляется окно чтобы войти»). Пароль Сейфа осознанно
+    # не восстанавливается — его мини-апп спросит заново.
+    try:
+        _ws_n = _web_sessions_restore()
+        if _ws_n:
+            logger.info(f"ВОЛНА 22.80: веб-сессий восстановлено: {_ws_n}")
+    except Exception as e2:
+        logger.error(f"Не удалось восстановить веб-сессии: {e2}")
+
     # === ВОЛНА 22.55: восстановление очередей скачивания «через бота» ===
     # Пользователь закрыл Telegram посреди пачки — очередь жила на сервере;
     # даже рестарт бота её не убьёт: поднимаем воркеры и продолжаем отправку.
@@ -67710,19 +69942,37 @@ def main():
                         # ВОЛНА 22.79: «❗ Важное» тоже принимает файлы —
                         # свободный текст там получает busy-подсказку.
                         VAZHNO_WAIT)
+        # ВОЛНА 22.80: быстрые команды меню («⏰ Таймер», «☁️ Облако», …)
+        # во время загрузки должны ИСПОЛНЯТЬСЯ, а не получать отписку.
+        # В медиа-состояниях (облако/фото звонков/файлы кнопок/Важное) их
+        # раньше не было вовсе: текстовый хендлер появлялся только с
+        # busy-инжектом ниже, а _inject_quick_commands на тот момент уже
+        # отработал и пропустил эти состояния. Итог: пока бот грузит файлы
+        # в облако, команды молчали («должен отвечать на команды всё равно»).
+        try:
+            _quick_pat = build_quick_commands_pattern()
+        except Exception:
+            _quick_pat = None
         _n = 0
         for _st in _busy_states:
             _handlers = states_dict.get(_st)
             if not _handlers:
                 continue
 
+            if _quick_pat and not any(
+                    getattr(_h, "callback", None) is handle_quick_command
+                    for _h in _handlers):
+                _handlers.insert(0, MessageHandler(
+                    filters.Regex(_quick_pat), handle_quick_command))
+
             def _mk_busy(_state):
                 async def _upload_busy_reply_h(update, context):
                     try:
                         await update.message.reply_text(
                             "⚠️ Сейчас идёт загрузка файлов — бот принимает "
-                            "только файлы. Кнопки меню работают: просто "
-                            "нажмите нужную. Закончили — жмите «✅ Готово», "
+                            "только файлы. Команды и кнопки меню работают: "
+                            "просто отправьте нужную команду или нажмите "
+                            "кнопку. Закончили — жмите «✅ Готово», "
                             "передумали — «❌ Отмена».",
                             reply_markup=_upl_cancel_kb())
                     except Exception:
