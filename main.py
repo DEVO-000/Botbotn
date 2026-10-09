@@ -476,6 +476,8 @@ DEV_HOLIDAY_DELETE = 103
 # праздников одним сообщением, бот сам разбирает даты и названия.
 DEV_HOLIDAY_BULK = 164
 VAZHNO_WAIT = 165          # ВОЛНА 22.77: «❗ Важное» — текст + файлы одним потоком
+VAULT_PERFILE_WAIT = 166   # ВОЛНА 22.82: названия КАЖДОГО файла пачки по одному (Сейф)
+CLOUD_PERNAME_WAIT = 167   # ВОЛНА 22.82: названия КАЖДОГО файла загрузки по одному (облако)
 DEV_INSTANT_BROADCAST = 104
 # Состояние ввода времени уведомления «через сколько дней мой ДР».
 SET_BIRTHDAY_NOTIFICATION_TIME = 105
@@ -623,7 +625,10 @@ _QUICK_SKIP_STATES = frozenset({VAULT_REN_WAIT, VAULT_LABEL_WAIT,
                                 # Свободный текст там всё равно не данные.
                                 # ВОЛНА 22.29: пароль/время/даты — не команды.
                                 WEB_PW_ENTER, WEB_PW_ENTER_OLD,
-                                DND_WAIT_TIME, SICK_WAIT_FROM, SICK_WAIT_TO})
+                                DND_WAIT_TIME, SICK_WAIT_FROM, SICK_WAIT_TO,
+                                # ВОЛНА 22.82: здесь вводят НАЗВАНИЕ файла —
+                                # «⏰ Таймер» это имя файла, а не команда.
+                                VAULT_PERFILE_WAIT, CLOUD_PERNAME_WAIT})
 
 # ==================================
 # === ВОЛНА 12: ГЛОБАЛЬНАЯ КНОПКА ОТМЕНЫ ===
@@ -657,6 +662,7 @@ _VAULT_SESSION_KEYS = (
     'cloud_file_mode', 'cloud_batch', 'cloud_note', 'cloud_ren_id',
     'vault_pending', 'vault_batch_label',
     'vault_batch_cat', 'vault_batch_tags',  # 22.12: категория и теги загрузки
+    'vault_perfile_list', 'vault_perfile_pos',  # 22.82: пошаговое именование
     'poll_flow',  # 22.10: недоделанный опрос тоже стираем при отмене
 )
 
@@ -4376,7 +4382,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.81"
+BOT_BUILD = "22.84"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -8911,6 +8917,13 @@ def get_cloud_menu_keyboard(user=None):
         # по Telegram ID + паролю (без Telegram/VPN).
         [InlineKeyboardButton("🔑 Веб-пароль", callback_data="web_password_menu")],
     ]
+    # ВОЛНА 22.82: «⭐ Избранное» в самом боте — список ОДИН с мини-аппом.
+    try:
+        _fav_n = len(_fav_id_list(user)) if user is not None else 0
+    except Exception:
+        _fav_n = 0
+    _fav_label = "⭐ Избранное" + (f" ({_fav_n})" if _fav_n else "")
+    rows.append([InlineKeyboardButton(_fav_label, callback_data="cloud_fav")])
     if legacy:
         # ВОЛНА 22.33: «Старые файлы» → «Файлы без шифра». Файл, загруженный
         # в мини-аппе при выключенном шифровании, лежит ИМЕННО здесь — старое
@@ -8952,7 +8965,7 @@ def get_cloud_files_keyboard(user):
     """ВОЛНА 8/9: по файлу — ряд [📥 имя], под ним [📦 ZIP] [🔐] [✏️] [🗑].
     📦 — бот сам заворачивает файл в ZIP (LZMA, без потерь),
     🔐 — перенести файл в Сейф (зашифровать и удалить незашифрованный оригинал),
-    ✏️ — переименовать (подпись можно задать и при загрузке)."""
+    ✏️ — переименовать; ☆/⭐ — в избранное (список общий с мини-аппом)."""
     files = [f for f in (getattr(user, "cloud_files", []) or []) if isinstance(f, dict)]
     kb = []
     # ВОЛНА 22.77: 15 → 25 — «файлы не синхронизируются»: в боте было видно
@@ -8966,6 +8979,10 @@ def get_cloud_files_keyboard(user):
             callback_data=f"cloud_get_{rec.get('id')}")])
         kb.append([
             InlineKeyboardButton("📦 ZIP", callback_data=f"cloud_zip_{rec.get('id')}"),
+            # ВОЛНА 22.82: ☆/⭐ — в избранное (список общий с мини-аппом)
+            InlineKeyboardButton(
+                "⭐" if _fav_in(user, rec.get("id")) else "☆",
+                callback_data=f"favt_c_{rec.get('id')}"),
             InlineKeyboardButton("🔐", callback_data=f"cloud_mv_{rec.get('id')}"),
             InlineKeyboardButton("✏️", callback_data=f"cloud_ren_{rec.get('id')}"),
             InlineKeyboardButton("🗑", callback_data=f"cloud_del_{rec.get('id')}"),
@@ -9007,7 +9024,9 @@ def _cloud_files_text(user):
         lines.append(f"…и ещё {len(files) - len(shown)} шт.")
     lines.append("")
     lines.append("📥 — выдать файл; 📦 — за-ZIP-ить (открывается везде, без потерь); "
-                 "🔐 — перенести в Сейф (зашифрую и удалю оригинал); 🗑 — удалить.")
+                 "🔐 — перенести в Сейф (зашифрую и удалю оригинал); 🗑 — удалить. "
+                 "☆/⭐ — в избранное (список общий с мини-аппом: «⭐ Избранное» "
+                 "в меню облака).")
     if any(isinstance(f, dict) and f.get("va") for f in files):
         lines.append("🔒 — файлы, отмеченные «Vault» в 🌐 Веб-облаке (Mini App): "
                      "это их отдельная папка просмотра, шифрованием Сейфа она не является.")
@@ -9205,11 +9224,27 @@ async def _cloud_upload_items(update: Update, context: ContextTypes.DEFAULT_TYPE
         pass
 
     saved, skipped_big, failed, limit_hit = [], [], [], False
-    for item in items:
+    # ВОЛНА 22.84: честная отмена в режиме «☁️ Облако → загрузка»: статус с
+    # «❌ Отмена» снизу (для пачек), стоп между файлами, стирание уехавшего.
+    _op = _upl_op_begin(user_id)
+    _status = None
+    if len(items) > 1:
+        try:
+            _status = await msg.reply_text(
+                f"☁️ Сохраняю в облако: {len(items)} файл(ов)…",
+                reply_markup=_upl_cancel_kb())
+        except Exception:
+            _status = None
+    cancelled = False
+    try:
+      for item in items:
         if limit > 0 and len(files) >= limit:
             limit_hit = True
             skipped_big.append(item)
             continue
+        if _op["event"].is_set():
+            cancelled = True
+            break
         if item["size"] > STORAGE_MAX_FILE_BYTES:
             # ВОЛНА 8: не просто отказ — кнопка «отправить в канал самому».
             skipped_big.append(item)
@@ -9252,6 +9287,8 @@ async def _cloud_upload_items(update: Update, context: ContextTypes.DEFAULT_TYPE
             logger.error(f"cloud upload: {e}")
             failed.append(f"{name[:40]}: ошибка загрузки")
             continue
+        # ВОЛНА 22.84: залитое — в реестр отмены (стереть по «❌ Отмена»).
+        _op["sent"].append((int(channel_id), int(sent.message_id)))
         rec = {
             "id": _cloud_gen_file_id(user),
             "name": name[:120],
@@ -9276,10 +9313,45 @@ async def _cloud_upload_items(update: Update, context: ContextTypes.DEFAULT_TYPE
                 save_storage_config(cfg_rr)
             except Exception:
                 pass
+    finally:
+        _upl_op_end(user_id)
+
+    # ВОЛНА 22.84: честная отмена — стереть уехавшее в канал и не сохранять.
+    if cancelled:
+        _n_del = await _upl_op_cleanup(context, _op)
+        # снять anti-дубль метки отменённых файлов — повторная отправка
+        # сразу после отмены НЕ должна блокироваться на 150 с
+        try:
+            _UPLOAD_RECENT.pop(str(user_id), None)
+        except Exception:
+            pass
+        _txt = ("🛑 Загрузка остановлена — загруженное удалено из канала"
+                + (f" ({_n_del})." if _n_del else "."))
+        if _status is not None:
+            try:
+                await _status.edit_text(_txt)
+            except Exception:
+                pass
+        else:
+            try:
+                await msg.reply_text(_txt)
+            except Exception:
+                pass
+        return MAIN_MENU
+
+    # Статус с кнопкой отмены больше не нужен — сейчас будет итог.
+    if _status is not None:
+        try:
+            await _status.delete()
+        except Exception:
+            pass
 
     if saved:
         user.cloud_files = files
         save_user(user)
+        # ВОЛНА 22.82: id сохранённых — для шага «🏷 Назвать по одному»
+        context.user_data['cloud_per_ids'] = [r.get("id") for r in saved]
+        context.user_data.pop('cloud_per_pos', None)
 
     lines = []
     if len(saved) == 1:
@@ -9307,19 +9379,166 @@ async def _cloud_upload_items(update: Update, context: ContextTypes.DEFAULT_TYPE
         big_saved = [r for r in saved if r["size"] >= 512 * 1024
                      and _is_compressible_name(r["name"], r.get("mime", ""))]
         if big_saved:
-            kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton(f"📦 Завернуть «{big_saved[0]['name'][:24]}» в ZIP",
-                                     callback_data=f"cloud_zip_{big_saved[0]['id']}"),
-            ]])
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    f"📦 Завернуть «{big_saved[0]['name'][:24]}» в ZIP",
+                    callback_data=f"cloud_zip_{big_saved[0]['id']}")],
+                # ВОЛНА 22.82: подписать загруженные файлы ПО ОДНОМУ
+                [InlineKeyboardButton("🏷 Назвать по одному",
+                                      callback_data="cloud_pername")],
+            ])
             lines.append("💡 Этот файл — текстовый: в ZIP сожмётся в 3–10 раз без потерь. "
                          "Нажмите кнопку — я сделаю ZIP сам.")
             await msg.reply_text("\n".join(lines), reply_markup=kb)
             return CLOUD_UPLOAD_WAIT
     if skipped_big:
         # ВОЛНА 8: отказ с КНОПКОЙ «📤 Отправить в канал самому».
-        await msg.reply_text("\n".join(lines), reply_markup=get_big_file_keyboard())
+        _sb_kb = get_big_file_keyboard()
+        if saved:
+            # ВОЛНА 22.82: крупные пропущены, но сохранённые тоже подпишем
+            try:
+                _sb_kb = InlineKeyboardMarkup(
+                    list(getattr(_sb_kb, "inline_keyboard") or [])
+                    + [[InlineKeyboardButton(
+                        "🏷 Назвать по одному", callback_data="cloud_pername")]])
+            except Exception:
+                pass
+        await msg.reply_text("\n".join(lines), reply_markup=_sb_kb)
         return CLOUD_UPLOAD_WAIT
-    await msg.reply_text("\n".join(lines) if lines else "Нечего сохранять.")
+    _fin_kb = None
+    if saved:
+        # ВОЛНА 22.82: предложить подписать файлы ПО ОДНОМУ
+        _fin_kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🏷 Назвать по одному",
+                                 callback_data="cloud_pername")]])
+    await msg.reply_text("\n".join(lines) if lines else "Нечего сохранять.",
+                         reply_markup=_fin_kb)
+    return CLOUD_UPLOAD_WAIT
+
+
+# ═══ ВОЛНА 22.82: ПОШАГОВОЕ ИМЕНОВАНИЕ В ОБЛАКЕ — «по одному» после пачки ═══
+# Кнопка «🏷 Назвать по одному» в итоге загрузки (и в итоге фоновой загрузки
+# из чата 22.57): бот спрашивает название КАЖДОГО сохранённого файла по
+# очереди. Имя пишется в rec["name"] c ревизией rv+1 (22.80: merge-save не
+# откатит) и догоняет подпись в канале-хранилище.
+
+
+async def _cloud_pername_prompt(msg, context, user):
+    """Просит название для ОЧЕРЕДНОГО сохранённого файла облака."""
+    ids = context.user_data.get('cloud_per_ids') or []
+    pos = int(context.user_data.get('cloud_per_pos') or 0)
+    if pos >= len(ids):
+        context.user_data.pop('cloud_per_ids', None)
+        context.user_data.pop('cloud_per_pos', None)
+        try:
+            await msg.reply_text(
+                "✅ Все файлы названы — «📁 Файлы без шифра» уже с новыми именами.")
+        except Exception:
+            pass
+        return CLOUD_UPLOAD_WAIT
+    rec = _cloud_find_record(user, str(ids[pos]))
+    if rec is None:                      # файл уже удалён — пропускаем
+        context.user_data['cloud_per_pos'] = pos + 1
+        return await _cloud_pername_prompt(msg, context, user)
+    old = str(rec.get("name") or "").strip() or "(без имени)"
+    txt = (f"🏷 ФАЙЛ {pos + 1}/{len(ids)}: {_miniapp_kind_emoji(rec)} "
+           f"«{old[:60]}» ({_fmt_bytes(rec.get('size') or 0)})\n\n"
+           "Пришлите НАЗВАНИЕ этого файла одним сообщением.\n"
+           "⏭ Пропустить — оставить как есть; ⏹ Хватит — остальные без названий.")
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⏭ Пропустить", callback_data="cloud_perskip"),
+         InlineKeyboardButton("⏹ Хватит", callback_data="cloud_perdone")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="upl_cancel")],
+    ])
+    await msg.reply_text(txt, reply_markup=kb)
+    return CLOUD_PERNAME_WAIT
+
+
+async def cloud_pername_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.82: старт пошагового именования последней загрузки облака."""
+    query = update.callback_query
+    user = get_user(str(query.from_user.id))
+    if not user:
+        await _safe_cb_answer(query, "Сначала зарегистрируйтесь — /start", True)
+        return MAIN_MENU
+    await _safe_cb_answer(query)
+    ids = [i for i in (context.user_data.get('cloud_per_ids') or []) if i]
+    recs = [r for r in (_cloud_find_record(user, str(i)) for i in ids) if r]
+    if not recs:
+        await _safe_cb_answer(
+            query,
+            "Список загрузки устарел — файлы уже названы или удалены. "
+            "Переименовать можно кнопкой ✏️ в «📁 Файлы без шифра».", True)
+        return MAIN_MENU
+    context.user_data['cloud_per_ids'] = [r.get("id") for r in recs]
+    context.user_data['cloud_per_pos'] = 0
+    return await _cloud_pername_prompt(query.message, context, user)
+
+
+@timeout(CONVERSATION_TIMEOUT)
+async def cloud_pername_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.82: приём названия ОЧЕРЕДНОГО файла облака."""
+    msg = update.message
+    user = get_user(str(update.effective_user.id))
+    ids = context.user_data.get('cloud_per_ids')
+    if not user or not isinstance(ids, list) or not ids:
+        context.user_data.pop('cloud_per_ids', None)
+        context.user_data.pop('cloud_per_pos', None)
+        await msg.reply_text(
+            "Сессия именования потеряна — файлы можно переименовать и позже: "
+            "✏️ в «📁 Файлы без шифра».",
+            reply_markup=get_main_menu_keyboard(user) if user else None)
+        return MAIN_MENU
+    text = (msg.text or "").strip()
+    if not text:
+        await msg.reply_text("Напишите название ОДНИМ сообщением — или «⏭ Пропустить».")
+        return CLOUD_PERNAME_WAIT
+    pos = int(context.user_data.get('cloud_per_pos') or 0)
+    rec = _cloud_find_record(user, str(ids[pos])) if pos < len(ids) else None
+    if rec is None:
+        context.user_data['cloud_per_pos'] = pos + 1
+        return await _cloud_pername_prompt(msg, context, user)
+    old = str(rec.get("name") or "").strip() or "(без имени)"
+    rec["name"] = text[:120]
+    # ВОЛНА 22.80: ревизия +1 — merge-save не откатит имя
+    rec["rv"] = int(rec.get("rv") or 0) + 1
+    save_user(user)
+    try:
+        await _storage_rename_caption(context.bot, rec, rec["name"])
+    except Exception:
+        pass
+    await msg.reply_text(f"✏️ «{old[:60]}» → «{rec['name'][:60]}».")
+    context.user_data['cloud_per_pos'] = pos + 1
+    return await _cloud_pername_prompt(msg, context, user)
+
+
+async def cloud_pername_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.82: «⏭ Пропустить» — этот файл без переименования."""
+    query = update.callback_query
+    await _safe_cb_answer(query)
+    user = get_user(str(query.from_user.id))
+    if not user:
+        return MAIN_MENU
+    if not isinstance(context.user_data.get('cloud_per_ids'), list):
+        return CLOUD_UPLOAD_WAIT
+    context.user_data['cloud_per_pos'] = int(
+        context.user_data.get('cloud_per_pos') or 0) + 1
+    return await _cloud_pername_prompt(query.message, context, user)
+
+
+async def cloud_pername_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.82: «⏹ Хватит» — остальные файлы без переименования."""
+    query = update.callback_query
+    await _safe_cb_answer(query)
+    user = get_user(str(query.from_user.id))
+    if not user:
+        return MAIN_MENU
+    context.user_data.pop('cloud_per_ids', None)
+    context.user_data.pop('cloud_per_pos', None)
+    try:
+        await query.message.reply_text("Готово — имена оставлены как были.")
+    except Exception:
+        pass
     return CLOUD_UPLOAD_WAIT
 
 
@@ -9516,12 +9735,15 @@ def _bg_new_file_id(sent, kind):
     return getattr(getattr(sent, "document", None), "file_id", None)
 
 
-async def _bg_upload_big_mtproto(update, context, user, item, chat_msg, live=None):
+async def _bg_upload_big_mtproto(update, context, user, item, chat_msg, live=None,
+                                 upl_op=None):
     """>49 МБ: качаем сообщение пользователя из личного чата ПОТОКОМ через
     MTProto во временный файл и заливаем в канал контейнером (до 2 ГБ).
     Возвращает rec-словарь или None (причина — в item['_why']).
     ВОЛНА 22.58: live=(user_id, key) — живые проценты для мини-аппа
-    (реестр _BG_UPLOAD_LIVE: «качаю с Telegram 45%» → «загружаю 80%»)."""
+    (реестр _BG_UPLOAD_LIVE: «качаю с Telegram 45%» → «загружаю 80%»).
+    ВОЛНА 22.84: upl_op — операция честной отмены («❌ Отмена» на сообщении
+    прогресса): проверка на каждом куске, отмена = _VaultCancelled."""
     fsize = int(item.get("size") or 0)
     if fsize > VAULT_MTPROTO_MAX_BYTES:
         item["_why"] = "big_hard_limit"
@@ -9558,7 +9780,8 @@ async def _bg_upload_big_mtproto(update, context, user, item, chat_msg, live=Non
             status = await context.bot.send_message(
                 chat_id=update.effective_chat.id,
                 text=(f"📦 «{item['name'][:48]}» ({_fmt_bytes(fsize)}) — "
-                      "большой: качаю с Telegram потоком и сохраняю в облако…"))
+                      "большой: качаю с Telegram потоком и сохраняю в облако…"),
+                reply_markup=_upl_cancel_kb())   # ВОЛНА 22.84: «Отмена» снизу
         except Exception:
             status = None
 
@@ -9569,9 +9792,15 @@ async def _bg_upload_big_mtproto(update, context, user, item, chat_msg, live=Non
                 # event loop (каждые 512 КиБ на файл до 2 ГБ = тысячи фризов
                 # для ВСЕХ пользователей). Уводим запись в worker-поток.
                 await asyncio.to_thread(fh.write, chunk)
+
+            def _upl_cancel_check():
+                # ВОЛНА 22.84: «❌ Отмена» — проверка на каждом куске.
+                return bool(upl_op is not None and upl_op["event"].is_set())
+
             got = await _mt_download_stream(
                 client, doc, int(getattr(doc, "size", 0) or fsize), _sink,
-                progress=(_BgLiveProgressBar(live[0], live[1]) if live else None))
+                progress=(_BgLiveProgressBar(live[0], live[1]) if live else None),
+                cancel_check=(_upl_cancel_check if upl_op is not None else None))
         finally:
             fh.close()
         if got < fsize:
@@ -9580,6 +9809,10 @@ async def _bg_upload_big_mtproto(update, context, user, item, chat_msg, live=Non
         def _live_up(cur, tot, _uid=(live[0] if live else None),
                      _key=(live[1] if live else None)):
             # ВОЛНА 22.58: заливка контейнера в канал — живые проценты.
+            # ВОЛНА 22.84: «❌ Отмена» — бросаем отмену прямо из колбэка
+            # Telethon (тот же приём, что в заливке шифра Сейфа, волна 22.3).
+            if upl_op is not None and upl_op["event"].is_set():
+                raise _VaultCancelled()
             if _uid and tot:
                 _bg_live_set(_uid, _key, "mt_up", cur * 100 // tot)
 
@@ -9606,6 +9839,11 @@ async def _bg_upload_big_mtproto(update, context, user, item, chat_msg, live=Non
         if isinstance(sent.get("mt_doc"), dict):
             rec["mt_doc"] = sent["mt_doc"]
         return rec
+    except _VaultCancelled:
+        # ВОЛНА 22.84: честная отмена пользователя — НЕ «сбой сети»:
+        # подчистку канала делает вызвавший цикл (_upl_op_cleanup).
+        item["_why"] = "cancelled"
+        return None
     except Exception as e:
         logger.error(f"bg upload: большой файл не удался: {e}")
         item["_why"] = "mt_failed"
@@ -9761,11 +9999,32 @@ async def _bg_upload_items(update, context, items):
 
     _msg_mid = int(getattr(msg, "message_id", 0) or 0)
 
-    for _li, item in enumerate(items):
+    # ВОЛНА 22.84: честная отмена «файл в чате = в облако». Операция +
+    # статус-сообщение с «❌ Отмена» снизу (для пачек и больших файлов;
+    # одиночный быстрый файл успевает сохраниться сам). Отмена = стоп +
+    # стереть всё, что уже уехало в канал, и НЕ сохранять записи.
+    _op = _upl_op_begin(user_id)
+    _status = None
+    if len(items) > 1:
+        try:
+            _status = await msg.reply_text(
+                f"☁️ Сохраняю в облако: {len(items)} файл(ов)…",
+                reply_markup=_upl_cancel_kb())
+        except Exception:
+            _status = None
+
+    cancelled = False
+    try:
+      for _li, item in enumerate(items):
         if limit > 0 and len(files) >= limit:
             limit_hit = True
             skipped_big.append(item)
             continue
+        # ВОЛНА 22.84: «❌ Отмена» — прекращаем пачку немедленно;
+        # подчистку канала сделает блок после цикла.
+        if _op["event"].is_set():
+            cancelled = True
+            break
         size = int(item.get("size") or 0)
         name = str(item.get("name") or "файл")
         # ВОЛНА 22.62: дубль прямого стрима — автопередача и стрим грузили
@@ -9795,6 +10054,9 @@ async def _bg_upload_items(update, context, items):
                 _dup_release(user_id, name, size)
                 failed.append(f"{name[:40]}: Telegram не принял")
                 continue
+            # ВОЛНА 22.84: залитое в канал — в реестр отмены (чтобы «❌
+            # Отмена» могла это стереть).
+            _op["sent"].append((int(channel_id), int(sent.message_id)))
             rec = {
                 "id": _cloud_gen_file_id(user),
                 "name": name[:120],
@@ -9811,11 +10073,17 @@ async def _bg_upload_items(update, context, items):
         else:
             # >49 МБ — поток MTProto (до 2 ГБ); недоступен — честный совет.
             rec = await _bg_upload_big_mtproto(
-                update, context, user, item, msg, live=(user_id, _lk))
+                update, context, user, item, msg, live=(user_id, _lk),
+                upl_op=_op)   # ВОЛНА 22.84: кнопка «Отмена» на прогрессе
             if rec is None:
                 _bg_live_del(user_id, _lk)
                 _dup_release(user_id, name, size)
                 why = item.get("_why")
+                if why == "cancelled":
+                    # ВОЛНА 22.84: пользователь нажал «❌ Отмена» на
+                    # сообщении прогресса — стоп пачки + чистка канала.
+                    cancelled = True
+                    break
                 if why == "big_hard_limit":
                     await msg.reply_text(
                         f"🚫 «{name[:40]}» больше 2 ГБ — потолок Telegram "
@@ -9851,6 +10119,47 @@ async def _bg_upload_items(update, context, items):
         # Подсказка про качество — ОДНА строка и один раз за пачку.
         if not warned_quality and item.get("kind") in ("photo", "video"):
             warned_quality = True
+    finally:
+        _upl_op_end(user_id)
+
+    # ВОЛНА 22.84: честная отмена — стереть из канала всё, что успело
+    # уехать, и НЕ сохранять записи (до «user.cloud_files = files» не доходим).
+    if cancelled:
+        _n_del = await _upl_op_cleanup(context, _op)
+        # снять клеймы/метки: после отмены повторная отправка должна проходить
+        for _r in saved:
+            try:
+                _dup_release(user_id, _r.get("name"), _r.get("size"))
+            except Exception:
+                pass
+        try:
+            _UPLOAD_RECENT.pop(str(user_id), None)
+        except Exception:
+            pass
+        if _status is not None:
+            try:
+                await _status.edit_text(
+                    "🛑 Загрузка остановлена — загруженное удалено из канала"
+                    + (f" ({_n_del})." if _n_del else "."))
+            except Exception:
+                pass
+        else:
+            try:
+                await msg.reply_text(
+                    "🛑 Загрузка остановлена — загруженное удалено из канала"
+                    + (f" ({_n_del})." if _n_del else "."),
+                    disable_notification=_tg_silent)
+            except Exception:
+                pass
+        return
+
+    # ВОЛНА 22.84: статус «Сохраняю…» с кнопкой отмены больше не нужен —
+    # сейчас будет итоговое сообщение.
+    if _status is not None:
+        try:
+            await _status.delete()
+        except Exception:
+            pass
 
     if saved:
         user.cloud_files = files
@@ -9887,11 +10196,19 @@ async def _bg_upload_items(update, context, items):
         lines.append(f"♻️ {len(deduped)} файл(ов) уже загружен(ы) напрямую — "
                      "дубли не созданы.")
     if lines:
-        kb = None
+        # ВОЛНА 22.82: «🏷 Назвать по одному» прямо в итоге фоновой загрузки
+        _kb_rows = []
+        if saved:
+            context.user_data['cloud_per_ids'] = [r.get("id") for r in saved]
+            context.user_data.pop('cloud_per_pos', None)
         if MINIAPP_URL:
-            kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton("🌐 Открыть облако",
-                                     web_app=WebAppInfo(url=MINIAPP_URL))]])
+            _kb_rows.append([InlineKeyboardButton(
+                "🌐 Открыть облако",
+                web_app=WebAppInfo(url=MINIAPP_URL))])
+        if saved:
+            _kb_rows.append([InlineKeyboardButton(
+                "🏷 Назвать по одному", callback_data="cloud_pername")])
+        kb = InlineKeyboardMarkup(_kb_rows) if _kb_rows else None
         try:
             if skipped_big:
                 await msg.reply_text("\n".join(lines),
@@ -11824,6 +12141,36 @@ html.low-end .confirm-actions {
 
 }
 
+/* ВОЛНА 22.83: видимая кнопка отмены НА СООБЩЕНИИ ПРОГРЕССА (снизу).
+   Раньше отмена была жестом «2 клика по кольцу» — её никто не находил.
+   Показывается, только пока идёт загрузка (progressWrap.active). */
+.upload-cancel-btn {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  margin-top: 2px;
+  padding: 8px 18px;
+  border-radius: 12px;
+  border: 1px solid rgba(239, 68, 68, 0.35);
+  background: rgba(239, 68, 68, 0.08);
+  color: #ef4444;
+  font-family: 'Nunito', sans-serif;
+  font-weight: 800;
+  font-size: 13px;
+  cursor: pointer;
+  transition: background 0.25s var(--ease-smooth), transform 0.15s var(--ease-smooth);
+}
+
+.upload-cancel-btn:active {
+  transform: scale(0.96);
+}
+
+.download-progress-wrap.active .upload-cancel-btn {
+  display: inline-flex;
+  animation: softFadeIn 0.4s var(--ease-smooth) both;
+}
+
 .files-container {
   width: 100%;
   margin-top: 6px;
@@ -13712,7 +14059,7 @@ body.vp-lock {
 
       <button class="play-btn" id="mpPlayBtn" title="Воспроизвести" aria-label="Воспроизвести">
         <svg id="mpPlayIcon" viewBox="0 0 24 24">
-          <path d="M8 5.14v13.72a1 1 0 0 0 1.5.86l10.5-6.86a1 1 0 0 0 0-1.72L9.5 4.28A1 1 0 0 0 8 5.14z"/>
+          <path d="M6 5.14v13.72a1 1 0 0 0 1.5.86l10.5-6.86a1 1 0 0 0 0-1.72L7.5 4.28A1 1 0 0 0 6 5.14z"/>
         </svg>
       </button>
 
@@ -13839,14 +14186,9 @@ body.vp-lock {
         <i data-lucide="eye" style="width:18px;height:18px"></i>
       </button>
 
-      <button class="sound-item-btn" onclick="saveFileName()">
-        <span>Сохранить имя</span>
+      <button class="sound-item-btn" onclick="saveFileNameAndDesc()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
+        <span>Сохранить имя и описание</span>
         <i data-lucide="check" style="width:18px;height:18px"></i>
-      </button>
-
-      <button class="sound-item-btn" onclick="saveCurrentDescription()">
-        <span>Сохранить описание</span>
-        <i data-lucide="square-pen" style="width:18px;height:18px"></i>
       </button>
 
       <button class="sound-item-btn" id="modalToSafeBtn" onclick="toSafeCurrentFile()">
@@ -14068,10 +14410,10 @@ body.vp-lock {
     <div style="display:flex;flex-direction:column;gap:8px">
       <button class="sound-item-btn" onclick="chooseNameMode('album')" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
         <div style="text-align:left">
-          <div style="font-weight:800">Назвать альбомом</div>
-          <div style="font-size:11px;opacity:0.7;margin-top:2px">Одно имя для всех: Имя 1, Имя 2, ...</div>
+          <div style="font-weight:800">Создать альбом</div>
+          <div style="font-size:11px;opacity:0.7;margin-top:2px">Файлы попадут в новую папку с общим именем</div>
         </div>
-        <i data-lucide="layers" style="width:18px;height:18px"></i>
+        <i data-lucide="folder-plus" style="width:18px;height:18px"></i>
       </button>
 
       <button class="sound-item-btn" onclick="chooseNameMode('each')">
@@ -14104,10 +14446,15 @@ body.vp-lock {
 
     <div style="margin-bottom:14px">
       <label style="font-size:11px;font-weight:800;color:var(--subtext-color);text-transform:uppercase;letter-spacing:0.04em">Новое название</label>
-      <input type="text" id="nameModalInput" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;margin-top:4px;outline:none;font-size:15px" placeholder="Оставьте пустым для оригинала">
+      <input type="text" id="nameModalInput" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;margin-top:4px;outline:none;font-size:15px;transition:border-color 0.3s var(--ease-smooth)" placeholder="Оставьте пустым для оригинала" onfocus="this.style.borderColor='var(--btn-bg)'" onblur="this.style.borderColor='var(--border-color)'">
     </div>
 
-    <p id="nameModalOriginal" style="font-size:12px;font-weight:600;color:var(--subtext-color);margin-bottom:16px;word-break:break-all"></p>
+    <p id="nameModalOriginal" style="font-size:12px;font-weight:600;color:var(--subtext-color);margin-bottom:14px;word-break:break-all"></p>
+
+    <div style="margin-bottom:16px">
+      <label style="font-size:11px;font-weight:800;color:var(--subtext-color);text-transform:uppercase;letter-spacing:0.04em">Описание</label>
+      <textarea id="nameModalDescInput" rows="2" placeholder="Заметка к файлу (необязательно)" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:600;margin-top:4px;outline:none;font-size:14px;resize:vertical;min-height:60px;transition:border-color 0.3s var(--ease-smooth)" onfocus="this.style.borderColor='var(--btn-bg)'" onblur="this.style.borderColor='var(--border-color)'"></textarea>
+    </div>
 
     <div style="display:flex;flex-direction:column;gap:8px">
       <button class="sound-item-btn" onclick="confirmNameAndNext()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
@@ -14128,18 +14475,18 @@ body.vp-lock {
   </div>
 </div>
 
-<div id="albumModal" class="modal-overlay" onclick="closeAlbumModal(event)">
+<div id="albumUploadModal" class="modal-overlay" onclick="closeAlbumUploadModal(event)">
   <div class="modal-card" onclick="event.stopPropagation()">
     <div class="sheet-handle-area">
       <div class="sheet-handle"></div>
     </div>
 
     <h3 style="font-weight:900;font-size:20px;margin-bottom:4px">Название альбома</h3>
-    <p id="albumModalCounter" style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:14px"></p>
+    <p id="albumUploadModalCounter" style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:14px"></p>
 
     <div style="margin-bottom:14px">
       <label style="font-size:11px;font-weight:800;color:var(--subtext-color);text-transform:uppercase;letter-spacing:0.04em">Общее название</label>
-      <input type="text" id="albumModalInput" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;margin-top:4px;outline:none;font-size:15px" placeholder="Например: Отпуск 2026" oninput="renderAlbumPreview(this.value)">
+      <input type="text" id="albumUploadModalInput" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;margin-top:4px;outline:none;font-size:15px;transition:border-color 0.3s var(--ease-smooth)" placeholder="Например: Отпуск 2026" oninput="renderAlbumPreview(this.value)" onfocus="this.style.borderColor='var(--btn-bg)'" onblur="this.style.borderColor='var(--border-color)'">
     </div>
 
     <div style="padding:12px;background:var(--card-bg);border:1px solid var(--border-color);border-radius:14px;margin-bottom:16px;font-size:12px;font-weight:600;color:var(--subtext-color)">
@@ -14149,11 +14496,11 @@ body.vp-lock {
 
     <div style="display:flex;flex-direction:column;gap:8px">
       <button class="sound-item-btn" onclick="confirmAlbumName()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
-        <span>Применить ко всем</span>
+        <span>Создать альбом</span>
         <i data-lucide="check" style="width:18px;height:18px"></i>
       </button>
 
-      <button class="sound-item-btn" onclick="closeAlbumModal()">
+      <button class="sound-item-btn" onclick="closeAlbumUploadModal()">
         <span>Отмена</span>
         <i data-lucide="x" style="width:18px;height:18px"></i>
       </button>
@@ -14583,6 +14930,13 @@ body.vp-lock {
       </div>
 
       <p class="download-text" id="downloadText">Загрузка...</p>
+
+      <button type="button" id="uploadCancelBtn" class="upload-cancel-btn" onclick="cancelUpload()">
+        <svg viewBox="0 0 24 24" style="width:14px;height:14px;flex-shrink:0" fill="currentColor" aria-hidden="true">
+          <rect x="6" y="6" width="12" height="12" rx="2"></rect>
+        </svg>
+        <span>Отменить и удалить</span>
+      </button>
     </div>
 
     <input type="file" id="fileInput" multiple style="display:none">
@@ -16931,6 +17285,80 @@ async function saveFileName() {
   closeEditModal();
 }
 
+/* ВОЛНА: одна кнопка «Сохранить имя и описание» в окне действий —
+   экономит тапы. Имя шлём на сервер (как раньше), описание пишем
+   локально в DESC_MAP (как saveCurrentDescription). */
+async function saveFileNameAndDesc() {
+  if (!activeEditingFileId) return;
+
+  const id = String(activeEditingFileId);
+  const newName = (document.getElementById('modalInputName').value || '').trim();
+  const descEl = document.getElementById('modalInputDesc');
+  const newDesc = descEl ? descEl.value.trim() : '';
+
+  /* 1. Описание — сразу локально (как в saveCurrentDescription) */
+  if (newDesc) {
+    DESC_MAP[id] = newDesc;
+  } else {
+    delete DESC_MAP[id];
+  }
+  try { saveDescriptions(); } catch (e) {}
+
+  /* Обновляем превью на карточке без полной перерисовки */
+  const card = document.querySelector('.file-card[data-id="' + id + '"]');
+  if (card) {
+    let descElCard = card.querySelector('.file-desc');
+
+    if (newDesc) {
+      if (!descElCard) {
+        const info = card.querySelector('div[style*="flex:1"]');
+        if (info) {
+          descElCard = document.createElement('p');
+          descElCard.className = 'file-desc';
+          info.appendChild(descElCard);
+        }
+      }
+
+      if (descElCard) {
+        descElCard.textContent = newDesc;
+        descElCard.classList.remove('shown');
+        void descElCard.offsetWidth;
+        descElCard.classList.add('shown');
+      }
+    } else if (descElCard) {
+      descElCard.classList.remove('shown');
+      setTimeout(function () { if (descElCard) descElCard.remove(); }, 550);
+    }
+  }
+
+  /* 2. Имя — на сервер (только если изменилось) */
+  const f = ALL_FILES.find((x) => x.id === id);
+  const nameChanged = newName && (!f || f.name !== newName);
+
+  if (nameChanged) {
+    try {
+      const data = await apiJson('/api/files/' + encodeURIComponent(id), {
+        method: 'PATCH',
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ name: newName })
+      });
+
+      if (f) f.name = (data.file && data.file.name) || newName;
+    } catch (e) {
+      showToast('Имя не сохранено: ' + e.message);
+      /* описание уже сохранено — закрываем модалку */
+      closeEditModal();
+      renderAll();
+      return;
+    }
+  }
+
+  haptic('success');
+  showToast('Сохранено');
+  closeEditModal();
+  renderAll();
+}
+
 let VAULT_PW = '';
 let VAULT_SERVER_UNLOCKED = false;
 let PENDING_FILE_ACTION = null;
@@ -18489,10 +18917,51 @@ function togglePauseUpload() {
   }
 }
 
+/* ВОЛНА 22.83: удаление сессии на сервере с ДОГОНЯЮЩИМИ ПОВТОРАМИ.
+   Раньше abort уходил один раз: если бот как раз перезапускался (деплой),
+   запрос молча тонул — недокачанные байты оставались на сервере.
+   5 попыток с паузой 2 с покрывают типичное окно обновления. */
+function abortUploadIdRetry(uploadId, tries) {
+  const n = tries || 0;
+
+  apiJson('/api/upload/abort', {
+    method: 'POST',
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ uploadId: uploadId })
+  }).catch(() => {
+    if (n < 4) setTimeout(() => abortUploadIdRetry(uploadId, n + 1), 2000);
+  });
+}
+
+/* все известные сессии пачки (предохранка + файлы окна загрузки) */
+function abortAllUploadSessions() {
+  const ids = new Set();
+
+  const collect = (arr) => {
+    (arr || []).forEach((f) => { if (f && f._preId) ids.add(String(f._preId)); });
+  };
+
+  try { collect(uploadQueue); } catch (e) {}
+  try { collect(pendingFiles); } catch (e) {}
+
+  ids.forEach((id) => abortUploadIdRetry(id, 0));
+}
+
+/* статус в подписи кольца: null → вернуть обычный текст */
+function setUploadWaitText(t) {
+  const el = document.getElementById('downloadText');
+
+  if (!el) return;
+
+  el.textContent = (t === null || typeof t === 'undefined')
+    ? 'Загрузка... (1 клик - пауза, 2 - отмена)' : t;
+}
+
 function cancelUpload() {
   if (!isUploading) return;
 
   uploadAbortFlag = true;
+  isPaused = false;
 
   uploadXhrs.forEach((x) => {
     try { x.abort(); } catch (e) {}
@@ -18504,7 +18973,20 @@ function cancelUpload() {
     } catch (e) {}
   }
 
-  showToast('⏹ Загрузка отменена');
+  /* запланированный авто-ретрай гасим — пользователь решил сам */
+  try { clearTimeout(_upRetryTimer); } catch (e) {}
+
+  /* СТОП + УДАЛИТЬ: стираем недокачанные сессии на сервере
+     (воркеры при выходе тоже зовут abort — тут страховка на ВСЕ случаи) */
+  abortAllUploadSessions();
+
+  const dlText = document.getElementById('downloadText');
+  const sq = document.getElementById('squareStop');
+
+  if (dlText) dlText.textContent = '⏹ Отменено — загруженное удалено';
+  if (sq) sq.style.opacity = '0.3';
+
+  showToast('⏹ Загрузка остановлена, байты стёрты');
 }
 
 function openNameChoiceModal() {
@@ -18546,15 +19028,15 @@ function openAlbumModal() {
     return;
   }
 
-  const c = document.getElementById('albumModalCounter');
+  const c = document.getElementById('albumUploadModalCounter');
   if (c) c.textContent = 'Файлов: ' + pendingFiles.length;
 
-  const inp = document.getElementById('albumModalInput');
+  const inp = document.getElementById('albumUploadModalInput');
   if (inp) inp.value = '';
 
   renderAlbumPreview('');
 
-  openModalEl('albumModal');
+  openModalEl('albumUploadModal');
 }
 
 function renderAlbumPreview(baseName) {
@@ -18578,15 +19060,19 @@ function renderAlbumPreview(baseName) {
   preview.innerHTML = items.join('') + more;
 }
 
-function closeAlbumModal(e) {
+function closeAlbumUploadModal(e) {
   if (e) e.stopPropagation();
 
-  closeModalEl('albumModal');
+  closeModalEl('albumUploadModal');
   openNameChoiceModal();
 }
 
+/* closeAlbumModal для окна «Действия с папкой» (переименовать/удалить)
+   определена ниже, рядом с openAlbumActions — там же renameAlbumFromModal
+   и deleteAlbumFromModal. Здесь дублировать не нужно. */
+
 function confirmAlbumName() {
-  const inp = document.getElementById('albumModalInput');
+  const inp = document.getElementById('albumUploadModalInput');
   const base = (inp && inp.value.trim()) || 'Альбом';
 
   const extOf = (f) => {
@@ -18596,19 +19082,19 @@ function confirmAlbumName() {
     return i > 0 ? n.slice(i) : '';
   };
 
-  /* ВОЛНА 22.44: имя пишем ПРЯМО в объект файла (expando, как _entryKey),
-     а НЕ в Object.assign-копию. У File/Blob size/type/name — геттеры
-     ПРОТОТИПА, Object.assign их НЕ копирует: копия выходила пустым
-     объектом, size = 0 → сервер отвечал «Файл пустой (0 Б)» ровно тогда,
-     когда файл называли. Оригинальный File сохраняет size/slice —
-     загрузка идёт как при именовании, так и без него. */
+  /* ВОЛНА: создаём НАСТОЯЩИЙ альбом — файлы после загрузки попадут в папку,
+     а не просто получат переназванные имена в корне. */
+  const aid = albumIdNew();
   pendingFiles.forEach((f, i) => {
     try {
       f.uploadName = (base + ' ' + (i + 1) + extOf(f)).slice(0, 120);
+      f._pendingAlbumId = aid;
     } catch (e) {}
   });
 
-  closeModalEl('albumModal');
+  PENDING_ALBUM = { id: aid, name: base, fileIds: [] };
+
+  closeModalEl('albumUploadModal');
   startActualUpload();
 }
 
@@ -18619,6 +19105,7 @@ function openNameModal() {
 
   pendingFiles.forEach((f) => {
     try { delete f._customName; } catch (e) {}
+    try { delete f._customDesc; } catch (e) {}
   });
 
   showNameModal();
@@ -18654,6 +19141,9 @@ function showNameModal() {
   const inp = document.getElementById('nameModalInput');
   if (inp) inp.value = '';
 
+  const descInp = document.getElementById('nameModalDescInput');
+  if (descInp) descInp.value = '';
+
   openModalEl('nameModal');
 }
 
@@ -18661,11 +19151,18 @@ function confirmNameAndNext() {
   const inp = document.getElementById('nameModalInput');
   const v = inp ? inp.value.trim() : '';
 
+  const descInp = document.getElementById('nameModalDescInput');
+  const d = descInp ? descInp.value.trim() : '';
+
   if (v) {
     try { pendingFiles[nameEditIndex]._customName = v.slice(0, 120); } catch (e) {}
   }
+  if (d) {
+    try { pendingFiles[nameEditIndex]._customDesc = d.slice(0, 1000); } catch (e) {}
+  }
 
   if (inp) inp.value = '';
+  if (descInp) descInp.value = '';
 
   nextNameStep();
 }
@@ -18933,6 +19430,14 @@ function openModalEl(id) {
   m.classList.add('open');
   document.body.classList.add('modal-open');
 
+  /* ВОЛНА: swipe-back / Android back — push history state для модалки,
+     срабатывает ОДИН раз на открытие (флаг _navPushed). popstate закроет
+     верхнюю открытую модалку. */
+  if (!m._navPushed) {
+    m._navPushed = true;
+    try { history.pushState({ devoModal: id, t: Date.now() }, ''); } catch (e) {}
+  }
+
   /* 22.39: на время модалки останавливаем анимацию блобов — RAF-цикл
      под backdrop-filter сильно ест GPU и «лагает» при нажатии на файл */
   try { stopBlobAnimation(); } catch (e) {}
@@ -18950,6 +19455,11 @@ function closeModalEl(id) {
     m.classList.add('blur-off');
 
     m._blurT2 = setTimeout(() => m.classList.remove('blur-off'), 520);
+
+    /* ВОЛНА: сбрасываем флаг — следующий open запушит свежее состояние.
+       Сами stale history-записи не трогаем (history.back может рекурсивно
+       закрыть смежную модалку); popstate при необходимости их пропустит. */
+    if (m._navPushed) m._navPushed = false;
   }
 
   if (!document.querySelector('.modal-overlay.open')) {
@@ -18960,6 +19470,34 @@ function closeModalEl(id) {
 
   ensureScrollUnlocked();
 }
+
+/* ВОЛНА: единый обработчик swipe-back / Android back.
+   Порядок: сначала верхняя открытая модалка (если есть), потом альбом. */
+window.addEventListener('popstate', function () {
+  /* 1. Закрыть самую верхнюю ОТКРЫТУЮ модалку — ту, что запушила историю */
+  const openModals = document.querySelectorAll('.modal-overlay.open');
+  for (let i = openModals.length - 1; i >= 0; i--) {
+    const m = openModals[i];
+    if (m._navPushed) {
+      m._navPushed = false;
+      m.classList.remove('open');
+      m.classList.add('blur-off');
+      clearTimeout(m._blurT2);
+      m._blurT2 = setTimeout(() => m.classList.remove('blur-off'), 520);
+      if (!document.querySelector('.modal-overlay.open')) {
+        document.body.classList.remove('modal-open');
+        try { startBlobAnimation(); } catch (e) {}
+      }
+      ensureScrollUnlocked();
+      return;
+    }
+  }
+
+  /* 2. Нет модалки — выходим из альбома (если открыта папка) */
+  if (ALBUM_VIEW) {
+    _finishCloseAlbum();
+  }
+});
 
 /* ═══ СКРОЛЛ-СТРАЖ ═══
    Если из-за сбоя (закрылось не всё / гонка анимаций) на body остался
@@ -20329,7 +20867,9 @@ async function _preStreamFile(file) {
         const off = idx * CHUNK_SIZE;
         const end = Math.min(off + CHUNK_SIZE, file.size);
 
-        for (let attempt = 0; attempt < 3; attempt++) {
+        /* ВОЛНА 22.83: 3 → 10 попыток — предохранка не должна умирать
+           в окно деплоя бота (движок продолжит ТУ ЖЕ сессию) */
+        for (let attempt = 0; attempt < 10; attempt++) {
           if (!alive || file._preStop || uploadAbortFlag) return;
 
           try {
@@ -20340,7 +20880,7 @@ async function _preStreamFile(file) {
           } catch (e) {
             if (e && e.message === 'aborted') return;
             if (e && e.code === 'session_not_found') { alive = false; return; }
-            if (attempt < 2) await sleepMs(1200 * (attempt + 1));
+            if (attempt < 9) await sleepMs(Math.min(1200 * (attempt + 1), 6000));
             else { alive = false; return; }
           }
         }
@@ -20560,7 +21100,11 @@ async function _uploadOneSession(file, reportBytes) {
       let lastErr = null;
       let resp = null;
 
-      for (let attempt = 0; attempt < 3; attempt++) {
+      /* ВОЛНА 22.83: 3 попытки ≈ 4 секунды — деплой бота длится дольше этого
+         окна, загрузка падала и выглядела как «бот сломался». Теперь 10
+         попыток с паузами до 6 с (≈ минута терпения на кусок) + честный
+         статус «Бот обновляется, ждём…» вместо пугающего молчания. */
+      for (let attempt = 0; attempt < 10; attempt++) {
         /* ВОЛНА 22.49: проверка отмены на КАЖДОЙ попытке — раньше воркер,
            заснувший в sleepMs(1200*(attempt+1)) во время отмены, просыпался
            и отправлял ЕЩЁ ОДИН кусок поверх отменённой загрузки */
@@ -20572,6 +21116,8 @@ async function _uploadOneSession(file, reportBytes) {
 
           lastErr = null;
 
+          if (attempt > 0) setUploadWaitText(null);
+
           break;
         } catch (err) {
           if (err && err.message === 'aborted') return 'abort';
@@ -20582,9 +21128,15 @@ async function _uploadOneSession(file, reportBytes) {
 
           lastErr = err;
 
-          if (attempt < 2) await sleepMs(1200 * (attempt + 1));
+          if (attempt > 0) {
+            setUploadWaitText('🔄 Бот обновляется, ждём… (' + (attempt + 1) + '/10)');
+          }
+
+          if (attempt < 9) await sleepMs(Math.min(1200 * (attempt + 1), 6000));
         }
       }
+
+      setUploadWaitText(null);
 
       if (lastErr) throw lastErr;
 
@@ -20624,11 +21176,12 @@ async function _uploadOneSession(file, reportBytes) {
 
   if (results.includes('restart')) return 'restart';
 
-  /* complete — одна повторная попытка (сеть/503) */
+  /* ВОЛНА 22.83: complete — до 6 попыток (деплой бота больше не роняет
+     финализацию: байты уже на сервере, надо просто дождаться) */
   let done = null;
   let cErr = null;
 
-  for (let a = 0; a < 2; a++) {
+  for (let a = 0; a < 6; a++) {
     try {
       done = await apiJson('/api/upload/complete', {
         method: 'POST',
@@ -20648,15 +21201,25 @@ async function _uploadOneSession(file, reportBytes) {
 
       /* ВОЛНА 22.49: не хватает пароля Сейфа — сервер держит сессию и .part
          (куски НЕ потеряны). Запоминаем uploadId: после ввода пароля
-         complete повторится БЕЗ перекачки файла заново */
+         complete повторится БЕЗ перекачки файла заново. Ждать бессмысленно —
+         пароль не появится сам, выходим сразу (движок спросит пароль). */
       if (e && (e.code === 'safe_locked' || e.code === 'wrong_password')) {
         file._resumeId = uploadId;
         file._retryComplete = true;
+
+        break;
       }
 
-      if (!a) await sleepMs(2500);
+      /* ВОЛНА 22.83: сеть/деплой — ждём и пробуем снова (было 2 попытки) */
+      if (a > 0) {
+        setUploadWaitText('🔄 Бот обновляется, ждём… (' + (a + 1) + '/6)');
+      }
+
+      if (a < 5) await sleepMs(Math.min(1500 * (a + 1), 8000));
     }
   }
+
+  setUploadWaitText(null);
 
   if (cErr) {
     /* ВОЛНА 22.50: «фантомные ошибки». Сервер после разрыва связи может
@@ -20811,6 +21374,7 @@ async function uploadEngine(bar) {
   const fileBytes = new Map();
   let reportedTotal = 0;
   let dedupedCount = 0;   /* 22.62: сколько файлов свёл сервер (уже из чата) */
+  let _descDirty = false; /* ВОЛНА: накопительный флаг «есть новые описания» */
 
   const reportTotal = () => {
     setUploadPct((reportedTotal / totalBytes) * 100, bar);
@@ -20842,16 +21406,48 @@ async function uploadEngine(bar) {
       file._cancelFlag = false;
       fileBytes.set(file, 0);
 
-      try {
-        const rec = await uploadOneFile(file, (cur) => {
-          const prev = fileBytes.get(file) || 0;
+      /* ВОЛНА 22.83: «деплой не роняет файл». Раньше сетевой сбой внутри
+         uploadOneFile сразу уводил файл в failedFiles — пользователь видел
+         «⚠️ Не удалось» во время обновления бота. Теперь у файла до 4
+         ПОПЫТОК ЦЕЛИКОМ прямо в движке: сетевые ошибки (без кода —
+         «нет связи», таймаут, HTML-502) ждут 15–60 с и пробуют снова;
+         серверные кодовые ошибки (413 too large, unauthorized…) —
+         безнадёжные, отдаются наружу сразу. Поверх этого работает
+         прежняя страховка очереди IndexedDB (scheduleUploadRetry). */
+      let rec = null;
 
-          if (cur > prev) {
-            reportedTotal += cur - prev;
-            fileBytes.set(file, cur);
-            reportTotal();
+      try {
+        for (let swing = 0; swing < 4; swing++) {
+          try {
+            rec = await uploadOneFile(file, (cur) => {
+              const prev = fileBytes.get(file) || 0;
+
+              if (cur > prev) {
+                reportedTotal += cur - prev;
+                fileBytes.set(file, cur);
+                reportTotal();
+              }
+            });
+
+            break;
+          } catch (netErr) {
+            if ((netErr && netErr.message === 'aborted') || uploadAbortFlag) {
+              throw netErr;
+            }
+
+            const _c = String((netErr && netErr.code) || '');
+            const _m = String((netErr && netErr.message) || '');
+            const netish = !_c || /HTTP 5\d\d|нет связи|таймаут/i.test(_m);
+
+            if (!netish || swing === 3) throw netErr;
+
+            setUploadWaitText(
+              '🔄 Бот обновляется, ждём… (раунд ' + (swing + 1) + '/4)');
+
+            await sleepMs(15000 + swing * 15000);
+            setUploadWaitText(null);
           }
-        });
+        }
 
         /* 22.62: дубль сведён сервером (файл уже приехал через
            Telegram) — карточку и похвалу не дублируем */
@@ -20859,6 +21455,24 @@ async function uploadEngine(bar) {
           dedupedCount++;
         } else if (rec) {
           added.push(rec);
+        }
+
+        /* ВОЛНА: собираем ID успешно загруженных файлов в отложенный альбом,
+           если пользователь выбрал «Создать альбом» в окне выбора имени.
+           Дедуп-файлы (уже у бота) тоже идут в альбом — пользователь считает
+           их своими. Описание из того же окна (если ввели) — складываем
+           в DESC_MAP, но сам save откладываем до конца пачки (один запись
+           в localStorage вместо N). */
+        if (rec && rec.id) {
+          if (PENDING_ALBUM && file._pendingAlbumId === PENDING_ALBUM.id) {
+            PENDING_ALBUM.fileIds.push(String(rec.id));
+          }
+          if (file._customDesc) {
+            try {
+              DESC_MAP[String(rec.id)] = String(file._customDesc).slice(0, 1000);
+              _descDirty = true;
+            } catch (e) {}
+          }
         }
 
         /* ВОЛНА 22.54: страховка имени. Файл уходил в бота под оригинальным
@@ -20927,6 +21541,8 @@ async function uploadEngine(bar) {
       if (f._entryKey) upqDel(f._entryKey);
     }
 
+    PENDING_ALBUM = null;
+
     resetUploadUI(bar, checkmark, squareStop);
     return;
   }
@@ -20938,6 +21554,8 @@ async function uploadEngine(bar) {
       /safe_locked|пароль|password/i.test(msg);
 
     const retryFiles = needPass ? failedFiles.map((x) => x.file) : [];
+
+    PENDING_ALBUM = null;
 
     resetUploadUI(bar, checkmark, squareStop);
 
@@ -21002,6 +21620,30 @@ async function uploadEngine(bar) {
     }));
   });
 
+  /* ВОЛНА: финализируем отложенный альбом — если хотя бы один файл
+     загрузился, создаём запись в ALBUM_MAP. Файлы автоматически
+     убираются из корня (collectAlbumFileIds в renderAll) и становятся
+     видны только при открытии альбома. */
+  if (PENDING_ALBUM) {
+    if (PENDING_ALBUM.fileIds.length) {
+      ALBUM_MAP[PENDING_ALBUM.id] = {
+        id: PENDING_ALBUM.id,
+        name: PENDING_ALBUM.name,
+        ts: Date.now(),
+        fileIds: PENDING_ALBUM.fileIds
+      };
+      try { saveAlbums(); } catch (e) {}
+      showToast('📁 Альбом «' + PENDING_ALBUM.name + '» создан');
+    }
+    PENDING_ALBUM = null;
+  }
+
+  /* ВОЛНА: один пакетный save описаний (вместо N записей в localStorage
+     в цикле загрузки). */
+  if (_descDirty) {
+    try { saveDescriptions(); } catch (e) {}
+  }
+
   renderAll({ animate: true });
 
   /* ВОЛНА 22.68: тихая сверка с сервером СРАЗУ после пачки — подхватывает
@@ -21056,6 +21698,7 @@ const ALBUMS_KEY = 'devo_albums';
 const ALBUM_DEMO_KEY = 'devo_demo_album_done';
 let ALBUM_MAP = {};   /* id -> { id, name, ts, fileIds: [String] } */
 let ALBUM_VIEW = null;
+let PENDING_ALBUM = null;   /* { id, name, fileIds: [] } — собирается во время загрузки */
 try { loadAlbums(); } catch (e) {}
 
 initCustomColors();
@@ -21536,7 +22179,7 @@ function ctSyncNow() {
 const MP_DEFAULT_COLORS = { glow: '#4285f4', c1: '#9b72f2', c2: '#f442a1' };
 
 const MP_ICONS = {
-  play: '<path d="M8 5.14v13.72a1 1 0 0 0 1.5.86l10.5-6.86a1 1 0 0 0 0-1.72L9.5 4.28A1 1 0 0 0 8 5.14z" fill="currentColor"/>',
+  play: '<path d="M6 5.14v13.72a1 1 0 0 0 1.5.86l10.5-6.86a1 1 0 0 0 0-1.72L7.5 4.28A1 1 0 0 0 6 5.14z" fill="currentColor"/>',
   pause: '<rect x="6" y="4" width="4" height="16" rx="2" fill="currentColor"/><rect x="14" y="4" width="4" height="16" rx="2" fill="currentColor"/>'
 };
 
@@ -23626,6 +24269,12 @@ function loadAlbums() {
   try {
     const a = JSON.parse(localStorage.getItem(ALBUMS_KEY) || '{}');
     ALBUM_MAP = (a && typeof a === 'object' && !Array.isArray(a)) ? a : {};
+
+    /* ВОЛНА: подчищаем демо-папку alb_demo (создавалась в прошлых версиях) */
+    if (ALBUM_MAP['alb_demo']) {
+      delete ALBUM_MAP['alb_demo'];
+      try { localStorage.setItem(ALBUMS_KEY, JSON.stringify(ALBUM_MAP)); } catch (e) {}
+    }
   } catch (e) { ALBUM_MAP = {}; }
 }
 
@@ -23843,13 +24492,51 @@ function openAlbum(albumId) {
     b.classList.toggle('active', b.dataset.filter === 'all');
   });
 
+  /* ВОЛНА: навигация «назад» — push history + Telegram BackButton,
+     чтобы работали: Android back, iOS edge swipe, кнопка в шапке ТГ */
+  try {
+    history.pushState({ devoAlbum: ALBUM_VIEW, t: Date.now() }, '');
+  } catch (e) {}
+
+  try {
+    const bb = (window.Telegram && Telegram.WebApp && Telegram.WebApp.BackButton);
+    if (bb) {
+      try { bb.offClick(closeAlbum); } catch (e) {}
+      bb.onClick(closeAlbum);
+      bb.show();
+    }
+  } catch (e) {}
+
   renderAll({ animate: true });
 }
 
 function closeAlbum() {
+  /* Если есть запушенная история альбома — жмём назад: сработает popstate
+     и вызовет _finishCloseAlbum. Иначе просто закрываем напрямую. */
+  try {
+    if (history.state && history.state.devoAlbum) {
+      history.back();
+      return;
+    }
+  } catch (e) {}
+
+  _finishCloseAlbum();
+}
+
+function _finishCloseAlbum() {
+  if (!ALBUM_VIEW) return;
+
   ALBUM_VIEW = null;
 
   haptic('light'); /* 22.70: вышли из папки */
+
+  try {
+    const bb = (window.Telegram && Telegram.WebApp && Telegram.WebApp.BackButton);
+    if (bb) {
+      try { bb.offClick(closeAlbum); } catch (e) {}
+      bb.hide();
+    }
+  } catch (e) {}
 
   renderAll({ animate: true });
 }
@@ -24045,23 +24732,31 @@ function deleteAlbumFromModal() {
 
   closeModalEl('albumModal');
 
-  /* файлы НЕ удаляются — просто возвращаются в корень */
-  if (ALBUM_VIEW === id) ALBUM_VIEW = null;
+  /* файлы НЕ удаляются — просто возвращаются в корень.
+     Если удалили альбом, в котором находились — выходим «по-настоящему»:
+     closeAlbum сам снимет BackButton и history через popstate. */
+  if (ALBUM_VIEW === id) {
+    /* Сначала обнулим ALBUM_VIEW, чтобы popstate-обработчик не попытался
+       закрыть уже удалённый альбом; историю чистим прямым back(). */
+    ALBUM_VIEW = null;
+    try {
+      const bb = (window.Telegram && Telegram.WebApp && Telegram.WebApp.BackButton);
+      if (bb) { try { bb.offClick(closeAlbum); } catch (e) {} bb.hide(); }
+    } catch (e) {}
+    try {
+      if (history.state && history.state.devoAlbum) history.back();
+    } catch (e) {}
+  }
 
   renderAll({ animate: true });
 }
 
-/* Тестовые файлы: 8 разных типов с предзаполненными избранным и описаниями */
-const TEST_FILES = [
-  { id: 'test_1', name: 'Закат на море.jpg', kind: 'photo', size: 2453678, ts: Date.now() - 86400000 * 2, fav: true, desc: 'Закат с прошлого отпуска — очень красивый вид' },
-  { id: 'test_2', name: 'Прогулка по парку.mp4', kind: 'video', size: 47832145, ts: Date.now() - 86400000 * 5, fav: false, desc: 'Видео с прогулки на выходных' },
-  { id: 'test_3', name: 'Любимая песня.mp3', kind: 'audio', size: 8421547, ts: Date.now() - 86400000 * 7, fav: true, desc: '' },
-  { id: 'test_4', name: 'Презентация проекта.pdf', kind: 'document', size: 1452369, ts: Date.now() - 86400000 * 1, fav: false, desc: 'Финальная версия для встречи' },
-  { id: 'test_5', name: 'Семейное фото.png', kind: 'photo', size: 5234789, ts: Date.now() - 86400000 * 10, fav: true, desc: 'С дня рождения мамы' },
-  { id: 'test_6', name: 'Конспект лекции.txt', kind: 'document', size: 12453, ts: Date.now() - 86400000 * 3, fav: false, desc: '' },
-  { id: 'test_7', name: 'Утренняя пробежка.mp3', kind: 'audio', size: 6234123, ts: Date.now() - 86400000 * 4, fav: false, desc: 'Подкаст для бега' },
-  { id: 'test_8', name: 'Городской пейзаж.jpg', kind: 'photo', size: 3456789, ts: Date.now() - 86400000 * 6, fav: false, desc: '' }
-];
+/* Тестовые файлы были здесь — удалены по просьбе пользователя.
+   Список оставлен пустым, чтобы все injectTestFiles-циклы в коде
+   (старт, кэш, синхронизация) были холостыми и не добавляли
+   демо-карточек. Удалённые пользователями демо-файлы тоже больше
+   не восстанавливаются — TEST_DELETED не растёт. */
+const TEST_FILES = [];
 
 /* Подмешивает тестовые файлы в ALL_FILES (идемпотентно: не дублирует).
    Также предзаполняет избранное/описания для тестовых файлов,
@@ -24069,65 +24764,34 @@ const TEST_FILES = [
    видел демо-данные с избранным и описаниями.
    Удалённые пользователем тестовые файлы НЕ восстанавливаются. */
 function injectTestFiles() {
-  /* ВОЛНА: демо-папка — создаётся ОДИН раз при первом запуске,
-     чтобы фича «настоящих папок» была видна сразу. Пользователь удалил —
-     больше не возвращается */
+  /* ВОЛНА: демо-папка alb_demo БОЛЬШЕ не создаётся при первом запуске —
+     пользователь просил убрать начальные файлы. Удаляем следы старого
+     демо-альбома (если остался от прошлой версии), тестовые файлы тоже
+     не подмешиваем — TEST_FILES пуст. */
   try {
-    if (!localStorage.getItem(ALBUM_DEMO_KEY)) {
-      safeSet(ALBUM_DEMO_KEY, '1');
-
-      if (!Object.keys(ALBUM_MAP).length) {
-        ALBUM_MAP['alb_demo'] = {
-          id: 'alb_demo',
-          name: 'Фото',
-          ts: Date.now() - 86400000,
-          fileIds: ['test_1', 'test_5']
-        };
-        saveAlbums();
-      }
+    if (ALBUM_MAP['alb_demo']) {
+      delete ALBUM_MAP['alb_demo'];
+      saveAlbums();
     }
   } catch (e) {}
 
+  /* Подчищаем из ALL_FILES любые остатки демо-записей (src === 'test'
+     или id вида test_*), чтобы у пользователей, у которых они успели
+     попасть в кэш, не висели «фантомные» карточки. */
   try {
-    let needFavSave = false;
-    let needDescSave = false;
-
-    TEST_FILES.forEach(function (tf) {
-      if (TEST_DELETED.has(tf.id)) return;
-
-      if (tf.fav && !FAV_SET.has(tf.id)) {
-        FAV_SET.add(tf.id);
-        needFavSave = true;
-      }
-      if (tf.desc && !DESC_MAP[tf.id]) {
-        DESC_MAP[tf.id] = tf.desc;
-        needDescSave = true;
-      }
-    });
-
-    if (needFavSave) saveFavorites();
-    if (needDescSave) saveDescriptions();
-  } catch (e) {}
-
-  const existingIds = new Set(ALL_FILES.map((f) => String(f.id)));
-
-  TEST_FILES.forEach(function (tf) {
-    if (TEST_DELETED.has(tf.id)) return;
-    if (!existingIds.has(tf.id)) {
-      ALL_FILES.push({
-        id: tf.id,
-        name: tf.name,
-        kind: tf.kind,
-        size: tf.size,
-        ts: String(tf.ts),
-        vault: false,
-        safe: false,
-        plain: false,
-        src: 'test',
-        test: true
+    if (ALL_FILES && ALL_FILES.length) {
+      const before = ALL_FILES.length;
+      ALL_FILES = ALL_FILES.filter(function (f) {
+        if (!f) return false;
+        if (f.test) return false;
+        if (/^test_\d+$/.test(String(f.id))) return false;
+        return true;
       });
+      if (ALL_FILES.length !== before) {
+        /* изменён ALL_FILES в памяти — рендер вызовет вызывающий код */
+      }
     }
-  });
+  } catch (e) {}
 }
 
 /* Переключение избранного — с медленной плавной анимацией звёздочки */
@@ -25774,6 +26438,164 @@ def _miniapp_lists_sanitize(st):
     st["test_deleted"] = _lists_clean_ids(st.get("test_deleted"),
                                           _LISTS_MAX["test_deleted"])
     return st
+
+
+# ═══ ВОЛНА 22.82: ИЗБРАННОЕ В САМОМ БОТЕ (один список с мини-аппом) ═══
+# Избранное живёт в ОДНОМ месте — user.miniapp_lists["favorites"] (список
+# id). Мини-апп синхронизирует его через /api/lists (22.81); бот теперь
+# читает и меняет ТОТ ЖЕ список: звёздочка в боте = звёздочка в мини-аппе
+# (и наоборот — мини-апп подтянет при следующем открытии). В списке могут
+# быть id и облака (hex), и Сейфа (8 символов) — разрешаем по обоим.
+
+
+def _fav_id_list(user):
+    """Список избранных id (нормализованный) — ОДИН на бот и мини-апп."""
+    return list(_miniapp_lists_norm(user).get("favorites") or [])
+
+
+def _fav_in(user, fid):
+    """True — файл с таким id стоит в избранном."""
+    return str(fid or "") in set(_fav_id_list(user))
+
+
+def _fav_toggle(user, fid):
+    """Переключить звезду файла. True — теперь В избранном."""
+    fid = str(fid or "")[:_LISTS_MAX["id_len"]]
+    if not fid:
+        return False
+    st = _miniapp_lists_norm(user)
+    fav = st.get("favorites") or []
+    if fid in fav:
+        st["favorites"] = [x for x in fav if x != fid]
+        now = False
+    else:
+        st["favorites"] = ([fid] + [x for x in fav if x != fid])[:_LISTS_MAX["favorites"]]
+        now = True
+    user.miniapp_lists = st
+    save_user(user)
+    return now
+
+
+def _fav_resolve(user, cleanup=False):
+    """(cloud_recs, vault_recs) в порядке списка избранного. Мёртвые id
+    (файл удалён) выкидываются — список остаётся живым; тестовые id
+    мини-аппа (test_*) не трогаем — их чистит сам клиент."""
+    st = _miniapp_lists_norm(user)
+    fav = list(st.get("favorites") or [])
+    cloud = {f.get("id"): f for f in (getattr(user, "cloud_files", []) or [])
+             if isinstance(f, dict) and f.get("id")}
+    vault = {f.get("id"): f for f in (getattr(user, "vault_files", []) or [])
+             if isinstance(f, dict) and f.get("id")}
+    c_out, v_out, alive = [], [], []
+    for fid in fav:
+        rec = cloud.get(fid)
+        if rec is not None:
+            c_out.append(rec)
+            alive.append(fid)
+            continue
+        rec = vault.get(fid)
+        if rec is not None:
+            v_out.append(rec)
+            alive.append(fid)
+            continue
+        if str(fid).startswith("test_"):
+            alive.append(fid)      # демо-файлы мини-аппа — не мусор
+    if cleanup and len(alive) != len(fav):
+        st["favorites"] = alive
+        user.miniapp_lists = st
+        save_user(user)
+    return c_out, v_out
+
+
+def _fav_screen(user):
+    """(text, kb) экрана «⭐ Избранное» в боте: файлы облака + Сейфа."""
+    c_recs, v_recs = _fav_resolve(user, cleanup=True)
+    n = len(c_recs) + len(v_recs)
+    kb = []
+    lines = [f"⭐ ИЗБРАННЫЕ ФАЙЛЫ ({n}):", ""]
+    for rec in c_recs:
+        name = str(rec.get("name") or "").strip() or "(без имени)"
+        size = _fmt_bytes(rec.get("size", 0))
+        lines.append(f"• {_miniapp_kind_emoji(rec)} {name} — {size}")
+        kb.append([InlineKeyboardButton(
+            f"📥 {_miniapp_kind_emoji(rec)} {name[:34]} ({size})",
+            callback_data=f"cloud_get_{rec.get('id')}")])
+        kb.append([
+            InlineKeyboardButton("☆ Убрать", callback_data=f"favt_f_{rec.get('id')}"),
+            InlineKeyboardButton("✏️", callback_data=f"cloud_ren_{rec.get('id')}"),
+            InlineKeyboardButton("🗑", callback_data=f"cloud_del_{rec.get('id')}"),
+        ])
+    for rec in v_recs:
+        label = (str(rec.get("label") or rec.get("name") or "").strip()
+                 or "Файл Сейфа")
+        size = _fmt_bytes(rec.get("size_orig", 0))
+        lines.append(f"• 🔒 {label} — Сейф ({size})")
+        kb.append([InlineKeyboardButton(
+            f"📥 🔒 {label[:30]} ({size})",
+            callback_data=f"vault_get_{rec.get('id')}")])
+        kb.append([
+            InlineKeyboardButton("☆ Убрать", callback_data=f"favt_f_{rec.get('id')}"),
+            InlineKeyboardButton("✏️", callback_data=f"vault_ren_{rec.get('id')}"),
+        ])
+    if not n:
+        return ("⭐ В избранном пока пусто.\n\n"
+                "Добавляйте файлы звёздочкой ☆ рядом с файлом — и в «📁 Файлы "
+                "без шифра», и в Сейфе, — или звёздочкой на карточке в "
+                "мини-аппе: список ОДИН И ТОТ ЖЕ, всё синхронно.",
+                InlineKeyboardMarkup([[InlineKeyboardButton(
+                    "⬅️ Назад", callback_data="cloud_menu")]]))
+    lines.append("")
+    lines.append("☆ Убрать — снять звезду; ✏️ — переименовать; 📥 — выдать "
+                 "(файлы Сейфа спросят пароль). Список общий с мини-аппом.")
+    kb.append([InlineKeyboardButton("⬅️ Назад", callback_data="cloud_menu")])
+    return "\n".join(lines), InlineKeyboardMarkup(kb)
+
+
+async def cloud_fav_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.82: экран «⭐ Избранное» в самом боте (кнопка в меню облака)."""
+    query = update.callback_query
+    user = get_user(str(query.from_user.id))
+    if not user:
+        await _safe_cb_answer(query, "Сначала зарегистрируйтесь — /start", True)
+        return MAIN_MENU
+    await _safe_cb_answer(query)
+    text, kb = _fav_screen(user)
+    try:
+        await query.edit_message_text(text, reply_markup=kb)
+    except Exception:
+        try:
+            await query.message.reply_text(text, reply_markup=kb)
+        except Exception:
+            pass
+    return MAIN_MENU
+
+
+async def fav_toggle_cb(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                        src: str):
+    """ВОЛНА 22.82: переключить звезду файла. src: c — из списка облака,
+    v — из списка Сейфа, f — с экрана избранного (какую раскладку обновить)."""
+    query = update.callback_query
+    user = get_user(str(query.from_user.id))
+    if not user:
+        await _safe_cb_answer(query, "Сначала зарегистрируйтесь — /start", True)
+        return MAIN_MENU
+    fid = str(query.data or "").split("_", 2)[-1]
+    now_fav = _fav_toggle(user, fid)
+    await _safe_cb_answer(query, "⭐ В избранном" if now_fav else "☆ Убрано")
+    # Перерисовать список, из которого нажали (если сообщение ещё живое).
+    try:
+        if src == "c":
+            await query.edit_message_reply_markup(
+                reply_markup=get_cloud_files_keyboard(user))
+        elif src == "v":
+            await query.edit_message_reply_markup(
+                reply_markup=get_vault_files_keyboard(user))
+        else:
+            text, kb = _fav_screen(user)
+            await query.edit_message_text(text, reply_markup=kb)
+    except Exception:
+        pass
+    return MAIN_MENU
 
 
 def _lists_merge_into_local(base, srv):
@@ -32938,6 +33760,10 @@ def get_vault_files_keyboard(user):
             # возвращает к списку — можно раскрыть другой файл).
             InlineKeyboardButton("🔎", callback_data=f"vault_show_{rec.get('id')}"),
             InlineKeyboardButton("🔑", callback_data=f"vault_chp_{rec.get('id')}"),
+            # ВОЛНА 22.82: ☆/⭐ — в избранное (список общий с мини-аппом)
+            InlineKeyboardButton(
+                "⭐" if _fav_in(user, rec.get("id")) else "☆",
+                callback_data=f"favt_v_{rec.get('id')}"),
             # Карандаш НЕ убираем (просьба пользователя): ✏️ — подписать/переименовать.
             InlineKeyboardButton("✏️", callback_data=f"vault_ren_{rec.get('id')}"),
             InlineKeyboardButton("🗑", callback_data=f"vault_del_{rec.get('id')}"),
@@ -34981,6 +35807,16 @@ def _vault_put_kb():
     ])
 
 
+def _vault_cancel_inline_kb():
+    """ВОЛНА 22.84: ОДНА кнопка «❌ Отмена» — для СООБЩЕНИЯ-ПРОГРЕССА
+    шифрования/заливки Сейфа. Раньше во время самой заливки кнопки на
+    прогрессе не было (она оставалась на старом ack-сообщении выше —
+    её никто не находил). Тот же callback vault_cancel: пока операция
+    идёт, он честно ставит флаг отмены (волна 22.5)."""
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("❌ Отмена", callback_data="vault_cancel")]])
+
+
 class _VaultAckRef:
     """ВОЛНА 22.19: лёгкая ссылка на сообщение-уведомление пачки (id уже
     известен) — для _vault_mt_precheck, который правит ТЕКСТ того же
@@ -35090,22 +35926,148 @@ async def _vault_ask_label(msg, context, user):
     словом) и ДО пароля Сейфа. Одно название на всю загрузку; попадает в
     «📦 Мои файлы» (кнопка-строка, текст списка, карточка 🔎). Пропустить
     можно кнопкой «⏭ Пропустить» — останутся исходные имена/подписи файлов."""
+    # ВОЛНА 22.82: если в пачке есть файлы — предлагаем назвать КАЖДЫЙ
+    # по одному (шаг «🔢 Назвать по одному» перед общим названием).
+    _batch_n = len(context.user_data.get('vault_batch') or [])
+    _has_files = any(isinstance(it, dict) and it.get("source") != "text"
+                     for it in (context.user_data.get('vault_batch') or []))
+    _rows = []
+    if _has_files:
+        _rows.append([InlineKeyboardButton(
+            "🔢 Назвать по одному", callback_data="vault_perfile")])
+    _rows.append([InlineKeyboardButton("⏭ Пропустить", callback_data="vault_labelskip"),
+                  InlineKeyboardButton("❌ Отмена", callback_data="vault_cancel")])
+    # ВОЛНА 22.25: «⬅️ Назад» — вернуться к добавлению файлов в пачку.
+    _rows.append([InlineKeyboardButton("⬅️ Назад к файлам", callback_data="vault_put_back")])
     _ack = await msg.reply_text(
         "🏷 НАЗОВИТЕ, что вы кладёте в Сейф — одно название для всей загрузки "
-        f"(файлов в пачке: {len(context.user_data.get('vault_batch') or [])}).\n\n"
+        f"(файлов в пачке: {_batch_n}).\n\n"
         "Название будет ВИДНО в «📦 Мои файлы» — чтобы не запутаться, где что. "
         "Например: «Контрольная по алгебре», «Документы на кружок».\n\n"
-        "Не нужно общее название — нажмите «⏭ Пропустить»: останутся исходные "
-        "имена файлов (подписать каждый отдельно можно и позже — ✏️ в списке).",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("⏭ Пропустить", callback_data="vault_labelskip"),
-             InlineKeyboardButton("❌ Отмена", callback_data="vault_cancel")],
-            # ВОЛНА 22.25: «⬅️ Назад» — вернуться к добавлению файлов в пачку.
-            [InlineKeyboardButton("⬅️ Назад к файлам", callback_data="vault_put_back")],
-        ]),
+        + ("Хотите СВОЁ имя у каждого файла — нажмите «🔢 Назвать по одному»: "
+           "я спрошу название каждого файла по очереди.\n\n"
+           if _has_files else "")
+        + "Не нужно ничего — «⏭ Пропустить»: останутся исходные имена файлов "
+        "(подписать каждый отдельно можно и позже — ✏️ в списке).",
+        reply_markup=InlineKeyboardMarkup(_rows),
     )
     _vault_track_ack(context, _ack, user=user)
     return VAULT_LABEL_WAIT
+
+
+# ═══ ВОЛНА 22.82: ПОШАГОВОЕ ИМЕНОВАНИЕ — название КАЖДОГО файла пачки ═══
+# «При загрузке файлов в боте можно назвать их по одному». После «✅ Готово»
+# бот спрашивает название КАЖДОГО файла по очереди (⏭ Пропустить — оставить
+# как есть, ⏹ Хватит — остальные без названий, ❌ Отмена — выйти), потом
+# как обычно — общее название → категория → пароль. Название пишется в
+# label файла (тот же механизм, что ✏️/reply-подписи) — виден в списке.
+
+
+async def _vault_perfile_prompt(msg, context, user):
+    """Просит название для ОЧЕРЕДНОГО файла пачки (позиция в user_data)."""
+    batch = context.user_data.get('vault_batch') or []
+    idxs = context.user_data.get('vault_perfile_list') or []
+    pos = int(context.user_data.get('vault_perfile_pos') or 0)
+    if pos >= len(idxs):
+        # Все файлы подписаны — дальше общий шаг названия (можно Пропустить).
+        context.user_data.pop('vault_perfile_list', None)
+        context.user_data.pop('vault_perfile_pos', None)
+        try:
+            await msg.reply_text("✅ Все файлы подписаны.")
+        except Exception:
+            pass
+        return await _vault_ask_label(msg, context, user)
+    it = batch[idxs[pos]] if pos < len(batch) else None
+    if not isinstance(it, dict):
+        context.user_data['vault_perfile_pos'] = pos + 1
+        return await _vault_perfile_prompt(msg, context, user)
+    old = str(it.get("label") or it.get("name") or "").strip() or "(без имени)"
+    txt = (f"🏷 ФАЙЛ {pos + 1}/{len(idxs)}: {_miniapp_kind_emoji(it)} "
+           f"«{old[:60]}» ({_fmt_bytes(it.get('size') or 0)})\n\n"
+           "Пришлите НАЗВАНИЕ этого файла одним сообщением — например "
+           "«Контрольная по алгебре».\n"
+           "⏭ Пропустить — оставить как есть; ⏹ Хватит — остальные без названий.")
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⏭ Пропустить", callback_data="vault_perskip"),
+         InlineKeyboardButton("⏹ Хватит", callback_data="vault_perdone")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="vault_cancel")],
+    ])
+    _ack = await msg.reply_text(txt, reply_markup=kb)
+    _vault_track_ack(context, _ack, user=user)
+    return VAULT_PERFILE_WAIT
+
+
+async def vault_perfile_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.82: «🔢 Назвать по одному» — подписать каждый файл пачки."""
+    query = update.callback_query
+    await _safe_cb_answer(query)
+    user = get_user(str(query.from_user.id))
+    batch = context.user_data.get('vault_batch')
+    if not user or not isinstance(batch, list) or not batch:
+        await _safe_cb_answer(query, "Пачка пуста — пришлите файлы.", True)
+        return VAULT_PUT_WAIT
+    files_idx = [i for i, it in enumerate(batch)
+                 if isinstance(it, dict) and it.get("source") != "text"]
+    if not files_idx:
+        return await _vault_ask_label(query.message, context, user)
+    context.user_data['vault_perfile_list'] = files_idx
+    context.user_data['vault_perfile_pos'] = 0
+    return await _vault_perfile_prompt(query.message, context, user)
+
+
+@timeout(CONVERSATION_TIMEOUT)
+async def vault_perfile_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.82: приём названия ОЧЕРЕДНОГО файла пачки Сейфа."""
+    msg = update.message
+    user = get_user(str(update.effective_user.id))
+    batch = context.user_data.get('vault_batch')
+    idxs = context.user_data.get('vault_perfile_list')
+    if (not user or not isinstance(batch, list) or not isinstance(idxs, list)
+            or int(context.user_data.get('vault_perfile_pos') or 0) >= len(idxs)):
+        context.user_data.pop('vault_perfile_list', None)
+        context.user_data.pop('vault_perfile_pos', None)
+        await msg.reply_text(
+            "Сессия именования потеряна. Начните заново: ☁️ Облако → 🔐 Сейф.",
+            reply_markup=get_main_menu_keyboard(user) if user else None)
+        return MAIN_MENU
+    text = (msg.text or "").strip()
+    if not text:
+        await msg.reply_text("Напишите название ОДНИМ сообщением — или «⏭ Пропустить».")
+        return VAULT_PERFILE_WAIT
+    pos = int(context.user_data.get('vault_perfile_pos') or 0)
+    it = batch[idxs[pos]]
+    old = str(it.get("label") or it.get("name") or "").strip() or "(без имени)"
+    it["label"] = text[:80]
+    context.user_data['vault_perfile_pos'] = pos + 1
+    _ack = await msg.reply_text(f"✏️ «{text[:80]}» — вместо «{old[:60]}».")
+    _vault_track_ack(context, _ack, user=user)
+    return await _vault_perfile_prompt(msg, context, user)
+
+
+async def vault_perfile_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.82: «⏭ Пропустить» — этот файл без названия, следующий."""
+    query = update.callback_query
+    await _safe_cb_answer(query)
+    user = get_user(str(query.from_user.id))
+    if not user:
+        return MAIN_MENU
+    if not isinstance(context.user_data.get('vault_perfile_list'), list):
+        return VAULT_PUT_WAIT
+    context.user_data['vault_perfile_pos'] = int(
+        context.user_data.get('vault_perfile_pos') or 0) + 1
+    return await _vault_perfile_prompt(query.message, context, user)
+
+
+async def vault_perfile_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.82: «⏹ Хватит» — остальные файлы без названий."""
+    query = update.callback_query
+    await _safe_cb_answer(query)
+    user = get_user(str(query.from_user.id))
+    if not user:
+        return MAIN_MENU
+    context.user_data.pop('vault_perfile_list', None)
+    context.user_data.pop('vault_perfile_pos', None)
+    return await _vault_ask_label(query.message, context, user)
 
 
 async def vault_done_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -35466,7 +36428,8 @@ async def vault_cancel_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     batch = context.user_data.get('vault_batch')
     _batch_clean = batch if isinstance(batch, list) else None
     for key in ('vault_put_mode', 'vault_batch', 'vault_migrate_ids',
-                'vault_batch_label', 'vault_batch_cat', 'vault_batch_tags'):
+                'vault_batch_label', 'vault_batch_cat', 'vault_batch_tags',
+                'vault_perfile_list', 'vault_perfile_pos'):  # 22.82
         context.user_data.pop(key, None)
     _cleaned = 0
     try:
@@ -36070,7 +37033,10 @@ async def _vault_animate_progress(context, progress_msg, op):
         try:
             await context.bot.edit_message_text(
                 txt, chat_id=progress_msg.chat_id,
-                message_id=progress_msg.message_id)
+                message_id=progress_msg.message_id,
+                # ВОЛНА 22.84: «❌ Отмена» должна остаться на прогрессе
+                # после каждой правки (edit без markup снимает кнопки).
+                reply_markup=_vault_cancel_inline_kb())
         except Exception:
             pass  # один сбой правки не должен убивать анимацию
 
@@ -36212,7 +37178,8 @@ async def _vault_encrypt_batch(msg, context, user, password):
     anim = None
     try:
         progress = await msg.reply_text(
-            f"🔐 Шифрую и заливаю 0/{len(batch)} {_VAULT_OP_FRAMES[0]}")
+            f"🔐 Шифрую и заливаю 0/{len(batch)} {_VAULT_OP_FRAMES[0]}",
+            reply_markup=_vault_cancel_inline_kb())   # ВОЛНА 22.84: «Отмена» снизу
     except Exception:
         progress = None
     if progress is not None:
@@ -39752,7 +40719,8 @@ def _automation_system_prompt(context_text, is_admin):
         '51) {"action":"set_city","city":"<город>"} — ИЗМЕНИТЬ СВОЙ город (доступно всем; меняет и время уведомлений — бот перепланирует погоду и праздники сам).\n'
         '52) {"action":"show_profile"} — МОЙ ПРОФИЛЬ: звёзды, VIP-подписки, город, день рождения, класс (доступно всем; «мой профиль», «что у меня есть»).\n'
         '53) {"action":"show_referrals"} — РЕФЕРАЛЫ: сколько приглашено друзей и как пригласить (доступно всем; «мои рефералы», «как пригласить друга»).\n'
-        '54) {"action":"message_developer","text":"<сообщение>"} — НАПИСАТЬ РАЗРАБОТЧИКУ бота (доступно всем; «напиши разработчику …», «сообщи разработчику …»). Если текст не дан — clarify.\n\n'
+        '54) {"action":"message_developer","text":"<сообщение>"} — НАПИСАТЬ РАЗРАБОТЧИКУ бота (доступно всем; «напиши разработчику …», «сообщи разработчику …»). Если текст не дан — clarify.\n'
+        '55) {"action":"show_favorites"} — ИЗБРАННЫЕ ФАЙЛЫ: показать список ⭐ (доступно всем; «моё избранное», «какие файлы в избранном»).\n\n'
         "ПРАВИЛА:\n"
         "- Отвечай ТОЛЬКО JSON-объектом, без пояснений и markdown.\n"
         "- Не выдумывай даты: считай их строго от сегодняшней даты из контекста. «Пятница этой недели» — пятница текущей недели (даже если она уже прошла — берём ближайшую ПЯТНИЦУ ТЕКУЩЕЙ недели, а не следующую). Для «следующей недели» есть отдельная строка контекста с готовыми датами.\n"
@@ -41390,6 +42358,28 @@ async def _automation_execute_action(update, context, user, class_obj, action):
             f"• ваша ссылка-приглашение: {ref_link}",
             "Поделиться: кнопка «⭐ Звезды» → «🤝 Пригласить друга».",
         ]), True)
+
+    if name == "show_favorites":
+        # ВОЛНА 22.82: избранное — общий список бота и мини-аппа
+        _fc, _fv = _fav_resolve(user, cleanup=True)
+        _flines = []
+        for _rec in _fc:
+            _flines.append(
+                f"• {_miniapp_kind_emoji(_rec)} "
+                f"{str(_rec.get('name') or '(без имени)')[:50]} "
+                f"({_fmt_bytes(_rec.get('size', 0))}) — облако")
+        for _rec in _fv:
+            _flines.append(
+                f"• 🔒 {str(_rec.get('label') or _rec.get('name') or 'Файл')[:50]} "
+                f"({_fmt_bytes(_rec.get('size_orig', 0))}) — Сейф")
+        if not _flines:
+            return ("⭐ В избранном пусто. Добавляйте файлы звёздочкой ☆ — "
+                    "кнопкой у файла в боте или на карточке в мини-аппе "
+                    "(список общий).", True)
+        _head = "⭐ Ваши избранные файлы:\n" + "\n".join(_flines[:20])
+        if len(_flines) > 20:
+            _head += f"\n…и ещё {len(_flines) - 20} шт."
+        return (_head + "\nСписок общий с мини-аппом.", True)
 
     if name == "message_developer":
         text = (action.get("text") or "").strip()
@@ -61736,6 +62726,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await cloud_mv_cb(update, context)
     elif data.startswith("cloud_get_"):
         return await cloud_get_cb(update, context)
+    elif data == "cloud_fav":
+        # ВОЛНА 22.82: «⭐ Избранное» в самом боте — общий список с мини-аппом
+        return await cloud_fav_cb(update, context)
+    elif data.startswith("favt_c_") or data.startswith("favt_v_") \
+            or data.startswith("favt_f_"):
+        # ВОЛНА 22.82: звёздочка ☆/⭐ у файла (список/Сейф/экран избранного)
+        return await fav_toggle_cb(update, context, data[5])
+    elif data == "cloud_pername":
+        # ВОЛНА 22.82: подписать файлы последней загрузки ПО ОДНОМУ
+        return await cloud_pername_start(update, context)
+    elif data == "cloud_perskip":
+        return await cloud_pername_skip(update, context)
+    elif data == "cloud_perdone":
+        return await cloud_pername_done(update, context)
     # === Сейф (шифрованное хранилище) ===
     elif data == "vault_menu":
         return await vault_menu_callback(update, context)
@@ -61882,6 +62886,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "vault_labelskip":
         # ВОЛНА 13: «⏭ Пропустить» на шаге названия загрузки Сейфа.
         return await vault_labelskip_cb(update, context)
+    elif data == "vault_perfile":
+        # ВОЛНА 22.82: «🔢 Назвать по одному» — каждый файл пачки по очереди
+        return await vault_perfile_start(update, context)
+    elif data == "vault_perskip":
+        return await vault_perfile_skip(update, context)
+    elif data == "vault_perdone":
+        return await vault_perfile_done(update, context)
     elif data.startswith("vault_cat_"):
         # ВОЛНА 22.12: выбор категории загрузки (🎵/📷/🎬/📄/📦).
         return await vault_cat_cb(update, context)
@@ -62297,6 +63308,9 @@ _UPLOAD_TEMP_KEYS = (
     'custom_button_type',
     # решения, пачки облака, Сейф, «❗ Важное»
     'sol_pending', 'cloud_batch', 'vault_put_mode', 'vazhno_buf',
+    # ВОЛНА 22.82: пошаговое именование файлов (по одному)
+    'vault_perfile_list', 'vault_perfile_pos',
+    'cloud_per_ids', 'cloud_per_pos',
 )
 
 
@@ -62348,6 +63362,54 @@ def _upload_recent_mark(uid, fuid):
     ent[fuid] = time.time()
 
 
+class _UplCancelled(Exception):
+    """ВОЛНА 22.84: кооперативная отмена загрузки ИЗ ЧАТА (облако/фон).
+    Зарезервировано: пока циклы используют проверку события напрямую."""
+
+
+# ВОЛНА 22.84: реестр активных ЗАГРУЗОК ИЗ ЧАТА — «❌ Отмена» на сообщении
+# прогресса (фоновая «файл в чате = в облако», режим «☁️ Облако → загрузка»)
+# останавливает заливку и СТИРАЕТ всё, что уже уехало в канал-хранилище.
+_UPL_OPS = {}
+
+
+def _upl_op_begin(user_id):
+    op = {
+        "event": asyncio.Event(),   # установка = «пользователь нажал Отмена»
+        "sent": [],                 # (channel_id, msg_id) — залитое ЭТОЙ пачкой
+        "active": True,
+    }
+    _UPL_OPS[str(user_id)] = op
+    return op
+
+
+def _upl_op_end(user_id):
+    op = _UPL_OPS.pop(str(user_id), None)
+    if op is not None:
+        op["active"] = False
+    return op
+
+
+def _upl_op_running(user_id):
+    op = _UPL_OPS.get(str(user_id))
+    return bool(op and op.get("active") and not op["event"].is_set())
+
+
+async def _upl_op_cleanup(context, op):
+    """Стирает из канала-хранилища всё, что успела залить отменённая пачка.
+    Записи НЕ сохранялись в базу до конца цикла — достаточно удалить
+    сообщения. Возвращает число удалённых."""
+    deleted = 0
+    for cid, mid in list(op.get("sent") or []):
+        try:
+            await context.bot.delete_message(chat_id=int(cid), message_id=int(mid))
+            deleted += 1
+        except Exception:
+            pass
+    op["sent"] = []
+    return deleted
+
+
 def _upl_cancel_kb():
     """Кнопка «❌ Отмена» для приглашений загрузки (универсальная)."""
     return InlineKeyboardMarkup(
@@ -62358,13 +63420,36 @@ async def _upl_cancel_cmd(update, context):
     """ВОЛНА 22.77: универсальная отмена ЛЮБОЙ загрузки. Чистит ВСЕ
     временные буферы (по списку _UPLOAD_TEMP_KEYS) и возвращает в меню.
     Вызывается из handle_callback — то есть работает в ЛЮБОМ состоянии
-    (entry_points с allow_reentry перехватывают колбэки раньше хендлеров)."""
+    (entry_points с allow_reentry перехватывают колбэки раньше хендлеров).
+    ВОЛНА 22.84: если ПРЯМО СЕЙЧАС идёт загрузка ИЗ ЧАТА (облако/фоновая
+    MTProto) или операция Сейфа — только ставим флаг отмены и НЕ трогаем
+    user_data: буферы и следы принадлежат работающему циклу, честную
+    зачистку канала и честный ответ сделает сам цикл."""
     query = update.callback_query
     try:
         await query.answer()
     except Exception:
         pass
     user_id = str(query.from_user.id)
+    # ВОЛНА 22.84: активная операция Сейфа — её собственный механизм (22.5).
+    if _vault_op_running(user_id):
+        _VAULT_OPS[user_id]["event"].set()
+        try:
+            await query.edit_message_text(
+                "⛔ Останавливаю операцию Сейфа — секунду, подчищу всё "
+                "недогруженное…")
+        except Exception:
+            pass
+        return None
+    # ВОЛНА 22.84: активная загрузка ИЗ ЧАТА — флаг, чистку сделает цикл.
+    if _upl_op_running(user_id):
+        _UPL_OPS[user_id]["event"].set()
+        try:
+            await query.edit_message_text(
+                "🛑 Останавливаю загрузку и стираю загруженное из канала…")
+        except Exception:
+            pass
+        return None
     user = get_user(user_id)
     if not user:
         user = User(user_id)
@@ -69810,6 +70895,18 @@ def main():
             #     глобальная отмена инжектируется как везде) ===
             VAULT_LABEL_WAIT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, vault_label_receive),
+                CallbackQueryHandler(handle_callback),
+            ],
+            # === ВОЛНА 22.82: ПОШАГОВОЕ ИМЕНОВАНИЕ Сейфа — текст = название
+            #     КАЖДОГО файла по очереди (в _QUICK_SKIP_STATES) ===
+            VAULT_PERFILE_WAIT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, vault_perfile_receive),
+                CallbackQueryHandler(handle_callback),
+            ],
+            # === ВОЛНА 22.82: пошаговое именование облака (после кнопки
+            #     «🏷 Назвать по одному» в итоге загрузки) ===
+            CLOUD_PERNAME_WAIT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, cloud_pername_receive),
                 CallbackQueryHandler(handle_callback),
             ],
             # === ВОЛНА 22.20: «🔗 Моё облако» — ждём пересланное сообщение
