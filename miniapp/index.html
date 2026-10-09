@@ -3641,17 +3641,42 @@ body.vp-lock {
           </div>
         </button>
 
-        <!-- 22.70: ВИБРАЦИЯ — отклик при действиях (Android + iOS),
-             отключается одним тапом, состояние синхронизируется с базой -->
-        <button class="settings-item" onclick="toggleHaptics()">
+        <!-- 22.85: ВИБРАЦИЯ — отклик при действиях + СИЛА (слабая /
+             средняя / сильная), состояние синхронизируется с базой -->
+        <button class="settings-item" onclick="toggleSettingsSubmenu('hapticsSubmenu')">
           <div class="settings-item-icon">
             <i id="hapticsIcon" data-lucide="vibrate" style="width:18px;height:18px"></i>
           </div>
           <div class="settings-item-label">
             Вибрация
-            <small id="hapticsLabel">Включена</small>
+            <small id="hapticsLabel">Средняя</small>
           </div>
+          <i data-lucide="chevron-right" style="width:16px;height:16px;color:var(--subtext-color);flex-shrink:0"></i>
         </button>
+
+        <div class="settings-submenu" id="hapticsSubmenu">
+          <div class="settings-submenu-inner">
+            <button class="sound-item-btn" id="haptics-off-btn" onclick="setHapticsMode('off')">
+              <span>Выключена</span>
+              <i data-lucide="vibrate-off" style="width:16px;height:16px"></i>
+            </button>
+
+            <button class="sound-item-btn" id="haptics-light-btn" onclick="setHapticsMode('light')">
+              <span>Слабая</span>
+              <i data-lucide="feather" style="width:16px;height:16px"></i>
+            </button>
+
+            <button class="sound-item-btn" id="haptics-normal-btn" onclick="setHapticsMode('normal')">
+              <span>Средняя</span>
+              <i data-lucide="vibrate" style="width:16px;height:16px"></i>
+            </button>
+
+            <button class="sound-item-btn" id="haptics-strong-btn" onclick="setHapticsMode('strong')">
+              <span>Сильная</span>
+              <i data-lucide="zap" style="width:16px;height:16px"></i>
+            </button>
+          </div>
+        </div>
 
         <button class="settings-item" onclick="toggleSettingsSubmenu('themeSubmenu')">
           <div class="settings-item-icon">
@@ -4011,6 +4036,33 @@ if (tg) {
    с базой, по умолчанию ВКЛЮЧЕНА). */
 let hapticsEnabled = localStorage.getItem('devo_haptics_enabled') !== 'false';
 
+/* 22.85: СИЛА ВИБРАЦИИ — «насколько сильная». Три уровня: light (слабая),
+   normal (средняя, как было), strong (сильная). Влияет и на нативную
+   гаптику Telegram (стиль impactOccurred), и на паттерны Vibration API.
+   Хранится в localStorage (devo_haptics_strength) и в базе
+   (/api/settings → haptics_strength) — переживает смену телефона. */
+let hapticsStrength = (function () {
+  const v = localStorage.getItem('devo_haptics_strength');
+  return (v === 'light' || v === 'strong') ? v : 'normal';
+})();
+
+/* Масштаб паттернов Vibration API по силе: слабая — короче и тише,
+   сильная — дольше и заметнее (×1.8). */
+function _vibScale(p) {
+  const f = hapticsStrength === 'light' ? 0.55
+    : hapticsStrength === 'strong' ? 1.8 : 1;
+  if (typeof p === 'number') return Math.max(1, Math.round(p * f));
+  return p.map(function (x) { return Math.max(1, Math.round(x * f)); });
+}
+
+/* Стили impactOccurred по силе (Telegram Android/iOS):
+   слабая — «мягкие» стили, сильная — вплоть до rigid. */
+const _HAPTIC_IMPACT = {
+  light:  { light: 'soft',   medium: 'light',  heavy: 'medium' },
+  normal: { light: 'light',  medium: 'medium', heavy: 'heavy'  },
+  strong: { light: 'medium', medium: 'heavy',  heavy: 'rigid'  }
+};
+
 /* Шаблоны вибрации браузера: короткий тик — лёгкие действия,
    «двойной тап» — успех, резкая двойная — ошибка. Миллисекунды
    подобраны заметными для вибромоторов Android (8мс почти не
@@ -4040,8 +4092,10 @@ function haptic(kind) {
       } else if (kind === 'select' && hf.selectionChanged) {
         hf.selectionChanged();
       } else if (hf.impactOccurred) {
+        /* 22.85: стиль зависит от силы вибрации */
+        const _imap = _HAPTIC_IMPACT[hapticsStrength] || _HAPTIC_IMPACT.normal;
         hf.impactOccurred(
-          kind === 'light' ? 'light' : kind === 'heavy' ? 'heavy' : 'medium'
+          _imap[kind === 'light' ? 'light' : kind === 'heavy' ? 'heavy' : 'medium']
         );
       }
     }
@@ -4055,7 +4109,7 @@ function haptic(kind) {
 
   try {
     if (typeof navigator.vibrate === 'function') {
-      navigator.vibrate(VIB_PATTERNS[kind] || VIB_PATTERNS.medium);
+      navigator.vibrate(_vibScale(VIB_PATTERNS[kind] || VIB_PATTERNS.medium));
     }
   } catch (e) {}
 }
@@ -4070,9 +4124,11 @@ function updateHapticsUi() {
 
   const lbl = document.getElementById('hapticsLabel');
   if (lbl) {
+    const stTxt = hapticsStrength === 'light' ? 'Слабая'
+      : hapticsStrength === 'strong' ? 'Сильная' : 'Средняя';
     lbl.textContent = !supported
       ? 'Недоступна в этом браузере'
-      : (hapticsEnabled ? 'Включена' : 'Выключена');
+      : (!hapticsEnabled ? 'Выключена' : stTxt);
   }
 
   const ico = document.getElementById('hapticsIcon');
@@ -4081,16 +4137,42 @@ function updateHapticsUi() {
       (supported && hapticsEnabled) ? 'vibrate' : 'vibrate-off');
     safeIcons();
   }
+
+  /* 22.85: галочка активного варианта в подменю «Вибрация» */
+  const optMap = { off: 'haptics-off-btn', light: 'haptics-light-btn',
+                   normal: 'haptics-normal-btn', strong: 'haptics-strong-btn' };
+  Object.keys(optMap).forEach(function (k) {
+    const b = document.getElementById(optMap[k]);
+    if (b) b.classList.toggle('active-sound',
+      hapticsEnabled ? hapticsStrength === k : k === 'off');
+  });
 }
 
-function toggleHaptics() {
-  hapticsEnabled = !hapticsEnabled;
+/* 22.85: один выбор из четырёх — выключена / слабая / средняя / сильная */
+function setHapticsMode(mode) {
+  if (mode === 'off') {
+    hapticsEnabled = false;
+  } else {
+    hapticsEnabled = true;
+    hapticsStrength = (mode === 'light' || mode === 'strong') ? mode : 'normal';
+  }
   safeSet('devo_haptics_enabled', hapticsEnabled ? 'true' : 'false');
+  safeSet('devo_haptics_strength', hapticsStrength);
   settingsChanged(); /* 22.39: настройки живут в базе */
   updateHapticsUi();
 
-  /* сразу чувствуем, что включили */
+  /* сразу чувствуем, что выбрали */
   if (hapticsEnabled) haptic('medium');
+}
+
+/* легаси: старый тумблер (одиночный тап по строке) → открываем подменю */
+function toggleHaptics() {
+  const sm = document.getElementById('hapticsSubmenu');
+  if (sm && typeof toggleSettingsSubmenu === 'function') {
+    toggleSettingsSubmenu('hapticsSubmenu');
+    return;
+  }
+  setHapticsMode(hapticsEnabled ? 'off' : 'normal');
 }
 
 let currentTheme = localStorage.getItem('devo_theme') || 'system';
@@ -9029,6 +9111,10 @@ function showDropLoader(files) {
   initial.style.display = 'none';
   wrap.classList.add('active');
 
+  /* 22.85: кнопка отмены видна ровно пока идёт пачка */
+  const _ucb = document.getElementById('uploadCancelBtn');
+  if (_ucb) _ucb.style.display = '';
+
   bar.classList.remove('success');
   bar.style.strokeDasharray = '157';
   bar.style.strokeDashoffset = '157';
@@ -9327,6 +9413,10 @@ function resetUploadUI(bar, checkmark, squareStop) {
   const circumference = 157;
 
   wrap.classList.remove('active');
+  /* 22.85: «Отменить и удалить» исчезает СРАЗУ по завершении пачки —
+     кнопка не должна висеть над пустой зоной загрузки */
+  const _ucb = document.getElementById('uploadCancelBtn');
+  if (_ucb) _ucb.style.display = 'none';
   filenameEl.style.display = 'none';
   initial.style.display = 'flex';
 
@@ -10707,6 +10797,7 @@ async function pushSettingsToServer() {
     const s = {
       theme: localStorage.getItem('devo_theme') || 'system',
       haptics: localStorage.getItem('devo_haptics_enabled') !== 'false',
+      haptics_strength: localStorage.getItem('devo_haptics_strength') || 'normal',
       blobs: localStorage.getItem('devo_blobs_enabled') !== 'false',
       blob_speed: localStorage.getItem('devo_blob_speed') || '5',
       sound: localStorage.getItem('devo_sound_id') || '1',
@@ -10773,6 +10864,17 @@ async function pullSettingsApply() {
       if (localStorage.getItem('devo_haptics_enabled') !== wantH) {
         safeSet('devo_haptics_enabled', wantH);
         hapticsEnabled = wantH === 'true';
+        updateHapticsUi();
+      }
+    }
+
+    /* 22.85: сила вибрации тоже живёт в базе */
+    if (typeof s.haptics_strength === 'string' &&
+        (s.haptics_strength === 'light' || s.haptics_strength === 'strong' ||
+         s.haptics_strength === 'normal')) {
+      if (localStorage.getItem('devo_haptics_strength') !== s.haptics_strength) {
+        safeSet('devo_haptics_strength', s.haptics_strength);
+        hapticsStrength = s.haptics_strength;
         updateHapticsUi();
       }
     }
