@@ -3208,6 +3208,14 @@ class Class:
         # ВОЛНА 22.74: ФОТО расписания звонков (file_id). Если задано — бот
         # показывает фото; точный отсчёт «сколько осталось» по фото невозможен.
         self.bells_photo = ""
+        # ВОЛНА 22.85: РАЗНЫЕ РАСПИСАНИЯ ЗВОНКОВ ПО ДНЯМ И ПО ЧИСЛАМ.
+        # bells_week: {"0".."6"} (0=Пн) → свой список звонков этого дня недели;
+        # bells_dates: {"YYYY-MM-DD"} → свой список на конкретную дату.
+        # Приоритет на день: дата → день недели → общие bells. Нет записи
+        # (или пусто) — работают общие звонки. «Поставить звонки на какие-то
+        # дни другие, пн вт ср чт пт сб вс — или по числам».
+        self.bells_week = {}
+        self.bells_dates = {}
         self.holidays = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
         self.created_date = datetime.now().strftime("%Y-%m-%d %H:%M")
         self.is_active = True
@@ -3270,6 +3278,13 @@ class Class:
             'bells': self.bells,
             # ВОЛНА 22.74: фото звонков (может не быть у старых классов)
             'bells_photo': str(getattr(self, 'bells_photo', '') or ''),
+            # ВОЛНА 22.85: расписания по дням недели и по датам
+            'bells_week': (getattr(self, 'bells_week', None)
+                           if isinstance(getattr(self, 'bells_week', None), dict)
+                           else {}),
+            'bells_dates': (getattr(self, 'bells_dates', None)
+                            if isinstance(getattr(self, 'bells_dates', None), dict)
+                            else {}),
             'holidays': self.holidays,
             'created_date': self.created_date,
             'is_active': self.is_active,
@@ -3328,6 +3343,31 @@ class Class:
             class_obj.duty_count = max(1, min(3, int(getattr(class_obj, 'duty_count', 1) or 1)))
         except (TypeError, ValueError):
             class_obj.duty_count = 1
+        # ВОЛНА 22.85: расписания звонков по дням/числам — старые классы
+        # без полей не падают; мусор чистим (≤7 дней, ≤60 дат, ≤15 уроков,
+        # валидные ЧЧ:ММ, конец позже начала).
+        _bw_raw = getattr(class_obj, 'bells_week', None)
+        if not isinstance(_bw_raw, dict):
+            _bw_raw = {}
+        _bw_clean = {}
+        for _k, _v in list(_bw_raw.items())[:7]:
+            _sk = str(_k)
+            if _sk in ("0", "1", "2", "3", "4", "5", "6") and isinstance(_v, dict):
+                _cl = _bells_sanitize(_v)
+                if _cl:
+                    _bw_clean[_sk] = _cl
+        class_obj.bells_week = _bw_clean
+        _bd_raw = getattr(class_obj, 'bells_dates', None)
+        if not isinstance(_bd_raw, dict):
+            _bd_raw = {}
+        _bd_clean = {}
+        for _k, _v in list(_bd_raw.items())[:60]:
+            _sk = str(_k)[:10]
+            if isinstance(_v, dict) and _bells_date_ok(_sk):
+                _cl = _bells_sanitize(_v)
+                if _cl:
+                    _bd_clean[_sk] = _cl
+        class_obj.bells_dates = _bd_clean
         # ВОЛНА 22.67: «Расписание с сайтов» — старые классы без поля не падают.
         if not isinstance(getattr(class_obj, 'schedule_web', None), dict):
             class_obj.schedule_web = None
@@ -4382,7 +4422,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.84"
+BOT_BUILD = "22.85"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -4962,15 +5002,30 @@ def get_local_time(user):
     return utc_time + timedelta(hours=_user_tz_offset(user))
 
 def get_bells_info(class_obj, user=None):
-    if not class_obj or not class_obj.bells:
+    # ВОЛНА 22.85: звонки зависят от ДНЯ/ДАТЫ — берём расписание, которое
+    # действует именно сегодня (дата → день недели → общие).
+    now = get_local_time(user) if user is not None else _utcnow() + timedelta(hours=3)
+    today_bells, _src = ({}, "base")
+    if class_obj is not None:
+        today_bells, _src = _bells_for_date(class_obj, now.date())
+    if not class_obj or not today_bells:
         return "🔔 Расписание звонков не установлено"
 
-    # ИСПРАВЛЕНО: считаем «сейчас» по локальному времени пользователя, а
-    # не по времени сервера, иначе после полуночи показывается «вчера».
-    now = get_local_time(user) if user is not None else _utcnow() + timedelta(hours=3)
+    # Если сегодня работает особое расписание — честно скажем об этом.
+    _src_line = ""
+    if _src == "date":
+        _src_line = "📆 Сегодня особое расписание звонков (задано по числам).\n"
+    elif _src == "week":
+        _src_line = (f"📅 Сегодня действует расписание "
+                     f"{_BELL_DAY_GEN[now.weekday()]}.\n")
+
     current_time = now.time()
 
-    sorted_bells = sorted(class_obj.bells.items(), key=lambda x: datetime.strptime(x[1]['start'], "%H:%M").time())
+    try:
+        sorted_bells = sorted(today_bells.items(),
+                              key=lambda x: datetime.strptime(x[1]['start'], "%H:%M").time())
+    except Exception:
+        return _src_line + "🔔 Расписание звонков не установлено"
 
     for lesson, times in sorted_bells:
         start_time = datetime.strptime(times['start'], "%H:%M").time()
@@ -4979,14 +5034,14 @@ def get_bells_info(class_obj, user=None):
         if start_time <= current_time <= end_time:
             time_left = datetime.combine(now.date(), end_time) - datetime.combine(now.date(), current_time)
             minutes, seconds = divmod(time_left.total_seconds(), 60)
-            return f"🔔 Сейчас идёт {lesson} урок\n⏰ До конца: {int(minutes)} мин {int(seconds)} сек"
+            return _src_line + f"🔔 Сейчас идёт {lesson} урок\n⏰ До конца: {int(minutes)} мин {int(seconds)} сек"
 
         if current_time < start_time:
             time_until = datetime.combine(now.date(), start_time) - datetime.combine(now.date(), current_time)
             minutes, seconds = divmod(time_until.total_seconds(), 60)
-            return f"🔔 Следующий урок ({lesson}) через {int(minutes)} мин {int(seconds)} сек"
+            return _src_line + f"🔔 Следующий урок ({lesson}) через {int(minutes)} мин {int(seconds)} сек"
 
-    return "🔔 Уроки на сегодня закончились"
+    return _src_line + "🔔 Уроки на сегодня закончились"
 
 def get_holidays_count(class_obj, user=None):
     if not class_obj or not class_obj.holidays:
@@ -5421,6 +5476,17 @@ def get_bells_edit_keyboard(class_obj):
                          InlineKeyboardButton("🗑 Убрать фото", callback_data="bells_photo_del")])
     else:
         keyboard.append([InlineKeyboardButton("📷 Добавить фото звонков", callback_data="bells_photo_set")])
+    # ВОЛНА 22.85: разные расписания по дням недели (пн–вс) и по числам.
+    _ov_days = len([k for k, v in (getattr(class_obj, 'bells_week', None) or {}).items()
+                    if isinstance(v, dict) and v])
+    _ov_dates = len([k for k, v in (getattr(class_obj, 'bells_dates', None) or {}).items()
+                     if isinstance(v, dict) and v])
+    keyboard.append([InlineKeyboardButton(
+        "📅 По дням недели" + (f" ({_ov_days})" if _ov_days else ""),
+        callback_data="bells_days")])
+    keyboard.append([InlineKeyboardButton(
+        "📆 По числам" + (f" ({_ov_dates})" if _ov_dates else ""),
+        callback_data="bells_dates")])
     keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_to_admin")])
     return InlineKeyboardMarkup(keyboard)
 
@@ -7456,6 +7522,38 @@ async def _pub_send(channel_id, coro_factory):
         st["waiters"] = max(0, st["waiters"] - 1)
 
 
+def _st_err_human(e):
+    """ВОЛНА 22.85: честная причина отказа канала — вместо глухого «канал не
+    принял файл — проверьте, что бот администратор» пользователь видит, ЧТО
+    случилось: флуд-контроль, права, сеть, размер. Причина попадает в
+    «Причины:» итогового сообщения загрузки."""
+    try:
+        s = str(getattr(e, "message", None) or e or "").strip()
+    except Exception:
+        s = ""
+    if not s:
+        s = "неизвестная ошибка"
+    low = s.lower()
+    if ("retryafter" in low.replace(" ", "") or "retry after" in low
+            or "too many requests" in low or "flood" in low):
+        return ("Telegram просит паузу (флуд-контроль) — слишком много "
+                "сообщений подряд; попробуйте ещё раз через пару минут")
+    if "slow mode" in low or "slowmode" in low:
+        return "в канале включён медленный режим (slow mode) — бот ждёт и повторяет"
+    if ("chat_write_forbidden" in low or "chat_admin_required" in low
+            or "have no rights" in low or "not enough rights" in low
+            or "not a member" in low or "kicked" in low):
+        return ("бот не админ канала (или лишён права писать) — добавьте его "
+                "администратором канала")
+    if ("unauthorized" in low or "401" in low or "timeout" in low
+            or "timed out" in low or "connection" in low or "network" in low):
+        return "нет связи с Telegram (сеть) — попробуйте позже"
+    if ("entity too large" in low or "too big" in low
+            or "request entity" in low):
+        return "файл слишком большой для этого способа загрузки"
+    return f"канал не принял файл ({s[:120]})"
+
+
 # ============================================================
 # === ВОЛНА 22.75 (M4): WAL-ЖУРНАЛ ОБЛАЧНЫХ ОПЕРАЦИЙ ===
 # ============================================================
@@ -7590,7 +7688,7 @@ async def _cloud_wal_reconcile(application):
 
 async def _storage_upload_document(context, data: bytes, filename: str, caption: str = "",
                                    channel_id=None, user=None, data_path=None,
-                                   silent=False):
+                                   silent=False, err_out=None):
     """Загружает документ в канал-хранилище.
 
     НОВОЕ (волна 7): если channel_id не задан явно — грузим по КРУГУ во все
@@ -7606,6 +7704,11 @@ async def _storage_upload_document(context, data: bytes, filename: str, caption:
     из-за чего пакетная загрузка падала, а по одной — работала.
     ВОЛНА 22.56: silent=True → disable_notification (снапшоты/бэкапы в
     db-каналы больше не звонят разработчику в телефон).
+    ВОЛНА 22.85: до 4 попыток НА КАНАЛ с паузами 2/6/14 с — флуд-контроль
+    и одноразовые сбои сети больше не роняют файл сразу («чтобы таких
+    ошибок не было»). Постоянные ошибки прав (бот не админ канала) — без
+    повторов, там пауза не помогает. err_out — список; сюда пишется
+    человекочитаемая причина последнего сбоя (_st_err_human).
     Возвращает ({"message_id", "file_id", "size", "channel_id", "queue_pos"}) или None."""
 
     def _payload_bytes():
@@ -7652,7 +7755,35 @@ async def _storage_upload_document(context, data: bytes, filename: str, caption:
                     disable_notification=bool(silent),
                 )
 
-            sent, queue_pos = await _pub_send(ch, _send_doc)
+            # ВОЛНА 22.85: паузы-повторы на этом же канале (2/6/14 с).
+            _upl_exc = None
+            _sent_ok = False
+            for _att in range(4):
+                try:
+                    sent, queue_pos = await _pub_send(ch, _send_doc)
+                    _sent_ok = True
+                    break
+                except Exception as _upl_e:
+                    _upl_exc = _upl_e
+                    logger.error(
+                        f"storage: загрузка документа в канал {ch} не удалась "
+                        f"(попытка {_att + 1}/4): {_upl_e}")
+                    _upl_low = str(getattr(_upl_e, "message", "") or _upl_e).lower()
+                    if any(_x in _upl_low for _x in (
+                            "chat_write_forbidden", "chat_admin_required",
+                            "have no rights", "not enough rights",
+                            "not a member", "kicked")):
+                        break  # постоянная ошибка — пауза не поможет
+                    if _att < 3:
+                        await asyncio.sleep((2.0, 6.0, 14.0)[_att])
+            if not _sent_ok:
+                if err_out is not None and _upl_exc is not None:
+                    try:
+                        err_out.append(_st_err_human(_upl_exc))
+                    except Exception:
+                        pass
+                raise _upl_exc if _upl_exc is not None else RuntimeError(
+                    "загрузка в канал не удалась")
             doc = getattr(sent, "document", None)
             # Продвигаем указатель круговой загрузки (только общий путь).
             # Считаем от позиции канала в ИСХОДНОМ списке, а не в повёрнутом.
@@ -14663,17 +14794,42 @@ body.vp-lock {
           </div>
         </button>
 
-        <!-- 22.70: ВИБРАЦИЯ — отклик при действиях (Android + iOS),
-             отключается одним тапом, состояние синхронизируется с базой -->
-        <button class="settings-item" onclick="toggleHaptics()">
+        <!-- 22.85: ВИБРАЦИЯ — отклик при действиях + СИЛА (слабая /
+             средняя / сильная), состояние синхронизируется с базой -->
+        <button class="settings-item" onclick="toggleSettingsSubmenu('hapticsSubmenu')">
           <div class="settings-item-icon">
             <i id="hapticsIcon" data-lucide="vibrate" style="width:18px;height:18px"></i>
           </div>
           <div class="settings-item-label">
             Вибрация
-            <small id="hapticsLabel">Включена</small>
+            <small id="hapticsLabel">Средняя</small>
           </div>
+          <i data-lucide="chevron-right" style="width:16px;height:16px;color:var(--subtext-color);flex-shrink:0"></i>
         </button>
+
+        <div class="settings-submenu" id="hapticsSubmenu">
+          <div class="settings-submenu-inner">
+            <button class="sound-item-btn" id="haptics-off-btn" onclick="setHapticsMode('off')">
+              <span>Выключена</span>
+              <i data-lucide="vibrate-off" style="width:16px;height:16px"></i>
+            </button>
+
+            <button class="sound-item-btn" id="haptics-light-btn" onclick="setHapticsMode('light')">
+              <span>Слабая</span>
+              <i data-lucide="feather" style="width:16px;height:16px"></i>
+            </button>
+
+            <button class="sound-item-btn" id="haptics-normal-btn" onclick="setHapticsMode('normal')">
+              <span>Средняя</span>
+              <i data-lucide="vibrate" style="width:16px;height:16px"></i>
+            </button>
+
+            <button class="sound-item-btn" id="haptics-strong-btn" onclick="setHapticsMode('strong')">
+              <span>Сильная</span>
+              <i data-lucide="zap" style="width:16px;height:16px"></i>
+            </button>
+          </div>
+        </div>
 
         <button class="settings-item" onclick="toggleSettingsSubmenu('themeSubmenu')">
           <div class="settings-item-icon">
@@ -15033,6 +15189,33 @@ if (tg) {
    с базой, по умолчанию ВКЛЮЧЕНА). */
 let hapticsEnabled = localStorage.getItem('devo_haptics_enabled') !== 'false';
 
+/* 22.85: СИЛА ВИБРАЦИИ — «насколько сильная». Три уровня: light (слабая),
+   normal (средняя, как было), strong (сильная). Влияет и на нативную
+   гаптику Telegram (стиль impactOccurred), и на паттерны Vibration API.
+   Хранится в localStorage (devo_haptics_strength) и в базе
+   (/api/settings → haptics_strength) — переживает смену телефона. */
+let hapticsStrength = (function () {
+  const v = localStorage.getItem('devo_haptics_strength');
+  return (v === 'light' || v === 'strong') ? v : 'normal';
+})();
+
+/* Масштаб паттернов Vibration API по силе: слабая — короче и тише,
+   сильная — дольше и заметнее (×1.8). */
+function _vibScale(p) {
+  const f = hapticsStrength === 'light' ? 0.55
+    : hapticsStrength === 'strong' ? 1.8 : 1;
+  if (typeof p === 'number') return Math.max(1, Math.round(p * f));
+  return p.map(function (x) { return Math.max(1, Math.round(x * f)); });
+}
+
+/* Стили impactOccurred по силе (Telegram Android/iOS):
+   слабая — «мягкие» стили, сильная — вплоть до rigid. */
+const _HAPTIC_IMPACT = {
+  light:  { light: 'soft',   medium: 'light',  heavy: 'medium' },
+  normal: { light: 'light',  medium: 'medium', heavy: 'heavy'  },
+  strong: { light: 'medium', medium: 'heavy',  heavy: 'rigid'  }
+};
+
 /* Шаблоны вибрации браузера: короткий тик — лёгкие действия,
    «двойной тап» — успех, резкая двойная — ошибка. Миллисекунды
    подобраны заметными для вибромоторов Android (8мс почти не
@@ -15062,8 +15245,10 @@ function haptic(kind) {
       } else if (kind === 'select' && hf.selectionChanged) {
         hf.selectionChanged();
       } else if (hf.impactOccurred) {
+        /* 22.85: стиль зависит от силы вибрации */
+        const _imap = _HAPTIC_IMPACT[hapticsStrength] || _HAPTIC_IMPACT.normal;
         hf.impactOccurred(
-          kind === 'light' ? 'light' : kind === 'heavy' ? 'heavy' : 'medium'
+          _imap[kind === 'light' ? 'light' : kind === 'heavy' ? 'heavy' : 'medium']
         );
       }
     }
@@ -15077,7 +15262,7 @@ function haptic(kind) {
 
   try {
     if (typeof navigator.vibrate === 'function') {
-      navigator.vibrate(VIB_PATTERNS[kind] || VIB_PATTERNS.medium);
+      navigator.vibrate(_vibScale(VIB_PATTERNS[kind] || VIB_PATTERNS.medium));
     }
   } catch (e) {}
 }
@@ -15092,9 +15277,11 @@ function updateHapticsUi() {
 
   const lbl = document.getElementById('hapticsLabel');
   if (lbl) {
+    const stTxt = hapticsStrength === 'light' ? 'Слабая'
+      : hapticsStrength === 'strong' ? 'Сильная' : 'Средняя';
     lbl.textContent = !supported
       ? 'Недоступна в этом браузере'
-      : (hapticsEnabled ? 'Включена' : 'Выключена');
+      : (!hapticsEnabled ? 'Выключена' : stTxt);
   }
 
   const ico = document.getElementById('hapticsIcon');
@@ -15103,16 +15290,42 @@ function updateHapticsUi() {
       (supported && hapticsEnabled) ? 'vibrate' : 'vibrate-off');
     safeIcons();
   }
+
+  /* 22.85: галочка активного варианта в подменю «Вибрация» */
+  const optMap = { off: 'haptics-off-btn', light: 'haptics-light-btn',
+                   normal: 'haptics-normal-btn', strong: 'haptics-strong-btn' };
+  Object.keys(optMap).forEach(function (k) {
+    const b = document.getElementById(optMap[k]);
+    if (b) b.classList.toggle('active-sound',
+      hapticsEnabled ? hapticsStrength === k : k === 'off');
+  });
 }
 
-function toggleHaptics() {
-  hapticsEnabled = !hapticsEnabled;
+/* 22.85: один выбор из четырёх — выключена / слабая / средняя / сильная */
+function setHapticsMode(mode) {
+  if (mode === 'off') {
+    hapticsEnabled = false;
+  } else {
+    hapticsEnabled = true;
+    hapticsStrength = (mode === 'light' || mode === 'strong') ? mode : 'normal';
+  }
   safeSet('devo_haptics_enabled', hapticsEnabled ? 'true' : 'false');
+  safeSet('devo_haptics_strength', hapticsStrength);
   settingsChanged(); /* 22.39: настройки живут в базе */
   updateHapticsUi();
 
-  /* сразу чувствуем, что включили */
+  /* сразу чувствуем, что выбрали */
   if (hapticsEnabled) haptic('medium');
+}
+
+/* легаси: старый тумблер (одиночный тап по строке) → открываем подменю */
+function toggleHaptics() {
+  const sm = document.getElementById('hapticsSubmenu');
+  if (sm && typeof toggleSettingsSubmenu === 'function') {
+    toggleSettingsSubmenu('hapticsSubmenu');
+    return;
+  }
+  setHapticsMode(hapticsEnabled ? 'off' : 'normal');
 }
 
 let currentTheme = localStorage.getItem('devo_theme') || 'system';
@@ -20051,6 +20264,10 @@ function showDropLoader(files) {
   initial.style.display = 'none';
   wrap.classList.add('active');
 
+  /* 22.85: кнопка отмены видна ровно пока идёт пачка */
+  const _ucb = document.getElementById('uploadCancelBtn');
+  if (_ucb) _ucb.style.display = '';
+
   bar.classList.remove('success');
   bar.style.strokeDasharray = '157';
   bar.style.strokeDashoffset = '157';
@@ -20349,6 +20566,10 @@ function resetUploadUI(bar, checkmark, squareStop) {
   const circumference = 157;
 
   wrap.classList.remove('active');
+  /* 22.85: «Отменить и удалить» исчезает СРАЗУ по завершении пачки —
+     кнопка не должна висеть над пустой зоной загрузки */
+  const _ucb = document.getElementById('uploadCancelBtn');
+  if (_ucb) _ucb.style.display = 'none';
   filenameEl.style.display = 'none';
   initial.style.display = 'flex';
 
@@ -21729,6 +21950,7 @@ async function pushSettingsToServer() {
     const s = {
       theme: localStorage.getItem('devo_theme') || 'system',
       haptics: localStorage.getItem('devo_haptics_enabled') !== 'false',
+      haptics_strength: localStorage.getItem('devo_haptics_strength') || 'normal',
       blobs: localStorage.getItem('devo_blobs_enabled') !== 'false',
       blob_speed: localStorage.getItem('devo_blob_speed') || '5',
       sound: localStorage.getItem('devo_sound_id') || '1',
@@ -21795,6 +22017,17 @@ async function pullSettingsApply() {
       if (localStorage.getItem('devo_haptics_enabled') !== wantH) {
         safeSet('devo_haptics_enabled', wantH);
         hapticsEnabled = wantH === 'true';
+        updateHapticsUi();
+      }
+    }
+
+    /* 22.85: сила вибрации тоже живёт в базе */
+    if (typeof s.haptics_strength === 'string' &&
+        (s.haptics_strength === 'light' || s.haptics_strength === 'strong' ||
+         s.haptics_strength === 'normal')) {
+      if (localStorage.getItem('devo_haptics_strength') !== s.haptics_strength) {
+        safeSet('devo_haptics_strength', s.haptics_strength);
+        hapticsStrength = s.haptics_strength;
         updateHapticsUi();
       }
     }
@@ -37365,6 +37598,21 @@ async def _vault_encrypt_batch(msg, context, user, password):
             "Положить заново: 🔐 Сейф → 📥 Положить.",
             reply_markup=get_main_menu_keyboard(user))
         return MAIN_MENU
+    # ВОЛНА 22.85: сообщение-прогресс с «❌ Отмена» больше не висит после
+    # завершения — операция окончена, кнопке нечего отменять (раньше тап
+    # по «Отмене» на УЖЕ ГОТОВОЙ загрузке писал «Загрузка прервана»).
+    if progress is not None:
+        try:
+            await context.bot.delete_message(chat_id=progress.chat_id,
+                                             message_id=progress.message_id)
+        except Exception:
+            try:
+                await context.bot.edit_message_text(
+                    f"🔐 Готово: {ok_n} файл(ов).",
+                    chat_id=progress.chat_id,
+                    message_id=progress.message_id)
+            except Exception:
+                pass
     user.vault_files = files
     # Миграция: незашифрованные оригиналы («старые файлы») больше не нужны —
     # правило «файлы всегда в сейфе облака».
@@ -37728,15 +37976,18 @@ async def _vault_plain_upload(msg, context, user, note=""):
             if op["event"].is_set():
                 raise _VaultCancelled()
             op["sub"] = f"«{(item.get('name') or 'файл')}»: заливаю…"
+            _upl_errs = []   # ВОЛНА 22.85: честная причина сбоя канала
             up = await _storage_upload_document(
-                context, payload, filename=name, caption=_PLAIN_CAP, user=user)
+                context, payload, filename=name, caption=_PLAIN_CAP, user=user,
+                err_out=_upl_errs)
             if up is None:
-                # Одна повторная попытка Bot API (одноразовые сбои бывают),
+                # Повторная попытка Bot API (одноразовые сбои бывают),
                 # затем MTProto-заливка, если поднят.
                 if op["event"].is_set():
                     raise _VaultCancelled()
                 up = await _storage_upload_document(
-                    context, payload, filename=name, caption=_PLAIN_CAP, user=user)
+                    context, payload, filename=name, caption=_PLAIN_CAP,
+                    user=user, err_out=_upl_errs)
                 if up is None and _TELETHON_OK and BOT_TOKEN:
                     _mtc = await _mt_client()
                     if _mtc is not None:
@@ -37751,13 +38002,17 @@ async def _vault_plain_upload(msg, context, user, note=""):
                                 caption=_PLAIN_CAP, filename=name, user=user)
                         finally:
                             _shutil.rmtree(_updir, ignore_errors=True)
-            item["payload"] = b""  # исходник больше не нужен
             if up is None:
                 fail_n += 1
+                # ВОЛНА 22.85: причина — реальная (флуд-контроль / права /
+                # сеть), а не всегда «проверьте, что бот администратор».
                 fail_reasons.append(
-                    f"«{(item.get('name') or 'файл')}»: канал не принял файл — "
-                    "проверьте, что бот администратор вашего канала")
+                    f"«{(item.get('name') or 'файл')}»: "
+                    + (_upl_errs[-1] if _upl_errs else
+                       "канал не принял файл — проверьте, что бот "
+                       "администратор вашего канала"))
                 continue
+            item["payload"] = b""  # исходник больше не нужен
             try:
                 op["sent"].append((int(up.get("channel_id") or _uch[0] or 0),
                                    int(up.get("message_id") or 0)))
@@ -37819,6 +38074,20 @@ async def _vault_plain_upload(msg, context, user, note=""):
             "Положить заново: 🔐 Сейф → 📥 Положить.",
             reply_markup=get_main_menu_keyboard(user))
         return MAIN_MENU
+    # ВОЛНА 22.85: сообщение-прогресс с «❌ Отмена» чистится после завершения
+    # (см. _vault_encrypt_batch) — кнопка не должна переживать операцию.
+    if progress is not None:
+        try:
+            await context.bot.delete_message(chat_id=progress.chat_id,
+                                             message_id=progress.message_id)
+        except Exception:
+            try:
+                await context.bot.edit_message_text(
+                    f"🔓 Готово: {ok_n} файл(ов).",
+                    chat_id=progress.chat_id,
+                    message_id=progress.message_id)
+            except Exception:
+                pass
     user.vault_files = files
     migrated = 0
     migrate_ids = context.user_data.get('vault_migrate_ids') or []
@@ -40668,7 +40937,7 @@ def _automation_system_prompt(context_text, is_admin):
         '5) {"action":"remove_subject","subject":"<предмет>"} — удалить предмет.\n'
         '6) {"action":"edit_schedule","day":"<Понедельник..Воскресенье>","content":"<номер. предмет через \\n>"} — заменить расписание на день.\n'
         '7) {"action":"edit_bell","lesson":<номер урока числом>,"start":"ЧЧ:ММ","end":"ЧЧ:ММ"} — задать время звонков урока. end обязан быть позже start.\n'
-        '7b) {"action":"set_bells","bells":[{"lesson":1,"start":"08:30","end":"09:15"},{"lesson":2,"start":"09:25","end":"10:10"}]} — ЗАМЕНИТЬ ВЕСЬ список звонков, когда пользователь прислал СПИСОК звонков ЦЕЛИКОМ («1 урок 8:30-9:15, 2 урок 9:25-10:10…»): разобрай каждую строку в элемент массива (lesson — число, end позже start). Только админ.\n'
+        '7b) {"action":"set_bells","bells":[{"lesson":1,"start":"08:30","end":"09:15"},{"lesson":2,"start":"09:25","end":"10:10"}]} — ЗАМЕНИТЬ ВЕСЬ список звонков, когда пользователь прислал СПИСОК звонков ЦЕЛИКОМ («1 урок 8:30-9:15, 2 урок 9:25-10:10…»): разобрай каждую строку в элемент массива (lesson — число, end позже start). Чтобы задать звонки ОТДЕЛЬНОМУ ДНЮ НЕДЕЛИ или ОТДЕЛЬНОЙ ДАТЕ, добавь в это же действие "day":"пн"…"вс" (или 0–6, где 0=понедельник) либо "date":"ДД.ММ.ГГГГ" (или "ГГГГ-ММ-ДД") — тогда список заменит звонки ТОЛЬКО этого дня или даты (дата приоритетнее дня, день приоритетнее общих звонков). Только админ.\n'
         '8) {"action":"set_holidays","date":"ГГГГ-ММ-ДД"} — дата начала каникул.\n'
         '9) {"action":"create_timer","date":"ГГГГ-ММ-ДД","time":"ЧЧ:ММ","text":"<текст напоминания>","kind":"timer|wish","repeat_daily":false} — таймер/напоминание/ПОЖЕЛАНИЕ ПО РАСПИСАНИЮ (доступно всем). Если пользователь говорит «через N минут/часов» — используй вместо даты поле in_minutes: {"action":"create_timer","in_minutes":<целое число минут>,"text":"<текст>"}. Разрешено передавать date как «today»/«tomorrow» — исполнитель сам посчитает дату. ПОЛЕ kind: "timer" (по умолчанию) — обычное напоминание; "wish" — когда пользователь просит бота ПОЖЕЛАТЬ/сказать/поздравить его самого («пожелай мне спокойной ночи в 23:00», «говори мне доброе утро в 7:00», «поздравь меня с наступающим в 12:00») — в text запиши САМО ПОЖЕЛАНИЕ живой фразой с уместным эмодзи (например «Спокойной ночи! Пусть тебе приснятся самые добрые сны 🌙»), а не служебный текст. ПОЛЕ repeat_daily: true — ТОЛЬКО если сказано «каждый день», «каждое утро», «всегда в это время» и НЕ названы исключения; иначе false. ПОЛЕ repeat_weekday — ЕЖЕНЕДЕЛЬНЫЙ повтор: «каждый понедельник в 15:00» = {"repeat_weekday":"mon","time":"15:00"} (дни: mon|tue|wed|thu|fri|sat|sun или по-русски); дата не нужна, исполнитель сам найдёт ближайший день. ПОЛЯ repeat_days/skip_days — ПОВТОР ПО НЕСКОЛЬКИМ ДНЯМ С ИСКЛЮЧЕНИЯМИ: «напоминай каждое утро в 7:00, но не считай понедельник и выходные» = {"repeat_days":["tue","wed","thu","fri"],"time":"07:00"} — перечисли ОСТАЮЩИЕСЯ дни; можно вместо этого передать skip_days (исключённые): {"skip_days":["mon","sat","sun"],"time":"07:00"} = «каждый день кроме пн, сб, вс». Понимай любые формулировки: «по будням» = repeat_days:["mon","tue","wed","thu","fri"], «кроме выходных» = skip_days:["sat","sun"], «только в школу» = будни. Напоминаний можно создавать сколько угодно.\n'
         '10) {"action":"send_class_message","text":"<сообщение>"} — объявление всему классу (только админ).\n'
@@ -41086,7 +41355,12 @@ async def _automation_execute_action(update, context, user, class_obj, action):
         return "👨‍🏫 Учителя класса:\n\n" + "\n".join(rows), True
 
     if name == "show_bells":
-        return get_bells_info(class_obj, user), True
+        # ВОЛНА 22.85: показываем и особые расписания (дни недели / даты).
+        _txt = get_bells_info(class_obj, user)
+        _extra = _bells_overrides_summary(class_obj)
+        if _extra:
+            _txt = _txt + "\n\n" + _extra
+        return _txt, True
 
     if name == "show_class_timers":
         # ВОЛНА 22.41: список таймеров сообщений классу (id нужен для
@@ -42760,6 +43034,55 @@ async def _automation_execute_action(update, context, user, class_obj, action):
                 new_bells[lesson] = {"start": start, "end": end}
             if not new_bells:
                 return "❓ Список звонков пуст.", False
+            # ВОЛНА 22.85: расписание можно повесить на ДЕНЬ НЕДЕЛИ
+            # ("day": "пн"…"вс" или 0–6, 0=Пн) или на ДАТУ
+            # ("date": "ДД.ММ.ГГГГ" / "ГГГГ-ММ-ДД").
+            _ai_day = action.get("day")
+            _ai_date = action.get("date")
+            if _ai_day is not None:
+                _d = _bells_day_from_text(_ai_day)
+                if _d is None:
+                    return ("❓ Не понял день недели (нужно «пн»…«вс» или "
+                            "0–6, где 0 = понедельник).", False)
+                bw = getattr(class_obj, 'bells_week', None)
+                if not isinstance(bw, dict):
+                    bw = {}
+                bw[str(_d)] = new_bells
+                class_obj.bells_week = bw
+                classes = load_classes()
+                classes[class_obj.class_code] = class_obj
+                save_classes(classes)
+                try:
+                    _info = "; ".join(
+                        f"{l}: {v['start']}–{v['end']}"
+                        for l, v in sorted(new_bells.items(),
+                                           key=_bells_ovr_sort_key))
+                except Exception:
+                    _info = f"{len(new_bells)} уроков"
+                return (f"🔔 Звонки на {_BELL_DAY_ACC[_d]} заданы "
+                        f"({len(new_bells)} шт.): {_info}. В этот день они "
+                        "заменяют общие.", True)
+            if _ai_date is not None:
+                _iso = _bells_date_from_text(_ai_date)
+                if not _iso:
+                    return ("❓ Не понял дату (нужно ДД.ММ.ГГГГ или "
+                            "ГГГГ-ММ-ДД).", False)
+                bd = getattr(class_obj, 'bells_dates', None)
+                if not isinstance(bd, dict):
+                    bd = {}
+                if len(bd) >= 60 and _iso not in bd:
+                    return "⚠️ Лимит 60 дат исчерпан — удалите лишние.", False
+                bd[_iso] = new_bells
+                class_obj.bells_dates = bd
+                classes = load_classes()
+                classes[class_obj.class_code] = class_obj
+                save_classes(classes)
+                try:
+                    _dd = datetime.strptime(_iso, "%Y-%m-%d").strftime("%d.%m.%Y")
+                except ValueError:
+                    _dd = _iso
+                return (f"🔔 Звонки на {_dd} заданы ({len(new_bells)} шт.). "
+                        "В эту дату они заменяют обычные.", True)
             class_obj.bells = new_bells
             classes = load_classes()
             classes[class_obj.class_code] = class_obj
@@ -61405,6 +61728,173 @@ def _parse_bells_bulk(raw):
     return bells, errors
 
 
+# ==================================
+# === ВОЛНА 22.85: ЗВОНКИ ПО ДНЯМ НЕДЕЛИ И ПО ЧИСЛАМ ===
+# ==================================
+# «Можно установить звонки на какие-то дни — разные расписания, пн вт ср чт
+# пт сб вс — или по числам». Механика:
+#   • На день действует ПЕРВЫЙ найденный список: class_obj.bells_dates[дата]
+#     → class_obj.bells_week[день недели] → общие class_obj.bells.
+#   • Список для дня/даты вводится тем же парсером, что «весь список»
+#     (_parse_bells_bulk, БЕЗ ИИ): превью → ✅/❌ → сохранение.
+#   • Ожидание ввода — персистентный флаг user.bells_pending с полем
+#     target («day:5» / «date:YYYY-MM-DD» / «date:new»); переживает рестарт.
+#   • ИИ-путь: действие set_bells с полями "day" / "date" (см. промпт).
+
+_BELL_DAY_SHORT = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+_BELL_DAY_FULL = ["Понедельник", "Вторник", "Среда", "Четверг",
+                  "Пятница", "Суббота", "Воскресенье"]
+_BELL_DAY_ACC = ["понедельник", "вторник", "среду", "четверг",
+                 "пятницу", "субботу", "воскресенье"]   # «в пятницу», «на субботу»
+_BELL_DAY_GEN = ["понедельника", "вторника", "среды", "четверга",
+                 "пятницы", "субботы", "воскресенья"]   # «расписание пятницы»
+_BELL_DAY_DAT = ["понедельнику", "вторнику", "среде", "четвергу",
+                 "пятнице", "субботе", "воскресенью"]   # «к пятнице»
+
+_BELL_DAY_ALIASES = {
+    "пн": 0, "понедельник": 0, "понед": 0, "mon": 0, "monday": 0,
+    "вт": 1, "вторник": 1, "втр": 1, "tue": 1, "tues": 1, "tuesday": 1,
+    "ср": 2, "среда": 2, "среду": 2, "wed": 2, "wednesday": 2,
+    "чт": 3, "четверг": 3, "thu": 3, "thur": 3, "thursday": 3,
+    "пт": 4, "пятница": 4, "пятницу": 4, "fri": 4, "friday": 4,
+    "сб": 5, "суббота": 5, "субботу": 5, "sat": 5, "saturday": 5,
+    "вс": 6, "воскресенье": 6, "воскресение": 6, "sun": 6, "sunday": 6,
+}
+
+
+def _bells_sanitize(raw):
+    '''ВОЛНА 22.85: чистка словаря звонков {"урок": {"start","end"}} из базы
+    или ИИ: ≤15 уроков, номера-цифры 1..15, валидные ЧЧ:ММ, конец позже
+    начала. Возвращает dict или None (пусто).'''
+    if not isinstance(raw, dict):
+        return None
+    out = {}
+    for k, v in raw.items():
+        if len(out) >= 15:
+            break
+        sk = str(k).strip()
+        if not sk.isdigit() or not (1 <= int(sk) <= 15) or not isinstance(v, dict):
+            continue
+        st = str(v.get("start") or "").strip()
+        en = str(v.get("end") or "").strip()
+        try:
+            s_t = datetime.strptime(st, "%H:%M")
+            e_t = datetime.strptime(en, "%H:%M")
+        except ValueError:
+            continue
+        if e_t <= s_t:
+            continue
+        out[str(int(sk))] = {"start": st, "end": en}
+    return out or None
+
+
+def _bells_date_ok(s):
+    '''ВОЛНА 22.85: строка — валидная дата YYYY-MM-DD?'''
+    try:
+        datetime.strptime(str(s or ""), "%Y-%m-%d")
+        return True
+    except ValueError:
+        return False
+
+
+def _bells_day_from_text(txt):
+    '''«пн», «СУББОТУ», «Monday», 5, «5» → номер дня недели (0=Пн) или None.'''
+    if txt is None:
+        return None
+    if isinstance(txt, bool):
+        return None
+    if isinstance(txt, int) and 0 <= txt <= 6:
+        return txt
+    s = str(txt).strip().lower()
+    if s.isdigit():
+        try:
+            v = int(s)
+            return v if 0 <= v <= 6 else None
+        except ValueError:
+            return None
+    s = re.sub(r"[^а-яёa-z]", "", s)
+    return _BELL_DAY_ALIASES.get(s)
+
+
+def _bells_date_from_text(txt):
+    '''«09.10.2026», «09.10», «2026-10-09» → 'YYYY-MM-DD' или None.
+    «ДД.ММ» без года — ближайшая СЛЕДУЮЩАЯ такая дата (или сегодня).'''
+    s = str(txt or "").strip()
+    if not s:
+        return None
+    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d.%m.%y"):
+        try:
+            return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+    m = re.match(r"^(\d{1,2})\.(\d{1,2})$", s)
+    if m:
+        today = datetime.now().date()
+        day_i, mon_i = int(m.group(1)), int(m.group(2))
+        for yr in (today.year, today.year + 1):
+            try:
+                d = date(yr, mon_i, day_i)
+                if d >= today:
+                    return d.strftime("%Y-%m-%d")
+            except ValueError:
+                continue
+    return None
+
+
+def _bells_for_date(class_obj, d):
+    '''Какие звонки действуют на дату d (datetime.date).
+    Возвращает (bells: dict, source: 'date'|'week'|'base').'''
+    if class_obj is None:
+        return {}, "base"
+    bd = getattr(class_obj, "bells_dates", None)
+    if isinstance(bd, dict):
+        rec = bd.get(d.strftime("%Y-%m-%d"))
+        if isinstance(rec, dict) and rec:
+            return rec, "date"
+    bw = getattr(class_obj, "bells_week", None)
+    if isinstance(bw, dict):
+        rec = bw.get(str(d.weekday()))
+        if isinstance(rec, dict) and rec:
+            return rec, "week"
+    bells = getattr(class_obj, "bells", None)
+    if not isinstance(bells, dict):
+        bells = {}
+    return bells, "base"
+
+
+def _bells_overrides_summary(class_obj):
+    '''ВОЛНА 22.85: сводка особых расписаний (дни недели + даты). Пусто —
+    особых нет.'''
+    if class_obj is None:
+        return ""
+    rows = []
+    bw = getattr(class_obj, 'bells_week', None) or {}
+    for i in range(7):
+        rec = bw.get(str(i))
+        if isinstance(rec, dict) and rec:
+            rows.append(f"• {_BELL_DAY_FULL[i]}: {len(rec)} уроков")
+    bd = getattr(class_obj, 'bells_dates', None) or {}
+    for iso in sorted(bd.keys())[:60]:
+        rec = bd.get(iso)
+        if isinstance(rec, dict) and rec and _bells_date_ok(iso):
+            try:
+                _dd = datetime.strptime(iso, "%Y-%m-%d").strftime("%d.%m.%Y")
+            except ValueError:
+                _dd = iso
+            rows.append(f"• {_dd}: {len(rec)} уроков")
+    if not rows:
+        return ""
+    return "Особые расписания:\n" + "\n".join(rows)
+
+
+def _bells_ovr_sort_key(kv):
+    '''Ключ сортировки уроков: «10» → 10, мусор — в конец.'''
+    try:
+        return int(str(kv[0]))
+    except (TypeError, ValueError):
+        return 99
+
+
 # === ВОЛНА 22.74: ФОТО расписания звонков ===
 async def bells_photo_set_start(update: Update,
                                 context: ContextTypes.DEFAULT_TYPE):
@@ -61565,6 +62055,28 @@ async def _bells_bulk_text_handler(update: Update,
         save_user(user)
         await update.message.reply_text("Замена звонков отменена.")
         return
+    # ВОЛНА 22.85: цель замены — общие звонки, день недели или дата.
+    tgt = str(pend.get("target") or "base")
+    if tgt == "date:new":
+        # Первый шаг даты: прислали САМУ ДАТУ.
+        _iso = _bells_date_from_text(raw)
+        if not _iso:
+            await update.message.reply_text(
+                "❓ Не понял дату. Пришлите её в формате ДД.ММ.ГГГГ (или "
+                "ДД.ММ — год подставлю сам), например: 31.12.2026\n"
+                "«отмена» — выйти.")
+            return
+        pend["target"] = f"date:{_iso}"
+        save_user(user)
+        try:
+            _dd = datetime.strptime(_iso, "%Y-%m-%d").strftime("%d.%m.%Y")
+        except ValueError:
+            _dd = _iso
+        await update.message.reply_text(
+            f"📅 Дата: {_dd}. Теперь пришлите список звонков для этой даты "
+            "одним сообщением (например: 1) 8:30-9:15, 2) 9:25-10:10).\n"
+            "«отмена» — выйти.")
+        return
     class_obj = None
     code = None
     try:
@@ -61592,15 +62104,32 @@ async def _bells_bulk_text_handler(update: Update,
             "1) 8:30-9:15\n2 урок: 9:25-10:10")
         return
     context.user_data['bells_bulk'] = bells
+    context.user_data['bells_bulk_target'] = tgt   # ВОЛНА 22.85: цель
     user.bells_pending = None
     save_user(user)
     lines = [f"🔔 Распознал звонков: {len(bells)}."]
-    for l, v in sorted(bells.items(), key=lambda kv: int(kv[0])):
+    for l, v in sorted(bells.items(), key=_bells_ovr_sort_key):
         lines.append(f"• {l} урок: {v['start']}–{v['end']}")
     if errors:
         lines.append(f"\n⚠️ Пропустил непонятных строк: {len(errors)}:")
         lines.extend(f"  {e}" for e in errors[:5])
-    lines.append("\nЗаменить текущие звонки целиком?")
+    # ВОЛНА 22.85: вопрос зависит от цели (день недели / дата / общие).
+    if tgt.startswith("day:"):
+        try:
+            _di = int(tgt.split(":", 1)[1])
+            assert 0 <= _di <= 6
+            lines.append(f"\nПрименить эти звонки к {_BELL_DAY_DAT[_di]}?")
+        except Exception:
+            lines.append("\nПрименить эти звонки к выбранному дню?")
+    elif tgt.startswith("date:"):
+        try:
+            _dd = datetime.strptime(tgt.split(":", 1)[1],
+                                    "%Y-%m-%d").strftime("%d.%m.%Y")
+            lines.append(f"\nПрименить эти звонки к дате {_dd}?")
+        except Exception:
+            lines.append("\nПрименить эти звонки к выбранной дате?")
+    else:
+        lines.append("\nЗаменить текущие звонки целиком?")
     kb = InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ Сохранить", callback_data="bells_bulk_ok"),
         InlineKeyboardButton("❌ Отмена", callback_data="bells_bulk_no"),
@@ -61623,6 +62152,7 @@ async def _bells_bulk_confirm_cb(update: Update,
         return
     if data == "bells_bulk_no":
         context.user_data.pop('bells_bulk', None)
+        context.user_data.pop('bells_bulk_target', None)   # 22.85
         try:
             await query.message.edit_text("Замена звонков отменена.")
         except Exception:
@@ -61640,26 +62170,426 @@ async def _bells_bulk_confirm_cb(update: Update,
         except Exception:
             pass
         return
-    class_obj.bells = {str(k): dict(v) for k, v in bells.items()}
+    _new = {str(k): dict(v) for k, v in bells.items()}
+    _tgt = str(context.user_data.get('bells_bulk_target') or "base")
+    # ВОЛНА 22.85: применяем к цели — день недели / дата / общие звонки.
+    if _tgt.startswith("day:"):
+        _d = _tgt.split(":", 1)[1]
+        if _d not in ("0", "1", "2", "3", "4", "5", "6"):
+            context.user_data.pop('bells_bulk', None)
+            context.user_data.pop('bells_bulk_target', None)
+            try:
+                await query.answer("День устарел — выберите его заново.",
+                                   show_alert=True)
+            except Exception:
+                pass
+            return
+        bw = getattr(class_obj, 'bells_week', None)
+        if not isinstance(bw, dict):
+            bw = {}
+        bw[_d] = _new
+        class_obj.bells_week = bw
+        _label = f"Звонки (на {_BELL_DAY_ACC[int(_d)]})"
+        _done = (f"✅ Звонки на {_BELL_DAY_ACC[int(_d)]} сохранены "
+                 f"({len(_new)} уроков). В остальные дни работают общие.")
+    elif _tgt.startswith("date:"):
+        _iso = _tgt.split(":", 1)[1]
+        if not _bells_date_ok(_iso):
+            context.user_data.pop('bells_bulk', None)
+            context.user_data.pop('bells_bulk_target', None)
+            try:
+                await query.answer("Дата устарела — выберите её заново.",
+                                   show_alert=True)
+            except Exception:
+                pass
+            return
+        bd = getattr(class_obj, 'bells_dates', None)
+        if not isinstance(bd, dict):
+            bd = {}
+        if len(bd) >= 60 and _iso not in bd:
+            context.user_data.pop('bells_bulk', None)
+            context.user_data.pop('bells_bulk_target', None)
+            try:
+                await query.answer("Лимит 60 дат исчерпан — удалите лишние.",
+                                   show_alert=True)
+            except Exception:
+                pass
+            return
+        bd[_iso] = _new
+        class_obj.bells_dates = bd
+        try:
+            _dd = datetime.strptime(_iso, "%Y-%m-%d").strftime("%d.%m.%Y")
+        except ValueError:
+            _dd = _iso
+        _label = f"Звонки на {_dd}"
+        _done = (f"✅ Звонки на {_dd} сохранены ({len(_new)} уроков). "
+                 "В эту дату они заменяют обычные.")
+    else:
+        class_obj.bells = _new
+        _label = "Звонки заменены списком"
+        _done = f"✅ Звонки класса заменены ({len(_new)} уроков)."
     classes = load_classes()
     classes[class_obj.class_code] = class_obj
     save_classes(classes)
     context.user_data.pop('bells_bulk', None)
+    context.user_data.pop('bells_bulk_target', None)
     try:
-        _log_admin_action(uid, class_obj.class_code, "Звонки заменены списком",
-                          f"{len(class_obj.bells)} уроков")
+        _log_admin_action(uid, class_obj.class_code, _label,
+                          f"{len(_new)} уроков")
     except Exception:
         pass
     try:
-        await query.message.edit_text(
-            f"✅ Звонки класса заменены ({len(class_obj.bells)} уроков).\n\n"
-            + get_bells_info(class_obj))
+        await query.message.edit_text(_done + "\n\n" + get_bells_info(class_obj))
     except Exception:
         pass
     try:
         await query.answer()
     except Exception:
         pass
+
+
+# ==================================
+# === ВОЛНА 22.85: ЭКРАНЫ «ПО ДНЯМ» / «ПО ЧИСЛАМ» ===
+# ==================================
+
+async def _bells_days_menu_cb(update, context, class_obj):
+    """Экран «📅 По дням недели»: Пн–Вс по 2 кнопки в ряд, у каждого дня
+    пометка «общие» или «своё (N уроков)»."""
+    query = update.callback_query
+    bw = getattr(class_obj, 'bells_week', None) or {}
+    rows, row = [], []
+    for i in range(7):
+        rec = bw.get(str(i))
+        if isinstance(rec, dict) and rec:
+            row.append(InlineKeyboardButton(
+                f"{_BELL_DAY_SHORT[i]} · своё ({len(rec)})",
+                callback_data=f"bells_day_{i}"))
+        else:
+            row.append(InlineKeyboardButton(
+                f"{_BELL_DAY_SHORT[i]} · общие",
+                callback_data=f"bells_day_{i}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("⬅️ К звонкам", callback_data="edit_bells")])
+    txt = (
+        "📅 <b>Звонки по дням недели</b>\n\n"
+        "Для каждого дня можно задать СВОЙ список звонков: например, в "
+        "субботу — короткий день, в пятницу — длинный. У дня без своего "
+        "расписания работают общие звонки.\n\n"
+        "Выберите день:")
+    try:
+        await query.edit_message_text(
+            txt, reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML)
+    except Exception:
+        try:
+            await context.bot.send_message(
+                chat_id=int(query.from_user.id), text=txt,
+                reply_markup=InlineKeyboardMarkup(rows))
+        except Exception:
+            pass
+    return ADMIN_PANEL
+
+
+async def _bells_dates_menu_cb(update, context, class_obj):
+    """Экран «📆 По числам»: список дат со своими звонками + «добавить»."""
+    query = update.callback_query
+    bd = getattr(class_obj, 'bells_dates', None) or {}
+    rows = []
+    for iso in sorted(bd.keys())[:60]:
+        rec = bd.get(iso)
+        if not (isinstance(rec, dict) and rec) or not _bells_date_ok(iso):
+            continue
+        try:
+            _dt = datetime.strptime(iso, "%Y-%m-%d")
+            _dd = _dt.strftime("%d.%m.%Y")
+            _wd = _BELL_DAY_SHORT[_dt.weekday()]
+        except ValueError:
+            continue
+        rows.append([InlineKeyboardButton(
+            f"📆 {_dd} ({_wd}) — {len(rec)} ур.",
+            callback_data=f"bells_dated_{iso}")])
+    if not rows:
+        txt = ("📆 <b>Звонки по числам</b>\n\n"
+               "Можно задать своё расписание звонков на КОНКРЕТНУЮ дату — "
+               "контрольную, выездное мероприятие, сокращёнку. В эту дату "
+               "звонки заменяют обычные (и расписание дня недели, и общие).")
+    else:
+        txt = ("📆 <b>Звонки по числам</b>\n\n"
+               "У этих дат своё расписание звонков — тапните, чтобы "
+               "посмотреть или изменить:")
+    rows.append([InlineKeyboardButton("➕ Добавить дату", callback_data="bells_dateadd")])
+    rows.append([InlineKeyboardButton("⬅️ К звонкам", callback_data="edit_bells")])
+    try:
+        await query.edit_message_text(
+            txt, reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML)
+    except Exception:
+        try:
+            await context.bot.send_message(
+                chat_id=int(query.from_user.id), text=txt,
+                reply_markup=InlineKeyboardMarkup(rows))
+        except Exception:
+            pass
+    return ADMIN_PANEL
+
+
+async def _bells_day_screen(query, context, class_obj, day_i):
+    """Экран одного дня недели: что действует + кнопки управления."""
+    bw = getattr(class_obj, 'bells_week', None) or {}
+    rec = bw.get(str(day_i))
+    if isinstance(rec, dict) and rec:
+        cur_txt = "\n".join(
+            f"• {l} урок: {v['start']}–{v['end']}"
+            for l, v in sorted(rec.items(), key=_bells_ovr_sort_key))
+        head = (f"📅 <b>{_BELL_DAY_FULL[day_i]}</b> — своё расписание:\n\n"
+                f"{cur_txt}\n\n"
+                "Эти звонки действуют только "
+                f"в {_BELL_DAY_ACC[day_i]}.")
+    else:
+        base = getattr(class_obj, 'bells', None) or {}
+        if base:
+            cur_txt = "\n".join(
+                f"• {l} урок: {v['start']}–{v['end']}"
+                for l, v in sorted(base.items(), key=_bells_ovr_sort_key)
+                if isinstance(v, dict))
+            head = (f"📅 <b>{_BELL_DAY_FULL[day_i]}</b> — работают ОБЩИЕ "
+                    f"звонки:\n\n{cur_txt}\n\n"
+                    f"Задайте свой список, если в {_BELL_DAY_ACC[day_i]} "
+                    "уроки идут по-другому.")
+        else:
+            head = (f"📅 <b>{_BELL_DAY_FULL[day_i]}</b> — общие звонки не "
+                    "заданы. Задайте список для этого дня.")
+    rows = [[InlineKeyboardButton("✍️ Задать своё расписание",
+                                  callback_data=f"bells_dayin_{day_i}")]]
+    if getattr(class_obj, 'bells', None):
+        rows.append([InlineKeyboardButton("📋 Скопировать общие звонки",
+                                          callback_data=f"bells_daycopy_{day_i}")])
+    if isinstance(rec, dict) and rec:
+        rows.append([InlineKeyboardButton("🗑 Убрать своё (вернуть общие)",
+                                          callback_data=f"bells_daydel_{day_i}")])
+    rows.append([InlineKeyboardButton("⬅️ К дням", callback_data="bells_days")])
+    try:
+        await query.edit_message_text(
+            head, reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML)
+    except Exception:
+        try:
+            await context.bot.send_message(
+                chat_id=int(query.from_user.id), text=head,
+                reply_markup=InlineKeyboardMarkup(rows))
+        except Exception:
+            pass
+    return ADMIN_PANEL
+
+
+async def _bells_date_screen(query, context, class_obj, iso):
+    """Экран одной даты: список звонков + управление."""
+    bd = getattr(class_obj, 'bells_dates', None) or {}
+    rec = bd.get(iso)
+    try:
+        _dt = datetime.strptime(iso, "%Y-%m-%d")
+        _dd = _dt.strftime("%d.%m.%Y")
+        _wd = f"{_BELL_DAY_FULL[_dt.weekday()]}"
+    except ValueError:
+        _dd, _wd = iso, ""
+    if isinstance(rec, dict) and rec:
+        cur_txt = "\n".join(
+            f"• {l} урок: {v['start']}–{v['end']}"
+            for l, v in sorted(rec.items(), key=_bells_ovr_sort_key))
+        head = (f"📆 <b>{_dd}</b> ({_wd}) — своё расписание:\n\n{cur_txt}\n\n"
+                "В эту дату звонки заменяют и общие, и расписания дня недели.")
+    else:
+        head = f"📆 <b>{_dd}</b> ({_wd}) — своего расписания нет."
+    rows = [[InlineKeyboardButton("✍️ Задать своё расписание",
+                                  callback_data=f"bells_datein_{iso}")]]
+    if isinstance(rec, dict) and rec:
+        rows.append([InlineKeyboardButton("🗑 Удалить дату",
+                                          callback_data=f"bells_datedel_{iso}")])
+    rows.append([InlineKeyboardButton("⬅️ К датам", callback_data="bells_dates")])
+    try:
+        await query.edit_message_text(
+            head, reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML)
+    except Exception:
+        try:
+            await context.bot.send_message(
+                chat_id=int(query.from_user.id), text=head,
+                reply_markup=InlineKeyboardMarkup(rows))
+        except Exception:
+            pass
+    return ADMIN_PANEL
+
+
+async def _bells_ovr_route(update, context):
+    """ВОЛНА 22.85: маршрутизатор колбэков дней/дат (из handle_callback).
+    data: bells_days | bells_dates | bells_day_<i> | bells_dayin_<i> |
+    bells_daycopy_<i> | bells_daydel_<i> | bells_dateadd |
+    bells_dated_<iso> | bells_datedel_<iso> | bells_datein_<iso>"""
+    query = update.callback_query
+    data = query.data or ""
+    uid = str(query.from_user.id)
+    class_obj = _ct_admin_class(query, context)
+    if class_obj is None:
+        try:
+            await query.answer("Только для админа класса.", show_alert=True)
+        except Exception:
+            pass
+        return ADMIN_PANEL
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+    if data == "bells_days":
+        return await _bells_days_menu_cb(update, context, class_obj)
+    if data == "bells_dates":
+        return await _bells_dates_menu_cb(update, context, class_obj)
+
+    if data.startswith("bells_daydel_"):
+        _d = data.rsplit("_", 1)[1]
+        bw = getattr(class_obj, 'bells_week', None)
+        if isinstance(bw, dict) and _d in bw:
+            bw.pop(_d, None)
+            class_obj.bells_week = bw
+            classes = load_classes()
+            classes[class_obj.class_code] = class_obj
+            save_classes(classes)
+            try:
+                _log_admin_action(uid, class_obj.class_code,
+                                  f"Звонки (на {_BELL_DAY_ACC[int(_d)]})",
+                                  "убраны, работают общие")
+            except Exception:
+                pass
+        return await _bells_days_menu_cb(update, context, class_obj)
+
+    if data.startswith("bells_daycopy_"):
+        _d = data.rsplit("_", 1)[1]
+        base = getattr(class_obj, 'bells', None) or {}
+        if not base:
+            try:
+                await query.answer(
+                    "Общих звонков нет — нечего копировать. Задайте список "
+                    "кнопкой «Задать своё расписание».", show_alert=True)
+            except Exception:
+                pass
+            return ADMIN_PANEL
+        bw = getattr(class_obj, 'bells_week', None)
+        if not isinstance(bw, dict):
+            bw = {}
+        bw[_d] = {str(k): dict(v) for k, v in base.items()}
+        class_obj.bells_week = bw
+        classes = load_classes()
+        classes[class_obj.class_code] = class_obj
+        save_classes(classes)
+        try:
+            _log_admin_action(uid, class_obj.class_code,
+                              f"Звонки (на {_BELL_DAY_ACC[int(_d)]})",
+                              "скопированы из общих")
+        except Exception:
+            pass
+        return await _bells_day_screen(query, context, class_obj, int(_d))
+
+    if data.startswith("bells_dayin_"):
+        _d = data.rsplit("_", 1)[1]
+        if _d not in ("0", "1", "2", "3", "4", "5", "6"):
+            return ADMIN_PANEL
+        user = get_user(uid)
+        if user is None:
+            user = User(uid)
+        user.bells_pending = {"ts": time.time(), "target": f"day:{_d}"}
+        save_user(user)
+        ask = (
+            f"✍️ Пришлите список звонков для {_BELL_DAY_GEN[int(_d)]} одним "
+            "сообщением — они будут работать только "
+            f"в {_BELL_DAY_ACC[int(_d)]}.\n\n"
+            "Понимаю любые формы (номер урока можно не писать — поставлю "
+            "по порядку):\n"
+            "1) 8:30-9:15\n2 урок: 9:25-10:10\n3 10:20 до 11:05\n\n"
+            "Можно одной строкой через запятую.\n\n"
+            "«отмена» — не менять звонки.")
+        try:
+            await query.message.edit_text(ask)
+        except Exception:
+            try:
+                await context.bot.send_message(chat_id=int(uid), text=ask)
+            except Exception:
+                pass
+        return ADMIN_PANEL
+
+    if data == "bells_dateadd":
+        user = get_user(uid)
+        if user is None:
+            user = User(uid)
+        user.bells_pending = {"ts": time.time(), "target": "date:new"}
+        save_user(user)
+        ask = (
+            "📆 Пришлите ДАТУ, для которой нужно своё расписание звонков:\n"
+            "• ДД.ММ.ГГГГ (например, 31.12.2026)\n"
+            "• или ДД.ММ — год подставлю сам (ближайшая будущая дата)\n\n"
+            "«отмена» — выйти.")
+        try:
+            await query.message.edit_text(ask)
+        except Exception:
+            try:
+                await context.bot.send_message(chat_id=int(uid), text=ask)
+            except Exception:
+                pass
+        return ADMIN_PANEL
+
+    if data.startswith("bells_datedel_"):
+        _iso = data.replace("bells_datedel_", "", 1)
+        bd = getattr(class_obj, 'bells_dates', None)
+        if isinstance(bd, dict) and _iso in bd:
+            bd.pop(_iso, None)
+            class_obj.bells_dates = bd
+            classes = load_classes()
+            classes[class_obj.class_code] = class_obj
+            save_classes(classes)
+            try:
+                _dd = datetime.strptime(_iso, "%Y-%m-%d").strftime("%d.%m.%Y")
+                _log_admin_action(uid, class_obj.class_code,
+                                  f"Звонки на {_dd}", "удалены")
+            except Exception:
+                pass
+        return await _bells_dates_menu_cb(update, context, class_obj)
+
+    if data.startswith("bells_dated_"):
+        _iso = data.replace("bells_dated_", "", 1)
+        if not _bells_date_ok(_iso):
+            return ADMIN_PANEL
+        return await _bells_date_screen(query, context, class_obj, _iso)
+
+    if data.startswith("bells_datein_"):
+        _iso = data.replace("bells_datein_", "", 1)
+        if not _bells_date_ok(_iso):
+            return ADMIN_PANEL
+        user = get_user(uid)
+        if user is None:
+            user = User(uid)
+        user.bells_pending = {"ts": time.time(), "target": f"date:{_iso}"}
+        save_user(user)
+        try:
+            _dd = datetime.strptime(_iso, "%Y-%m-%d").strftime("%d.%m.%Y")
+        except ValueError:
+            _dd = _iso
+        ask = (
+            f"✍️ Пришлите список звонков для {_dd} одним сообщением — они "
+            "будут работать только в эту дату.\n\n"
+            "Понимаю любые формы (номер урока можно не писать — поставлю "
+            "по порядку):\n"
+            "1) 8:30-9:15\n2 урок: 9:25-10:10\n3 10:20 до 11:05\n\n"
+            "Можно одной строкой через запятую.\n\n"
+            "«отмена» — не менять звонки.")
+        try:
+            await query.message.edit_text(ask)
+        except Exception:
+            try:
+                await context.bot.send_message(chat_id=int(uid), text=ask)
+            except Exception:
+                pass
+        return ADMIN_PANEL
+
+    return ADMIN_PANEL
 
 
 class _BellsBulkFilter(filters.MessageFilter):
@@ -63024,6 +63954,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data in ("bells_bulk_ok", "bells_bulk_no"):
         # ВОЛНА 22.41: подтверждение/отмена замены звонков списком.
         return await _bells_bulk_confirm_cb(update, context)
+    elif data in ("bells_days", "bells_dates") or data.startswith(
+            ("bells_day_", "bells_dayin_", "bells_daycopy_", "bells_daydel_",
+             "bells_dateadd", "bells_dated_", "bells_datedel_",
+             "bells_datein_")):
+        # ВОЛНА 22.85: расписания звонков по дням недели и по числам.
+        return await _bells_ovr_route(update, context)
     elif data == "set_holidays":
         return await set_holidays_start(update, context)
     elif data == "manage_admins":
@@ -71064,6 +72000,31 @@ def main():
 
             def _mk_busy(_state):
                 async def _upload_busy_reply_h(update, context):
+                    # ВОЛНА 22.85: текст = КНОПКА пользователя (переименованная
+                    # стандартная, личная, глобальная, классная) — ИСПОЛНЯЕМ её,
+                    # а не отписываемся «идёт загрузка». Стандартные кнопки
+                    # уже ловит инжект быстрых команд выше; здесь добираем
+                    # ВСЕ остальные имена кнопок этого пользователя.
+                    try:
+                        _txt = (getattr(update.message, "text", None)
+                                or "").strip()
+                        _uid = str(update.effective_user.id)
+                        _u = get_user(_uid)
+                        if _txt and _u is not None:
+                            _names = set()
+                            try:
+                                _names.update(get_all_user_button_names(_u))
+                            except Exception:
+                                pass
+                            try:
+                                _names.update(
+                                    get_user_button_reverse_map(_u).keys())
+                            except Exception:
+                                pass
+                            if _txt in _names:
+                                return await handle_main_menu(update, context)
+                    except Exception:
+                        pass
                     try:
                         await update.message.reply_text(
                             "⚠️ Сейчас идёт загрузка файлов — бот принимает "
