@@ -2576,6 +2576,13 @@ class User:
         # потом пишет, что нет прав к админке»). Теперь название доведёт
         # глобальный приёмник _cls_pending_text_handler.
         self.cls_pending = None
+        # ВОЛНА 22.86: ОЧЕРЕДЬ «ЖДЁТ ОТПРАВКИ» — файлы, присланные в чат МИМО
+        # режимов (глобальный роутер 22.57), больше НЕ грузятся сразу: они
+        # копятся здесь и уезжают в облако ТОЛЬКО по кнопке «📤 Отправить».
+        # ПЕРСИСТЕНТЕН (TTL 48 ч) — переживает рестарт/деплой бота: после
+        # перезапуска кнопка «📤 Отправить» по-прежнему работает, файлы не
+        # теряются (это указатели file_id, не байты).
+        self.bg_pending = []
         self.birthday = None
         # ВОЛНА 22.28: пропустить ввод ДР больше нельзя — дата обязательна.
         # Флаг остался только для совместимости старых JSON-записей; при
@@ -2819,6 +2826,10 @@ class User:
             'bells_pending': getattr(self, 'bells_pending', None),
             # ВОЛНА 22.67: ожидаемое название класса (переживает рестарт)
             'cls_pending': getattr(self, 'cls_pending', None),
+            # ВОЛНА 22.86: очередь файлов «ждёт отправки» (переживает рестарт)
+            'bg_pending': (getattr(self, 'bg_pending', None)
+                           if isinstance(getattr(self, 'bg_pending', None), list)
+                           else []),
             'birthday': self.birthday,
             'birthday_skipped': getattr(self, 'birthday_skipped', False),
             'show_birthday_countdown': self.show_birthday_countdown,
@@ -2979,6 +2990,10 @@ class User:
                     user.cls_pending = None
             except Exception:
                 user.cls_pending = None
+        # ВОЛНА 22.86: очередь «ждёт отправки» — строгая санитизация (старые
+        # записи без поля / битые структуры не должны ронять загрузку юзера).
+        user.bg_pending = _bg_pending_sanitize_list(
+            getattr(user, 'bg_pending', None))
         # ВОЛНА 22.67: старые записи могли сохранить created_classes=None —
         # create_class_handler падал на .append ДО сохранения класса
         # («класс не создаётся»), молча для пользователя.
@@ -4422,7 +4437,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.85"
+BOT_BUILD = "22.86"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -9333,6 +9348,14 @@ async def _cloud_upload_items(update: Update, context: ContextTypes.DEFAULT_TYPE
     user = get_user(user_id)
     if not user:
         return ConversationHandler.END
+    # ВОЛНА 22.86: загрузка уже идёт — вторую не запускаем (честный ответ
+    # вместо второго прогресса; файлы остаются у вызвавшего потока).
+    if _upl_op_running(user_id) or _vault_op_running(user_id):
+        await msg.reply_text(
+            "⏳ Предыдущая загрузка ещё идёт — подождите её окончания. "
+            "Пришлите эти файлы ещё раз, когда она завершится.",
+            reply_markup=_upl_cancel_kb())
+        return CLOUD_UPLOAD_WAIT
     cloud_ids = get_cloud_channel_ids()
     if not cloud_ids:
         context.user_data.pop('cloud_file_mode', None)
@@ -10098,11 +10121,31 @@ _TG_AUTOSHARE_MARK = {}
 
 async def _bg_upload_items(update, context, items):
     """Сохраняет пачку файлов из чата в облако и пишет ОДИН компактный итог.
-    Вызывается из bg_chat_upload_receive (глобальный роутер 22.57)."""
-    msg = update.message
+    ВОЛНА 22.86: вызывается из bg_pending_send_cb (кнопка «📤 Отправить»);
+    раньше — из bg_chat_upload_receive (глобальный роутер 22.57)."""
+    # ВОЛНА 22.86: кнопка «📤 Отправить» — это КОЛБЭК, у него нет
+    # update.message; отвечать надо в тот же чат — берём сообщение,
+    # под которым лежала очередь.
+    msg = getattr(update, "message", None)
+    if msg is None:
+        _q = getattr(update, "callback_query", None)
+        msg = getattr(_q, "message", None) if _q is not None else None
+    if msg is None:
+        return
     user_id = str(update.effective_user.id)
     user = get_user(user_id)
     if not user:
+        return
+    # ВОЛНА 22.86: повторный старт поверх идущей загрузки невозможен —
+    # честный ответ, файлы остаются у вызвавшего (bgp_send вернёт их
+    # в очередь сам). Гвард страхует и прямые вызовы.
+    if _upl_op_running(user_id) or _vault_op_running(user_id):
+        try:
+            await msg.reply_text(
+                "⏳ Предыдущая загрузка ещё идёт. Как только она закончится — "
+                "нажмите «📤 Отправить» ещё раз.")
+        except Exception:
+            pass
         return
     # ВОЛНА 22.62: автопередача из мини-аппа — работаем максимально тихо:
     # итог в чат БЕЗ звука и пуша (пользователь просил «без оповещений»,
@@ -10203,8 +10246,16 @@ async def _bg_upload_items(update, context, items):
             }
         else:
             # >49 МБ — поток MTProto (до 2 ГБ); недоступен — честный совет.
+            # ВОЛНА 22.86: источник — ИСХОДНОЕ сообщение файла (координаты
+            # сохранены в очереди), а НЕ сообщение-очередь, под которым
+            # лежала кнопка «📤 Отправить».
+            class _SrcMsg:                     # локальный шим chat_id/message_id
+                chat_id = int(item.get("chat_id") or 0)
+                message_id = int(item.get("msg_id") or 0)
+            _src_msg = (_SrcMsg() if _SrcMsg.chat_id and _SrcMsg.message_id
+                        else msg)
             rec = await _bg_upload_big_mtproto(
-                update, context, user, item, msg, live=(user_id, _lk),
+                update, context, user, item, _src_msg, live=(user_id, _lk),
                 upl_op=_op)   # ВОЛНА 22.84: кнопка «Отмена» на прогрессе
             if rec is None:
                 _bg_live_del(user_id, _lk)
@@ -10352,6 +10403,193 @@ async def _bg_upload_items(update, context, items):
             pass
 
 
+# ═══ ВОЛНА 22.86: ОЧЕРЕДЬ «ЖДЁТ ОТПРАВКИ» ═══
+# Файлы, присланные в чат МИМО режимов (глобальный роутер 22.57), больше НЕ
+# улетают в облако сразу. Они копятся в user.bg_pending (ПЕРСИСТЕНТНО —
+# переживает рестарт/деплой бота), а заливка начинается ТОЛЬКО по кнопке
+# «📤 Отправить» (callback bgp_send). «🗑 Очистить» (bgp_clear) сбрасывает
+# очередь, не трогая сообщения в чате — ничего не теряется.
+_BG_PENDING_MAX = 200          # максимум файлов в очереди (остальное — в отказ)
+_BG_PENDING_TTL = 48 * 3600    # файлы ждут не дольше 48 часов
+
+_BG_PENDING_ITEM_KEYS = ("kind", "file_id", "fuid", "size", "mime", "name",
+                         "chat_id", "msg_id", "ts")
+
+
+def _bg_pending_sanitize_list(raw):
+    """Строгая санитизация очереди «ждёт отправки»: только известные ключи,
+    только строки/числа, ≤ _BG_PENDING_MAX штук, TTL-фильтр по ts.
+    Элемент БЕЗ ts считается свежим (не молча теряется)."""
+    if not isinstance(raw, list):
+        return []
+    out = []
+    now = time.time()
+    for it in raw:
+        if not isinstance(it, dict):
+            continue
+        if not str(it.get("file_id") or ""):
+            continue
+        try:
+            _ts = float(it.get("ts") or 0)
+        except (TypeError, ValueError):
+            _ts = 0.0
+        if _ts <= 0:
+            _ts = now
+        if now - _ts > _BG_PENDING_TTL:
+            continue
+        clean = {}
+        for k in _BG_PENDING_ITEM_KEYS:
+            if k not in it:
+                continue
+            v = it[k]
+            if k in ("size", "chat_id", "msg_id"):
+                try:
+                    clean[k] = int(v or 0)
+                except (TypeError, ValueError):
+                    clean[k] = 0
+            elif k == "ts":
+                try:
+                    clean[k] = float(v or 0)
+                except (TypeError, ValueError):
+                    clean[k] = now
+            else:
+                clean[k] = str(v or "")[:300]
+        if clean.get("file_id"):
+            out.append(clean)
+        if len(out) >= _BG_PENDING_MAX:
+            break
+    return out
+
+
+def _bg_pending_clean(user):
+    """Актуальная очередь пользователя: TTL-фильтр + правка поля в профиле."""
+    if user is None:
+        return []
+    items = _bg_pending_sanitize_list(getattr(user, "bg_pending", None))
+    if items != getattr(user, "bg_pending", None):
+        user.bg_pending = items
+    return items
+
+
+def _bg_pending_add(user, items):
+    """Добавляет файлы в очередь. Возвращает (всего_в_очереди, отказано)."""
+    if user is None:
+        return 0, len(items or [])
+    cur = _bg_pending_clean(user)
+    denied = 0
+    for it in (items or []):
+        if not isinstance(it, dict) or not str(it.get("file_id") or ""):
+            continue
+        if len(cur) >= _BG_PENDING_MAX:
+            denied += 1
+            continue
+        rec = dict(it)
+        rec.setdefault("ts", time.time())
+        cur.append(rec)
+    user.bg_pending = cur
+    return len(cur), denied
+
+
+def _bg_pending_take(user):
+    """Забирает ВСЮ очередь (и очищает её). Возвращает список элементов."""
+    if user is None:
+        return []
+    items = _bg_pending_clean(user)
+    user.bg_pending = []
+    return items
+
+
+def _bg_pending_kb(n):
+    """Кнопки очереди: «📤 Отправить (N)» + «🗑 Очистить»."""
+    rows = [[InlineKeyboardButton(
+        f"📤 Отправить ({n})", callback_data="bgp_send")]]
+    rows.append([InlineKeyboardButton("🗑 Очистить очередь",
+                                      callback_data="bgp_clear")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def bg_pending_send_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.86: «📤 Отправить» — заливает ВСЮ очередь «ждёт отправки»
+    в облако (те же честные итоги, «❌ Отмена» и дедуп, что и раньше).
+    Работает из ЛЮБОГО состояния (роут в handle_callback до FSM) и после
+    рестарта бота (очередь персистентна)."""
+    query = update.callback_query
+    user_id = str(query.from_user.id)
+    user = get_user(user_id)
+    if not user:
+        try:
+            await query.answer("Сначала зарегистрируйтесь — /start",
+                               show_alert=True)
+        except Exception:
+            pass
+        return MAIN_MENU
+    # Загрузка уже идёт — очередь НЕ трогаем: файлы останутся ждать.
+    if _upl_op_running(user_id) or _vault_op_running(user_id):
+        try:
+            await query.answer("⏳ Дождитесь окончания текущей загрузки — "
+                               "файлы остались в очереди.", show_alert=True)
+        except Exception:
+            pass
+        return None
+    items = _bg_pending_take(user)
+    if not items:
+        try:
+            await query.answer("Очередь пуста — пришлите файлы в чат, "
+                               "а затем нажмите «📤 Отправить».",
+                               show_alert=True)
+        except Exception:
+            pass
+        return None
+    save_user(user)
+    try:
+        await query.answer(f"📤 Отправляю {len(items)}…", show_alert=False)
+    except Exception:
+        pass
+    # Кнопки на сообщении-очереди больше не нужны (файлы поехали).
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    try:
+        await _bg_upload_items(update, context, items)
+    except Exception as e:
+        logger.error(f"bgp_send: заливка очереди не удалась: {e}")
+        try:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="⚠️ Не удалось отправить файлы — попробуйте ещё раз "
+                     "чуть позже. Файлы вернул в очередь.")
+        except Exception:
+            pass
+        # ВОЛНА 22.86: файлы НЕ теряем — возвращаем их в очередь.
+        _bg_pending_add(user, items)
+        save_user(user)
+    return None
+
+
+async def bg_pending_clear_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.86: «🗑 Очистить» — сбросить очередь без отправки.
+    Сами сообщения с файлами ОСТАЮТСЯ в чате — ничего не теряется."""
+    query = update.callback_query
+    user = get_user(str(query.from_user.id))
+    if user is not None:
+        _bg_pending_take(user)
+        save_user(user)
+    try:
+        await query.answer("Очередь очищена.", show_alert=False)
+    except Exception:
+        pass
+    try:
+        await query.edit_message_text(
+            "🗑 Очередь очищена — файлы не отправлены.\n\n"
+            "Сами сообщения с файлами остались в чате — ничего не потеряно. "
+            "Пришлите их ещё раз или нажмите «📤 Отправить» после новой "
+            "загрузки файлов.")
+    except Exception:
+        pass
+    return None
+
+
 async def bg_chat_upload_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """ВОЛНА 22.57: глобальный роутер «файл в чате = файл в облаке».
 
@@ -10377,6 +10615,11 @@ async def bg_chat_upload_receive(update: Update, context: ContextTypes.DEFAULT_T
     item = _cloud_item_from_message(msg)
     if item is None:
         return None                      # не файл (стикер/локация/контакт) — молча
+    # ВОЛНА 22.86: координаты источника — большому файлу (>49 МБ) они нужны,
+    # чтобы MTProto-поток смог докачать его ПОСЛЕ нажатия «📤 Отправить»
+    # (исходное сообщение могло давно уехать вверх по чату).
+    item["chat_id"] = int(getattr(msg, "chat_id", 0) or 0)
+    item["msg_id"] = int(getattr(msg, "message_id", 0) or 0)
 
     # Альбом/пачка: собираем с дебаунсом (как cloud_upload_receive).
     mgid = getattr(msg, "media_group_id", None)
@@ -10393,16 +10636,43 @@ async def bg_chat_upload_receive(update: Update, context: ContextTypes.DEFAULT_T
     else:
         items = [item]
 
-    try:
-        await _bg_upload_items(update, context, items)
-    except Exception as e:
-        logger.error(f"bg upload: пачка не удалась: {e}")
+    # ═══ ВОЛНА 22.86: ФАЙЛЫ ЖДУТ «📤 ОТПРАВИТЬ» ═══
+    # Раньше пачка уходила в облако СРАЗУ (пользователь видел «Сохраняю…»
+    # посреди ввода файлов). Теперь файлы просто ЖДУТ в персистентной
+    # очереди, а загрузка начинается только по кнопке «📤 Отправить».
+    # Исключение — автопередача мини-аппа (22.62): те файлы уже были
+    # отправлены явно и помечены _TG_AUTOSHARE_MARK; но и они идут через
+    # очередь ЧЕСТНО — итог тот же, просто с тихими сообщениями.
+    _tg_silent = time.time() - _TG_AUTOSHARE_MARK.get(user_id, 0.0) < 900.0
+    if not get_cloud_channel_ids() and not _user_vault_channel(user):
         try:
             await msg.reply_text(
-                "⚠️ Не удалось сохранить файл(ы) в облако — попробуйте "
-                "ещё раз чуть позже.")
+                "❌ Хранилище не настроено — файл не сохранён. Попросите "
+                "разработчика подключить канал, либо подключите СВОЙ: "
+                "🔐 Сейф → 🔗 Моё облако.", disable_notification=_tg_silent)
         except Exception:
             pass
+        return None
+    total, denied = _bg_pending_add(user, items)
+    save_user(user)
+    _names = ", ".join(str(i.get("name") or "файл")[:32] for i in items[:3])
+    if len(items) > 3:
+        _names += f" …и ещё {len(items) - 3}"
+    lines = [f"📎 В очереди на отправку: {total} файл(ов).",
+             f"   • {_names}",
+             "",
+             "Загрузка НЕ начнётся, пока вы не нажмёте «📤 Отправить» — "
+             "до этого момента файлы просто ждут."]
+    if denied:
+        lines.append(f"🚫 {denied} файл(ов) не влезли в очередь "
+                     f"(максимум {_BG_PENDING_MAX}) — отправьте текущую "
+                     "очередь и пришлите их снова.")
+    try:
+        await msg.reply_text("\n".join(lines),
+                             reply_markup=_bg_pending_kb(total),
+                             disable_notification=_tg_silent)
+    except Exception:
+        pass
     return None
 
 
@@ -12154,11 +12424,22 @@ html.low-end .confirm-actions {
   background: var(--drop-active);
 }
 
-.initial-state {
+/* ВОЛНА 22.86: кнопка выбора файлов удалена — зона грузится только как
+   индикатор прогресса. Видимость управляет JS: showDropLoader показывает
+   зону мягко (класс .uploading + keyframes), resetUploadUI прячет её. */
+.drop-zone.uploading {
   display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 4px;
+  animation: softFadeIn 0.45s var(--ease-smooth) both;
+}
+
+html.low-end .drop-zone.uploading {
+  animation: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .drop-zone.uploading {
+    animation: none;
+  }
 }
 
 .upload-filename {
@@ -12272,35 +12553,10 @@ html.low-end .confirm-actions {
 
 }
 
-/* ВОЛНА 22.83: видимая кнопка отмены НА СООБЩЕНИИ ПРОГРЕССА (снизу).
-   Раньше отмена была жестом «2 клика по кольцу» — её никто не находил.
-   Показывается, только пока идёт загрузка (progressWrap.active). */
-.upload-cancel-btn {
-  display: none;
-  align-items: center;
-  justify-content: center;
-  gap: 6px;
-  margin-top: 2px;
-  padding: 8px 18px;
-  border-radius: 12px;
-  border: 1px solid rgba(239, 68, 68, 0.35);
-  background: rgba(239, 68, 68, 0.08);
-  color: #ef4444;
-  font-family: 'Nunito', sans-serif;
-  font-weight: 800;
-  font-size: 13px;
-  cursor: pointer;
-  transition: background 0.25s var(--ease-smooth), transform 0.15s var(--ease-smooth);
-}
-
-.upload-cancel-btn:active {
-  transform: scale(0.96);
-}
-
-.download-progress-wrap.active .upload-cancel-btn {
-  display: inline-flex;
-  animation: softFadeIn 0.4s var(--ease-smooth) both;
-}
+/* ВОЛНА 22.86: кнопка «Отменить и удалить» (uploadCancelBtn) УДАЛЕНА
+   по решению пользователя — отменять загрузку мини-аппа можно жестом
+   «2 клика по кольцу» (handleLoaderClick), а отмены загрузок В БОТЕ
+   живут на сообщении прогресса в чате. CSS-блок кнопки убран целиком. */
 
 .files-container {
   width: 100%;
@@ -14481,7 +14737,7 @@ body.vp-lock {
       <div class="sheet-handle"></div>
     </div>
 
-    <h3 style="font-weight:900;font-size:20px;margin-bottom:4px">Добавление файлов</h3>
+    <h3 style="font-weight:900;font-size:20px;margin-bottom:4px">Отправка файлов</h3>
     <p id="uploadModalInfo" style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:10px;word-break:break-word"></p>
 
     <div id="uploadFileList" style="display:none;padding:10px 12px;background:var(--card-bg);border:1px solid var(--border-color);border-radius:12px;margin-bottom:14px;font-size:12px;font-weight:600;color:var(--subtext-color);max-height:140px;overflow-y:auto"></div>
@@ -14496,24 +14752,16 @@ body.vp-lock {
     </p>
 
     <div style="display:flex;flex-direction:column;gap:8px">
-      <!-- ВОЛНА 22.63: кнопки «Загрузить через Telegram» и «Автопередача
-           в Telegram» УДАЛЕНЫ по просьбе пользователя. Файлы всегда (по
-           умолчанию) летят боту напрямую стримом с момента выбора —
-           никаких переключателей и лишних кнопок. -->
-
-      <button class="sound-item-btn" id="uploadAddBtn" onclick="pickUploadFiles()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
-        <span>Добавить файл</span>
-        <i data-lucide="plus" style="width:18px;height:18px"></i>
-      </button>
+      <!-- ВОЛНА 22.86: кнопки «Добавить файл» и «Добавить ещё» УДАЛЕНЫ по
+           решению пользователя — выбор файлов в мини-аппе больше не нужен,
+           файлы загружаются через бота (чат). Окно осталось для ввода
+           пароля и отправки уже выбранных (недокачанных/повторных) файлов.
+           ВОЛНА 22.63: тумблеры «Загрузить через Telegram» / «Автопередача»
+           удалены ещё раньше — окна выбора в мини-аппе больше нет. -->
 
       <button class="sound-item-btn hidden" id="uploadSendBtn" onclick="confirmUploadFiles()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
         <span>Отправить</span>
         <i data-lucide="send" style="width:18px;height:18px"></i>
-      </button>
-
-      <button class="sound-item-btn hidden" id="uploadMoreBtn" onclick="addMoreUploadFiles()">
-        <span>Добавить ещё</span>
-        <i data-lucide="file-plus" style="width:18px;height:18px"></i>
       </button>
 
       <button class="sound-item-btn" onclick="closeUploadModal()">
@@ -15057,18 +15305,12 @@ body.vp-lock {
     </div>
   </div>
 
-  <div class="drop-zone" id="dropZone" onclick="handleDropZoneClick(event)">
-    <div class="initial-state" id="initialState">
-      <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M4 14.899A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.5 8.242"/>
-        <path d="M12 12v9"/>
-        <path d="m16 16-4-4-4 4"/>
-      </svg>
-
-      <p style="font-weight:800;font-size:15px;color:var(--text-color)">Загрузить файлы</p>
-      <p style="font-weight:600;font-size:12px;color:var(--subtext-color)">нажмите или перетащите файлы сюда</p>
-    </div>
-
+  <!-- ВОЛНА 22.86: зона загрузки — ТОЛЬКО индикатор прогресса.
+       «Загрузить файлы… нажмите или перетащите» (кнопка выбора файлов)
+       удалена по решению пользователя: файлы теперь загружаются через
+       бота (чат). Зона скрыта, пока ничего не грузится, появляется мягко
+       на время передачи (см. showDropLoader/resetUploadUI). -->
+  <div class="drop-zone" id="dropZone" style="display:none">
     <div class="upload-filename" id="uploadFilename"></div>
 
     <div class="download-progress-wrap" id="progressWrap">
@@ -15086,16 +15328,7 @@ body.vp-lock {
       </div>
 
       <p class="download-text" id="downloadText">Загрузка...</p>
-
-      <button type="button" id="uploadCancelBtn" class="upload-cancel-btn" onclick="cancelUpload()">
-        <svg viewBox="0 0 24 24" style="width:14px;height:14px;flex-shrink:0" fill="currentColor" aria-hidden="true">
-          <rect x="6" y="6" width="12" height="12" rx="2"></rect>
-        </svg>
-        <span>Отменить и удалить</span>
-      </button>
     </div>
-
-    <input type="file" id="fileInput" multiple style="display:none">
   </div>
 
   <div class="files-container">
@@ -15107,7 +15340,7 @@ body.vp-lock {
       </div>
 
       <p id="emptyTitle" style="font-weight:800;font-size:16px;color:var(--text-color)">Облако пусто</p>
-      <p id="emptySub" style="font-weight:600;font-size:13px;color:var(--subtext-color);margin-top:2px">Загрузите первые файлы</p>
+      <p id="emptySub" style="font-weight:600;font-size:13px;color:var(--subtext-color);margin-top:2px">Пришлите файлы боту в чат — они появятся здесь</p>
     </section>
   </div>
 
@@ -15230,26 +15463,57 @@ const VIB_PATTERNS = {
   error: [80, 50, 80]
 };
 
+/* 22.86: ДОБАВКА К нативной гаптике для силы «Сильная». Нативные стили
+   Telegram (soft/light/medium/heavy/rigid) на многих Android-устройствах
+   различаются слабо — «регуляция не работает». Честное усиление —
+   короткий явный виброимпульс Vibration API ПОВЕРХ нативного (на iOS
+   navigator.vibrate не существует — там остаётся только нативная гаптика,
+   двойной вибрации не будет; если WebView блокирует Vibration API —
+   вызов просто ничего не сделает, остаётся нативная). */
+function _strongBoost(kind) {
+  try {
+    if (typeof navigator.vibrate !== 'function') return;
+    const base = VIB_PATTERNS[kind];
+    if (typeof base === 'number') {
+      navigator.vibrate(Math.max(30, Math.round(base * 1.8)));
+    } else if (Array.isArray(base)) {
+      navigator.vibrate(base.map((x) => Math.max(30, Math.round(x * 1.8))));
+    } else {
+      navigator.vibrate(55);
+    }
+  } catch (e) {}
+}
+
 function haptic(kind) {
   if (!hapticsEnabled) return;
 
   const hf = tg && tg.HapticFeedback;
   const realTg = !!(hf && !hf.__stub);
 
-  /* 1) Настоящий Telegram-клиент → нативная гаптика (iOS + Android) */
+  /* 1) Настоящий Telegram-клиент → нативная гаптика (iOS + Android).
+     22.86: сила вибрации РЕАЛЬНО влияет на ВСЕ виды отклика:
+     • impact-виды (light/medium/heavy) — стиль по таблице _HAPTIC_IMPACT;
+     • select — раньше был ВЕЧНЫЙ selectionChanged без силы: теперь
+       «Слабая» = мягкий soft-стук, «Средняя» = selectionChanged,
+       «Сильная» = явный medium-стук;
+     • уведомления (success/error/warning) — семантику сохраняем, но при
+       силе «Сильная» добавляем явный виброимпульс (_strongBoost). */
   try {
     if (realTg) {
       if ((kind === 'success' || kind === 'error' || kind === 'warning') &&
           hf.notificationOccurred) {
         hf.notificationOccurred(kind);
-      } else if (kind === 'select' && hf.selectionChanged) {
+        if (hapticsStrength === 'strong') _strongBoost(kind);
+      } else if (kind === 'select' && hapticsStrength === 'normal' &&
+                 hf.selectionChanged) {
         hf.selectionChanged();
       } else if (hf.impactOccurred) {
-        /* 22.85: стиль зависит от силы вибрации */
         const _imap = _HAPTIC_IMPACT[hapticsStrength] || _HAPTIC_IMPACT.normal;
-        hf.impactOccurred(
-          _imap[kind === 'light' ? 'light' : kind === 'heavy' ? 'heavy' : 'medium']
-        );
+        /* 22.86: select — самое лёгкое действие, берём «лёгкий» слот
+           таблицы (light→soft … strong→medium), а не средний. */
+        const _slot = (kind === 'heavy') ? 'heavy'
+          : (kind === 'medium') ? 'medium' : 'light';
+        hf.impactOccurred(_imap[_slot]);
       }
     }
   } catch (e) {}
@@ -15301,7 +15565,7 @@ function updateHapticsUi() {
   });
 }
 
-/* 22.85: один выбор из четырёх — выключена / слабая / средняя / сильная */
+/* 22.85/22.86: один выбор из четырёх — выключена / слабая / средняя / сильная */
 function setHapticsMode(mode) {
   if (mode === 'off') {
     hapticsEnabled = false;
@@ -15314,8 +15578,13 @@ function setHapticsMode(mode) {
   settingsChanged(); /* 22.39: настройки живут в базе */
   updateHapticsUi();
 
-  /* сразу чувствуем, что выбрали */
-  if (hapticsEnabled) haptic('medium');
+  /* 22.86: сразу чувствуем ИМЕННО выбранный уровень — раньше всегда
+     игрался один и тот же haptic('medium'), и «Слабая» от «Средней»
+     не отличались ничем (выглядело как «регуляция не работает»). */
+  if (hapticsEnabled) {
+    haptic(hapticsStrength === 'light' ? 'light'
+      : hapticsStrength === 'strong' ? 'heavy' : 'medium');
+  }
 }
 
 /* легаси: старый тумблер (одиночный тап по строке) → открываем подменю */
@@ -19090,11 +19359,9 @@ document.addEventListener('pointerdown', (e) => {
   }
 });
 
-function handleDropZoneClick(e) {
-  if (isUploading) return;
-
-  openUploadModal();
-}
+/* ВОЛНА 22.86: handleDropZoneClick удалён вместе с кнопкой выбора файлов —
+   зона загрузки больше не открывает окно отправки, она только показывает
+   прогресс (её видимостью управляют showDropLoader/resetUploadUI). */
 
 function handleLoaderClick(e) {
   if (e) e.stopPropagation();
@@ -19828,9 +20095,7 @@ setInterval(ensureScrollUnlocked, 4000);
 function refreshUploadModal() {
   const info = document.getElementById('uploadModalInfo');
   const list = document.getElementById('uploadFileList');
-  const addBtn = document.getElementById('uploadAddBtn');
   const sendBtn = document.getElementById('uploadSendBtn');
-  const moreBtn = document.getElementById('uploadMoreBtn');
   const passRow = document.getElementById('uploadPassRow');
   const plainHint = document.getElementById('uploadPlainHint');
   const passInput = document.getElementById('uploadPassword');
@@ -19839,9 +20104,9 @@ function refreshUploadModal() {
 
   if (info) {
     info.textContent = !has
-      /* ВОЛНА 22.74: автостарт убран — файлы грузятся ТОЛЬКО по кнопке
-         «Отправить». Окно снова «шлюз»: список, пароль, «Отправить». */
-      ? 'Выберите файлы кнопкой ниже, при необходимости укажите пароль — и нажмите «Отправить». Файлы не загружаются, пока вы не нажмёте «Отправить».'
+      /* ВОЛНА 22.86: выбор файлов удалён — окно открывается только с уже
+         выбранными (повторными/недокачанными) файлами. */
+      ? 'Файлы загружаются через бота: пришлите их в чат. Здесь вводится пароль и подтверждается отправка уже выбранных файлов.'
       : pendingFiles.length === 1
         ? (pendingFiles[0].name || 'файл') + ' — ждёт отправки. Загрузка начнётся после нажатия кнопки «Отправить».'
         : 'Выбрано файлов: ' + pendingFiles.length + ' — все ждут отправки. Загрузка начнётся после нажатия кнопки «Отправить».';
@@ -19852,6 +20117,8 @@ function refreshUploadModal() {
       list.style.display = 'none';
       list.innerHTML = '';
     } else {
+      const wasHidden = list.style.display === 'none' || !list.innerHTML;
+
       const rows = pendingFiles.slice(0, 5).map((f, i) =>
         '<div style="display:flex;justify-content:space-between;gap:10px;padding:2px 0">' +
         '<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + escapeHtml(f.name || ('файл ' + (i + 1))) + '</span>' +
@@ -19865,18 +20132,18 @@ function refreshUploadModal() {
       list.innerHTML = rows + more;
       list.style.display = 'block';
 
-      /* ВОЛНА 22.59: список появляется мягко — без «выскакивания» */
-      softReveal(list);
+      /* ВОЛНА 22.59 + фикс 22.86: мягкое появление — ТОЛЬКО когда список
+         реально сменил «скрыт» на «виден». Раньше softReveal перезапускался
+         на КАЖДОЕ обновление окна (каждый новый файл «мигал» всем списком
+         заново) — «анимации дёргаются и накладываются». */
+      if (wasHidden) softReveal(list);
     }
   }
 
-  if (addBtn) addBtn.classList.toggle('hidden', has);
   if (sendBtn) sendBtn.classList.toggle('hidden', !has);
-  if (moreBtn) moreBtn.classList.toggle('hidden', !has);
 
-  /* ВОЛНА 22.63: тумблер автопередачи и подзаголовок кнопки «через
-     Telegram» удалены вместе с самими кнопками — окно загрузки снова
-     простое: пароль, список файлов, «Отправить» / «Добавить ещё». */
+  /* ВОЛНА 22.86: кнопки «Добавить файл»/«Добавить ещё» удалены — их
+     переключатели убраны вместе с ними. */
 
   /* ВОЛНА 22.40: пароль ОБЯЗАТЕЛЕН только когда хранилище шифруется
      (STORAGE_ENCRYPTED === true). Раньше поле становилось обязательным,
@@ -19934,7 +20201,6 @@ function closeUploadModal(e) {
   }
 
   pendingFiles = [];
-  pickerAppend = false;
 
   closeModalEl('uploadModal');
 }
@@ -19995,21 +20261,10 @@ function confirmUploadFiles() {
   openNameChoiceModal();
 }
 
-let pickerAppend = false;
 /* ВОЛНА 22.40: пароль, введённый В ЭТОМ окне загрузки (для режима
    «без шифрования»: ввёл — файл шифруется в Сейф; пусто — обычная загрузка).
    Передаётся В ТЕЛЕ init-запроса — не наследуется от прежних разблокировок. */
 let UPLOAD_PLAIN_PW = '';
-
-function pickUploadFiles() {
-  pickerAppend = false;
-  document.getElementById('fileInput').click();
-}
-
-function addMoreUploadFiles() {
-  pickerAppend = true;
-  document.getElementById('fileInput').click();
-}
 
 /* ═══ ВОЛНА 22.63: ЕДИНЫЙ ПУТЬ ЗАГРУЗКИ — ПРЯМО БОТУ, ВСЕГДА ═══
    Кнопки «Загрузить через Telegram» и «Автопередача в Telegram»
@@ -20020,227 +20275,22 @@ function addMoreUploadFiles() {
    следующем открытии облака, прогресс — в панели передач. Никаких
    переключателей, панелей «поделиться» и переходов в чат. */
 
-/* ═══ ВОЛНА 22.79: СНИФФИНГ ФОРМАТА ПО МАГИЧЕСКИМ БАЙТАМ ═══
-   На Android WebView файлы из галереи часто приходят с пустым type и
-   безымянными («blob») — фото/видео/музыка становились «документом»,
-   а файлы назывались «file.bin». Первые байты честно говорят, что это:
-   JPEG/PNG/GIF/WEBP/BMP/HEIC, MP4/MOV/WEBM/AVI, MP3/WAV/OGG/FLAC/M4A,
-   PDF/ZIP. Плюс дружелюбное имя по типу — «Фото 07.10 14:32.jpg». */
-function devoSniffMime(b) {
-  if (!b || !b.length) return '';
-  const ascii = (off, s) => {
-    for (let i = 0; i < s.length; i++) {
-      if (b[off + i] !== s.charCodeAt(i)) return false;
-    }
-    return true;
-  };
-  if (b.length >= 3 && b[0] === 0xFF && b[1] === 0xD8 && b[2] === 0xFF) return 'image/jpeg';
-  if (b.length >= 4 && b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4E && b[3] === 0x47) return 'image/png';
-  if (b.length >= 6 && ascii(0, 'GIF8')) return 'image/gif';
-  if (b.length >= 12 && ascii(0, 'RIFF') && ascii(8, 'WEBP')) return 'image/webp';
-  if (b.length >= 12 && ascii(0, 'RIFF') && ascii(8, 'AVI ')) return 'video/x-msvideo';
-  if (b.length >= 12 && ascii(0, 'RIFF') && ascii(8, 'WAVE')) return 'audio/wav';
-  if (b.length >= 2 && b[0] === 0x42 && b[1] === 0x4D) return 'image/bmp';
-  if (b.length >= 12 && ascii(4, 'ftyp')) {
-    const brand = String.fromCharCode(b[8] || 0, b[9] || 0, b[10] || 0, b[11] || 0).toLowerCase();
-    if (brand.indexOf('qt') === 0) return 'video/quicktime';
-    if (brand.indexOf('m4a') === 0 || brand.indexOf('m4b') === 0) return 'audio/mp4';
-    if (brand.indexOf('heic') === 0 || brand.indexOf('heix') === 0 ||
-        brand.indexOf('mif1') === 0 || brand.indexOf('heif') === 0) return 'image/heic';
-    return 'video/mp4';
-  }
-  if (b.length >= 4 && b[0] === 0x1A && b[1] === 0x45 && b[2] === 0xDF && b[3] === 0xA3) return 'video/webm';
-  if (b.length >= 4 && ascii(0, 'fLaC')) return 'audio/flac';
-  if (b.length >= 4 && ascii(0, 'OggS')) return 'audio/ogg';
-  if (b.length >= 3 && ascii(0, 'ID3')) return 'audio/mpeg';
-  if (b.length >= 2 && b[0] === 0xFF && (b[1] & 0xE0) === 0xE0) return 'audio/mpeg';
-  if (b.length >= 4 && b[0] === 0x25 && b[1] === 0x50 && b[2] === 0x44 && b[3] === 0x46) return 'application/pdf';
-  if (b.length >= 4 && b[0] === 0x50 && b[1] === 0x4B && (b[2] === 3 || b[2] === 5 || b[2] === 7)) return 'application/zip';
-  return '';
-}
+/* ═══ ВОЛНА 22.86: СНИФФИНГ ФОРМАТА И ЗАГРУЗКА ИЗ МИНИ-АППА УДАЛЕНЫ ═══
+   Функции devoSniffMime/devoMimeExt/devoFriendlyName/devoFixFile и
+   uploadFiles обслуживали кнопку выбора файлов (и drag&drop), которую
+   пользователь просил удалить полностью: файлы загружаются через бота.
+   Тип/имя недокачанных файлов чинятся на сервере (_miniapp_rec_out).
+   Путь подтверждения (пароль + «Отправить») сохранён для повторной
+   отправки недокачанных файлов — см. confirmUploadFiles выше. */
 
-function devoMimeExt(mime) {
-  return ({
-    'image/jpeg': '.jpg', 'image/png': '.png', 'image/gif': '.gif',
-    'image/webp': '.webp', 'image/bmp': '.bmp', 'image/heic': '.heic',
-    'video/mp4': '.mp4', 'video/quicktime': '.mov', 'video/webm': '.webm',
-    'video/x-msvideo': '.avi',
-    'audio/mpeg': '.mp3', 'audio/wav': '.wav', 'audio/ogg': '.ogg',
-    'audio/flac': '.flac', 'audio/mp4': '.m4a',
-    'application/pdf': '.pdf', 'application/zip': '.zip'
-  })[String(mime || '')] || '';
-}
-
-function devoFriendlyName(mime) {
-  const d = new Date();
-  const p = (x) => String(x).padStart(2, '0');
-  const ts = p(d.getDate()) + '.' + p(d.getMonth() + 1) + ' ' +
-    p(d.getHours()) + ':' + p(d.getMinutes());
-  const m = String(mime || '');
-  let base = 'Файл';
-  let ext = devoMimeExt(m);
-
-  if (m.indexOf('image/') === 0) { base = 'Фото'; ext = ext || '.jpg'; }
-  else if (m.indexOf('video/') === 0) { base = 'Видео'; ext = ext || '.mp4'; }
-  else if (m.indexOf('audio/') === 0) { base = 'Аудио'; ext = ext || '.mp3'; }
-  else if (m === 'application/pdf') { base = 'Документ'; ext = '.pdf'; }
-
-  return base + ' ' + ts + ext;
-}
-
-async function devoFixFile(f) {
-  /* Возвращает файл с исправленными type/name (или исходный, если всё ок).
-     File.type — геттер прототипа, поэтому при изменениях создаём новый
-     File/Blob с тем же содержимым (slice не теряет байты). */
-  try {
-    if (!f || !(+f.size)) return f;
-    let head = null;
-
-    try { head = new Uint8Array(await f.slice(0, 24).arrayBuffer()); } catch (eH) { head = null; }
-
-    const sniffed = head ? devoSniffMime(head) : '';
-    const curType = (String(f.type || '') === 'application/octet-stream')
-      ? '' : String(f.type || '');
-    const mime = sniffed || curType;
-    const name = String(f.name || '');
-    let newName = name;
-    let needNew = false;
-
-    if (!name || name === 'blob') {
-      newName = devoFriendlyName(mime);
-      needNew = true;
-    } else if (!/\.[a-z0-9]{1,8}$/i.test(name)) {
-      const ext = devoMimeExt(mime);
-      if (ext) { newName = name + ext; needNew = true; }
-    }
-
-    if (mime && mime !== curType) needNew = true;
-    if (!needNew) return f;
-
-    const type = mime || 'application/octet-stream';
-    const keepName = newName || name || 'file';
-
-    try {
-      return new File([f], keepName, {
-        type: type,
-        lastModified: f.lastModified || Date.now()
-      });
-    } catch (eF) {
-      try {
-        const nb = new Blob([f], { type: type });
-        nb.name = keepName;
-        nb.lastModified = f.lastModified || Date.now();
-        return nb;
-      } catch (eB) { return f; }
-    }
-  } catch (e) { return f; }
-}
-
-async function uploadFiles(fileList) {
-  let files = Array.from(fileList);
-
-  if (!files.length) return;
-
-  /* ═══ ВОЛНА 22.79: ТИП И ИМЯ ЧИНЯТСЯ СРАЗУ ПРИ ВЫБОРЕ ═══
-     На Android WebView часто отдаёт файлы без mime (type='') и с
-     безымянным name («blob», без расширения) — фото/видео/музыка
-     превращались в «документ», а файлы назывались «file.bin». Читаем
-     первые байты и распознаём формат по магической сигнатуре, имя
-     достраиваем честным «Фото 07.10 14:32.jpg». */
-  try {
-    files = await Promise.all(files.map((f) => devoFixFile(f)));
-  } catch (eFix) { /* чиним, как получилось */ }
-
-  if (!files.length) return;
-
-  /* 22.39: пустые файлы (0 Б) не грузим вообще — «такого не должно быть»
-     (сервер их отвергает, клиент отсекает сразу с честным тостом) */
-  const empty = files.filter((f) => !+f.size);
-
-  if (empty.length) {
-    showToast('⚠️ Пустых файлов (0 Б): ' + empty.length +
-      ' — пропущены. Перекачайте их заново.');
-  }
-
-  files = files.filter((f) => +f.size);
-
-  if (!files.length) return;
-
-  /* ВОЛНА 22.49: раньше файлы, выбранные ВО ВРЕМЯ активной загрузки, молча
-     пропадали (return без тоста) — пользователь думал, что «не сработало».
-     ВОЛНА 22.68: теперь они СНАЧАЛА сохраняются в очередь докачки (IndexedDB),
-     и сразу после окончания текущей пачки движок сам подхватит их
-     (soft-resume) — «дождитесь окончания» больше не означает «потеряйте». */
-  if (files.length && isUploading) {
-    for (const f of files) {
-      if (f._entryKey || (+f.size || 0) > UPQ_MAX_PERSIST) continue;
-
-      const k = 'up_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
-
-      f._entryKey = k;
-
-      upqPut({
-        k: k, blob: f, name: f.name, uploadName: f.uploadName || f.name,
-        size: +f.size || 0, mime: f.type || '', uploadId: '', added: Date.now()
-      });
-    }
-
-    showToast('⏳ Дождитесь окончания текущей загрузки — эти ' + files.length +
-      ' файл(ов) в очереди и полетят следом');
-    return;
-  }
-
-  /* ВОЛНА 22.63: автопередача (панель «поделиться») удалена — выбор
-     файлов сразу запускает ПРЯМОЙ стрим боту ниже: очередь IndexedDB,
-     prestreamInitAll, prestreamStart. Всё включено по умолчанию. */
-
-  const modalOpen = !!(document.getElementById('uploadModal') || {}).classList &&
-    document.getElementById('uploadModal').classList.contains('open');
-
-  /* ВОЛНА 22.54: файлы сохраняются в очередь докачки (IndexedDB) ПРЯМО В
-     МОМЕНТ ВЫБОРА — раньше запись происходила только после всех окон
-     (пароль + имя), и закрытие мини аппа до старта загрузки теряло файлы
-     целиком. Теперь даже внезапное закрытие на любом шаге оставляет файл
-     в очереди: при следующем открытии мини апп сам предложит докачку. */
-  for (const f of files) {
-    if (f._entryKey) continue;
-
-    if ((+f.size || 0) > UPQ_MAX_PERSIST) {
-      f._entryKey = '';
-      continue;
-    }
-
-    const k = 'up_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
-
-    f._entryKey = k;
-
-    upqPut({
-      k: k, blob: f, name: f.name, uploadName: f.uploadName || f.name,
-      size: +f.size || 0, mime: f.type || '', uploadId: '', added: Date.now()
-    });
-  }
-
-  if (pickerAppend && modalOpen) {
-    pendingFiles = pendingFiles.concat(files);
-    refreshUploadModal();
-  } else {
-    pendingFiles = files;
-    openUploadModal();
-  }
-
-  /* ═══ ВОЛНА 22.74: ЗАГРУЗКА ТОЛЬКО ПО КНОПКЕ «ОТПРАВИТЬ» ═══
-     Раньше (22.59–22.65) байты летели боту С МОМЕНТА ВЫБОРА и тост
-     сообщал «Файлы сразу пошли боту». По решению пользователя автостарт
-     УБРАН: выбранные файлы просто ждут в окне, а передача начинается
-     по кнопке «Отправить» (confirmUploadFiles → prestreamStart).
-     Закрытие окна до «Отправить» НЕ отправляет файлы. */
-  pickerAppend = false;
-}
-
-/* ─── UI загрузки: кольцо в зоне «Загрузить файлы» (как в эталоне) ───
+/* ─── UI загрузки: кольцо в зоне прогресса ───
+   ВОЛНА 22.86: зона больше не «кнопка выбора файлов», а ТОЛЬКО индикатор:
+   скрыта, пока ничего не грузится; появляется мягко на время передачи.
    Имя файла над кольцом, «Загрузка...» под ним, 1 клик — пауза, 2 — отмена */
+let _zoneHideT = null;
+
 function showDropLoader(files) {
-  const initial = document.getElementById('initialState');
+  const zone = document.getElementById('dropZone');
   const filenameEl = document.getElementById('uploadFilename');
   const wrap = document.getElementById('progressWrap');
   const bar = document.getElementById('progressBar');
@@ -20261,12 +20311,20 @@ function showDropLoader(files) {
   filenameEl.style.display = 'block';
   softReveal(filenameEl);   /* 22.59: имя файла появляется мягко */
 
-  initial.style.display = 'none';
+  /* 22.86: зона проявляется мягко (класс .uploading несёт keyframes
+     softFadeIn — играют при первом рендере). Отложенное скрытие предыдущей
+     пачки отменяем, чтобы гонка «прячу → показываю» не мигала зоной. */
+  if (zone) {
+    clearTimeout(_zoneHideT);
+    _zoneHideT = null;
+    zone.style.opacity = '';
+    zone.style.transition = '';
+    if (!zone.classList.contains('uploading')) {
+      zone.classList.add('uploading');   // анимация — только на ПЕРВОМ показе
+    }
+    zone.style.display = 'flex';
+  }
   wrap.classList.add('active');
-
-  /* 22.85: кнопка отмены видна ровно пока идёт пачка */
-  const _ucb = document.getElementById('uploadCancelBtn');
-  if (_ucb) _ucb.style.display = '';
 
   bar.classList.remove('success');
   bar.style.strokeDasharray = '157';
@@ -20559,26 +20617,33 @@ function sleepMs(ms) {
 }
 
 function resetUploadUI(bar, checkmark, squareStop) {
-  const initial = document.getElementById('initialState');
+  const zone = document.getElementById('dropZone');
   const filenameEl = document.getElementById('uploadFilename');
   const wrap = document.getElementById('progressWrap');
 
   const circumference = 157;
 
   wrap.classList.remove('active');
-  /* 22.85: «Отменить и удалить» исчезает СРАЗУ по завершении пачки —
-     кнопка не должна висеть над пустой зоной загрузки */
-  const _ucb = document.getElementById('uploadCancelBtn');
-  if (_ucb) _ucb.style.display = 'none';
   filenameEl.style.display = 'none';
-  initial.style.display = 'flex';
 
-  /* ВОЛНА 22.56: зона загрузки мягко возвращается после завершения пачки —
-     раньше «выскакивала» рывком */
-  if (!LOW_END && !REDUCED_MOTION) {
-    initial.classList.remove('fade-soft-in');
-    void initial.offsetWidth;
-    initial.classList.add('fade-soft-in');
+  /* ВОЛНА 22.86: кнопки выбора файлов больше нет — после пачки зона
+     прогресса МЯГКО прячется целиком (opacity → display:none). Раньше
+     здесь «выскакивало» пустое приглашение «Загрузить файлы». */
+  if (zone) {
+    if (LOW_END || REDUCED_MOTION) {
+      zone.classList.remove('uploading');
+      zone.style.display = 'none';
+    } else {
+      zone.style.transition = 'opacity 0.3s var(--ease-smooth)';
+      zone.style.opacity = '0';
+      _zoneHideT = setTimeout(() => {
+        _zoneHideT = null;
+        zone.classList.remove('uploading');
+        zone.style.display = 'none';
+        zone.style.opacity = '';
+        zone.style.transition = '';
+      }, 320);
+    }
   }
 
   if (bar) {
@@ -21886,25 +21951,14 @@ async function uploadEngine(bar) {
   }, 1200);
 }
 
-document.getElementById('fileInput').addEventListener('change', (e) => {
-  if (e.target.files?.length) uploadFiles(e.target.files);
-
-  e.target.value = '';
-});
-
-const dz = document.getElementById('dropZone');
-
-['dragenter', 'dragover'].forEach((ev) =>
-  dz.addEventListener(ev, (e) => e.preventDefault())
-);
-
-['dragleave', 'drop'].forEach((ev) =>
-  dz.addEventListener(ev, (e) => e.preventDefault())
-);
-
-dz.addEventListener('drop', (e) => {
-  if (e.dataTransfer?.files?.length) uploadFiles(e.dataTransfer.files);
-});
+/* ═══ ВОЛНА 22.86: ВЫБОР ФАЙЛОВ В МИНИ-АППЕ УДАЛЁН ═══
+   Кнопка «Добавить файл»/«Добавить ещё», скрытый <input type=file>,
+   drag&drop и функции pickUploadFiles/addMoreUploadFiles/uploadFiles
+   (со сниффером devoSniffMime/devoFixFile) удалены по решению
+   пользователя: файлы загружаются через бота — «кнопка выбора файлов
+   больше не нужна, удали её полностью». Путь подтверждения (пароль +
+   «Отправить» → confirmUploadFiles) сохранён для повторной отправки
+   недокачанных файлов и ввода пароля после safe_locked. */
 
 const blobSpeedInput = document.getElementById('blobSpeedInput');
 if (blobSpeedInput) blobSpeedInput.value = blobIdleSpeed;
@@ -35451,6 +35505,12 @@ async def vault_put_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user:
         await query.answer("Сначала зарегистрируйтесь — /start", show_alert=True)
         return MAIN_MENU
+    # ВОЛНА 22.86: заливка уже идёт — новую сессию «Положить» не открываем
+    # (иначе кнопка СТИРАЛА бы пачку работающей загрузки и путала шаги).
+    if _vault_op_running(str(getattr(user, "user_id", "") or "")):
+        await query.answer("⏳ Загрузка ещё идёт — подождите итог, потом "
+                           "положите новые файлы.", show_alert=True)
+        return None
     # ВОЛНА 22.20: если общего хранилища нет, но у пользователя подключён
     # СВОЙ канал — Сейф полностью работает и без разработчика.
     if not get_cloud_channel_ids() and not _user_vault_channel(user):
@@ -35725,6 +35785,14 @@ async def vault_put_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop('vault_put_mode', None)
         await msg.reply_text("Сначала зарегистрируйтесь — отправьте /start.")
         return ConversationHandler.END
+    # ВОЛНА 22.86: заливка Сейфа уже идёт — файл НЕ подмешиваем в пачку
+    # (она принадлежит работающему циклу), честно объясняем.
+    if _vault_op_running(user_id):
+        await msg.reply_text(
+            "⏳ Предыдущая загрузка Сейфа ещё идёт — этот файл я НЕ добавил "
+            "в неё, чтобы ничего не сломать. Пришлите его снова, когда "
+            "загрузка завершится (итог придёт сам).")
+        return VAULT_PUT_WAIT
     if not get_cloud_channel_ids() and not _user_vault_channel(user):
         context.user_data.pop('vault_put_mode', None)
         await msg.reply_text(
@@ -36312,6 +36380,12 @@ async def vault_done_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user:
         await query.answer("Сначала зарегистрируйтесь — /start", show_alert=True)
         return MAIN_MENU
+    # ВОЛНА 22.86: заливка уже идёт — «Готово» не открывает вторую цепочку
+    # шагов поверх неё.
+    if _vault_op_running(str(getattr(user, "user_id", "") or "")):
+        await query.answer("⏳ Загрузка ещё идёт — подождите итог.",
+                           show_alert=True)
+        return None
     batch = context.user_data.get('vault_batch')
     if not isinstance(batch, list) or not batch:
         await query.answer(
@@ -36471,6 +36545,18 @@ async def vault_tags_receive(update: Update,
             reply_markup=get_main_menu_keyboard(user) if user else None,
         )
         return MAIN_MENU
+    # ВОЛНА 22.86: КНОПКА — это действие, а не теги. Раньше нажатие любой
+    # кнопки в шаге тегов съедалось как «теги» и ЗАПУСКАЛО ЗАЛИВКУ —
+    # пользователь вместо меню получал «☁️ Заливаю в ваш канал 0/1 🌑»
+    # («показывает экран загрузки вместо нормального ответа»).
+    if _text_is_user_button(msg.text, user):
+        return await handle_main_menu(update, context)
+    # ВОЛНА 22.86: заливка уже идёт — теги не съедаем, честно отвечаем.
+    if _vault_op_running(str(getattr(user, "user_id", "") or "")):
+        await msg.reply_text(
+            "⏳ Загрузка ещё идёт — подождите итог. Это сообщение я приняла "
+            "не как теги, а просто как заметку: ничего не потеряно.")
+        return VAULT_TAGS_WAIT
     tags = _vault_parse_tags(msg.text)
     if not tags:
         await msg.reply_text(
@@ -36494,6 +36580,13 @@ async def vault_tagskip_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("Сессия загрузки потеряна. Начните заново.",
                            show_alert=True)
         return MAIN_MENU
+    # ВОЛНА 22.86: заливка уже идёт — повторное «Пропустить» не запускает
+    # вторую заливку (гвард продублирован в _vault_plain_upload, но здесь
+    # отвечаем сразу, без лишнего шага).
+    if _vault_op_running(str(getattr(user, "user_id", "") or "")):
+        await query.answer("⏳ Загрузка ещё идёт — подождите итог.",
+                           show_alert=True)
+        return None
     context.user_data['vault_batch_tags'] = []
     # ВОЛНА 22.25: режим «БЕЗ шифрования» — пароль не нужен, заливаем сразу.
     if _user_vault_channel(user) is not None and _vault_channel_plain(user):
@@ -37103,14 +37196,19 @@ async def vault_put_password(update: Update, context: ContextTypes.DEFAULT_TYPE)
     msg = update.message
     user_id = str(update.effective_user.id)
     user = get_user(user_id)
-    # ВОЛНА 22.3: прямо сейчас идёт шифрование/загрузка Сейфа? Тогда «Отмена»
-    # ТОЛЬКО ставит флаг отмены и не трогает user_data — им владеет работающий
-    # процесс; зачистку и честный отчёт сделает сам цикл шифрования.
+    # ВОЛНА 22.86: КНОПКА во время шага пароля — это ДЕЙСТВИЕ. Исполняем её
+    # (не сжигаем попытку пароля и не отменяем идущую заливку!).
+    if _text_is_user_button(msg.text, user):
+        return await handle_main_menu(update, context)
+    # ВОЛНА 22.3/22.86: прямо сейчас идёт шифрование/загрузка Сейфа?
+    # Раньше ЛЮБОЙ текст здесь ОТМЕНЯЛ операцию (нажатие кнопки убивало
+    # заливку). Теперь произвольный текст НЕ отменяет: честно отвечаем.
+    # Настоящая отмена — кнопка/слово «отмена»: их ловит глобальный
+    # перехватчик отмены (инжект выше по списку хендлеров).
     if _vault_op_running(user_id):
-        _VAULT_OPS[user_id]["event"].set()
         await msg.reply_text(
-            "⛔ Останавливаю шифрование/загрузку — секунду, подчищу всё "
-            "недогруженное…")
+            "⏳ Загрузка ещё идёт — подождите итог. Отменить её можно "
+            "кнопкой «❌ Отмена» или словом «отмена».")
         return VAULT_PUT_PASSWORD
     batch = context.user_data.get('vault_batch')
     if not user or not isinstance(batch, list) or not batch:
@@ -37404,6 +37502,16 @@ async def _vault_encrypt_batch(msg, context, user, password):
     batch = context.user_data.get('vault_batch') or []
     # ВОЛНА 13: читаем название ДО чистки user_data ниже.
     _batch_label = str(context.user_data.get('vault_batch_label') or "").strip()[:80]
+    # ВОЛНА 22.86: ЗАЛИВКА УЖЕ ИДЁТ — вторую не запускаем (та же защита,
+    # что и в _vault_plain_upload: без неё нажатие кнопки в шаге пароля
+    # запускало ВТОРУЮ заливку поверх первой).
+    if _vault_op_running(str(getattr(user, "user_id", "") or "")):
+        await msg.reply_text(
+            "⏳ Предыдущая загрузка Сейфа ещё идёт — подождите пару минут, "
+            "она сама пришлёт итог. Новых файлов не теряю: пришлите их "
+            "снова после завершения.",
+            reply_markup=get_main_menu_keyboard(user))
+        return MAIN_MENU
     # ВОЛНА 22.3: операция (для честной отмены) + ЖИВАЯ анимация прогресса
     # вместо статичного текста — пользователь видит, что всё грузится.
     op = _vault_op_begin(getattr(user, "user_id", "") or "", len(batch))
@@ -37919,6 +38027,18 @@ async def _vault_plain_upload(msg, context, user, note=""):
             "❌ Режим «без шифра» работает только с ВАШИМ каналом, а он не "
             "подключён — незашифрованные файлы в общее хранилище бота я не "
             "принимаю. Подключите канал: 🔐 Сейф → 🔗 Моё облако.",
+            reply_markup=get_main_menu_keyboard(user))
+        return MAIN_MENU
+    # ВОЛНА 22.86: ЗАЛИВКА УЖЕ ИДЁТ — вторую не запускаем. Раньше любое
+    # нажатие кнопки/текст в шаге тегов заново вызывали заливку: появлялось
+    # ВТОРОЕ сообщение «☁️ Заливаю в ваш канал (БЕЗ шифра) 0/1 …», две
+    # заливки конкурировали за одну пачку, и бот выглядел зависшим.
+    _vuid = str(getattr(user, "user_id", "") or "")
+    if _vault_op_running(_vuid):
+        await msg.reply_text(
+            "⏳ Предыдущая загрузка Сейфа ещё идёт — подождите пару минут, "
+            "она сама пришлёт итог. Новых файлов не теряю: пришлите их "
+            "снова после завершения.",
             reply_markup=get_main_menu_keyboard(user))
         return MAIN_MENU
     op = _vault_op_begin(getattr(user, "user_id", "") or "", len(batch))
@@ -45206,6 +45326,34 @@ async def handle_quick_command(update: Update, context: ContextTypes.DEFAULT_TYP
     и вернёт корректное новое состояние разговора.
     """
     return await handle_main_menu(update, context)
+
+
+def _text_is_user_button(text, user) -> bool:
+    """ВОЛНА 22.86: текст = НАЗВАНИЕ КНОПКИ этого пользователя?
+    Учитываются ВСЕ имена: стандартные (QUICK_COMMANDS), переименованные
+    стандартные, личные, глобальные и классные кнопки. Используется
+    состояними приёма файлов/тегов/пароля Сейфа (там, где быстрые команды
+    НЕ инжектируются, потому что текст = данные): нажатие КНОПКИ обязано
+    исполниться, а не съесться как теги/пароль/заметка."""
+    _txt = str(text or "").strip()
+    if not _txt or user is None:
+        return False
+    try:
+        if _txt in set(QUICK_COMMANDS):
+            return True
+    except Exception:
+        pass
+    try:
+        if _txt in set(get_all_user_button_names(user)):
+            return True
+    except Exception:
+        pass
+    try:
+        if _txt in set(get_user_button_reverse_map(user).keys()):
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def build_quick_commands_pattern():
@@ -62950,6 +63098,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # entry_points стоит безпаттерновый CallbackQueryHandler(handle_callback)
     # — он перехватывал btnfiles_* ДО _btn_files_cb_router, маршрута не
     # находил, и «❌ Отмена / ✅ Готово» молча ничего не делали.
+    if data in ("bgp_send", "bgp_clear"):
+        # ВОЛНА 22.86: очередь «ждёт отправки» — маршрутизируем ЗДЕСЬ,
+        # до всех FSM-маршрутов: кнопка работает из ЛЮБОГО состояния
+        # (в том числе во время других процессов и после рестарта бота).
+        # Свои answer() колбэки делают сами (тост «Отправляю N…» доходит).
+        if data == "bgp_send":
+            return await bg_pending_send_cb(update, context)
+        return await bg_pending_clear_cb(update, context)
     if data in ("btnfiles_cancel", "btnfiles_done", "btnfiles_skip", "upl_cancel"):
         # Гасим спиннер сразу: дальше общего query.answer() не будет
         # (маршруты ниже завершают обработку раньше него).
@@ -72000,29 +72156,18 @@ def main():
 
             def _mk_busy(_state):
                 async def _upload_busy_reply_h(update, context):
-                    # ВОЛНА 22.85: текст = КНОПКА пользователя (переименованная
-                    # стандартная, личная, глобальная, классная) — ИСПОЛНЯЕМ её,
-                    # а не отписываемся «идёт загрузка». Стандартные кнопки
-                    # уже ловит инжект быстрых команд выше; здесь добираем
-                    # ВСЕ остальные имена кнопок этого пользователя.
+                    # ВОЛНА 22.85/22.86: текст = КНОПКА пользователя
+                    # (стандартная, переименованная, личная, глобальная,
+                    # классная) — ИСПОЛНЯЕМ её, а не отписываемся «идёт
+                    # загрузка» (общий хелпер _text_is_user_button).
                     try:
                         _txt = (getattr(update.message, "text", None)
                                 or "").strip()
                         _uid = str(update.effective_user.id)
                         _u = get_user(_uid)
-                        if _txt and _u is not None:
-                            _names = set()
-                            try:
-                                _names.update(get_all_user_button_names(_u))
-                            except Exception:
-                                pass
-                            try:
-                                _names.update(
-                                    get_user_button_reverse_map(_u).keys())
-                            except Exception:
-                                pass
-                            if _txt in _names:
-                                return await handle_main_menu(update, context)
+                        if _txt and _u is not None and _text_is_user_button(
+                                _txt, _u):
+                            return await handle_main_menu(update, context)
                     except Exception:
                         pass
                     try:
