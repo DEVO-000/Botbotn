@@ -1119,6 +1119,36 @@ html.low-end .confirm-actions {
 
 }
 
+/* ВОЛНА 22.83: видимая кнопка отмены НА СООБЩЕНИИ ПРОГРЕССА (снизу).
+   Раньше отмена была жестом «2 клика по кольцу» — её никто не находил.
+   Показывается, только пока идёт загрузка (progressWrap.active). */
+.upload-cancel-btn {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  margin-top: 2px;
+  padding: 8px 18px;
+  border-radius: 12px;
+  border: 1px solid rgba(239, 68, 68, 0.35);
+  background: rgba(239, 68, 68, 0.08);
+  color: #ef4444;
+  font-family: 'Nunito', sans-serif;
+  font-weight: 800;
+  font-size: 13px;
+  cursor: pointer;
+  transition: background 0.25s var(--ease-smooth), transform 0.15s var(--ease-smooth);
+}
+
+.upload-cancel-btn:active {
+  transform: scale(0.96);
+}
+
+.download-progress-wrap.active .upload-cancel-btn {
+  display: inline-flex;
+  animation: softFadeIn 0.4s var(--ease-smooth) both;
+}
+
 .files-container {
   width: 100%;
   margin-top: 6px;
@@ -3007,7 +3037,7 @@ body.vp-lock {
 
       <button class="play-btn" id="mpPlayBtn" title="Воспроизвести" aria-label="Воспроизвести">
         <svg id="mpPlayIcon" viewBox="0 0 24 24">
-          <path d="M8 5.14v13.72a1 1 0 0 0 1.5.86l10.5-6.86a1 1 0 0 0 0-1.72L9.5 4.28A1 1 0 0 0 8 5.14z"/>
+          <path d="M6 5.14v13.72a1 1 0 0 0 1.5.86l10.5-6.86a1 1 0 0 0 0-1.72L7.5 4.28A1 1 0 0 0 6 5.14z"/>
         </svg>
       </button>
 
@@ -3134,14 +3164,9 @@ body.vp-lock {
         <i data-lucide="eye" style="width:18px;height:18px"></i>
       </button>
 
-      <button class="sound-item-btn" onclick="saveFileName()">
-        <span>Сохранить имя</span>
+      <button class="sound-item-btn" onclick="saveFileNameAndDesc()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
+        <span>Сохранить имя и описание</span>
         <i data-lucide="check" style="width:18px;height:18px"></i>
-      </button>
-
-      <button class="sound-item-btn" onclick="saveCurrentDescription()">
-        <span>Сохранить описание</span>
-        <i data-lucide="square-pen" style="width:18px;height:18px"></i>
       </button>
 
       <button class="sound-item-btn" id="modalToSafeBtn" onclick="toSafeCurrentFile()">
@@ -3363,10 +3388,10 @@ body.vp-lock {
     <div style="display:flex;flex-direction:column;gap:8px">
       <button class="sound-item-btn" onclick="chooseNameMode('album')" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
         <div style="text-align:left">
-          <div style="font-weight:800">Назвать альбомом</div>
-          <div style="font-size:11px;opacity:0.7;margin-top:2px">Одно имя для всех: Имя 1, Имя 2, ...</div>
+          <div style="font-weight:800">Создать альбом</div>
+          <div style="font-size:11px;opacity:0.7;margin-top:2px">Файлы попадут в новую папку с общим именем</div>
         </div>
-        <i data-lucide="layers" style="width:18px;height:18px"></i>
+        <i data-lucide="folder-plus" style="width:18px;height:18px"></i>
       </button>
 
       <button class="sound-item-btn" onclick="chooseNameMode('each')">
@@ -3399,10 +3424,15 @@ body.vp-lock {
 
     <div style="margin-bottom:14px">
       <label style="font-size:11px;font-weight:800;color:var(--subtext-color);text-transform:uppercase;letter-spacing:0.04em">Новое название</label>
-      <input type="text" id="nameModalInput" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;margin-top:4px;outline:none;font-size:15px" placeholder="Оставьте пустым для оригинала">
+      <input type="text" id="nameModalInput" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;margin-top:4px;outline:none;font-size:15px;transition:border-color 0.3s var(--ease-smooth)" placeholder="Оставьте пустым для оригинала" onfocus="this.style.borderColor='var(--btn-bg)'" onblur="this.style.borderColor='var(--border-color)'">
     </div>
 
-    <p id="nameModalOriginal" style="font-size:12px;font-weight:600;color:var(--subtext-color);margin-bottom:16px;word-break:break-all"></p>
+    <p id="nameModalOriginal" style="font-size:12px;font-weight:600;color:var(--subtext-color);margin-bottom:14px;word-break:break-all"></p>
+
+    <div style="margin-bottom:16px">
+      <label style="font-size:11px;font-weight:800;color:var(--subtext-color);text-transform:uppercase;letter-spacing:0.04em">Описание</label>
+      <textarea id="nameModalDescInput" rows="2" placeholder="Заметка к файлу (необязательно)" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:600;margin-top:4px;outline:none;font-size:14px;resize:vertical;min-height:60px;transition:border-color 0.3s var(--ease-smooth)" onfocus="this.style.borderColor='var(--btn-bg)'" onblur="this.style.borderColor='var(--border-color)'"></textarea>
+    </div>
 
     <div style="display:flex;flex-direction:column;gap:8px">
       <button class="sound-item-btn" onclick="confirmNameAndNext()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
@@ -3423,18 +3453,18 @@ body.vp-lock {
   </div>
 </div>
 
-<div id="albumModal" class="modal-overlay" onclick="closeAlbumModal(event)">
+<div id="albumUploadModal" class="modal-overlay" onclick="closeAlbumUploadModal(event)">
   <div class="modal-card" onclick="event.stopPropagation()">
     <div class="sheet-handle-area">
       <div class="sheet-handle"></div>
     </div>
 
     <h3 style="font-weight:900;font-size:20px;margin-bottom:4px">Название альбома</h3>
-    <p id="albumModalCounter" style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:14px"></p>
+    <p id="albumUploadModalCounter" style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:14px"></p>
 
     <div style="margin-bottom:14px">
       <label style="font-size:11px;font-weight:800;color:var(--subtext-color);text-transform:uppercase;letter-spacing:0.04em">Общее название</label>
-      <input type="text" id="albumModalInput" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;margin-top:4px;outline:none;font-size:15px" placeholder="Например: Отпуск 2026" oninput="renderAlbumPreview(this.value)">
+      <input type="text" id="albumUploadModalInput" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;margin-top:4px;outline:none;font-size:15px;transition:border-color 0.3s var(--ease-smooth)" placeholder="Например: Отпуск 2026" oninput="renderAlbumPreview(this.value)" onfocus="this.style.borderColor='var(--btn-bg)'" onblur="this.style.borderColor='var(--border-color)'">
     </div>
 
     <div style="padding:12px;background:var(--card-bg);border:1px solid var(--border-color);border-radius:14px;margin-bottom:16px;font-size:12px;font-weight:600;color:var(--subtext-color)">
@@ -3444,11 +3474,11 @@ body.vp-lock {
 
     <div style="display:flex;flex-direction:column;gap:8px">
       <button class="sound-item-btn" onclick="confirmAlbumName()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
-        <span>Применить ко всем</span>
+        <span>Создать альбом</span>
         <i data-lucide="check" style="width:18px;height:18px"></i>
       </button>
 
-      <button class="sound-item-btn" onclick="closeAlbumModal()">
+      <button class="sound-item-btn" onclick="closeAlbumUploadModal()">
         <span>Отмена</span>
         <i data-lucide="x" style="width:18px;height:18px"></i>
       </button>
@@ -3878,6 +3908,13 @@ body.vp-lock {
       </div>
 
       <p class="download-text" id="downloadText">Загрузка...</p>
+
+      <button type="button" id="uploadCancelBtn" class="upload-cancel-btn" onclick="cancelUpload()">
+        <svg viewBox="0 0 24 24" style="width:14px;height:14px;flex-shrink:0" fill="currentColor" aria-hidden="true">
+          <rect x="6" y="6" width="12" height="12" rx="2"></rect>
+        </svg>
+        <span>Отменить и удалить</span>
+      </button>
     </div>
 
     <input type="file" id="fileInput" multiple style="display:none">
@@ -6226,6 +6263,80 @@ async function saveFileName() {
   closeEditModal();
 }
 
+/* ВОЛНА: одна кнопка «Сохранить имя и описание» в окне действий —
+   экономит тапы. Имя шлём на сервер (как раньше), описание пишем
+   локально в DESC_MAP (как saveCurrentDescription). */
+async function saveFileNameAndDesc() {
+  if (!activeEditingFileId) return;
+
+  const id = String(activeEditingFileId);
+  const newName = (document.getElementById('modalInputName').value || '').trim();
+  const descEl = document.getElementById('modalInputDesc');
+  const newDesc = descEl ? descEl.value.trim() : '';
+
+  /* 1. Описание — сразу локально (как в saveCurrentDescription) */
+  if (newDesc) {
+    DESC_MAP[id] = newDesc;
+  } else {
+    delete DESC_MAP[id];
+  }
+  try { saveDescriptions(); } catch (e) {}
+
+  /* Обновляем превью на карточке без полной перерисовки */
+  const card = document.querySelector('.file-card[data-id="' + id + '"]');
+  if (card) {
+    let descElCard = card.querySelector('.file-desc');
+
+    if (newDesc) {
+      if (!descElCard) {
+        const info = card.querySelector('div[style*="flex:1"]');
+        if (info) {
+          descElCard = document.createElement('p');
+          descElCard.className = 'file-desc';
+          info.appendChild(descElCard);
+        }
+      }
+
+      if (descElCard) {
+        descElCard.textContent = newDesc;
+        descElCard.classList.remove('shown');
+        void descElCard.offsetWidth;
+        descElCard.classList.add('shown');
+      }
+    } else if (descElCard) {
+      descElCard.classList.remove('shown');
+      setTimeout(function () { if (descElCard) descElCard.remove(); }, 550);
+    }
+  }
+
+  /* 2. Имя — на сервер (только если изменилось) */
+  const f = ALL_FILES.find((x) => x.id === id);
+  const nameChanged = newName && (!f || f.name !== newName);
+
+  if (nameChanged) {
+    try {
+      const data = await apiJson('/api/files/' + encodeURIComponent(id), {
+        method: 'PATCH',
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ name: newName })
+      });
+
+      if (f) f.name = (data.file && data.file.name) || newName;
+    } catch (e) {
+      showToast('Имя не сохранено: ' + e.message);
+      /* описание уже сохранено — закрываем модалку */
+      closeEditModal();
+      renderAll();
+      return;
+    }
+  }
+
+  haptic('success');
+  showToast('Сохранено');
+  closeEditModal();
+  renderAll();
+}
+
 let VAULT_PW = '';
 let VAULT_SERVER_UNLOCKED = false;
 let PENDING_FILE_ACTION = null;
@@ -7784,10 +7895,51 @@ function togglePauseUpload() {
   }
 }
 
+/* ВОЛНА 22.83: удаление сессии на сервере с ДОГОНЯЮЩИМИ ПОВТОРАМИ.
+   Раньше abort уходил один раз: если бот как раз перезапускался (деплой),
+   запрос молча тонул — недокачанные байты оставались на сервере.
+   5 попыток с паузой 2 с покрывают типичное окно обновления. */
+function abortUploadIdRetry(uploadId, tries) {
+  const n = tries || 0;
+
+  apiJson('/api/upload/abort', {
+    method: 'POST',
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ uploadId: uploadId })
+  }).catch(() => {
+    if (n < 4) setTimeout(() => abortUploadIdRetry(uploadId, n + 1), 2000);
+  });
+}
+
+/* все известные сессии пачки (предохранка + файлы окна загрузки) */
+function abortAllUploadSessions() {
+  const ids = new Set();
+
+  const collect = (arr) => {
+    (arr || []).forEach((f) => { if (f && f._preId) ids.add(String(f._preId)); });
+  };
+
+  try { collect(uploadQueue); } catch (e) {}
+  try { collect(pendingFiles); } catch (e) {}
+
+  ids.forEach((id) => abortUploadIdRetry(id, 0));
+}
+
+/* статус в подписи кольца: null → вернуть обычный текст */
+function setUploadWaitText(t) {
+  const el = document.getElementById('downloadText');
+
+  if (!el) return;
+
+  el.textContent = (t === null || typeof t === 'undefined')
+    ? 'Загрузка... (1 клик - пауза, 2 - отмена)' : t;
+}
+
 function cancelUpload() {
   if (!isUploading) return;
 
   uploadAbortFlag = true;
+  isPaused = false;
 
   uploadXhrs.forEach((x) => {
     try { x.abort(); } catch (e) {}
@@ -7799,7 +7951,20 @@ function cancelUpload() {
     } catch (e) {}
   }
 
-  showToast('⏹ Загрузка отменена');
+  /* запланированный авто-ретрай гасим — пользователь решил сам */
+  try { clearTimeout(_upRetryTimer); } catch (e) {}
+
+  /* СТОП + УДАЛИТЬ: стираем недокачанные сессии на сервере
+     (воркеры при выходе тоже зовут abort — тут страховка на ВСЕ случаи) */
+  abortAllUploadSessions();
+
+  const dlText = document.getElementById('downloadText');
+  const sq = document.getElementById('squareStop');
+
+  if (dlText) dlText.textContent = '⏹ Отменено — загруженное удалено';
+  if (sq) sq.style.opacity = '0.3';
+
+  showToast('⏹ Загрузка остановлена, байты стёрты');
 }
 
 function openNameChoiceModal() {
@@ -7841,15 +8006,15 @@ function openAlbumModal() {
     return;
   }
 
-  const c = document.getElementById('albumModalCounter');
+  const c = document.getElementById('albumUploadModalCounter');
   if (c) c.textContent = 'Файлов: ' + pendingFiles.length;
 
-  const inp = document.getElementById('albumModalInput');
+  const inp = document.getElementById('albumUploadModalInput');
   if (inp) inp.value = '';
 
   renderAlbumPreview('');
 
-  openModalEl('albumModal');
+  openModalEl('albumUploadModal');
 }
 
 function renderAlbumPreview(baseName) {
@@ -7873,15 +8038,19 @@ function renderAlbumPreview(baseName) {
   preview.innerHTML = items.join('') + more;
 }
 
-function closeAlbumModal(e) {
+function closeAlbumUploadModal(e) {
   if (e) e.stopPropagation();
 
-  closeModalEl('albumModal');
+  closeModalEl('albumUploadModal');
   openNameChoiceModal();
 }
 
+/* closeAlbumModal для окна «Действия с папкой» (переименовать/удалить)
+   определена ниже, рядом с openAlbumActions — там же renameAlbumFromModal
+   и deleteAlbumFromModal. Здесь дублировать не нужно. */
+
 function confirmAlbumName() {
-  const inp = document.getElementById('albumModalInput');
+  const inp = document.getElementById('albumUploadModalInput');
   const base = (inp && inp.value.trim()) || 'Альбом';
 
   const extOf = (f) => {
@@ -7891,19 +8060,19 @@ function confirmAlbumName() {
     return i > 0 ? n.slice(i) : '';
   };
 
-  /* ВОЛНА 22.44: имя пишем ПРЯМО в объект файла (expando, как _entryKey),
-     а НЕ в Object.assign-копию. У File/Blob size/type/name — геттеры
-     ПРОТОТИПА, Object.assign их НЕ копирует: копия выходила пустым
-     объектом, size = 0 → сервер отвечал «Файл пустой (0 Б)» ровно тогда,
-     когда файл называли. Оригинальный File сохраняет size/slice —
-     загрузка идёт как при именовании, так и без него. */
+  /* ВОЛНА: создаём НАСТОЯЩИЙ альбом — файлы после загрузки попадут в папку,
+     а не просто получат переназванные имена в корне. */
+  const aid = albumIdNew();
   pendingFiles.forEach((f, i) => {
     try {
       f.uploadName = (base + ' ' + (i + 1) + extOf(f)).slice(0, 120);
+      f._pendingAlbumId = aid;
     } catch (e) {}
   });
 
-  closeModalEl('albumModal');
+  PENDING_ALBUM = { id: aid, name: base, fileIds: [] };
+
+  closeModalEl('albumUploadModal');
   startActualUpload();
 }
 
@@ -7914,6 +8083,7 @@ function openNameModal() {
 
   pendingFiles.forEach((f) => {
     try { delete f._customName; } catch (e) {}
+    try { delete f._customDesc; } catch (e) {}
   });
 
   showNameModal();
@@ -7949,6 +8119,9 @@ function showNameModal() {
   const inp = document.getElementById('nameModalInput');
   if (inp) inp.value = '';
 
+  const descInp = document.getElementById('nameModalDescInput');
+  if (descInp) descInp.value = '';
+
   openModalEl('nameModal');
 }
 
@@ -7956,11 +8129,18 @@ function confirmNameAndNext() {
   const inp = document.getElementById('nameModalInput');
   const v = inp ? inp.value.trim() : '';
 
+  const descInp = document.getElementById('nameModalDescInput');
+  const d = descInp ? descInp.value.trim() : '';
+
   if (v) {
     try { pendingFiles[nameEditIndex]._customName = v.slice(0, 120); } catch (e) {}
   }
+  if (d) {
+    try { pendingFiles[nameEditIndex]._customDesc = d.slice(0, 1000); } catch (e) {}
+  }
 
   if (inp) inp.value = '';
+  if (descInp) descInp.value = '';
 
   nextNameStep();
 }
@@ -8228,6 +8408,14 @@ function openModalEl(id) {
   m.classList.add('open');
   document.body.classList.add('modal-open');
 
+  /* ВОЛНА: swipe-back / Android back — push history state для модалки,
+     срабатывает ОДИН раз на открытие (флаг _navPushed). popstate закроет
+     верхнюю открытую модалку. */
+  if (!m._navPushed) {
+    m._navPushed = true;
+    try { history.pushState({ devoModal: id, t: Date.now() }, ''); } catch (e) {}
+  }
+
   /* 22.39: на время модалки останавливаем анимацию блобов — RAF-цикл
      под backdrop-filter сильно ест GPU и «лагает» при нажатии на файл */
   try { stopBlobAnimation(); } catch (e) {}
@@ -8245,6 +8433,11 @@ function closeModalEl(id) {
     m.classList.add('blur-off');
 
     m._blurT2 = setTimeout(() => m.classList.remove('blur-off'), 520);
+
+    /* ВОЛНА: сбрасываем флаг — следующий open запушит свежее состояние.
+       Сами stale history-записи не трогаем (history.back может рекурсивно
+       закрыть смежную модалку); popstate при необходимости их пропустит. */
+    if (m._navPushed) m._navPushed = false;
   }
 
   if (!document.querySelector('.modal-overlay.open')) {
@@ -8255,6 +8448,34 @@ function closeModalEl(id) {
 
   ensureScrollUnlocked();
 }
+
+/* ВОЛНА: единый обработчик swipe-back / Android back.
+   Порядок: сначала верхняя открытая модалка (если есть), потом альбом. */
+window.addEventListener('popstate', function () {
+  /* 1. Закрыть самую верхнюю ОТКРЫТУЮ модалку — ту, что запушила историю */
+  const openModals = document.querySelectorAll('.modal-overlay.open');
+  for (let i = openModals.length - 1; i >= 0; i--) {
+    const m = openModals[i];
+    if (m._navPushed) {
+      m._navPushed = false;
+      m.classList.remove('open');
+      m.classList.add('blur-off');
+      clearTimeout(m._blurT2);
+      m._blurT2 = setTimeout(() => m.classList.remove('blur-off'), 520);
+      if (!document.querySelector('.modal-overlay.open')) {
+        document.body.classList.remove('modal-open');
+        try { startBlobAnimation(); } catch (e) {}
+      }
+      ensureScrollUnlocked();
+      return;
+    }
+  }
+
+  /* 2. Нет модалки — выходим из альбома (если открыта папка) */
+  if (ALBUM_VIEW) {
+    _finishCloseAlbum();
+  }
+});
 
 /* ═══ СКРОЛЛ-СТРАЖ ═══
    Если из-за сбоя (закрылось не всё / гонка анимаций) на body остался
@@ -9624,7 +9845,9 @@ async function _preStreamFile(file) {
         const off = idx * CHUNK_SIZE;
         const end = Math.min(off + CHUNK_SIZE, file.size);
 
-        for (let attempt = 0; attempt < 3; attempt++) {
+        /* ВОЛНА 22.83: 3 → 10 попыток — предохранка не должна умирать
+           в окно деплоя бота (движок продолжит ТУ ЖЕ сессию) */
+        for (let attempt = 0; attempt < 10; attempt++) {
           if (!alive || file._preStop || uploadAbortFlag) return;
 
           try {
@@ -9635,7 +9858,7 @@ async function _preStreamFile(file) {
           } catch (e) {
             if (e && e.message === 'aborted') return;
             if (e && e.code === 'session_not_found') { alive = false; return; }
-            if (attempt < 2) await sleepMs(1200 * (attempt + 1));
+            if (attempt < 9) await sleepMs(Math.min(1200 * (attempt + 1), 6000));
             else { alive = false; return; }
           }
         }
@@ -9855,7 +10078,11 @@ async function _uploadOneSession(file, reportBytes) {
       let lastErr = null;
       let resp = null;
 
-      for (let attempt = 0; attempt < 3; attempt++) {
+      /* ВОЛНА 22.83: 3 попытки ≈ 4 секунды — деплой бота длится дольше этого
+         окна, загрузка падала и выглядела как «бот сломался». Теперь 10
+         попыток с паузами до 6 с (≈ минута терпения на кусок) + честный
+         статус «Бот обновляется, ждём…» вместо пугающего молчания. */
+      for (let attempt = 0; attempt < 10; attempt++) {
         /* ВОЛНА 22.49: проверка отмены на КАЖДОЙ попытке — раньше воркер,
            заснувший в sleepMs(1200*(attempt+1)) во время отмены, просыпался
            и отправлял ЕЩЁ ОДИН кусок поверх отменённой загрузки */
@@ -9867,6 +10094,8 @@ async function _uploadOneSession(file, reportBytes) {
 
           lastErr = null;
 
+          if (attempt > 0) setUploadWaitText(null);
+
           break;
         } catch (err) {
           if (err && err.message === 'aborted') return 'abort';
@@ -9877,9 +10106,15 @@ async function _uploadOneSession(file, reportBytes) {
 
           lastErr = err;
 
-          if (attempt < 2) await sleepMs(1200 * (attempt + 1));
+          if (attempt > 0) {
+            setUploadWaitText('🔄 Бот обновляется, ждём… (' + (attempt + 1) + '/10)');
+          }
+
+          if (attempt < 9) await sleepMs(Math.min(1200 * (attempt + 1), 6000));
         }
       }
+
+      setUploadWaitText(null);
 
       if (lastErr) throw lastErr;
 
@@ -9919,11 +10154,12 @@ async function _uploadOneSession(file, reportBytes) {
 
   if (results.includes('restart')) return 'restart';
 
-  /* complete — одна повторная попытка (сеть/503) */
+  /* ВОЛНА 22.83: complete — до 6 попыток (деплой бота больше не роняет
+     финализацию: байты уже на сервере, надо просто дождаться) */
   let done = null;
   let cErr = null;
 
-  for (let a = 0; a < 2; a++) {
+  for (let a = 0; a < 6; a++) {
     try {
       done = await apiJson('/api/upload/complete', {
         method: 'POST',
@@ -9943,15 +10179,25 @@ async function _uploadOneSession(file, reportBytes) {
 
       /* ВОЛНА 22.49: не хватает пароля Сейфа — сервер держит сессию и .part
          (куски НЕ потеряны). Запоминаем uploadId: после ввода пароля
-         complete повторится БЕЗ перекачки файла заново */
+         complete повторится БЕЗ перекачки файла заново. Ждать бессмысленно —
+         пароль не появится сам, выходим сразу (движок спросит пароль). */
       if (e && (e.code === 'safe_locked' || e.code === 'wrong_password')) {
         file._resumeId = uploadId;
         file._retryComplete = true;
+
+        break;
       }
 
-      if (!a) await sleepMs(2500);
+      /* ВОЛНА 22.83: сеть/деплой — ждём и пробуем снова (было 2 попытки) */
+      if (a > 0) {
+        setUploadWaitText('🔄 Бот обновляется, ждём… (' + (a + 1) + '/6)');
+      }
+
+      if (a < 5) await sleepMs(Math.min(1500 * (a + 1), 8000));
     }
   }
+
+  setUploadWaitText(null);
 
   if (cErr) {
     /* ВОЛНА 22.50: «фантомные ошибки». Сервер после разрыва связи может
@@ -10106,6 +10352,7 @@ async function uploadEngine(bar) {
   const fileBytes = new Map();
   let reportedTotal = 0;
   let dedupedCount = 0;   /* 22.62: сколько файлов свёл сервер (уже из чата) */
+  let _descDirty = false; /* ВОЛНА: накопительный флаг «есть новые описания» */
 
   const reportTotal = () => {
     setUploadPct((reportedTotal / totalBytes) * 100, bar);
@@ -10137,16 +10384,48 @@ async function uploadEngine(bar) {
       file._cancelFlag = false;
       fileBytes.set(file, 0);
 
-      try {
-        const rec = await uploadOneFile(file, (cur) => {
-          const prev = fileBytes.get(file) || 0;
+      /* ВОЛНА 22.83: «деплой не роняет файл». Раньше сетевой сбой внутри
+         uploadOneFile сразу уводил файл в failedFiles — пользователь видел
+         «⚠️ Не удалось» во время обновления бота. Теперь у файла до 4
+         ПОПЫТОК ЦЕЛИКОМ прямо в движке: сетевые ошибки (без кода —
+         «нет связи», таймаут, HTML-502) ждут 15–60 с и пробуют снова;
+         серверные кодовые ошибки (413 too large, unauthorized…) —
+         безнадёжные, отдаются наружу сразу. Поверх этого работает
+         прежняя страховка очереди IndexedDB (scheduleUploadRetry). */
+      let rec = null;
 
-          if (cur > prev) {
-            reportedTotal += cur - prev;
-            fileBytes.set(file, cur);
-            reportTotal();
+      try {
+        for (let swing = 0; swing < 4; swing++) {
+          try {
+            rec = await uploadOneFile(file, (cur) => {
+              const prev = fileBytes.get(file) || 0;
+
+              if (cur > prev) {
+                reportedTotal += cur - prev;
+                fileBytes.set(file, cur);
+                reportTotal();
+              }
+            });
+
+            break;
+          } catch (netErr) {
+            if ((netErr && netErr.message === 'aborted') || uploadAbortFlag) {
+              throw netErr;
+            }
+
+            const _c = String((netErr && netErr.code) || '');
+            const _m = String((netErr && netErr.message) || '');
+            const netish = !_c || /HTTP 5\d\d|нет связи|таймаут/i.test(_m);
+
+            if (!netish || swing === 3) throw netErr;
+
+            setUploadWaitText(
+              '🔄 Бот обновляется, ждём… (раунд ' + (swing + 1) + '/4)');
+
+            await sleepMs(15000 + swing * 15000);
+            setUploadWaitText(null);
           }
-        });
+        }
 
         /* 22.62: дубль сведён сервером (файл уже приехал через
            Telegram) — карточку и похвалу не дублируем */
@@ -10154,6 +10433,24 @@ async function uploadEngine(bar) {
           dedupedCount++;
         } else if (rec) {
           added.push(rec);
+        }
+
+        /* ВОЛНА: собираем ID успешно загруженных файлов в отложенный альбом,
+           если пользователь выбрал «Создать альбом» в окне выбора имени.
+           Дедуп-файлы (уже у бота) тоже идут в альбом — пользователь считает
+           их своими. Описание из того же окна (если ввели) — складываем
+           в DESC_MAP, но сам save откладываем до конца пачки (один запись
+           в localStorage вместо N). */
+        if (rec && rec.id) {
+          if (PENDING_ALBUM && file._pendingAlbumId === PENDING_ALBUM.id) {
+            PENDING_ALBUM.fileIds.push(String(rec.id));
+          }
+          if (file._customDesc) {
+            try {
+              DESC_MAP[String(rec.id)] = String(file._customDesc).slice(0, 1000);
+              _descDirty = true;
+            } catch (e) {}
+          }
         }
 
         /* ВОЛНА 22.54: страховка имени. Файл уходил в бота под оригинальным
@@ -10222,6 +10519,8 @@ async function uploadEngine(bar) {
       if (f._entryKey) upqDel(f._entryKey);
     }
 
+    PENDING_ALBUM = null;
+
     resetUploadUI(bar, checkmark, squareStop);
     return;
   }
@@ -10233,6 +10532,8 @@ async function uploadEngine(bar) {
       /safe_locked|пароль|password/i.test(msg);
 
     const retryFiles = needPass ? failedFiles.map((x) => x.file) : [];
+
+    PENDING_ALBUM = null;
 
     resetUploadUI(bar, checkmark, squareStop);
 
@@ -10297,6 +10598,30 @@ async function uploadEngine(bar) {
     }));
   });
 
+  /* ВОЛНА: финализируем отложенный альбом — если хотя бы один файл
+     загрузился, создаём запись в ALBUM_MAP. Файлы автоматически
+     убираются из корня (collectAlbumFileIds в renderAll) и становятся
+     видны только при открытии альбома. */
+  if (PENDING_ALBUM) {
+    if (PENDING_ALBUM.fileIds.length) {
+      ALBUM_MAP[PENDING_ALBUM.id] = {
+        id: PENDING_ALBUM.id,
+        name: PENDING_ALBUM.name,
+        ts: Date.now(),
+        fileIds: PENDING_ALBUM.fileIds
+      };
+      try { saveAlbums(); } catch (e) {}
+      showToast('📁 Альбом «' + PENDING_ALBUM.name + '» создан');
+    }
+    PENDING_ALBUM = null;
+  }
+
+  /* ВОЛНА: один пакетный save описаний (вместо N записей в localStorage
+     в цикле загрузки). */
+  if (_descDirty) {
+    try { saveDescriptions(); } catch (e) {}
+  }
+
   renderAll({ animate: true });
 
   /* ВОЛНА 22.68: тихая сверка с сервером СРАЗУ после пачки — подхватывает
@@ -10351,6 +10676,7 @@ const ALBUMS_KEY = 'devo_albums';
 const ALBUM_DEMO_KEY = 'devo_demo_album_done';
 let ALBUM_MAP = {};   /* id -> { id, name, ts, fileIds: [String] } */
 let ALBUM_VIEW = null;
+let PENDING_ALBUM = null;   /* { id, name, fileIds: [] } — собирается во время загрузки */
 try { loadAlbums(); } catch (e) {}
 
 initCustomColors();
@@ -10831,7 +11157,7 @@ function ctSyncNow() {
 const MP_DEFAULT_COLORS = { glow: '#4285f4', c1: '#9b72f2', c2: '#f442a1' };
 
 const MP_ICONS = {
-  play: '<path d="M8 5.14v13.72a1 1 0 0 0 1.5.86l10.5-6.86a1 1 0 0 0 0-1.72L9.5 4.28A1 1 0 0 0 8 5.14z" fill="currentColor"/>',
+  play: '<path d="M6 5.14v13.72a1 1 0 0 0 1.5.86l10.5-6.86a1 1 0 0 0 0-1.72L7.5 4.28A1 1 0 0 0 6 5.14z" fill="currentColor"/>',
   pause: '<rect x="6" y="4" width="4" height="16" rx="2" fill="currentColor"/><rect x="14" y="4" width="4" height="16" rx="2" fill="currentColor"/>'
 };
 
@@ -12921,6 +13247,12 @@ function loadAlbums() {
   try {
     const a = JSON.parse(localStorage.getItem(ALBUMS_KEY) || '{}');
     ALBUM_MAP = (a && typeof a === 'object' && !Array.isArray(a)) ? a : {};
+
+    /* ВОЛНА: подчищаем демо-папку alb_demo (создавалась в прошлых версиях) */
+    if (ALBUM_MAP['alb_demo']) {
+      delete ALBUM_MAP['alb_demo'];
+      try { localStorage.setItem(ALBUMS_KEY, JSON.stringify(ALBUM_MAP)); } catch (e) {}
+    }
   } catch (e) { ALBUM_MAP = {}; }
 }
 
@@ -13138,13 +13470,51 @@ function openAlbum(albumId) {
     b.classList.toggle('active', b.dataset.filter === 'all');
   });
 
+  /* ВОЛНА: навигация «назад» — push history + Telegram BackButton,
+     чтобы работали: Android back, iOS edge swipe, кнопка в шапке ТГ */
+  try {
+    history.pushState({ devoAlbum: ALBUM_VIEW, t: Date.now() }, '');
+  } catch (e) {}
+
+  try {
+    const bb = (window.Telegram && Telegram.WebApp && Telegram.WebApp.BackButton);
+    if (bb) {
+      try { bb.offClick(closeAlbum); } catch (e) {}
+      bb.onClick(closeAlbum);
+      bb.show();
+    }
+  } catch (e) {}
+
   renderAll({ animate: true });
 }
 
 function closeAlbum() {
+  /* Если есть запушенная история альбома — жмём назад: сработает popstate
+     и вызовет _finishCloseAlbum. Иначе просто закрываем напрямую. */
+  try {
+    if (history.state && history.state.devoAlbum) {
+      history.back();
+      return;
+    }
+  } catch (e) {}
+
+  _finishCloseAlbum();
+}
+
+function _finishCloseAlbum() {
+  if (!ALBUM_VIEW) return;
+
   ALBUM_VIEW = null;
 
   haptic('light'); /* 22.70: вышли из папки */
+
+  try {
+    const bb = (window.Telegram && Telegram.WebApp && Telegram.WebApp.BackButton);
+    if (bb) {
+      try { bb.offClick(closeAlbum); } catch (e) {}
+      bb.hide();
+    }
+  } catch (e) {}
 
   renderAll({ animate: true });
 }
@@ -13340,23 +13710,31 @@ function deleteAlbumFromModal() {
 
   closeModalEl('albumModal');
 
-  /* файлы НЕ удаляются — просто возвращаются в корень */
-  if (ALBUM_VIEW === id) ALBUM_VIEW = null;
+  /* файлы НЕ удаляются — просто возвращаются в корень.
+     Если удалили альбом, в котором находились — выходим «по-настоящему»:
+     closeAlbum сам снимет BackButton и history через popstate. */
+  if (ALBUM_VIEW === id) {
+    /* Сначала обнулим ALBUM_VIEW, чтобы popstate-обработчик не попытался
+       закрыть уже удалённый альбом; историю чистим прямым back(). */
+    ALBUM_VIEW = null;
+    try {
+      const bb = (window.Telegram && Telegram.WebApp && Telegram.WebApp.BackButton);
+      if (bb) { try { bb.offClick(closeAlbum); } catch (e) {} bb.hide(); }
+    } catch (e) {}
+    try {
+      if (history.state && history.state.devoAlbum) history.back();
+    } catch (e) {}
+  }
 
   renderAll({ animate: true });
 }
 
-/* Тестовые файлы: 8 разных типов с предзаполненными избранным и описаниями */
-const TEST_FILES = [
-  { id: 'test_1', name: 'Закат на море.jpg', kind: 'photo', size: 2453678, ts: Date.now() - 86400000 * 2, fav: true, desc: 'Закат с прошлого отпуска — очень красивый вид' },
-  { id: 'test_2', name: 'Прогулка по парку.mp4', kind: 'video', size: 47832145, ts: Date.now() - 86400000 * 5, fav: false, desc: 'Видео с прогулки на выходных' },
-  { id: 'test_3', name: 'Любимая песня.mp3', kind: 'audio', size: 8421547, ts: Date.now() - 86400000 * 7, fav: true, desc: '' },
-  { id: 'test_4', name: 'Презентация проекта.pdf', kind: 'document', size: 1452369, ts: Date.now() - 86400000 * 1, fav: false, desc: 'Финальная версия для встречи' },
-  { id: 'test_5', name: 'Семейное фото.png', kind: 'photo', size: 5234789, ts: Date.now() - 86400000 * 10, fav: true, desc: 'С дня рождения мамы' },
-  { id: 'test_6', name: 'Конспект лекции.txt', kind: 'document', size: 12453, ts: Date.now() - 86400000 * 3, fav: false, desc: '' },
-  { id: 'test_7', name: 'Утренняя пробежка.mp3', kind: 'audio', size: 6234123, ts: Date.now() - 86400000 * 4, fav: false, desc: 'Подкаст для бега' },
-  { id: 'test_8', name: 'Городской пейзаж.jpg', kind: 'photo', size: 3456789, ts: Date.now() - 86400000 * 6, fav: false, desc: '' }
-];
+/* Тестовые файлы были здесь — удалены по просьбе пользователя.
+   Список оставлен пустым, чтобы все injectTestFiles-циклы в коде
+   (старт, кэш, синхронизация) были холостыми и не добавляли
+   демо-карточек. Удалённые пользователями демо-файлы тоже больше
+   не восстанавливаются — TEST_DELETED не растёт. */
+const TEST_FILES = [];
 
 /* Подмешивает тестовые файлы в ALL_FILES (идемпотентно: не дублирует).
    Также предзаполняет избранное/описания для тестовых файлов,
@@ -13364,65 +13742,34 @@ const TEST_FILES = [
    видел демо-данные с избранным и описаниями.
    Удалённые пользователем тестовые файлы НЕ восстанавливаются. */
 function injectTestFiles() {
-  /* ВОЛНА: демо-папка — создаётся ОДИН раз при первом запуске,
-     чтобы фича «настоящих папок» была видна сразу. Пользователь удалил —
-     больше не возвращается */
+  /* ВОЛНА: демо-папка alb_demo БОЛЬШЕ не создаётся при первом запуске —
+     пользователь просил убрать начальные файлы. Удаляем следы старого
+     демо-альбома (если остался от прошлой версии), тестовые файлы тоже
+     не подмешиваем — TEST_FILES пуст. */
   try {
-    if (!localStorage.getItem(ALBUM_DEMO_KEY)) {
-      safeSet(ALBUM_DEMO_KEY, '1');
-
-      if (!Object.keys(ALBUM_MAP).length) {
-        ALBUM_MAP['alb_demo'] = {
-          id: 'alb_demo',
-          name: 'Фото',
-          ts: Date.now() - 86400000,
-          fileIds: ['test_1', 'test_5']
-        };
-        saveAlbums();
-      }
+    if (ALBUM_MAP['alb_demo']) {
+      delete ALBUM_MAP['alb_demo'];
+      saveAlbums();
     }
   } catch (e) {}
 
+  /* Подчищаем из ALL_FILES любые остатки демо-записей (src === 'test'
+     или id вида test_*), чтобы у пользователей, у которых они успели
+     попасть в кэш, не висели «фантомные» карточки. */
   try {
-    let needFavSave = false;
-    let needDescSave = false;
-
-    TEST_FILES.forEach(function (tf) {
-      if (TEST_DELETED.has(tf.id)) return;
-
-      if (tf.fav && !FAV_SET.has(tf.id)) {
-        FAV_SET.add(tf.id);
-        needFavSave = true;
-      }
-      if (tf.desc && !DESC_MAP[tf.id]) {
-        DESC_MAP[tf.id] = tf.desc;
-        needDescSave = true;
-      }
-    });
-
-    if (needFavSave) saveFavorites();
-    if (needDescSave) saveDescriptions();
-  } catch (e) {}
-
-  const existingIds = new Set(ALL_FILES.map((f) => String(f.id)));
-
-  TEST_FILES.forEach(function (tf) {
-    if (TEST_DELETED.has(tf.id)) return;
-    if (!existingIds.has(tf.id)) {
-      ALL_FILES.push({
-        id: tf.id,
-        name: tf.name,
-        kind: tf.kind,
-        size: tf.size,
-        ts: String(tf.ts),
-        vault: false,
-        safe: false,
-        plain: false,
-        src: 'test',
-        test: true
+    if (ALL_FILES && ALL_FILES.length) {
+      const before = ALL_FILES.length;
+      ALL_FILES = ALL_FILES.filter(function (f) {
+        if (!f) return false;
+        if (f.test) return false;
+        if (/^test_\d+$/.test(String(f.id))) return false;
+        return true;
       });
+      if (ALL_FILES.length !== before) {
+        /* изменён ALL_FILES в памяти — рендер вызовет вызывающий код */
+      }
     }
-  });
+  } catch (e) {}
 }
 
 /* Переключение избранного — с медленной плавной анимацией звёздочки */
