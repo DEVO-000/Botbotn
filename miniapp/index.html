@@ -991,7 +991,7 @@ html.low-end .confirm-actions {
   justify-content: center;
   min-height: 110px;
   position: relative;
-  transition: transform 0.2s var(--ease-spring);
+  transition: transform 0.2s var(--ease-spring), background 0.2s, border-color 0.2s;
   margin-bottom: 12px;
   touch-action: manipulation;
 }
@@ -1001,9 +1001,33 @@ html.low-end .confirm-actions {
   background: var(--drop-active);
 }
 
-/* ВОЛНА 22.86: кнопка выбора файлов удалена — зона грузится только как
-   индикатор прогресса. Видимость управляет JS: showDropLoader показывает
-   зону мягко (класс .uploading + keyframes), resetUploadUI прячет её. */
+/* drag&drop-подсветка: зона подсвечивается, когда над ней файл */
+.drop-zone.drag-over {
+  background: var(--drop-active);
+  border-color: var(--btn-bg);
+  transform: scale(1.02);
+}
+
+/* ВОЛНА 22.86→REVERT: зона СНОВА всегда видна. Два состояния:
+   • idle — видно .drop-prompt (приглашение загрузить)
+   • uploading — скрыто .drop-prompt, видно .download-progress-wrap */
+.drop-prompt {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+}
+
+.drop-prompt .dp-icon {
+  margin-bottom: 4px;
+}
+
+/* uploading-состояние: прячем приглашение, показываем прогресс */
+.drop-zone.uploading .drop-prompt {
+  display: none;
+}
+
 .drop-zone.uploading {
   display: flex;
   animation: softFadeIn 0.45s var(--ease-smooth) both;
@@ -1130,10 +1154,35 @@ html.low-end .drop-zone.uploading {
 
 }
 
-/* ВОЛНА 22.86: кнопка «Отменить и удалить» (uploadCancelBtn) УДАЛЕНА
-   по решению пользователя — отменять загрузку мини-аппа можно жестом
-   «2 клика по кольцу» (handleLoaderClick), а отмены загрузок В БОТЕ
-   живут на сообщении прогресса в чате. CSS-блок кнопки убран целиком. */
+/* ВОЛНА 22.89: кнопка «Отменить и удалить» вернулась (22.86 удаляла) —
+   один тап вместо жеста «2 клика по кольцу» (жест тоже остался).
+   Видна ровно пока идёт пачка (.active у обёртки), после — исчезает. */
+.upload-cancel-btn {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  margin-top: 2px;
+  padding: 8px 18px;
+  border-radius: 12px;
+  border: 1px solid rgba(239, 68, 68, 0.35);
+  background: rgba(239, 68, 68, 0.08);
+  color: #ef4444;
+  font-family: 'Nunito', sans-serif;
+  font-weight: 800;
+  font-size: 13px;
+  cursor: pointer;
+  transition: background 0.25s var(--ease-smooth), transform 0.15s var(--ease-smooth);
+}
+
+.upload-cancel-btn:active {
+  transform: scale(0.96);
+}
+
+.download-progress-wrap.active .upload-cancel-btn {
+  display: inline-flex;
+  animation: softFadeIn 0.4s var(--ease-smooth) both;
+}
 
 .files-container {
   width: 100%;
@@ -3363,20 +3412,145 @@ body.vp-lock {
     </p>
 
     <div style="display:flex;flex-direction:column;gap:8px">
-      <!-- ВОЛНА 22.86: кнопки «Добавить файл» и «Добавить ещё» УДАЛЕНЫ по
-           решению пользователя — выбор файлов в мини-аппе больше не нужен,
-           файлы загружаются через бота (чат). Окно осталось для ввода
-           пароля и отправки уже выбранных (недокачанных/повторных) файлов.
-           ВОЛНА 22.63: тумблеры «Загрузить через Telegram» / «Автопередача»
-           удалены ещё раньше — окна выбора в мини-аппе больше нет. -->
+      <!-- ВОЛНА 22.89: кнопки «Добавить файл»/«Добавить ещё» вернулись
+           (22.86 удаляла) — окно снова полный шлюз: добавить, пароль,
+           «Отправить». Загрузка по-прежнему ТОЛЬКО по «Отправить» (22.74). -->
+
+      <button class="sound-item-btn" id="uploadAddBtn" onclick="pickUploadFiles()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
+        <span>Добавить файл</span>
+        <i data-lucide="plus" style="width:18px;height:18px"></i>
+      </button>
 
       <button class="sound-item-btn hidden" id="uploadSendBtn" onclick="confirmUploadFiles()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
         <span>Отправить</span>
         <i data-lucide="send" style="width:18px;height:18px"></i>
       </button>
 
+      <button class="sound-item-btn hidden" id="uploadMoreBtn" onclick="addMoreUploadFiles()">
+        <span>Добавить ещё</span>
+        <i data-lucide="file-plus" style="width:18px;height:18px"></i>
+      </button>
+
       <button class="sound-item-btn" onclick="closeUploadModal()">
         <span>Закрыть</span>
+        <i data-lucide="x" style="width:18px;height:18px"></i>
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- ВОЛНА 22.89: окна именования вернулись (22.87 удаляла) —
+     «Как назвать эти файлы?» / «Назовите файл» (+описание) /
+     «Название альбома» (с превью имён). -->
+<div id="nameChoiceModal" class="modal-overlay" onclick="closeNameChoiceModal(event)">
+  <div class="modal-card" onclick="event.stopPropagation()">
+    <div class="sheet-handle-area">
+      <div class="sheet-handle"></div>
+    </div>
+
+    <h3 style="font-weight:900;font-size:20px;margin-bottom:4px">
+      Выбрано файлов: <span id="nameChoiceCount">0</span>
+    </h3>
+
+    <p style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:16px">
+      Как назвать эти файлы?
+    </p>
+
+    <div style="display:flex;flex-direction:column;gap:8px">
+      <button class="sound-item-btn" onclick="chooseNameMode('album')" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
+        <div style="text-align:left">
+          <div style="font-weight:800">Создать альбом</div>
+          <div style="font-size:11px;opacity:0.7;margin-top:2px">Файлы попадут в новую папку с общим именем</div>
+        </div>
+        <i data-lucide="folder-plus" style="width:18px;height:18px"></i>
+      </button>
+
+      <button class="sound-item-btn" onclick="chooseNameMode('each')">
+        <div style="text-align:left">
+          <div style="font-weight:800">Назвать по одному</div>
+          <div style="font-size:11px;opacity:0.7;margin-top:2px">Каждому файлу своё имя</div>
+        </div>
+        <i data-lucide="list" style="width:18px;height:18px"></i>
+      </button>
+
+      <button class="sound-item-btn" onclick="chooseNameMode('skip')">
+        <div style="text-align:left">
+          <div style="font-weight:800">Пропустить всё</div>
+          <div style="font-size:11px;opacity:0.7;margin-top:2px">Оставить оригинальные имена</div>
+        </div>
+        <i data-lucide="fast-forward" style="width:18px;height:18px"></i>
+      </button>
+    </div>
+  </div>
+</div>
+
+<div id="nameModal" class="modal-overlay" onclick="closeNameModal(event)">
+  <div class="modal-card" onclick="event.stopPropagation()">
+    <div class="sheet-handle-area">
+      <div class="sheet-handle"></div>
+    </div>
+
+    <h3 style="font-weight:900;font-size:20px;margin-bottom:4px">Назовите файл</h3>
+    <p id="nameModalCounter" style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:14px"></p>
+
+    <div style="margin-bottom:14px">
+      <label style="font-size:11px;font-weight:800;color:var(--subtext-color);text-transform:uppercase;letter-spacing:0.04em">Новое название</label>
+      <input type="text" id="nameModalInput" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;margin-top:4px;outline:none;font-size:15px;transition:border-color 0.3s var(--ease-smooth)" placeholder="Оставьте пустым для оригинала" onfocus="this.style.borderColor='var(--btn-bg)'" onblur="this.style.borderColor='var(--border-color)'">
+    </div>
+
+    <p id="nameModalOriginal" style="font-size:12px;font-weight:600;color:var(--subtext-color);margin-bottom:14px;word-break:break-all"></p>
+
+    <div style="margin-bottom:16px">
+      <label style="font-size:11px;font-weight:800;color:var(--subtext-color);text-transform:uppercase;letter-spacing:0.04em">Описание</label>
+      <textarea id="nameModalDescInput" rows="2" placeholder="Заметка к файлу (необязательно)" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:600;margin-top:4px;outline:none;font-size:14px;resize:vertical;min-height:60px;transition:border-color 0.3s var(--ease-smooth)" onfocus="this.style.borderColor='var(--btn-bg)'" onblur="this.style.borderColor='var(--border-color)'"></textarea>
+    </div>
+
+    <div style="display:flex;flex-direction:column;gap:8px">
+      <button class="sound-item-btn" onclick="confirmNameAndNext()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
+        <span>Сохранить и продолжить</span>
+        <i data-lucide="arrow-right" style="width:18px;height:18px"></i>
+      </button>
+
+      <button class="sound-item-btn" onclick="skipNameAndNext()">
+        <span>Пропустить</span>
+        <i data-lucide="skip-forward" style="width:18px;height:18px"></i>
+      </button>
+
+      <button class="sound-item-btn" id="nameModalSkipAll" onclick="skipAllNames()">
+        <span>Пропустить все</span>
+        <i data-lucide="fast-forward" style="width:18px;height:18px"></i>
+      </button>
+    </div>
+  </div>
+</div>
+
+<div id="albumUploadModal" class="modal-overlay" onclick="closeAlbumUploadModal(event)">
+  <div class="modal-card" onclick="event.stopPropagation()">
+    <div class="sheet-handle-area">
+      <div class="sheet-handle"></div>
+    </div>
+
+    <h3 style="font-weight:900;font-size:20px;margin-bottom:4px">Название альбома</h3>
+    <p id="albumUploadModalCounter" style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:14px"></p>
+
+    <div style="margin-bottom:14px">
+      <label style="font-size:11px;font-weight:800;color:var(--subtext-color);text-transform:uppercase;letter-spacing:0.04em">Общее название</label>
+      <input type="text" id="albumUploadModalInput" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;margin-top:4px;outline:none;font-size:15px;transition:border-color 0.3s var(--ease-smooth)" placeholder="Например: Отпуск 2026" oninput="renderAlbumPreview(this.value)" onfocus="this.style.borderColor='var(--btn-bg)'" onblur="this.style.borderColor='var(--border-color)'">
+    </div>
+
+    <div style="padding:12px;background:var(--card-bg);border:1px solid var(--border-color);border-radius:14px;margin-bottom:16px;font-size:12px;font-weight:600;color:var(--subtext-color)">
+      <div style="font-weight:800;color:var(--text-color);margin-bottom:6px">Файлы получат имена:</div>
+      <div id="albumPreview"></div>
+    </div>
+
+    <div style="display:flex;flex-direction:column;gap:8px">
+      <button class="sound-item-btn" onclick="confirmAlbumName()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
+        <span>Создать альбом</span>
+        <i data-lucide="check" style="width:18px;height:18px"></i>
+      </button>
+
+      <button class="sound-item-btn" onclick="closeAlbumUploadModal()">
+        <span>Отмена</span>
         <i data-lucide="x" style="width:18px;height:18px"></i>
       </button>
     </div>
@@ -3814,12 +3988,23 @@ body.vp-lock {
     <i data-lucide="send" style="width:18px;height:18px;flex-shrink:0"></i>
   </button>
 
-  <!-- ВОЛНА 22.86: зона загрузки — ТОЛЬКО индикатор прогресса.
-       «Загрузить файлы… нажмите или перетащите» (кнопка выбора файлов)
-       удалена по решению пользователя: файлы теперь загружаются через
-       бота (чат). Зона скрыта, пока ничего не грузится, появляется мягко
-       на время передачи (см. showDropLoader/resetUploadUI). -->
-  <div class="drop-zone" id="dropZone" style="display:none">
+  <!-- ВОЛНА 22.86→REVERT: зона загрузки СНОВА видна всегда — пользователь
+       попросил вернуть загрузку файлов прямо в мини-аппе (не только через
+       чат бота). Зона совмещает два состояния:
+         • idle — приглашение «Загрузить файлы…», клик / drag&drop открывает
+           выбор файлов;
+         • uploading — кольцо прогресса, имя файла, пауза/отмена.
+       Видимостью внутреннего состояния управляет JS: showDropLoader прячет
+       prompt, resetUploadUI возвращает его обратно. -->
+  <div class="drop-zone" id="dropZone" onclick="handleDropZoneClick(event)">
+    <div class="drop-prompt" id="dropPrompt">
+      <div class="dp-icon">
+        <i data-lucide="upload-cloud" style="width:26px;height:26px;color:var(--text-color);opacity:.55"></i>
+      </div>
+      <p style="font-weight:800;font-size:14px;color:var(--text-color);margin:0">Загрузить файлы</p>
+      <p style="font-size:12px;color:var(--subtext-color);margin:2px 0 0">Нажмите или перетащите сюда</p>
+    </div>
+
     <div class="upload-filename" id="uploadFilename"></div>
 
     <div class="download-progress-wrap" id="progressWrap">
@@ -3837,8 +4022,17 @@ body.vp-lock {
       </div>
 
       <p class="download-text" id="downloadText">Загрузка...</p>
+
+      <button type="button" id="uploadCancelBtn" class="upload-cancel-btn" onclick="cancelUpload()">
+        <svg viewBox="0 0 24 24" style="width:14px;height:14px;flex-shrink:0" fill="currentColor" aria-hidden="true">
+          <rect x="6" y="6" width="12" height="12" rx="2"></rect>
+        </svg>
+        <span>Отменить и удалить</span>
+      </button>
     </div>
   </div>
+
+  <input type="file" id="fileInput" multiple style="display:none">
 
   <div class="files-container">
     <section id="filesList" style="display:flex;flex-direction:column;gap:10px"></section>
@@ -3849,7 +4043,7 @@ body.vp-lock {
       </div>
 
       <p id="emptyTitle" style="font-weight:800;font-size:16px;color:var(--text-color)">Облако пусто</p>
-      <p id="emptySub" style="font-weight:600;font-size:13px;color:var(--subtext-color);margin-top:2px">Пришлите файлы боту в чат — они появятся здесь</p>
+      <p id="emptySub" style="font-weight:600;font-size:13px;color:var(--subtext-color);margin-top:2px">Нажмите «Загрузить файлы» выше или пришлите их боту в чат</p>
     </section>
   </div>
 
@@ -7876,9 +8070,258 @@ document.addEventListener('pointerdown', (e) => {
   }
 });
 
-/* ВОЛНА 22.86: handleDropZoneClick удалён вместе с кнопкой выбора файлов —
-   зона загрузки больше не открывает окно отправки, она только показывает
-   прогресс (её видимостью управляют showDropLoader/resetUploadUI). */
+/* ВОЛНА 22.86→REVERT: handleDropZoneClick и uploadFiles ВЕРНУЛИСЬ.
+   Зона загрузки снова служит кнопкой выбора файлов + drag&drop.
+   handleLoaderClick ниже по коду по-прежнему управляет паузой/отменой
+   во время загрузки. */
+
+function handleDropZoneClick(e) {
+  if (e) {
+    /* клик по внутреннему лоадеру во время загрузки — его собственный
+       onclick сам поймает событие, не открываем выбор файла */
+    const target = e.target;
+    if (target && target.closest && target.closest('#dropLoader')) return;
+  }
+
+  /* если идёт загрузка — не открываем окно выбора */
+  if (isUploading) return;
+
+  const fi = document.getElementById('fileInput');
+  if (fi) {
+    try { fi.value = ''; } catch (e2) {}
+    fi.click();
+  }
+}
+
+/* Файлы из <input type=file> или drag&drop — складываем в pendingFiles
+   и открываем окно «Отправка файлов» (пароль / «Отправить»). */
+let pickerAppend = false;
+
+function pickUploadFiles() {
+  pickerAppend = false;
+  document.getElementById('fileInput').click();
+}
+
+function addMoreUploadFiles() {
+  pickerAppend = true;
+  document.getElementById('fileInput').click();
+}
+
+/* ═══ ВОЛНА 22.79 (вернулось в 22.89): СНИФФИНГ ФОРМАТА ПО МАГИЧЕСКИМ БАЙТАМ ═══
+   На Android WebView файлы из галереи часто приходят с пустым type и
+   безымянными («blob») — фото/видео/музыка становились «документом»,
+   а файлы назывались «file.bin». Первые байты честно говорят, что это:
+   JPEG/PNG/GIF/WEBP/BMP/HEIC, MP4/MOV/WEBM/AVI, MP3/WAV/OGG/FLAC/M4A,
+   PDF/ZIP. Плюс дружелюбное имя по типу — «Фото 07.10 14:32.jpg». */
+function devoSniffMime(b) {
+  if (!b || !b.length) return '';
+  const ascii = (off, s) => {
+    for (let i = 0; i < s.length; i++) {
+      if (b[off + i] !== s.charCodeAt(i)) return false;
+    }
+    return true;
+  };
+  if (b.length >= 3 && b[0] === 0xFF && b[1] === 0xD8 && b[2] === 0xFF) return 'image/jpeg';
+  if (b.length >= 4 && b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4E && b[3] === 0x47) return 'image/png';
+  if (b.length >= 6 && ascii(0, 'GIF8')) return 'image/gif';
+  if (b.length >= 12 && ascii(0, 'RIFF') && ascii(8, 'WEBP')) return 'image/webp';
+  if (b.length >= 12 && ascii(0, 'RIFF') && ascii(8, 'AVI ')) return 'video/x-msvideo';
+  if (b.length >= 12 && ascii(0, 'RIFF') && ascii(8, 'WAVE')) return 'audio/wav';
+  if (b.length >= 2 && b[0] === 0x42 && b[1] === 0x4D) return 'image/bmp';
+  if (b.length >= 12 && ascii(4, 'ftyp')) {
+    const brand = String.fromCharCode(b[8] || 0, b[9] || 0, b[10] || 0, b[11] || 0).toLowerCase();
+    if (brand.indexOf('qt') === 0) return 'video/quicktime';
+    if (brand.indexOf('m4a') === 0 || brand.indexOf('m4b') === 0) return 'audio/mp4';
+    if (brand.indexOf('heic') === 0 || brand.indexOf('heix') === 0 ||
+        brand.indexOf('mif1') === 0 || brand.indexOf('heif') === 0) return 'image/heic';
+    return 'video/mp4';
+  }
+  if (b.length >= 4 && b[0] === 0x1A && b[1] === 0x45 && b[2] === 0xDF && b[3] === 0xA3) return 'video/webm';
+  if (b.length >= 4 && ascii(0, 'fLaC')) return 'audio/flac';
+  if (b.length >= 4 && ascii(0, 'OggS')) return 'audio/ogg';
+  if (b.length >= 3 && ascii(0, 'ID3')) return 'audio/mpeg';
+  if (b.length >= 2 && b[0] === 0xFF && (b[1] & 0xE0) === 0xE0) return 'audio/mpeg';
+  if (b.length >= 4 && b[0] === 0x25 && b[1] === 0x50 && b[2] === 0x44 && b[3] === 0x46) return 'application/pdf';
+  if (b.length >= 4 && b[0] === 0x50 && b[1] === 0x4B && (b[2] === 3 || b[2] === 5 || b[2] === 7)) return 'application/zip';
+  return '';
+}
+
+function devoMimeExt(mime) {
+  return ({
+    'image/jpeg': '.jpg', 'image/png': '.png', 'image/gif': '.gif',
+    'image/webp': '.webp', 'image/bmp': '.bmp', 'image/heic': '.heic',
+    'video/mp4': '.mp4', 'video/quicktime': '.mov', 'video/webm': '.webm',
+    'video/x-msvideo': '.avi',
+    'audio/mpeg': '.mp3', 'audio/wav': '.wav', 'audio/ogg': '.ogg',
+    'audio/flac': '.flac', 'audio/mp4': '.m4a',
+    'application/pdf': '.pdf', 'application/zip': '.zip'
+  })[String(mime || '')] || '';
+}
+
+function devoFriendlyName(mime) {
+  const d = new Date();
+  const p = (x) => String(x).padStart(2, '0');
+  const ts = p(d.getDate()) + '.' + p(d.getMonth() + 1) + ' ' +
+    p(d.getHours()) + ':' + p(d.getMinutes());
+  const m = String(mime || '');
+  let base = 'Файл';
+  let ext = devoMimeExt(m);
+
+  if (m.indexOf('image/') === 0) { base = 'Фото'; ext = ext || '.jpg'; }
+  else if (m.indexOf('video/') === 0) { base = 'Видео'; ext = ext || '.mp4'; }
+  else if (m.indexOf('audio/') === 0) { base = 'Аудио'; ext = ext || '.mp3'; }
+  else if (m === 'application/pdf') { base = 'Документ'; ext = '.pdf'; }
+
+  return base + ' ' + ts + ext;
+}
+
+async function devoFixFile(f) {
+  /* Возвращает файл с исправленными type/name (или исходный, если всё ок).
+     File.type — геттер прототипа, поэтому при изменениях создаём новый
+     File/Blob с тем же содержимым (slice не теряет байты). */
+  try {
+    if (!f || !(+f.size)) return f;
+    let head = null;
+
+    try { head = new Uint8Array(await f.slice(0, 24).arrayBuffer()); } catch (eH) { head = null; }
+
+    const sniffed = head ? devoSniffMime(head) : '';
+    const curType = (String(f.type || '') === 'application/octet-stream')
+      ? '' : String(f.type || '');
+    const mime = sniffed || curType;
+    const name = String(f.name || '');
+    let newName = name;
+    let needNew = false;
+
+    if (!name || name === 'blob') {
+      newName = devoFriendlyName(mime);
+      needNew = true;
+    } else if (!/\.[a-z0-9]{1,8}$/i.test(name)) {
+      const ext = devoMimeExt(mime);
+      if (ext) { newName = name + ext; needNew = true; }
+    }
+
+    if (mime && mime !== curType) needNew = true;
+    if (!needNew) return f;
+
+    const type = mime || 'application/octet-stream';
+    const keepName = newName || name || 'file';
+
+    try {
+      return new File([f], keepName, {
+        type: type,
+        lastModified: f.lastModified || Date.now()
+      });
+    } catch (eF) {
+      try {
+        const nb = new Blob([f], { type: type });
+        nb.name = keepName;
+        nb.lastModified = f.lastModified || Date.now();
+        return nb;
+      } catch (eB) { return f; }
+    }
+  } catch (e) { return f; }
+}
+
+async function uploadFiles(fileList) {
+  let files = Array.from(fileList || []);
+
+  if (!files.length) return;
+
+  /* Вне Telegram без входа — предлагаем войти (из index-10 пользователя) */
+  if (!IS_TELEGRAM && !WEB_TOKEN) {
+    showToast('Войдите, чтобы загружать файлы');
+    setTimeout(openLoginModal, 400);
+    return;
+  }
+
+  /* ═══ ВОЛНА 22.79 (вернулось в 22.89): ТИП И ИМЯ ЧИНЯТСЯ СРАЗУ ПРИ ВЫБОРЕ ═══
+     На Android WebView часто отдаёт файлы без mime (type='') и с
+     безымянным name («blob», без расширения) — фото/видео/музыка
+     превращались в «документ», а файлы назывались «file.bin». Читаем
+     первые байты и распознаём формат по магической сигнатуре, имя
+     достраиваем честным «Фото 07.10 14:32.jpg». */
+  try {
+    files = await Promise.all(files.map((f) => devoFixFile(f)));
+  } catch (eFix) { /* чиним, как получилось */ }
+
+  if (!files.length) return;
+
+  /* 22.39: пустые файлы (0 Б) не грузим вообще — «такого не должно быть»
+     (сервер их отвергает, клиент отсекает сразу с честным тостом) */
+  const empty = files.filter((f) => !+f.size);
+
+  if (empty.length) {
+    showToast('⚠️ Пустых файлов (0 Б): ' + empty.length +
+      ' — пропущены. Перекачайте их заново.');
+  }
+
+  files = files.filter((f) => +f.size);
+
+  if (!files.length) return;
+
+  /* ВОЛНА 22.49/22.68 (вернулось в 22.89): файлы, выбранные ВО ВРЕМЯ
+     активной загрузки, не пропадают — сохраняются в очередь докачки
+     (IndexedDB) и сразу после окончания текущей пачки движок сам
+     подхватит их (soft-resume) — «дождитесь окончания» больше не
+     означает «потеряйте». */
+  if (files.length && isUploading) {
+    for (const f of files) {
+      if (f._entryKey || (+f.size || 0) > UPQ_MAX_PERSIST) continue;
+
+      const k = 'up_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+
+      f._entryKey = k;
+
+      upqPut({
+        k: k, blob: f, name: f.name, uploadName: f.uploadName || f.name,
+        size: +f.size || 0, mime: f.type || '', uploadId: '', added: Date.now()
+      });
+    }
+
+    showToast('⏳ Дождитесь окончания текущей загрузки — эти ' + files.length +
+      ' файл(ов) в очереди и полетят следом');
+    return;
+  }
+
+  const modalOpen = !!(document.getElementById('uploadModal') || {}).classList &&
+    document.getElementById('uploadModal').classList.contains('open');
+
+  /* ВОЛНА 22.54 (вернулось в 22.89): файлы сохраняются в очередь докачки
+     (IndexedDB) ПРЯМО В МОМЕНТ ВЫБОРА — закрытие мини аппа до старта
+     загрузки не теряет файлы целиком. */
+  for (const f of files) {
+    if (f._entryKey) continue;
+
+    if ((+f.size || 0) > UPQ_MAX_PERSIST) {
+      f._entryKey = '';
+      continue;
+    }
+
+    const k = 'up_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+
+    f._entryKey = k;
+
+    upqPut({
+      k: k, blob: f, name: f.name, uploadName: f.uploadName || f.name,
+      size: +f.size || 0, mime: f.type || '', uploadId: '', added: Date.now()
+    });
+  }
+
+  if (pickerAppend && modalOpen) {
+    pendingFiles = pendingFiles.concat(files);
+    refreshUploadModal();
+  } else {
+    pendingFiles = files;
+    openUploadModal();
+  }
+
+  /* ═══ ВОЛНА 22.74: ЗАГРУЗКА ТОЛЬКО ПО КНОПКЕ «ОТПРАВИТЬ» ═══
+     Выбранные файлы просто ждут в окне, передача начинается по кнопке
+     «Отправить» (confirmUploadFiles → prestreamStart). Закрытие окна
+     до «Отправить» НЕ отправляет файлы. */
+  pickerAppend = false;
+}
 
 function handleLoaderClick(e) {
   if (e) e.stopPropagation();
@@ -7984,6 +8427,224 @@ function cancelUpload() {
   if (sq) sq.style.opacity = '0.3';
 
   showToast('⏹ Загрузка остановлена, байты стёрты');
+}
+
+function openNameChoiceModal() {
+  /* ВОЛНА 22.43: шаг имени — для ЛЮБОГО количества файлов.
+     Раньше ОДИН файл уходил в загрузку сразу, без возможности назвать;
+     теперь одиночный файл тоже открывает окно «Назовите файл» —
+     можно ввести имя или нажать «Пропустить» (останется оригинальное). */
+  if (!pendingFiles.length) return;
+
+  if (pendingFiles.length === 1) {
+    openNameModal();
+    return;
+  }
+
+  const c = document.getElementById('nameChoiceCount');
+  if (c) c.textContent = pendingFiles.length;
+
+  openModalEl('nameChoiceModal');
+}
+
+function closeNameChoiceModal(e) {
+  if (e) e.stopPropagation();
+
+  pendingFiles = [];
+  closeModalEl('nameChoiceModal');
+}
+
+function chooseNameMode(mode) {
+  closeModalEl('nameChoiceModal');
+
+  if (mode === 'album') openAlbumModal();
+  else if (mode === 'each') openNameModal();
+  else startActualUpload();
+}
+
+function openAlbumModal() {
+  if (pendingFiles.length < 2) {
+    startActualUpload();
+    return;
+  }
+
+  const c = document.getElementById('albumUploadModalCounter');
+  if (c) c.textContent = 'Файлов: ' + pendingFiles.length;
+
+  const inp = document.getElementById('albumUploadModalInput');
+  if (inp) inp.value = '';
+
+  renderAlbumPreview('');
+
+  openModalEl('albumUploadModal');
+}
+
+function renderAlbumPreview(baseName) {
+  const preview = document.getElementById('albumPreview');
+  if (!preview) return;
+
+  if (!baseName || !baseName.trim()) {
+    preview.innerHTML = '<span style="opacity:0.6">Введите название, чтобы увидеть превью</span>';
+    return;
+  }
+
+  const items = pendingFiles.slice(0, 4).map((f, i) => {
+    const ext = f.name.includes('.') ? '.' + f.name.split('.').pop() : '';
+    return `<div style="padding:2px 0">${escapeHtml(baseName.trim())} ${i + 1}${escapeHtml(ext)}</div>`;
+  });
+
+  const more = pendingFiles.length > 4
+    ? `<div style="opacity:0.6;padding:2px 0">... и ещё ${pendingFiles.length - 4}</div>`
+    : '';
+
+  preview.innerHTML = items.join('') + more;
+}
+
+function closeAlbumUploadModal(e) {
+  if (e) e.stopPropagation();
+
+  closeModalEl('albumUploadModal');
+  openNameChoiceModal();
+}
+
+/* closeAlbumModal для окна «Действия с папкой» (переименовать/удалить)
+   определена ниже, рядом с openAlbumActions — здесь дублировать не нужно. */
+
+function confirmAlbumName() {
+  const inp = document.getElementById('albumUploadModalInput');
+  const base = (inp && inp.value.trim()) || 'Альбом';
+
+  const extOf = (f) => {
+    const n = String(f.name || '');
+    const i = n.lastIndexOf('.');
+
+    return i > 0 ? n.slice(i) : '';
+  };
+
+  /* ВОЛНА 22.83: создаём НАСТОЯЩИЙ альбом — файлы после загрузки попадут
+     в папку, а не просто получат переназванные имена в корне. */
+  const aid = albumIdNew();
+  pendingFiles.forEach((f, i) => {
+    try {
+      f.uploadName = (base + ' ' + (i + 1) + extOf(f)).slice(0, 120);
+      f._pendingAlbumId = aid;
+    } catch (e) {}
+  });
+
+  PENDING_ALBUM = { id: aid, name: base, fileIds: [] };
+
+  closeModalEl('albumUploadModal');
+  startActualUpload();
+}
+
+let nameEditIndex = 0;
+
+function openNameModal() {
+  nameEditIndex = 0;
+
+  pendingFiles.forEach((f) => {
+    try { delete f._customName; } catch (e) {}
+    try { delete f._customDesc; } catch (e) {}
+  });
+
+  showNameModal();
+}
+
+function showNameModal() {
+  const f = pendingFiles[nameEditIndex];
+
+  if (!f) {
+    applyCustomNames();
+    return;
+  }
+
+  /* ВОЛНА 22.43: у одиночного файла счётчик «Файл 1 из 1» и кнопка
+     «Пропустить все» (дублирует «Пропустить») не нужны — прячем;
+     у пачки всё как раньше. */
+  const many = pendingFiles.length > 1;
+
+  const counter = document.getElementById('nameModalCounter');
+  if (counter) {
+    counter.textContent = many
+      ? 'Файл ' + (nameEditIndex + 1) + ' из ' + pendingFiles.length
+      : '';
+    counter.style.display = many ? 'block' : 'none';
+  }
+
+  const skipAllBtn = document.getElementById('nameModalSkipAll');
+  if (skipAllBtn) skipAllBtn.style.display = many ? 'flex' : 'none';
+
+  const orig = document.getElementById('nameModalOriginal');
+  if (orig) orig.textContent = 'Текущее имя: ' + (f.name || '');
+
+  const inp = document.getElementById('nameModalInput');
+  if (inp) inp.value = '';
+
+  const descInp = document.getElementById('nameModalDescInput');
+  if (descInp) descInp.value = '';
+
+  openModalEl('nameModal');
+}
+
+function confirmNameAndNext() {
+  const inp = document.getElementById('nameModalInput');
+  const v = inp ? inp.value.trim() : '';
+
+  const descInp = document.getElementById('nameModalDescInput');
+  const d = descInp ? descInp.value.trim() : '';
+
+  if (v) {
+    try { pendingFiles[nameEditIndex]._customName = v.slice(0, 120); } catch (e) {}
+  }
+  if (d) {
+    try { pendingFiles[nameEditIndex]._customDesc = d.slice(0, 1000); } catch (e) {}
+  }
+
+  if (inp) inp.value = '';
+  if (descInp) descInp.value = '';
+
+  nextNameStep();
+}
+
+function skipNameAndNext() {
+  nextNameStep();
+}
+
+function skipAllNames() {
+  closeModalEl('nameModal');
+  applyCustomNames();
+}
+
+function nextNameStep() {
+  closeModalEl('nameModal');
+
+  nameEditIndex++;
+
+  if (nameEditIndex < pendingFiles.length) {
+    setTimeout(showNameModal, 200);
+  } else {
+    applyCustomNames();
+  }
+}
+
+function applyCustomNames() {
+  /* ВОЛНА 22.44: то же, что в confirmAlbumName — expando на оригинальном
+     File, НЕ Object.assign-копия (копия теряла size → «Файл пустой (0 Б)»
+     у КАЖДОГО названного файла). */
+  pendingFiles.forEach((f) => {
+    if (f && f._customName) {
+      try { f.uploadName = String(f._customName).slice(0, 120); } catch (e) {}
+    }
+  });
+
+  startActualUpload();
+}
+
+function closeNameModal(e) {
+  if (e) e.stopPropagation();
+
+  closeModalEl('nameModal');
+  applyCustomNames();
 }
 
 function startActualUpload() {
@@ -8495,7 +9156,9 @@ async function bgQueueSendClick() {
 function refreshUploadModal() {
   const info = document.getElementById('uploadModalInfo');
   const list = document.getElementById('uploadFileList');
+  const addBtn = document.getElementById('uploadAddBtn');
   const sendBtn = document.getElementById('uploadSendBtn');
+  const moreBtn = document.getElementById('uploadMoreBtn');
   const passRow = document.getElementById('uploadPassRow');
   const plainHint = document.getElementById('uploadPlainHint');
   const passInput = document.getElementById('uploadPassword');
@@ -8504,9 +9167,9 @@ function refreshUploadModal() {
 
   if (info) {
     info.textContent = !has
-      /* ВОЛНА 22.86: выбор файлов удалён — окно открывается только с уже
-         выбранными (повторными/недокачанными) файлами. */
-      ? 'Файлы загружаются через бота: пришлите их в чат. Здесь вводится пароль и подтверждается отправка уже выбранных файлов.'
+      /* 22.86→REVERT: файлов нет в очереди, но мы снова умеем выбирать их
+         из мини-аппа. Подсказка указывает на зону загрузки вверху. */
+      ? 'Нажмите «Загрузить файлы» вверху или перетащите их туда. Здесь вводится пароль и подтверждается отправка уже выбранных файлов.'
       : pendingFiles.length === 1
         ? (pendingFiles[0].name || 'файл') + ' — ждёт отправки. Загрузка начнётся после нажатия кнопки «Отправить».'
         : 'Выбрано файлов: ' + pendingFiles.length + ' — все ждут отправки. Загрузка начнётся после нажатия кнопки «Отправить».';
@@ -8540,10 +9203,9 @@ function refreshUploadModal() {
     }
   }
 
+  if (addBtn) addBtn.classList.toggle('hidden', has);
   if (sendBtn) sendBtn.classList.toggle('hidden', !has);
-
-  /* ВОЛНА 22.86: кнопки «Добавить файл»/«Добавить ещё» удалены — их
-     переключатели убраны вместе с ними. */
+  if (moreBtn) moreBtn.classList.toggle('hidden', !has);
 
   /* ВОЛНА 22.40: пароль ОБЯЗАТЕЛЕН только когда хранилище шифруется
      (STORAGE_ENCRYPTED === true). Раньше поле становилось обязательным,
@@ -8655,12 +9317,11 @@ function confirmUploadFiles() {
   }
   prestreamStart(pendingFiles.slice());
 
-  /* ВОЛНА 22.87: окна «Как назвать эти файлы?» / «Назовите файл» /
-     «Название альбома» УДАЛЕНЫ (пользователь: «не назвать файл в мини
-     аппе») — файлы уходят СРАЗУ и с ИСХОДНЫМИ именами. Назвать по-
-     прежнему можно ПОСЛЕ загрузки: кнопка «🏷 Назвать по одному» в итоге
-     в чате и ✏️ в облаке. */
-  startActualUpload();
+  /* ВОЛНА 22.43 (вернулось в 22.89): окно имени открывается для ЛЮБОГО
+     количества файлов — один файл можно назвать или пропустить, пачка —
+     альбом / по одному / пропустить всё. Байты уже летят (предохранка
+     выше), введённые имена «догоняют» загрузку (startActualUpload). */
+  openNameChoiceModal();
 }
 
 /* ВОЛНА 22.40: пароль, введённый В ЭТОМ окне загрузки (для режима
@@ -8698,6 +9359,7 @@ function showDropLoader(files) {
   const bar = document.getElementById('progressBar');
   const checkmark = document.getElementById('checkmark');
   const squareStop = document.getElementById('squareStop');
+  const prompt = document.getElementById('dropPrompt');
 
   if (files.length === 1) {
     filenameEl.innerHTML = `Загружается:<br><b>${escapeHtml(files[0].uploadName || files[0].name)}</b>`;
@@ -8713,20 +9375,26 @@ function showDropLoader(files) {
   filenameEl.style.display = 'block';
   softReveal(filenameEl);   /* 22.59: имя файла появляется мягко */
 
-  /* 22.86: зона проявляется мягко (класс .uploading несёт keyframes
-     softFadeIn — играют при первом рендере). Отложенное скрытие предыдущей
-     пачки отменяем, чтобы гонка «прячу → показываю» не мигала зоной. */
+  /* 22.86→REVERT: зона была скрыта по умолчанию, теперь она всегда видна
+     (idle-состояние). При старте загрузки:
+       • прячем приглашение (.drop-prompt) добавлением класса .uploading;
+       • отменяем отложенное скрытие предыдущей пачки (гонка «прячу→показываю»);
+       • показываем прогресс-блок. */
   if (zone) {
     clearTimeout(_zoneHideT);
     _zoneHideT = null;
     zone.style.opacity = '';
     zone.style.transition = '';
     if (!zone.classList.contains('uploading')) {
-      zone.classList.add('uploading');   // анимация — только на ПЕРВОМ показе
+      zone.classList.add('uploading');   // анимация + прячем .drop-prompt
     }
     zone.style.display = 'flex';
   }
   wrap.classList.add('active');
+
+  /* 22.85 (вернулось в 22.89): кнопка отмены видна ровно пока идёт пачка */
+  const _ucb = document.getElementById('uploadCancelBtn');
+  if (_ucb) _ucb.style.display = '';
 
   bar.classList.remove('success');
   bar.style.strokeDasharray = '157';
@@ -9026,24 +9694,29 @@ function resetUploadUI(bar, checkmark, squareStop) {
   const circumference = 157;
 
   wrap.classList.remove('active');
+  /* 22.85 (вернулось в 22.89): «Отменить и удалить» исчезает СРАЗУ по
+     завершении пачки — кнопка не должна висеть над пустой зоной */
+  const _ucb = document.getElementById('uploadCancelBtn');
+  if (_ucb) _ucb.style.display = 'none';
   filenameEl.style.display = 'none';
 
-  /* ВОЛНА 22.86: кнопки выбора файлов больше нет — после пачки зона
-     прогресса МЯГКО прячется целиком (opacity → display:none). Раньше
-     здесь «выскакивало» пустое приглашение «Загрузить файлы». */
+  /* 22.86→REVERT: зона ВСЕГДА видна. После пачки просто возвращаем её
+     в idle-состояние: снимаем .uploading — проявится обратно приглашение
+     «Загрузить файлы…». Саму зону НЕ прячем. */
   if (zone) {
     if (LOW_END || REDUCED_MOTION) {
       zone.classList.remove('uploading');
-      zone.style.display = 'none';
     } else {
+      /* плавный fade прогресса → резкое возвращение prompt,
+         чтобы не было «прыжков» содержимого */
       zone.style.transition = 'opacity 0.3s var(--ease-smooth)';
       zone.style.opacity = '0';
       _zoneHideT = setTimeout(() => {
         _zoneHideT = null;
         zone.classList.remove('uploading');
-        zone.style.display = 'none';
         zone.style.opacity = '';
         zone.style.transition = '';
+        /* prompt проявится через CSS (его дефолтный display: flex) */
       }, 320);
     }
   }
@@ -10062,6 +10735,7 @@ async function uploadEngine(bar) {
   const fileBytes = new Map();
   let reportedTotal = 0;
   let dedupedCount = 0;   /* 22.62: сколько файлов свёл сервер (уже из чата) */
+  let _descDirty = false; /* ВОЛНА 22.83 (вернулось в 22.89): есть новые описания */
 
   const reportTotal = () => {
     setUploadPct((reportedTotal / totalBytes) * 100, bar);
@@ -10144,6 +10818,22 @@ async function uploadEngine(bar) {
           added.push(rec);
         }
 
+        /* ВОЛНА 22.83 (вернулось в 22.89): собираем ID успешно загруженных
+           файлов в отложенный альбом («Создать альбом» в окне имени).
+           Дедуп-файлы тоже идут в альбом. Описание из окна имени — в
+           DESC_MAP, сам save отложен до конца пачки (одна запись). */
+        if (rec && rec.id) {
+          if (PENDING_ALBUM && file._pendingAlbumId === PENDING_ALBUM.id) {
+            PENDING_ALBUM.fileIds.push(String(rec.id));
+          }
+          if (file._customDesc) {
+            try {
+              DESC_MAP[String(rec.id)] = String(file._customDesc).slice(0, 1000);
+              _descDirty = true;
+            } catch (e) {}
+          }
+        }
+
         /* ВОЛНА 22.54: страховка имени. Файл уходил в бота под оригинальным
            именем (предохранка), пользователь назвал его в окне имени — если
            сервер всё же записал старое имя (финализация обогнала ренейм),
@@ -10210,6 +10900,8 @@ async function uploadEngine(bar) {
       if (f._entryKey) upqDel(f._entryKey);
     }
 
+    PENDING_ALBUM = null;
+
     resetUploadUI(bar, checkmark, squareStop);
     return;
   }
@@ -10221,6 +10913,8 @@ async function uploadEngine(bar) {
       /safe_locked|пароль|password/i.test(msg);
 
     const retryFiles = needPass ? failedFiles.map((x) => x.file) : [];
+
+    PENDING_ALBUM = null;
 
     resetUploadUI(bar, checkmark, squareStop);
 
@@ -10285,6 +10979,29 @@ async function uploadEngine(bar) {
     }));
   });
 
+  /* ВОЛНА 22.83 (вернулось в 22.89): финализируем отложенный альбом —
+     если хотя бы один файл загрузился, создаём запись в ALBUM_MAP.
+     Файлы автоматически убираются из корня и видны внутри альбома. */
+  if (PENDING_ALBUM) {
+    if (PENDING_ALBUM.fileIds.length) {
+      ALBUM_MAP[PENDING_ALBUM.id] = {
+        id: PENDING_ALBUM.id,
+        name: PENDING_ALBUM.name,
+        ts: Date.now(),
+        fileIds: PENDING_ALBUM.fileIds
+      };
+      try { saveAlbums(); } catch (e) {}
+      showToast('📁 Альбом «' + PENDING_ALBUM.name + '» создан');
+    }
+    PENDING_ALBUM = null;
+  }
+
+  /* ВОЛНА 22.83 (вернулось в 22.89): один пакетный save описаний —
+     вместо N записей в localStorage в цикле загрузки. */
+  if (_descDirty) {
+    try { saveDescriptions(); } catch (e) {}
+  }
+
   renderAll({ animate: true });
 
   /* ВОЛНА 22.68: тихая сверка с сервером СРАЗУ после пачки — подхватывает
@@ -10306,14 +11023,63 @@ async function uploadEngine(bar) {
   }, 1200);
 }
 
-/* ═══ ВОЛНА 22.86: ВЫБОР ФАЙЛОВ В МИНИ-АППЕ УДАЛЁН ═══
-   Кнопка «Добавить файл»/«Добавить ещё», скрытый <input type=file>,
-   drag&drop и функции pickUploadFiles/addMoreUploadFiles/uploadFiles
-   (со сниффером devoSniffMime/devoFixFile) удалены по решению
-   пользователя: файлы загружаются через бота — «кнопка выбора файлов
-   больше не нужна, удали её полностью». Путь подтверждения (пароль +
-   «Отправить» → confirmUploadFiles) сохранён для повторной отправки
-   недокачанных файлов и ввода пароля после safe_locked. */
+/* ═══ ВОЛНА 22.89: ВСЁ ПРОПАВШЕЕ ВЕРНУЛОСЬ ═══
+   22.88 вернула выбор файлов (зона/клик/drag&drop), 22.89 вернула
+   ОСТАЛЬНОЕ, вырезанное в 22.86/22.87: сниффер MIME (devoFixFile чинит
+   тип/имя при выборе), кнопки «Добавить файл»/«Добавить ещё», кнопку
+   «Отменить и удалить» на прогрессе и шаг именования («Как назвать эти
+   файлы?» → альбом / по одному (+описание) / пропустить). Полный путь:
+   handleDropZoneClick / кнопки → uploadFiles (сниффер + очередь IDB) →
+   openUploadModal → confirmUploadFiles (пароль, предохранка) →
+   openNameChoiceModal → startActualUpload → proceedUpload (сбор
+   PENDING_ALBUM/_customDesc → финализация альбома + один save описаний). */
+
+(function wireFileInput() {
+  const fi = document.getElementById('fileInput');
+  if (fi) {
+    fi.addEventListener('change', (e) => {
+      if (e.target.files && e.target.files.length) {
+        uploadFiles(e.target.files);
+      }
+      /* сбрасываем, чтобы тот же файл можно было выбрать снова */
+      e.target.value = '';
+    });
+  }
+
+  const dz = document.getElementById('dropZone');
+  if (dz) {
+    /* drag&drop — предотвращаем дефолт (иначе браузер открыл бы файл) */
+    ['dragenter', 'dragover'].forEach((ev) =>
+      dz.addEventListener(ev, (e) => {
+        e.preventDefault();
+        if (!isUploading) dz.classList.add('drag-over');
+      })
+    );
+
+    ['dragleave', 'dragend'].forEach((ev) =>
+      dz.addEventListener(ev, (e) => {
+        e.preventDefault();
+        /* dragleave срабатывает при выходе за границы И при переходе на
+           дочерний элемент — упрощаем: убираем подсветку, проверяем related */
+        try {
+          if (e.relatedTarget && dz.contains(e.relatedTarget)) return;
+        } catch (e2) {}
+        dz.classList.remove('drag-over');
+      })
+    );
+
+    dz.addEventListener('drop', (e) => {
+      e.preventDefault();
+      dz.classList.remove('drag-over');
+
+      if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) {
+        /* 22.89: при активной загрузке uploadFiles сам поставит файлы в
+           очередь докачки («полетят следом») — как до волны 22.86 */
+        uploadFiles(e.dataTransfer.files);
+      }
+    });
+  }
+})();
 
 const blobSpeedInput = document.getElementById('blobSpeedInput');
 if (blobSpeedInput) blobSpeedInput.value = blobIdleSpeed;
@@ -10328,6 +11094,7 @@ const ALBUMS_KEY = 'devo_albums';
 const ALBUM_DEMO_KEY = 'devo_demo_album_done';
 let ALBUM_MAP = {};   /* id -> { id, name, ts, fileIds: [String] } */
 let ALBUM_VIEW = null;
+let PENDING_ALBUM = null;   /* { id, name, fileIds: [] } — собирается во время загрузки (22.89) */
 try { loadAlbums(); } catch (e) {}
 
 initCustomColors();
