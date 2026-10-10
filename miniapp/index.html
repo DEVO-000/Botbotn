@@ -658,7 +658,8 @@ html.low-end .file-card {
 }
 
 .soft-reveal {
-  animation: softReveal 0.32s var(--ease-smooth) both;
+  /* 22.90: 0.32s → 0.4s — появление блоков стало медленнее и мягче */
+  animation: softReveal 0.4s var(--ease-smooth) both;
 }
 
 /* Слабые устройства / «меньше движений» — без анимации */
@@ -673,13 +674,14 @@ html.low-end .soft-reveal {
 }
 
 .file-card.card-enter {
-  animation: cardIn 0.38s var(--ease-smooth) both;
+  animation: cardIn 0.45s var(--ease-smooth) both;
   /* --i приходит из JS и уже ограничен 12 — старые WebView не знают CSS min() */
-  animation-delay: calc(var(--i, 0) * 24ms);
+  animation-delay: calc(var(--i, 0) * 32ms);
 }
 
 .file-card.card-out {
-  animation: cardOut 0.2s var(--ease-smooth) both;
+  /* 22.90: 0.2s → 0.3s — уход карточки стал медленнее и мягче */
+  animation: cardOut 0.3s var(--ease-smooth) both;
   pointer-events: none;
 }
 
@@ -1017,29 +1019,45 @@ html.low-end .confirm-actions {
   align-items: center;
   justify-content: center;
   gap: 2px;
+  /* 22.90: для мягкого схлопывания (promptOut) — иначе содержимое
+     вылезало бы за пределы уменьшающейся высоты */
+  overflow: hidden;
+  max-height: 200px;
+  will-change: opacity, transform;
 }
 
 .drop-prompt .dp-icon {
   margin-bottom: 4px;
 }
 
-/* uploading-состояние: прячем приглашение, показываем прогресс */
+/* uploading-состояние: приглашение не «выключается» за один кадр,
+   а мягко тает и схлопывается — одновременно проявляется прогресс.
+   Получается честный кроссфейд без миганий (22.90) */
 .drop-zone.uploading .drop-prompt {
-  display: none;
+  animation: promptOut 0.34s var(--ease-smooth) both;
+  pointer-events: none;
+}
+
+@keyframes promptOut {
+  0%   { opacity: 1; max-height: 200px; transform: scale(1); }
+  100% { opacity: 0; max-height: 0; transform: scale(0.94); visibility: hidden; }
 }
 
 .drop-zone.uploading {
   display: flex;
-  animation: softFadeIn 0.45s var(--ease-smooth) both;
+  /* 22.90: анимация fade-in УБРАНА — зона и так уже видна на экране,
+     переанимация мигала всей зоной при старте каждой загрузки */
 }
 
-html.low-end .drop-zone.uploading {
+html.low-end .drop-zone.uploading .drop-prompt {
   animation: none;
+  display: none;
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .drop-zone.uploading {
+  .drop-zone.uploading .drop-prompt {
     animation: none;
+    display: none;
   }
 }
 
@@ -1105,7 +1123,12 @@ html.low-end .drop-zone.uploading {
   stroke-dasharray: 157;
   stroke-dashoffset: 157;
   stroke-linecap: round;
-  transition: stroke-dashoffset 0.15s linear;
+  /* 22.90: было 0.15s linear — дуга «дрожала» на каждый чанке.
+     Теперь она плавно ДОГОНЯЕТ значение — движение кольца стало
+     медленным и непрерывным, без рывков */
+  transition:
+    stroke-dashoffset 0.35s var(--ease-smooth),
+    stroke 0.45s var(--ease-smooth);
 }
 
 .drop-loader circle.bar.success {
@@ -1154,35 +1177,8 @@ html.low-end .drop-zone.uploading {
 
 }
 
-/* ВОЛНА 22.89: кнопка «Отменить и удалить» вернулась (22.86 удаляла) —
-   один тап вместо жеста «2 клика по кольцу» (жест тоже остался).
-   Видна ровно пока идёт пачка (.active у обёртки), после — исчезает. */
-.upload-cancel-btn {
-  display: none;
-  align-items: center;
-  justify-content: center;
-  gap: 6px;
-  margin-top: 2px;
-  padding: 8px 18px;
-  border-radius: 12px;
-  border: 1px solid rgba(239, 68, 68, 0.35);
-  background: rgba(239, 68, 68, 0.08);
-  color: #ef4444;
-  font-family: 'Nunito', sans-serif;
-  font-weight: 800;
-  font-size: 13px;
-  cursor: pointer;
-  transition: background 0.25s var(--ease-smooth), transform 0.15s var(--ease-smooth);
-}
-
-.upload-cancel-btn:active {
-  transform: scale(0.96);
-}
-
-.download-progress-wrap.active .upload-cancel-btn {
-  display: inline-flex;
-  animation: softFadeIn 0.4s var(--ease-smooth) both;
-}
+/* ВОЛНА 22.90: кнопка «Отменить и удалить» УДАЛЕНА по просьбе пользователя.
+   Отмена — одно нажатие по кружку, удаление — два (см. handleLoaderClick). */
 
 .files-container {
   width: 100%;
@@ -1210,7 +1206,8 @@ html.low-end .drop-zone.uploading {
   opacity: 0;
   pointer-events: none;
   transform: translateY(-12px) scale(0.94);
-  transition: transform 0.35s var(--ease-spring), opacity 0.3s var(--ease-smooth);
+  /* 22.90: пружина → плавное замедление (без перелёта), чуть медленнее */
+  transition: transform 0.4s var(--ease-ultra), opacity 0.3s var(--ease-smooth);
   transform-origin: top right;
   will-change: transform, opacity;
 
@@ -1514,7 +1511,9 @@ html.low-end .drop-zone.uploading {
   opacity: 0;
   pointer-events: none;
   transform: translateY(-16px) scale(0.9);
-  transition: transform 0.4s var(--ease-spring), opacity 0.3s var(--ease-smooth);
+  /* 22.90: пружина с перелётом 1.56 дёргала панель — заменена на
+     плавное замедление без перелёта, чуть медленнее */
+  transition: transform 0.45s var(--ease-ultra), opacity 0.35s var(--ease-smooth);
   transform-origin: top right;
   will-change: transform, opacity;
   overscroll-behavior: contain;
@@ -1607,14 +1606,19 @@ html.low-end .drop-zone.uploading {
   overflow: hidden;
   max-height: 0;
   opacity: 0;
-  transition: max-height 0.4s var(--ease-ultra), opacity 0.35s var(--ease-smooth);
+  transition:
+    max-height 0.48s var(--ease-ultra),
+    opacity 0.32s var(--ease-smooth);
   /* ВОЛНА 22.55 (плавность): will-change на max-height (layout-свойство)
      не помогает и лишь держит слой в памяти — убрано; opacity оставлена */
   will-change: opacity;
 }
 
+/* 22.90: точную высоту подменю ставит JS (toggleSettingsSubmenu) в --sm-h —
+   раскрытие идёт ровно до контента, без «мёртвой зоны» 700px, из-за которой
+   закрытие подменю выглядело мгновенным исчезновением */
 .settings-submenu.open {
-  max-height: 700px;
+  max-height: var(--sm-h, 700px);
   opacity: 1;
 }
 
@@ -1622,11 +1626,24 @@ html.low-end .drop-zone.uploading {
   padding: 6px 0 4px;
 }
 
-.settings-panel .settings-item,
+/* 22.90 ФИКС «настройка вибрации не работает»: раньше эта пара правил
+   ПЕРЕЗАПИСЫВАЛА transition подменю — max-height в переходе не было,
+   подменю выскакивало и исчезало ЗА ОДИН КАДР (выглядело как «настройка
+   не работает» и «что-то исчезает»). Теперь max-height остаётся в переходе,
+   а высоту ведёт JS. */
+.settings-panel .settings-item {
+  transform: translateX(16px);
+  opacity: 0;
+  transition: transform 0.4s var(--ease-ultra), opacity 0.3s var(--ease-smooth);
+}
+
 .settings-panel .settings-submenu {
   transform: translateX(16px);
   opacity: 0;
-  transition: transform 0.35s var(--ease-ultra), opacity 0.3s var(--ease-smooth);
+  transition:
+    transform 0.4s var(--ease-ultra),
+    opacity 0.32s var(--ease-smooth),
+    max-height 0.48s var(--ease-ultra);
 }
 
 .settings-panel.open .settings-item,
@@ -3702,15 +3719,9 @@ body.vp-lock {
           </div>
         </button>
 
-        <button class="settings-item" onclick="closeSettingsAndDo(toggleSelectMode)">
-          <div class="settings-item-icon">
-            <i data-lucide="check-square" style="width:18px;height:18px"></i>
-          </div>
-          <div class="settings-item-label">
-            Выбор файлов
-            <small>ZIP, удаление, распаковка</small>
-          </div>
-        </button>
+        <!-- 22.90: кнопка «Выбор файлов» УДАЛЕНА по просьбе пользователя.
+             Режим выбора по-прежнему доступен длинным нажатием на файл
+             (долгий тап → чекбоксы), а выход из него — «Готово». -->
 
         <!-- 22.85: ВИБРАЦИЯ — отклик при действиях + СИЛА (слабая /
              средняя / сильная), состояние синхронизируется с базой -->
@@ -4008,7 +4019,10 @@ body.vp-lock {
     <div class="upload-filename" id="uploadFilename"></div>
 
     <div class="download-progress-wrap" id="progressWrap">
-      <div class="drop-loader" id="dropLoader" onclick="handleLoaderClick(event)" title="1 клик - пауза/старт, 2 клика - отмена">
+      <!-- 22.90: красная кнопка «Отменить и удалить» УДАЛЕНА по просьбе
+           пользователя. Управление загрузкой — только кружком:
+           1 нажатие — отмена (продолжаемо), 2 нажатия — удаление. -->
+      <div class="drop-loader" id="dropLoader" onclick="handleLoaderClick(event)" title="1 нажатие — отмена, 2 нажатия — удаление">
         <svg viewBox="0 0 60 60">
           <circle class="bg" cx="30" cy="30" r="25"></circle>
           <circle class="bar" id="progressBar" cx="30" cy="30" r="25"></circle>
@@ -4022,13 +4036,6 @@ body.vp-lock {
       </div>
 
       <p class="download-text" id="downloadText">Загрузка...</p>
-
-      <button type="button" id="uploadCancelBtn" class="upload-cancel-btn" onclick="cancelUpload()">
-        <svg viewBox="0 0 24 24" style="width:14px;height:14px;flex-shrink:0" fill="currentColor" aria-hidden="true">
-          <rect x="6" y="6" width="12" height="12" rx="2"></rect>
-        </svg>
-        <span>Отменить и удалить</span>
-      </button>
     </div>
   </div>
 
@@ -4154,16 +4161,17 @@ const _HAPTIC_IMPACT = {
 
 /* Шаблоны вибрации браузера: короткий тик — лёгкие действия,
    «двойной тап» — успех, резкая двойная — ошибка. Миллисекунды
-   подобраны заметными для вибромоторов Android (8мс почти не
-   чувствуются — старые значения были слишком короткими). */
+   подобраны заметными для вибромоторов Android (8–15мс почти не
+   чувствуются — 22.90 ещё чуть усилены, чтобы настройка была
+   реально ощутимой). */
 const VIB_PATTERNS = {
-  light: 15,
-  select: 12,
-  medium: 30,
-  heavy: 50,
-  warning: [60],
-  success: [30, 60, 30],
-  error: [80, 50, 80]
+  light: 22,
+  select: 18,
+  medium: 36,
+  heavy: 60,
+  warning: [70],
+  success: [35, 70, 35],
+  error: [90, 60, 90]
 };
 
 /* 22.86: ДОБАВКА К нативной гаптике для силы «Сильная». Нативные стили
@@ -4397,15 +4405,75 @@ function toggleSettingsSubmenu(id) {
   const willOpen = !submenu.classList.contains('open');
 
   document.querySelectorAll('.settings-submenu.open').forEach((s) => {
-    if (s.id !== id) s.classList.remove('open');
+    if (s.id !== id) closeSettingsSubmenu(s);
   });
 
   if (willOpen) {
-    submenu.classList.add('open');
     if (id === 'soundSubmenu') renderSoundMenu();
+    openSettingsSubmenu(submenu);
   } else {
-    submenu.classList.remove('open');
+    closeSettingsSubmenu(submenu);
   }
+}
+
+/* ═══ 22.90: ПЛАВНОЕ «УМНОЕ» ПОДМЕНЮ НАСТРОЕК ═══
+   Раньше класс .open менял max-height 0→700px БЕЗ перехода (transition
+   подменю перезаписывался соседним правилом панели) — подменю выскакивало
+   и исчезало за один кадр, а на низких экранах варианты (в т.ч. «Вибрация»)
+   могли оказаться за пределами видимой части панели. Теперь:
+   • JS измеряет реальную высоту контента и ведёт max-height точно к ней —
+     открытие и закрытие идут медленным плавным аккордеоном 0.48s;
+   • после открытия панель мягко докручивается, чтобы подменю было видно. */
+function openSettingsSubmenu(submenu) {
+  try { clearTimeout(submenu._smT); } catch (e) {}
+
+  const h = Math.max(60, submenu.scrollHeight || 0);
+
+  submenu.classList.add('open');
+  submenu.style.setProperty('--sm-h', h + 'px');
+
+  if (!submenu.style.maxHeight) {
+    submenu.style.maxHeight = '0px';
+    void submenu.offsetHeight;   /* фиксируем стартовое 0px для перехода */
+  }
+
+  submenu.style.maxHeight = h + 'px';
+
+  /* панель ограничена 70vh — если подменю не влезает, плавно докручиваем */
+  try {
+    const panel = submenu.closest('.settings-panel');
+
+    if (panel) {
+      const need = submenu.offsetTop + h;
+      const visible = panel.scrollTop + panel.clientHeight;
+
+      if (submenu.offsetTop < panel.scrollTop || need > visible) {
+        panel.scrollTo({
+          top: Math.max(0, submenu.offsetTop - 64),
+          behavior: 'smooth'
+        });
+      }
+    }
+  } catch (e) {}
+}
+
+function closeSettingsSubmenu(submenu) {
+  try { clearTimeout(submenu._smT); } catch (e) {}
+
+  if (!submenu.classList.contains('open') && !submenu.style.maxHeight) return;
+
+  const h = Math.max(60, submenu.scrollHeight || 0);
+
+  /* фиксируем текущую высоту, затем плавно уводим в ноль */
+  submenu.style.maxHeight = h + 'px';
+  void submenu.offsetHeight;
+  submenu.classList.remove('open');
+  submenu.style.maxHeight = '0px';
+
+  submenu._smT = setTimeout(() => {
+    submenu.style.maxHeight = '';
+    submenu.style.removeProperty('--sm-h');
+  }, 520);
 }
 
 let themeBootApplied = false;
@@ -5404,6 +5472,13 @@ let LAST_SYNC = 0;
    карточками списка: DOM не трогаем вообще */
 let LAST_FILES_SIG = '';
 
+/* 22.90 «УМНЫЕ АНИМАЦИИ»: id карточек, УЖЕ виденных на экране.
+   При перерисовке списка (синхронизация, добавление файла) анимация
+   появления проигрывается ТОЛЬКО у новых карточек — остальные стоят
+   на месте без мигания. Раньше любой чих перерисовки заново «въезжал»
+   всей колонкой — выглядело как дёрганье. */
+let RENDERED_CARD_IDS = new Set();
+
 async function loadFiles(silent, quiet) {
   if (listLoading) return false;
 
@@ -5937,12 +6012,14 @@ function pluralFiles(n) {
 /* ═══ ВОЛНА: КАРТОЧКА ПАПКИ ═══
    Папка — настоящая сущность: своя карточка с синей иконкой-папкой,
    счётчиком файлов и шевроном. Открывается как папка (см. openAlbum) */
-function albumCardHtml(al, animate, idx, bornId) {
+function albumCardHtml(al, enterI, bornId) {
   const cnt = (al.fileIds || []).length;
   const born = bornId && bornId === al.id;
   const aid = escapeHtml(String(al.id));
-  const cls = `file-card album-card${animate ? ' card-enter' : ''}${born ? ' album-born' : ''}`;
-  const style = animate ? `--i:${Math.min(idx, 12)};` : '';
+
+  /* 22.90: card-enter — только новым папкам (enterI !== null) */
+  const cls = `file-card album-card${enterI !== null && enterI !== undefined ? ' card-enter' : ''}${born ? ' album-born' : ''}`;
+  const style = (enterI !== null && enterI !== undefined) ? `--i:${enterI};` : '';
 
   return `
     <article class="${cls}" data-album-id="${aid}" style="${style}" onclick="openAlbum('${aid}')">
@@ -6014,6 +6091,11 @@ function renderFiles(files, opts) {
   /* ВОЛНА: чекбоксы «вспыхивают» при входе в выбор долгим нажатием */
   const selAnim = !!(opts && opts.selAnim) && !LOW_END && !REDUCED_MOTION;
 
+  /* 22.90: смена «экрана» (фильтр/сортировка/поиск/вход в папку) —
+     волна проигрывается ВСЕМ карточкам; обычные обновления (синхронизация,
+     новые файлы) — только новичкам */
+  const refresh = !!(opts && opts.refresh);
+
   /* ВОЛНА: id только что созданной папки — её карточка рождается с поп-анимацией */
   const bornAlbum = opts && opts.bornAlbum;
 
@@ -6021,12 +6103,30 @@ function renderFiles(files, opts) {
   let headerHtml = '';
   let albumsHtml = '';
 
+  /* 22.90: стаггер «--i» считаем только по НОВЫМ карточкам — волна
+     появления идёт ровно по ним, а не по всему списку */
+  const seenIds = new Set();
+  let newIdx = 0;
+
+  const staggerFor = (key) => {
+    seenIds.add(key);
+
+    if (!animate || (RENDERED_CARD_IDS.has(key) && !refresh)) return null;
+
+    const i = Math.min(newIdx, 12);
+    newIdx++;
+    return i;
+  };
+
   if (ALBUM_VIEW) {
     const album = ALBUM_MAP[ALBUM_VIEW];
     if (album) headerHtml = albumHeaderHtml(album, animate);
   } else if (FILTER === 'all' && !SEARCH.trim()) {
     const albums = Object.values(ALBUM_MAP).sort((a, b) => (b.ts || 0) - (a.ts || 0));
-    albumsHtml = albums.map((al, i) => albumCardHtml(al, animate, i, bornAlbum)).join('');
+    albumsHtml = albums.map((al) => {
+      const enterI = staggerFor('alb_' + al.id);
+      return albumCardHtml(al, enterI, bornAlbum);
+    }).join('');
   }
 
   if (!files.length && !albumsHtml && !headerHtml) {
@@ -6040,6 +6140,8 @@ function renderFiles(files, opts) {
       void empty.offsetWidth;
       empty.classList.add('fade-soft-in');
     }
+
+    RENDERED_CARD_IDS = new Set();
 
     return;
   }
@@ -6061,9 +6163,12 @@ function renderFiles(files, opts) {
       ? `toggleFileSelection(event,'${fid}')`
       : `openEditModal('${fid}')`;
 
-    /* ВОЛНА 22.56: индекс стаггера (кап 12) для волны появления карточек */
-    const enterAttrs = animate
-      ? ` card-enter" data-id="${fid}" style="--i:${Math.min(idx, 12)};${sel ? 'outline:2px solid var(--btn-text);outline-offset:-2px' : ''}`
+    /* 22.90 «умная» анимация: card-enter — только карточкам, которых
+       не было на экране в прошлой отрисовке */
+    const enterI = staggerFor(String(f.id));
+
+    const enterAttrs = enterI !== null
+      ? ` card-enter" data-id="${fid}" style="--i:${enterI};${sel ? 'outline:2px solid var(--btn-text);outline-offset:-2px' : ''}`
       : `" data-id="${fid}" style="${sel ? 'outline:2px solid var(--btn-text);outline-offset:-2px' : ''}`;
 
     const checkHtml = selectMode ? `
@@ -6125,6 +6230,10 @@ function renderFiles(files, opts) {
       </article>
     `;
   }).join('') + emptyAlbumNote;
+
+  /* 22.90: запоминаем, что уже на экране — следующая перерисовка
+     анимирует только реально новые карточки */
+  RENDERED_CARD_IDS = seenIds;
 
   safeIcons();
 }
@@ -8006,7 +8115,7 @@ function clearSearch() {
 
   document.getElementById('clearSearch').classList.remove('shown');
 
-  renderAll({ animate: true });
+  renderAll({ animate: true, refresh: true });
 }
 
 function setFilter(f) {
@@ -8017,7 +8126,7 @@ function setFilter(f) {
   });
 
   /* 22.56: смена фильтра — как смена экрана: список мягко «подъезжает» */
-  renderAll({ animate: true });
+  renderAll({ animate: true, refresh: true });
 }
 
 function toggleSortMenu(e) {
@@ -8046,7 +8155,7 @@ function setSort(s) {
   document.getElementById('sortMenu').classList.remove('open');
 
   /* 22.56: пересортировка — карточки мягко перестраиваются волной */
-  renderAll({ animate: true });
+  renderAll({ animate: true, refresh: true });
 }
 
 document.addEventListener('pointerdown', (e) => {
@@ -8323,6 +8432,15 @@ async function uploadFiles(fileList) {
   pickerAppend = false;
 }
 
+/* ═══ 22.90: КРУЖОК ПРОГРЕССА — ЕДИНСТВЕННОЕ УПРАВЛЕНИЕ ЗАГРУЗКОЙ ═══
+   Красная кнопка «Отменить и удалить» удалена по просьбе пользователя.
+   Новая логика нажатий по кружку:
+   • 1 нажатие — ОТМЕНА: передача останавливается, но байты и очередь
+     докачки (IndexedDB) ЦЕЛЫ — при следующем открытии мини-аппа загрузка
+     продолжится с того же места (resume);
+   • 2 нажатия — УДАЛЕНИЕ: то же + стирание недокачанных байтов на
+     сервере и очистка очереди докачки (как прежняя красная кнопка).
+   Пауза отдельным кликом убрана — её место заняла мягкая отмена. */
 function handleLoaderClick(e) {
   if (e) e.stopPropagation();
 
@@ -8332,28 +8450,13 @@ function handleLoaderClick(e) {
 
   if (clickCount === 1) {
     clickTimer = setTimeout(() => {
-      togglePauseUpload();
+      cancelUpload(false);   /* одно нажатие — отмена (продолжаемо) */
       clickCount = 0;
-    }, 260);
+    }, 280);
   } else if (clickCount === 2) {
     clearTimeout(clickTimer);
     clickCount = 0;
-    cancelUpload();
-  }
-}
-
-function togglePauseUpload() {
-  isPaused = !isPaused;
-
-  const dlText = document.getElementById('downloadText');
-  const squareStop = document.getElementById('squareStop');
-
-  if (isPaused) {
-    if (dlText) dlText.textContent = 'Пауза (нажмите для продолжения)';
-    if (squareStop) squareStop.style.opacity = '0.4';
-  } else {
-    if (dlText) dlText.textContent = 'Загрузка... (1 клик - пауза, 2 - отмена)';
-    if (squareStop) squareStop.style.opacity = '1';
+    cancelUpload(true);      /* два нажатия — удаление загруженных байтов */
   }
 }
 
@@ -8394,12 +8497,19 @@ function setUploadWaitText(t) {
   if (!el) return;
 
   el.textContent = (t === null || typeof t === 'undefined')
-    ? 'Загрузка... (1 клик - пауза, 2 - отмена)' : t;
+    ? 'Загрузка… (1 нажатие — отмена, 2 — удаление)' : t;
 }
 
-function cancelUpload() {
+/* 22.90: жёсткость остановки. false — мягкая отмена (1 нажатие по кружку):
+   байты на сервере и очередь докачки ЦЕЛЫ, продолжится при следующем
+   открытии. true — удаление (2 нажатия): сессии стираются на сервере,
+   очередь докачки очищается. */
+let uploadHardStop = false;
+
+function cancelUpload(hard) {
   if (!isUploading) return;
 
+  uploadHardStop = !!hard;
   uploadAbortFlag = true;
   isPaused = false;
 
@@ -8416,17 +8526,22 @@ function cancelUpload() {
   /* запланированный авто-ретрай гасим — пользователь решил сам */
   try { clearTimeout(_upRetryTimer); } catch (e) {}
 
-  /* СТОП + УДАЛИТЬ: стираем недокачанные сессии на сервере
-     (воркеры при выходе тоже зовут abort — тут страховка на ВСЕ случаи) */
-  abortAllUploadSessions();
+  if (uploadHardStop) {
+    /* ТОЛЬКО при «удалении» (2 нажатия): стираем недокачанные сессии
+       на сервере. Мягкая отмена байты НЕ трогает — докачка продолжит их */
+    abortAllUploadSessions();
+  }
 
   const dlText = document.getElementById('downloadText');
   const sq = document.getElementById('squareStop');
 
-  if (dlText) dlText.textContent = '⏹ Отменено — загруженное удалено';
-  if (sq) sq.style.opacity = '0.3';
+  if (dlText) {
+    dlText.textContent = uploadHardStop
+      ? '⏹ Удалено — загруженные байты стёрты'
+      : '⏹ Отменено — продолжится позже';
+  }
 
-  showToast('⏹ Загрузка остановлена, байты стёрты');
+  if (sq) sq.style.opacity = '0.3';
 }
 
 function openNameChoiceModal() {
@@ -9359,7 +9474,6 @@ function showDropLoader(files) {
   const bar = document.getElementById('progressBar');
   const checkmark = document.getElementById('checkmark');
   const squareStop = document.getElementById('squareStop');
-  const prompt = document.getElementById('dropPrompt');
 
   if (files.length === 1) {
     filenameEl.innerHTML = `Загружается:<br><b>${escapeHtml(files[0].uploadName || files[0].name)}</b>`;
@@ -9375,26 +9489,23 @@ function showDropLoader(files) {
   filenameEl.style.display = 'block';
   softReveal(filenameEl);   /* 22.59: имя файла появляется мягко */
 
-  /* 22.86→REVERT: зона была скрыта по умолчанию, теперь она всегда видна
-     (idle-состояние). При старте загрузки:
-       • прячем приглашение (.drop-prompt) добавлением класса .uploading;
-       • отменяем отложенное скрытие предыдущей пачки (гонка «прячу→показываю»);
-       • показываем прогресс-блок. */
+  /* 22.90: КРОССФЕЙД СОСТОЯНИЯ ЗОНЫ. Раньше приглашение гасло
+     display:none за один кадр (рывок), а сама зона мигала — у .uploading
+     была анимация fade-in, которая переигрывалась на УЖЕ видимой зоне.
+     Теперь: приглашение мягко схлопывается (CSS promptOut), прогресс
+     проявляется softFadeIn, зона не мигает вовсе. Если зона была в
+     середине обратного кроссфейда — мягко доводим до полной видимости. */
   if (zone) {
     clearTimeout(_zoneHideT);
     _zoneHideT = null;
-    zone.style.opacity = '';
-    zone.style.transition = '';
+    zone.style.transition = 'opacity 0.3s var(--ease-smooth)';
+    zone.style.opacity = '1';
     if (!zone.classList.contains('uploading')) {
-      zone.classList.add('uploading');   // анимация + прячем .drop-prompt
+      zone.classList.add('uploading');
     }
     zone.style.display = 'flex';
   }
   wrap.classList.add('active');
-
-  /* 22.85 (вернулось в 22.89): кнопка отмены видна ровно пока идёт пачка */
-  const _ucb = document.getElementById('uploadCancelBtn');
-  if (_ucb) _ucb.style.display = '';
 
   bar.classList.remove('success');
   bar.style.strokeDasharray = '157';
@@ -9407,7 +9518,7 @@ function showDropLoader(files) {
     squareStop.style.opacity = '1';
   }
 
-  document.getElementById('downloadText').textContent = 'Загрузка... (1 клик - пауза, 2 - отмена)';
+  document.getElementById('downloadText').textContent = 'Загрузка… (1 нажатие — отмена, 2 — удаление)';
 }
 
 /* ═══ 22.39: ДОКАЧКА ПОСЛЕ ЗАКРЫТИЯ МИНИ-АППА (IndexedDB) ═══
@@ -9617,6 +9728,7 @@ function proceedUpload(files, opts) {
   isUploading = true;
   isPaused = false;
   uploadAbortFlag = false;
+  uploadHardStop = false;   /* 22.90: новая пачка — без «памяти» о прошлой отмене */
   uploadQueue = files.slice();
 
   /* ВОЛНА 22.59: строки предохранки гасим — визуализацию пачки берёт
@@ -9686,39 +9798,70 @@ function sleepMs(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-function resetUploadUI(bar, checkmark, squareStop) {
+function resetUploadUI(bar, checkmark, squareStop, opts) {
   const zone = document.getElementById('dropZone');
   const filenameEl = document.getElementById('uploadFilename');
   const wrap = document.getElementById('progressWrap');
 
   const circumference = 157;
 
-  wrap.classList.remove('active');
-  /* 22.85 (вернулось в 22.89): «Отменить и удалить» исчезает СРАЗУ по
-     завершении пачки — кнопка не должна висеть над пустой зоной */
-  const _ucb = document.getElementById('uploadCancelBtn');
-  if (_ucb) _ucb.style.display = 'none';
-  filenameEl.style.display = 'none';
+  /* 22.90: СОСТОЯНИЕ сбрасывается сразу (новую пачку можно начинать тут же),
+     а ВИЗУАЛЬНЫЙ переход «прогресс → приглашение» идёт плавным
+     кроссфейдом: fade-out зоны → незаметная замена содержимого →
+     мягкий медленный fade-in. Раньше прогресс исчезал display:none за
+     один кадр («что-то исчезает»), а приглашение выскакивало скачком.
+     holdMs — сколько держать на экране финальный статус (например,
+     «⏹ Отменено…»), чтобы пользователь успел его прочесть. */
+  const holdMs = (opts && +opts.holdMs > 0) ? +opts.holdMs : 0;
 
-  /* 22.86→REVERT: зона ВСЕГДА видна. После пачки просто возвращаем её
-     в idle-состояние: снимаем .uploading — проявится обратно приглашение
-     «Загрузить файлы…». Саму зону НЕ прячем. */
-  if (zone) {
-    if (LOW_END || REDUCED_MOTION) {
-      zone.classList.remove('uploading');
-    } else {
-      /* плавный fade прогресса → резкое возвращение prompt,
-         чтобы не было «прыжков» содержимого */
-      zone.style.transition = 'opacity 0.3s var(--ease-smooth)';
+  if (zone && (LOW_END || REDUCED_MOTION)) {
+    clearTimeout(_zoneHideT);
+    _zoneHideT = null;
+    zone.classList.remove('uploading');
+    zone.style.opacity = '';
+    zone.style.transition = '';
+    zone.style.display = 'flex';
+    wrap.classList.remove('active');
+    filenameEl.style.display = 'none';
+  } else if (zone) {
+    clearTimeout(_zoneHideT);
+    _zoneHideT = null;
+
+    const beginFadeOut = () => {
+      /* фаза 1 — прогресс мягко тает */
+      zone.style.transition = 'opacity 0.34s var(--ease-smooth)';
       zone.style.opacity = '0';
+
       _zoneHideT = setTimeout(() => {
-        _zoneHideT = null;
+        /* фаза 2 — зона невидима: меняем содержимое без единого рывка */
         zone.classList.remove('uploading');
-        zone.style.opacity = '';
-        zone.style.transition = '';
-        /* prompt проявится через CSS (его дефолтный display: flex) */
-      }, 320);
+        wrap.classList.remove('active');
+        filenameEl.style.display = 'none';
+        zone.style.display = 'flex';
+        void zone.offsetHeight;
+
+        /* фаза 3 — медленное плавное возвращение приглашения */
+        zone.style.transition = 'opacity 0.55s var(--ease-ultra)';
+        zone.style.opacity = '0';
+        void zone.offsetHeight;
+        zone.style.opacity = '1';
+
+        _zoneHideT = setTimeout(() => {
+          _zoneHideT = null;
+          zone.style.opacity = '';
+          zone.style.transition = '';
+        }, 600);
+      }, 360);
+    };
+
+    if (holdMs > 0) {
+      _zoneHideT = setTimeout(beginFadeOut, holdMs);
+    } else {
+      beginFadeOut();
     }
+  } else {
+    wrap.classList.remove('active');
+    filenameEl.style.display = 'none';
   }
 
   if (bar) {
@@ -9738,6 +9881,7 @@ function resetUploadUI(bar, checkmark, squareStop) {
 
   uploadQueue = [];
   uploadAbortFlag = false;
+  uploadHardStop = false;   /* 22.90 */
 
   pendingFiles = [];
   pendingNames = {};
@@ -10296,25 +10440,47 @@ async function _preStreamFile(file) {
 
 /* Имя из окна имени — догоняет уже летящую/готовую загрузку. */
 function prestreamApplyNames(files) {
+  /* 22.90 ФИКС «файлы не называются»: раньше rename отправлялся ТОЛЬКО
+     файлам, у которых сессия (_preId) уже создана. Если init ещё летел
+     (медленная сеть / длинная пачка), имя тихо терялось — сессия
+     рождалась со СТАРЫМ именем, а complete имени не передаёт.
+     Теперь: сессии ещё нет — вешаем переименование на её завершение
+     (_preInitPromise); сессия уже есть — переименовываем сразу. */
   for (const f of files || []) {
-    if (!f || !f._preId || !f.uploadName) continue;
+    if (!f || !f.uploadName) continue;
 
-    const nm = String(f.uploadName).slice(0, 120);
+    const applyRename = () => {
+      if (!f._preId || f._preState === 'fail') return;
 
-    f._preRename = apiJson('/api/upload/rename', {
-      method: 'POST',
-      headers: vaultHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify({ uploadId: f._preId, name: nm })
-    }).catch(() => {});
+      const nm = String(f.uploadName).slice(0, 120);
 
-    /* имя и в очереди докачки — резюм покажет правильное */
-    if (f._entryKey) {
-      upqPut({
-        k: f._entryKey, blob: f, name: f.name, uploadName: nm,
-        size: +f.size || 0, mime: f.type || '',
-        uploadId: f._preId, added: Date.now()
-      });
+      f._preRename = apiJson('/api/upload/rename', {
+        method: 'POST',
+        headers: vaultHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ uploadId: f._preId, name: nm })
+      }).catch(() => {});
+
+      /* имя и в очереди докачки — резюм покажет правильное */
+      if (f._entryKey) {
+        upqPut({
+          k: f._entryKey, blob: f, name: f.name, uploadName: nm,
+          size: +f.size || 0, mime: f.type || '',
+          uploadId: f._preId, added: Date.now()
+        });
+      }
+    };
+
+    if (f._preId) {
+      applyRename();
+    } else if (f._preInitPromise) {
+      /* сессия создаётся прямо сейчас — переименуем, как только родится */
+      const p = f._preInitPromise;
+      const next = () => { applyRename(); };
+
+      Promise.resolve(p).then(next, next);
     }
+    /* ни сессии, ни обещания — файл ещё не в полёте: движок создаст
+       сессию уже с file.uploadName (init уносит имя целиком). */
   }
 }
 
@@ -10401,6 +10567,20 @@ async function _uploadOneSession(file, reportBytes) {
 
   file._lastUploadId = uploadId;
   LOCALLY_DRIVEN.add(uploadId);   /* 22.65: сессию ведёт этот клиент */
+
+  /* 22.90 ФИКС «файлы не называются», страховка №2: сессия УЖЕ существует
+     (предохранка/докачка) — init с новым именем не выполнялся, а complete
+     имя не передаёт. Если пользователь задал имя — явно шлём rename,
+     чтобы сервер не финализировал файл под старым именем. */
+  if (file.uploadName && String(file.uploadName) !== String(file.name || '')) {
+    try {
+      await apiJson('/api/upload/rename', {
+        method: 'POST',
+        headers: vaultHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ uploadId: uploadId, name: upName })
+      });
+    } catch (eR) { /* сервер не согласился — PATCH после загрузки догонит */ }
+  }
 
   if (key) {
     upqPut({
@@ -10524,13 +10704,18 @@ async function _uploadOneSession(file, reportBytes) {
     Array.from({ length: Math.max(1, Math.min(UPLOAD_PARALLEL, 6)) }, worker));
 
   if (results.includes('abort')) {
-    apiJson('/api/upload/abort', {
-      method: 'POST',
-      headers: authHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify({ uploadId })
-    }).catch(() => {});
+    /* 22.90: серверную сессию и запись докачки стираем ТОЛЬКО при
+       «удалении» (2 нажатия по кружку) — мягкая отмена оставляет
+       байты на сервере и файл в очереди, чтобы докачка продолжила */
+    if (uploadHardStop) {
+      apiJson('/api/upload/abort', {
+        method: 'POST',
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ uploadId })
+      }).catch(() => {});
 
-    if (key) upqDel(key);
+      if (key) upqDel(key);
+    }
 
     throw new Error('aborted');
   }
@@ -10815,6 +11000,13 @@ async function uploadEngine(bar) {
         if (rec && file._dupFlag) {
           dedupedCount++;
         } else if (rec) {
+          /* 22.90 ФИКС «файлы не называются»: прикладываем к записи имя,
+             заданное пользователем в окне имени, — карточка в списке
+             покажет его сразу, не дожидаясь серверного PATCH */
+          if (file.uploadName && String(rec.name) !== String(file.uploadName)) {
+            rec.name = String(file.uploadName).slice(0, 120);
+          }
+
           added.push(rec);
         }
 
@@ -10895,14 +11087,21 @@ async function uploadEngine(bar) {
     engineWorker));
 
   if (uploadAbortFlag) {
-    /* отмена — стираем очередь докачки (пользователь сам отменил) */
-    for (const f of uploadQueue) {
-      if (f._entryKey) upqDel(f._entryKey);
+    /* 22.90: два вида остановки по кружку:
+       • отмена (1 нажатие) — очередь докачки ЦЕЛА: файлы продолжатся
+         при следующем открытии мини-аппа (resumePendingUploads);
+       • удаление (2 нажатия) — очередь стирается, байты на сервере тоже. */
+    if (uploadHardStop) {
+      for (const f of uploadQueue) {
+        if (f._entryKey) upqDel(f._entryKey);
+      }
     }
 
     PENDING_ALBUM = null;
 
-    resetUploadUI(bar, checkmark, squareStop);
+    /* 22.90: держим финальный статус («⏹ Отменено…» / «⏹ Удалено…»)
+       полторы секунды — раньше он исчезал быстрее, чем его можно прочесть */
+    resetUploadUI(bar, checkmark, squareStop, { holdMs: 1500 });
     return;
   }
 
@@ -10966,6 +11165,8 @@ async function uploadEngine(bar) {
        добавлял ВТОРУЮ карточку с тем же id («файлы дублируются»). */
     if (rec && rec.id && ALL_FILES.some((f) => f.id === String(rec.id))) return;
 
+    /* 22.90: rec.name уже содержит имя пользователя (проставлено в
+       движке выше) — карточка сразу выглядит правильно */
     ALL_FILES.unshift(filesMapAll({
       id: rec.id,
       name: rec.name,
@@ -11023,16 +11224,17 @@ async function uploadEngine(bar) {
   }, 1200);
 }
 
-/* ═══ ВОЛНА 22.89: ВСЁ ПРОПАВШЕЕ ВЕРНУЛОСЬ ═══
-   22.88 вернула выбор файлов (зона/клик/drag&drop), 22.89 вернула
-   ОСТАЛЬНОЕ, вырезанное в 22.86/22.87: сниффер MIME (devoFixFile чинит
-   тип/имя при выборе), кнопки «Добавить файл»/«Добавить ещё», кнопку
-   «Отменить и удалить» на прогрессе и шаг именования («Как назвать эти
-   файлы?» → альбом / по одному (+описание) / пропустить). Полный путь:
+/* ═══ ВОЛНА 22.90 ═══
+   Выбор файлов: зона/клик/drag&drop, сниффер MIME (devoFixFile чинит
+   тип/имя при выборе), кнопки «Добавить файл»/«Добавить ещё», шаг
+   именования («Как назвать эти файлы?» → альбом / по одному (+описание) /
+   пропустить). Полный путь:
    handleDropZoneClick / кнопки → uploadFiles (сниффер + очередь IDB) →
    openUploadModal → confirmUploadFiles (пароль, предохранка) →
    openNameChoiceModal → startActualUpload → proceedUpload (сбор
-   PENDING_ALBUM/_customDesc → финализация альбома + один save описаний). */
+   PENDING_ALBUM/_customDesc → финализация альбома + один save описаний).
+   22.90: красная кнопка «Отменить и удалить» УДАЛЕНА — управление
+   кружком: 1 нажатие отмена, 2 нажатия удаление (handleLoaderClick). */
 
 (function wireFileInput() {
   const fi = document.getElementById('fileInput');
@@ -13915,7 +14117,7 @@ function openAlbum(albumId) {
     }
   } catch (e) {}
 
-  renderAll({ animate: true });
+  renderAll({ animate: true, refresh: true });
 }
 
 function closeAlbum() {
@@ -13946,7 +14148,7 @@ function _finishCloseAlbum() {
     }
   } catch (e) {}
 
-  renderAll({ animate: true });
+  renderAll({ animate: true, refresh: true });
 }
 
 /* ── Окно «Создать папку» из выбранных файлов ── */
@@ -14022,7 +14224,7 @@ function finishAlbumAction(ids, albumId) {
   const animated = animateCardsOut(ids);
   setTimeout(() => {
     renderAll({ animate: true, bornAlbum: albumId });
-  }, animated ? 230 : 0);
+  }, animated ? 320 : 0);   /* 22.90: под новую медленную cardOut 0.3s */
 }
 
 /* Перемещает файлы в папку: добавляет в целевую и УБИРАЕТ из остальных —
@@ -14396,7 +14598,7 @@ async function executeConfirmedDelete() {
 
   /* 22.56: карточки мягко «улетают» ДО перерисовки списка */
   const animated = animateCardsOut(ids);
-  if (animated) await new Promise((r) => setTimeout(r, 210));
+  if (animated) await new Promise((r) => setTimeout(r, 310));   /* 22.90: под cardOut 0.3s */
 
   let ok = 0;
 
