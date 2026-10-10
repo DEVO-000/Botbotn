@@ -4437,7 +4437,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.86"
+BOT_BUILD = "22.87"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -10499,6 +10499,24 @@ def _bg_pending_take(user):
     return items
 
 
+def _bg_pending_out(user):
+    """ВОЛНА 22.87: очередь «ждёт отправки» для ответа /api/files (bg_queue).
+    Только имя и размер — мини-апп рисует кнопку «📤 Отправить (N)» и
+    подпись, какие файлы ждут. Порядок — как в очереди."""
+    out = []
+    try:
+        for it in _bg_pending_clean(user):
+            if not isinstance(it, dict):
+                continue
+            out.append({
+                "name": str(it.get("name") or "файл")[:120],
+                "size": int(it.get("size") or 0),
+            })
+    except Exception:
+        return []
+    return out
+
+
 def _bg_pending_kb(n):
     """Кнопки очереди: «📤 Отправить (N)» + «🗑 Очистить»."""
     rows = [[InlineKeyboardButton(
@@ -10590,6 +10608,144 @@ async def bg_pending_clear_cb(update: Update, context: ContextTypes.DEFAULT_TYPE
     return None
 
 
+# ═══ ВОЛНА 22.87: «📤 Отправить» ПРЯМО ИЗ МИНИ-АППА ═══
+# Кнопка выбора файлов из мини-аппа удалена (22.86), но сама ЗАГРУЗКА из
+# мини-аппа нужна: файлы, присланные боту в чат, ждут в очереди — теперь
+# мини-апп показывает кнопку «📤 Отправить (N)» и запускает заливку сам.
+# Логика ровно ТА ЖЕ, что у кнопки в чате (bgp_send): одна операция,
+# честный итог в чат, «❌ Отмена», дедуп, живой статус в панели передач.
+
+_BGQ_TASKS = set()          # сильные ссылки на фоновые задачи (защита от GC)
+
+
+class _ApiQueueActor:
+    """Минимальный «пользователь/чат» для update-заглушки: .id = telegram id."""
+
+    __slots__ = ("id",)
+
+    def __init__(self, uid):
+        self.id = int(uid)
+
+
+class _ApiQueueChatMsg:
+    """Сообщение-заглушка для ответов заливки, запущенной из мини-аппа:
+    reply_text пишет в ЛИЧНЫЙ чат пользователя — итог, «❌ Отмена» и советы
+    оказываются там же, где пользователь привык их видеть."""
+
+    __slots__ = ("_bot", "_chat_id", "message_id")
+
+    def __init__(self, bot, chat_id):
+        self._bot = bot
+        self._chat_id = int(chat_id)
+        self.message_id = 0
+
+    async def reply_text(self, text, reply_markup=None,
+                         disable_notification=False, **kwargs):
+        try:
+            m = await self._bot.send_message(
+                chat_id=self._chat_id, text=text, reply_markup=reply_markup,
+                disable_notification=bool(disable_notification))
+            try:
+                self.message_id = int(getattr(m, "message_id", 0) or 0)
+            except Exception:
+                pass
+            return m
+        except Exception:
+            return None
+
+
+class _ApiQueueUpdate:
+    """Update-заглушка для _bg_upload_items: у HTTP-запроса нет Update,
+    а заливке нужны message (ответы), effective_user и effective_chat."""
+
+    __slots__ = ("message", "effective_user", "effective_chat")
+
+    def __init__(self, bot, chat_id):
+        self.message = _ApiQueueChatMsg(bot, chat_id)
+        self.effective_user = _ApiQueueActor(chat_id)
+        self.effective_chat = _ApiQueueActor(chat_id)
+
+
+class _ApiQueueContext:
+    """Context-заглушка с РЕАЛЬНЫМ ботом и НАСТОЯЩИМ user_data пользователя
+    (application.user_data[uid]) — кнопка «🏷 Назвать по одному» в итоге
+    загрузки из мини-аппа работает так же, как после кнопки в чате."""
+
+    __slots__ = ("bot", "user_data")
+
+    def __init__(self, bot, user_data):
+        self.bot = bot
+        self.user_data = user_data
+
+
+async def _bg_queue_send_task(user, update, context, items):
+    """Фоновая заливка очереди из мини-аппа. Вся логика — в _bg_upload_items
+    (итог в чат, дедуп, отмена, живой статус). Жёсткий сбой — файлы
+    возвращаются в очередь, ничего не теряется."""
+    user_id = str(getattr(user, "user_id", "") or "")
+    try:
+        await _bg_upload_items(update, context, items)
+    except Exception as e:
+        logger.error(f"queue_send: заливка очереди не удалась: {e}")
+        try:
+            await context.bot.send_message(
+                chat_id=int(user_id),
+                text="⚠️ Не удалось отправить файлы — попробуйте ещё раз "
+                     "чуть позже. Файлы вернул в очередь.")
+        except Exception:
+            pass
+        try:
+            # ВАЖНО: берём СВЕЖЕГО пользователя — за время заливки мог
+            # обновиться (merge-on-save спасает, но не рискуем).
+            _fresh = get_user(user_id) or user
+            _bg_pending_add(_fresh, items)
+            save_user(_fresh)
+        except Exception:
+            pass
+    finally:
+        _BGQ_TASKS.discard(asyncio.current_task())
+
+
+async def miniapp_queue_send(request):
+    """POST /api/upload/queue_send — «📤 Отправить» из мини-аппа: заливает
+    очередь «ждёт отправки» (файлы, присланные боту в чат) в облако.
+    Ответ НЕ ждёт конца заливки: {ok:true, sent:N} — прогресс виден в панели
+    передач мини-аппа, итог и «❌ Отмена» — в чате."""
+    user, uid, err = await _api_get_user_any(request)
+    if err is not None:
+        return err
+    # Заливка уже идёт — очередь НЕ трогаем: файлы останутся ждать.
+    if _upl_op_running(uid) or _vault_op_running(uid):
+        return web.json_response({
+            "ok": False, "busy": True,
+            "message": "⏳ Предыдущая загрузка ещё идёт — файлы остались "
+                       "в очереди."})
+    items = _bg_pending_take(user)
+    if not items:
+        save_user(user)
+        return web.json_response({"ok": True, "sent": 0})
+    save_user(user)
+    try:
+        app = _MINIAPP_PTB_APP
+        bot = app.bot
+        # НАСТОЯЩИЙ user_data пользователя: итог загрузки ставит
+        # cloud_per_ids — кнопка «🏷 Назвать по одному» в чате сработает.
+        ud = app.user_data.setdefault(int(uid), {})
+        ctx = _ApiQueueContext(bot, ud)
+        upd = _ApiQueueUpdate(bot, uid)
+        t = asyncio.create_task(_bg_queue_send_task(user, upd, ctx, items))
+        _BGQ_TASKS.add(t)
+        return web.json_response({"ok": True, "sent": len(items)})
+    except Exception as e:
+        # Старт не состоялся — честно возвращаем файлы в очередь.
+        logger.error(f"queue_send: не удалось стартовать заливку: {e}")
+        _bg_pending_add(user, items)
+        save_user(user)
+        return web.json_response({
+            "ok": False,
+            "message": "Не удалось начать загрузку — попробуйте ещё раз."})
+
+
 async def bg_chat_upload_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """ВОЛНА 22.57: глобальный роутер «файл в чате = файл в облаке».
 
@@ -10661,8 +10817,8 @@ async def bg_chat_upload_receive(update: Update, context: ContextTypes.DEFAULT_T
     lines = [f"📎 В очереди на отправку: {total} файл(ов).",
              f"   • {_names}",
              "",
-             "Загрузка НЕ начнётся, пока вы не нажмёте «📤 Отправить» — "
-             "до этого момента файлы просто ждут."]
+             "Загрузка НЕ начнётся, пока вы не нажмёте «📤 Отправить» "
+             "(в чате или в мини-аппе) — до этого момента файлы просто ждут."]
     if denied:
         lines.append(f"🚫 {denied} файл(ов) не влезли в очередь "
                      f"(максимум {_BG_PENDING_MAX}) — отправьте текущую "
@@ -12630,6 +12786,40 @@ html.low-end .drop-zone.uploading {
   background: var(--btn-bg) !important;
   color: var(--btn-text) !important;
   border-color: var(--btn-bg) !important;
+}
+
+/* ВОЛНА 22.87: кнопка «📤 Отправить (N)» — очередь «ждёт отправки».
+   Акцентная, во всю ширину, над списком файлов; появляется мягко
+   (soft-reveal — только transform+opacity, без рывков), исчезает сразу. */
+.bg-queue-btn {
+  background: var(--btn-bg);
+  color: var(--btn-text);
+  border-color: var(--btn-bg);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.12);
+  padding: 12px 14px;
+  margin-bottom: 12px;
+  border-radius: 16px;
+}
+
+.bg-queue-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.bg-queue-title {
+  font-weight: 800;
+  font-size: 15px;
+}
+
+.bg-queue-sub {
+  font-weight: 600;
+  font-size: 11px;
+  opacity: 0.75;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .check-circle-icon {
@@ -14772,121 +14962,6 @@ body.vp-lock {
   </div>
 </div>
 
-<div id="nameChoiceModal" class="modal-overlay" onclick="closeNameChoiceModal(event)">
-  <div class="modal-card" onclick="event.stopPropagation()">
-    <div class="sheet-handle-area">
-      <div class="sheet-handle"></div>
-    </div>
-
-    <h3 style="font-weight:900;font-size:20px;margin-bottom:4px">
-      Выбрано файлов: <span id="nameChoiceCount">0</span>
-    </h3>
-
-    <p style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:16px">
-      Как назвать эти файлы?
-    </p>
-
-    <div style="display:flex;flex-direction:column;gap:8px">
-      <button class="sound-item-btn" onclick="chooseNameMode('album')" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
-        <div style="text-align:left">
-          <div style="font-weight:800">Создать альбом</div>
-          <div style="font-size:11px;opacity:0.7;margin-top:2px">Файлы попадут в новую папку с общим именем</div>
-        </div>
-        <i data-lucide="folder-plus" style="width:18px;height:18px"></i>
-      </button>
-
-      <button class="sound-item-btn" onclick="chooseNameMode('each')">
-        <div style="text-align:left">
-          <div style="font-weight:800">Назвать по одному</div>
-          <div style="font-size:11px;opacity:0.7;margin-top:2px">Каждому файлу своё имя</div>
-        </div>
-        <i data-lucide="list" style="width:18px;height:18px"></i>
-      </button>
-
-      <button class="sound-item-btn" onclick="chooseNameMode('skip')">
-        <div style="text-align:left">
-          <div style="font-weight:800">Пропустить всё</div>
-          <div style="font-size:11px;opacity:0.7;margin-top:2px">Оставить оригинальные имена</div>
-        </div>
-        <i data-lucide="fast-forward" style="width:18px;height:18px"></i>
-      </button>
-    </div>
-  </div>
-</div>
-
-<div id="nameModal" class="modal-overlay" onclick="closeNameModal(event)">
-  <div class="modal-card" onclick="event.stopPropagation()">
-    <div class="sheet-handle-area">
-      <div class="sheet-handle"></div>
-    </div>
-
-    <h3 style="font-weight:900;font-size:20px;margin-bottom:4px">Назовите файл</h3>
-    <p id="nameModalCounter" style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:14px"></p>
-
-    <div style="margin-bottom:14px">
-      <label style="font-size:11px;font-weight:800;color:var(--subtext-color);text-transform:uppercase;letter-spacing:0.04em">Новое название</label>
-      <input type="text" id="nameModalInput" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;margin-top:4px;outline:none;font-size:15px;transition:border-color 0.3s var(--ease-smooth)" placeholder="Оставьте пустым для оригинала" onfocus="this.style.borderColor='var(--btn-bg)'" onblur="this.style.borderColor='var(--border-color)'">
-    </div>
-
-    <p id="nameModalOriginal" style="font-size:12px;font-weight:600;color:var(--subtext-color);margin-bottom:14px;word-break:break-all"></p>
-
-    <div style="margin-bottom:16px">
-      <label style="font-size:11px;font-weight:800;color:var(--subtext-color);text-transform:uppercase;letter-spacing:0.04em">Описание</label>
-      <textarea id="nameModalDescInput" rows="2" placeholder="Заметка к файлу (необязательно)" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:600;margin-top:4px;outline:none;font-size:14px;resize:vertical;min-height:60px;transition:border-color 0.3s var(--ease-smooth)" onfocus="this.style.borderColor='var(--btn-bg)'" onblur="this.style.borderColor='var(--border-color)'"></textarea>
-    </div>
-
-    <div style="display:flex;flex-direction:column;gap:8px">
-      <button class="sound-item-btn" onclick="confirmNameAndNext()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
-        <span>Сохранить и продолжить</span>
-        <i data-lucide="arrow-right" style="width:18px;height:18px"></i>
-      </button>
-
-      <button class="sound-item-btn" onclick="skipNameAndNext()">
-        <span>Пропустить</span>
-        <i data-lucide="skip-forward" style="width:18px;height:18px"></i>
-      </button>
-
-      <button class="sound-item-btn" id="nameModalSkipAll" onclick="skipAllNames()">
-        <span>Пропустить все</span>
-        <i data-lucide="fast-forward" style="width:18px;height:18px"></i>
-      </button>
-    </div>
-  </div>
-</div>
-
-<div id="albumUploadModal" class="modal-overlay" onclick="closeAlbumUploadModal(event)">
-  <div class="modal-card" onclick="event.stopPropagation()">
-    <div class="sheet-handle-area">
-      <div class="sheet-handle"></div>
-    </div>
-
-    <h3 style="font-weight:900;font-size:20px;margin-bottom:4px">Название альбома</h3>
-    <p id="albumUploadModalCounter" style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:14px"></p>
-
-    <div style="margin-bottom:14px">
-      <label style="font-size:11px;font-weight:800;color:var(--subtext-color);text-transform:uppercase;letter-spacing:0.04em">Общее название</label>
-      <input type="text" id="albumUploadModalInput" style="width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--border-color);background:var(--card-bg);color:var(--text-color);font-family:'Nunito',sans-serif;font-weight:700;margin-top:4px;outline:none;font-size:15px;transition:border-color 0.3s var(--ease-smooth)" placeholder="Например: Отпуск 2026" oninput="renderAlbumPreview(this.value)" onfocus="this.style.borderColor='var(--btn-bg)'" onblur="this.style.borderColor='var(--border-color)'">
-    </div>
-
-    <div style="padding:12px;background:var(--card-bg);border:1px solid var(--border-color);border-radius:14px;margin-bottom:16px;font-size:12px;font-weight:600;color:var(--subtext-color)">
-      <div style="font-weight:800;color:var(--text-color);margin-bottom:6px">Файлы получат имена:</div>
-      <div id="albumPreview"></div>
-    </div>
-
-    <div style="display:flex;flex-direction:column;gap:8px">
-      <button class="sound-item-btn" onclick="confirmAlbumName()" style="background:var(--btn-bg);color:var(--btn-text);border-color:var(--btn-bg)">
-        <span>Создать альбом</span>
-        <i data-lucide="check" style="width:18px;height:18px"></i>
-      </button>
-
-      <button class="sound-item-btn" onclick="closeAlbumUploadModal()">
-        <span>Отмена</span>
-        <i data-lucide="x" style="width:18px;height:18px"></i>
-      </button>
-    </div>
-  </div>
-</div>
-
 <div id="storageModal" class="modal-overlay" onclick="closeStorageModal(event)">
   <div class="modal-card" onclick="event.stopPropagation()">
     <div class="sheet-handle-area">
@@ -15304,6 +15379,19 @@ body.vp-lock {
       </div>
     </div>
   </div>
+
+  <!-- ВОЛНА 22.87: «📤 Отправить» — ЗАГРУЗКА из мини-аппа. Кнопки ВЫБОРА
+       файлов здесь нет (удалена в 22.86): файлы пользователь шлёт боту в
+       чат, и они ждут в очереди. Эта кнопка отправляет их в облако — ТА ЖЕ
+       загрузка, что по кнопке «📤 Отправить» под очередью в чате. Появляется
+       только когда очередь не пуста, мягко (см. bgQueueApply/bgQueueRender). -->
+  <button type="button" class="sound-item-btn bg-queue-btn" id="bgQueueBtn" style="display:none" onclick="bgQueueSendClick()">
+    <span class="bg-queue-text">
+      <span class="bg-queue-title">📤 Отправить<span id="bgQueueCount"></span></span>
+      <span class="bg-queue-sub" id="bgQueueNames"></span>
+    </span>
+    <i data-lucide="send" style="width:18px;height:18px;flex-shrink:0"></i>
+  </button>
 
   <!-- ВОЛНА 22.86: зона загрузки — ТОЛЬКО индикатор прогресса.
        «Загрузить файлы… нажмите или перетащите» (кнопка выбора файлов)
@@ -16260,6 +16348,7 @@ function filesCacheSave(raw, force) {
         plain: (typeof raw.plain === 'boolean') ? raw.plain : null,
         pending: Array.isArray(raw.pending) ? raw.pending : [],
         bg_live: raw.bg_live || null,
+        bg_queue: Array.isArray(raw.bg_queue) ? raw.bg_queue : [],
         safe_count: +raw.safe_count || 0,
         limit: +raw.limit || 0
       }
@@ -16313,6 +16402,9 @@ function filesCacheBoot() {
   /* 22.65: панель передач тоже оживает из кэша (недогруженное/ждёт пароль) */
   try { srvPendingApply(d.pending); } catch (e) {}
   try { bgUploadApply(d.bg_live); } catch (e) {}
+  /* ВОЛНА 22.87: очередь «ждёт отправки» — кнопка «📤 Отправить» оживает
+     из кэша сразу (не ждёт первого опроса) */
+  try { bgQueueApply(d.bg_queue); } catch (e) {}
 
   return ALL_FILES.length > 0;
 }
@@ -16782,6 +16874,10 @@ async function loadFiles(silent, quiet) {
        передач после обновления страницы («файлы сбрасываются и ничего
        не остаётся» — больше не должно) */
     srvPendingApply(data.pending);
+
+    /* ВОЛНА 22.87: очередь «ждёт отправки» — показываем/обновляем кнопку
+       «📤 Отправить (N)» (рендер только при реальном изменении) */
+    bgQueueApply(data.bg_queue);
 
     return true;
   } catch (e) {
@@ -19469,225 +19565,6 @@ function cancelUpload() {
   showToast('⏹ Загрузка остановлена, байты стёрты');
 }
 
-function openNameChoiceModal() {
-  /* ВОЛНА 22.43: шаг имени — для ЛЮБОГО количества файлов.
-     Раньше ОДИН файл уходил в загрузку сразу, без возможности назвать;
-     теперь одиночный файл тоже открывает окно «Назовите файл» —
-     можно ввести имя или нажать «Пропустить» (останется оригинальное). */
-  if (!pendingFiles.length) return;
-
-  if (pendingFiles.length === 1) {
-    openNameModal();
-    return;
-  }
-
-  const c = document.getElementById('nameChoiceCount');
-  if (c) c.textContent = pendingFiles.length;
-
-  openModalEl('nameChoiceModal');
-}
-
-function closeNameChoiceModal(e) {
-  if (e) e.stopPropagation();
-
-  pendingFiles = [];
-  closeModalEl('nameChoiceModal');
-}
-
-function chooseNameMode(mode) {
-  closeModalEl('nameChoiceModal');
-
-  if (mode === 'album') openAlbumModal();
-  else if (mode === 'each') openNameModal();
-  else startActualUpload();
-}
-
-function openAlbumModal() {
-  if (pendingFiles.length < 2) {
-    startActualUpload();
-    return;
-  }
-
-  const c = document.getElementById('albumUploadModalCounter');
-  if (c) c.textContent = 'Файлов: ' + pendingFiles.length;
-
-  const inp = document.getElementById('albumUploadModalInput');
-  if (inp) inp.value = '';
-
-  renderAlbumPreview('');
-
-  openModalEl('albumUploadModal');
-}
-
-function renderAlbumPreview(baseName) {
-  const preview = document.getElementById('albumPreview');
-  if (!preview) return;
-
-  if (!baseName || !baseName.trim()) {
-    preview.innerHTML = '<span style="opacity:0.6">Введите название, чтобы увидеть превью</span>';
-    return;
-  }
-
-  const items = pendingFiles.slice(0, 4).map((f, i) => {
-    const ext = f.name.includes('.') ? '.' + f.name.split('.').pop() : '';
-    return `<div style="padding:2px 0">${escapeHtml(baseName.trim())} ${i + 1}${escapeHtml(ext)}</div>`;
-  });
-
-  const more = pendingFiles.length > 4
-    ? `<div style="opacity:0.6;padding:2px 0">... и ещё ${pendingFiles.length - 4}</div>`
-    : '';
-
-  preview.innerHTML = items.join('') + more;
-}
-
-function closeAlbumUploadModal(e) {
-  if (e) e.stopPropagation();
-
-  closeModalEl('albumUploadModal');
-  openNameChoiceModal();
-}
-
-/* closeAlbumModal для окна «Действия с папкой» (переименовать/удалить)
-   определена ниже, рядом с openAlbumActions — там же renameAlbumFromModal
-   и deleteAlbumFromModal. Здесь дублировать не нужно. */
-
-function confirmAlbumName() {
-  const inp = document.getElementById('albumUploadModalInput');
-  const base = (inp && inp.value.trim()) || 'Альбом';
-
-  const extOf = (f) => {
-    const n = String(f.name || '');
-    const i = n.lastIndexOf('.');
-
-    return i > 0 ? n.slice(i) : '';
-  };
-
-  /* ВОЛНА: создаём НАСТОЯЩИЙ альбом — файлы после загрузки попадут в папку,
-     а не просто получат переназванные имена в корне. */
-  const aid = albumIdNew();
-  pendingFiles.forEach((f, i) => {
-    try {
-      f.uploadName = (base + ' ' + (i + 1) + extOf(f)).slice(0, 120);
-      f._pendingAlbumId = aid;
-    } catch (e) {}
-  });
-
-  PENDING_ALBUM = { id: aid, name: base, fileIds: [] };
-
-  closeModalEl('albumUploadModal');
-  startActualUpload();
-}
-
-let nameEditIndex = 0;
-
-function openNameModal() {
-  nameEditIndex = 0;
-
-  pendingFiles.forEach((f) => {
-    try { delete f._customName; } catch (e) {}
-    try { delete f._customDesc; } catch (e) {}
-  });
-
-  showNameModal();
-}
-
-function showNameModal() {
-  const f = pendingFiles[nameEditIndex];
-
-  if (!f) {
-    applyCustomNames();
-    return;
-  }
-
-  /* ВОЛНА 22.43: у одиночного файла счётчик «Файл 1 из 1» и кнопка
-     «Пропустить все» (дублирует «Пропустить») не нужны — прячем;
-     у пачки всё как раньше. */
-  const many = pendingFiles.length > 1;
-
-  const counter = document.getElementById('nameModalCounter');
-  if (counter) {
-    counter.textContent = many
-      ? 'Файл ' + (nameEditIndex + 1) + ' из ' + pendingFiles.length
-      : '';
-    counter.style.display = many ? 'block' : 'none';
-  }
-
-  const skipAllBtn = document.getElementById('nameModalSkipAll');
-  if (skipAllBtn) skipAllBtn.style.display = many ? 'flex' : 'none';
-
-  const orig = document.getElementById('nameModalOriginal');
-  if (orig) orig.textContent = 'Текущее имя: ' + (f.name || '');
-
-  const inp = document.getElementById('nameModalInput');
-  if (inp) inp.value = '';
-
-  const descInp = document.getElementById('nameModalDescInput');
-  if (descInp) descInp.value = '';
-
-  openModalEl('nameModal');
-}
-
-function confirmNameAndNext() {
-  const inp = document.getElementById('nameModalInput');
-  const v = inp ? inp.value.trim() : '';
-
-  const descInp = document.getElementById('nameModalDescInput');
-  const d = descInp ? descInp.value.trim() : '';
-
-  if (v) {
-    try { pendingFiles[nameEditIndex]._customName = v.slice(0, 120); } catch (e) {}
-  }
-  if (d) {
-    try { pendingFiles[nameEditIndex]._customDesc = d.slice(0, 1000); } catch (e) {}
-  }
-
-  if (inp) inp.value = '';
-  if (descInp) descInp.value = '';
-
-  nextNameStep();
-}
-
-function skipNameAndNext() {
-  nextNameStep();
-}
-
-function skipAllNames() {
-  closeModalEl('nameModal');
-  applyCustomNames();
-}
-
-function nextNameStep() {
-  closeModalEl('nameModal');
-
-  nameEditIndex++;
-
-  if (nameEditIndex < pendingFiles.length) {
-    setTimeout(showNameModal, 200);
-  } else {
-    applyCustomNames();
-  }
-}
-
-function applyCustomNames() {
-  /* ВОЛНА 22.44: то же, что в confirmAlbumName — expando на оригинальном
-     File, НЕ Object.assign-копия (копия теряла size → «Файл пустой (0 Б)»
-     у КАЖДОГО названного файла). */
-  pendingFiles.forEach((f) => {
-    if (f && f._customName) {
-      try { f.uploadName = String(f._customName).slice(0, 120); } catch (e) {}
-    }
-  });
-
-  startActualUpload();
-}
-
-function closeNameModal(e) {
-  if (e) e.stopPropagation();
-
-  closeModalEl('nameModal');
-  applyCustomNames();
-}
-
 function startActualUpload() {
   if (!pendingFiles.length) return;
 
@@ -20092,6 +19969,108 @@ window.addEventListener('pagehide', function () {
 
 setInterval(ensureScrollUnlocked, 4000);
 
+/* ═══ ВОЛНА 22.87: КНОПКА «📤 ОТПРАВИТЬ» — ЗАГРУЗКА ОЧЕРЕДИ ИЗ МИНИ-АППА ═══
+   Кнопки выбора файлов в мини-аппе нет (22.86): файлы пользователь шлёт
+   боту в чат, и они ждут в персистентной очереди (User.bg_pending).
+   Кнопка над списком файлов показывает, сколько ждёт, и запускает ТА ЖЕ
+   заливку, что кнопка «📤 Отправить (N)» в чате: итог и «❌ Отмена» — в
+   чате, живой прогресс — в панели передач (bg_live), список обновится сам. */
+let BG_QUEUE = [];
+let BG_QUEUE_SENDING = false;
+
+function bgQueueRender() {
+  const btn = document.getElementById('bgQueueBtn');
+  const cnt = document.getElementById('bgQueueCount');
+  const sub = document.getElementById('bgQueueNames');
+
+  if (!btn) return;
+
+  const n = BG_QUEUE.length;
+
+  if (!n) {
+    /* скрытие — мгновенное (кнопка просто уходит, ничего не мигает);
+       появление ниже — мягкое, только на переходе «скрыт → виден» */
+    btn.style.display = 'none';
+    return;
+  }
+
+  if (cnt) cnt.textContent = ' (' + n + ')';
+
+  if (sub) {
+    const names = BG_QUEUE.slice(0, 2)
+      .map((x) => String(x.name || 'файл'))
+      .join(', ');
+    const more = n > 2 ? ' …и ещё ' + (n - 2) : '';
+    sub.textContent = names + more + ' — ждут отправки';
+  }
+
+  const wasHidden = btn.style.display !== 'flex';
+
+  btn.style.display = 'flex';
+
+  /* мягкое появление ТОЛЬКО когда кнопка реально сменила «скрыт» на
+     «виден» — опрос /api/files каждые 2.5 с больше ничего не перезапускает */
+  if (wasHidden) softReveal(btn);
+}
+
+function bgQueueApply(q) {
+  const arr = Array.isArray(q) ? q : [];
+
+  /* рендерим только при РЕАЛЬНОМ изменении очереди (сигнатура имён+размеров):
+     тихие опросы не дёргают DOM */
+  const sig = arr.map((x) => String((x && x.name) || '') + ':' +
+    (+((x && x.size) || 0))).join('|');
+  const prevSig = BG_QUEUE.map((x) => String(x.name || '') + ':' +
+    (+x.size || 0)).join('|');
+
+  BG_QUEUE = arr;
+
+  if (sig !== prevSig || !arr.length) bgQueueRender();
+}
+
+async function bgQueueSendClick() {
+  if (BG_QUEUE_SENDING) return;
+
+  if (!BG_QUEUE.length) {
+    showToast('Очередь пуста — пришлите файлы боту в чат');
+    return;
+  }
+
+  BG_QUEUE_SENDING = true;
+
+  try {
+    haptic('select');
+
+    const d = await apiJson('/api/upload/queue_send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}'
+    });
+
+    if (d && d.busy) {
+      /* загрузка уже идёт — очередь не тронута, кнопка остаётся */
+      showToast('⏳ Предыдущая загрузка ещё идёт — файлы остались в очереди');
+      return;
+    }
+
+    if (d && +d.sent > 0) {
+      showToast('📤 Отправляю ' + d.sent + ' файл(ов) — прогресс в панели передач');
+    } else {
+      showToast('Очередь пуста — пришлите файлы боту в чат');
+    }
+
+    /* очередь забрана сервером (или была пуста) — кнопка уходит сразу,
+       панель передач подхватит живой прогресс следующим опросом */
+    BG_QUEUE = [];
+    bgQueueRender();
+  } catch (e) {
+    showToast('⚠️ ' + (e && e.message ? e.message :
+      'Не удалось связаться с сервером'));
+  } finally {
+    BG_QUEUE_SENDING = false;
+  }
+}
+
 function refreshUploadModal() {
   const info = document.getElementById('uploadModalInfo');
   const list = document.getElementById('uploadFileList');
@@ -20238,10 +20217,10 @@ function confirmUploadFiles() {
   closeModalEl('uploadModal');
 
   /* ВОЛНА 22.54: ПРЕДОХРАНКА — байты каждого файла летят в бота СРАЗУ,
-     пока пользователь отвечает на окна имени. Пароль уже решён (выше):
+     сразу после «Отправить». Пароль уже решён (выше):
      шифрованный режим — VAULT_PW уйдёт заголовком, «без шифрования» —
      пароль Сейфа (если ввёл) телом init. Закрытие мини аппа посреди
-     окна имени больше НЕ теряет файлы: байты у бота, бот договорит сам. */
+     загрузки больше НЕ теряет файлы: байты у бота, бот договорит сам. */
   /* ВОЛНА 22.59: пароль перезаписываем, если ввели НОВЫЙ. Раньше поле
      фиксировалось только при «undefined» — повторный ввод пароля после
      wrong_password уходил на complete со СТАРЫМ пустым значением, и
@@ -20255,10 +20234,12 @@ function confirmUploadFiles() {
   }
   prestreamStart(pendingFiles.slice());
 
-  /* ВОЛНА 22.43: окно имени открывается для ЛЮБОГО количества файлов —
-     один файл можно назвать или пропустить, пачка — как раньше
-     (альбом / по одному / пропустить всё). */
-  openNameChoiceModal();
+  /* ВОЛНА 22.87: окна «Как назвать эти файлы?» / «Назовите файл» /
+     «Название альбома» УДАЛЕНЫ (пользователь: «не назвать файл в мини
+     аппе») — файлы уходят СРАЗУ и с ИСХОДНЫМИ именами. Назвать по-
+     прежнему можно ПОСЛЕ загрузки: кнопка «🏷 Назвать по одному» в итоге
+     в чате и ✏️ в облаке. */
+  startActualUpload();
 }
 
 /* ВОЛНА 22.40: пароль, введённый В ЭТОМ окне загрузки (для режима
@@ -21660,7 +21641,6 @@ async function uploadEngine(bar) {
   const fileBytes = new Map();
   let reportedTotal = 0;
   let dedupedCount = 0;   /* 22.62: сколько файлов свёл сервер (уже из чата) */
-  let _descDirty = false; /* ВОЛНА: накопительный флаг «есть новые описания» */
 
   const reportTotal = () => {
     setUploadPct((reportedTotal / totalBytes) * 100, bar);
@@ -21743,24 +21723,6 @@ async function uploadEngine(bar) {
           added.push(rec);
         }
 
-        /* ВОЛНА: собираем ID успешно загруженных файлов в отложенный альбом,
-           если пользователь выбрал «Создать альбом» в окне выбора имени.
-           Дедуп-файлы (уже у бота) тоже идут в альбом — пользователь считает
-           их своими. Описание из того же окна (если ввели) — складываем
-           в DESC_MAP, но сам save откладываем до конца пачки (один запись
-           в localStorage вместо N). */
-        if (rec && rec.id) {
-          if (PENDING_ALBUM && file._pendingAlbumId === PENDING_ALBUM.id) {
-            PENDING_ALBUM.fileIds.push(String(rec.id));
-          }
-          if (file._customDesc) {
-            try {
-              DESC_MAP[String(rec.id)] = String(file._customDesc).slice(0, 1000);
-              _descDirty = true;
-            } catch (e) {}
-          }
-        }
-
         /* ВОЛНА 22.54: страховка имени. Файл уходил в бота под оригинальным
            именем (предохранка), пользователь назвал его в окне имени — если
            сервер всё же записал старое имя (финализация обогнала ренейм),
@@ -21827,8 +21789,6 @@ async function uploadEngine(bar) {
       if (f._entryKey) upqDel(f._entryKey);
     }
 
-    PENDING_ALBUM = null;
-
     resetUploadUI(bar, checkmark, squareStop);
     return;
   }
@@ -21840,8 +21800,6 @@ async function uploadEngine(bar) {
       /safe_locked|пароль|password/i.test(msg);
 
     const retryFiles = needPass ? failedFiles.map((x) => x.file) : [];
-
-    PENDING_ALBUM = null;
 
     resetUploadUI(bar, checkmark, squareStop);
 
@@ -21906,30 +21864,6 @@ async function uploadEngine(bar) {
     }));
   });
 
-  /* ВОЛНА: финализируем отложенный альбом — если хотя бы один файл
-     загрузился, создаём запись в ALBUM_MAP. Файлы автоматически
-     убираются из корня (collectAlbumFileIds в renderAll) и становятся
-     видны только при открытии альбома. */
-  if (PENDING_ALBUM) {
-    if (PENDING_ALBUM.fileIds.length) {
-      ALBUM_MAP[PENDING_ALBUM.id] = {
-        id: PENDING_ALBUM.id,
-        name: PENDING_ALBUM.name,
-        ts: Date.now(),
-        fileIds: PENDING_ALBUM.fileIds
-      };
-      try { saveAlbums(); } catch (e) {}
-      showToast('📁 Альбом «' + PENDING_ALBUM.name + '» создан');
-    }
-    PENDING_ALBUM = null;
-  }
-
-  /* ВОЛНА: один пакетный save описаний (вместо N записей в localStorage
-     в цикле загрузки). */
-  if (_descDirty) {
-    try { saveDescriptions(); } catch (e) {}
-  }
-
   renderAll({ animate: true });
 
   /* ВОЛНА 22.68: тихая сверка с сервером СРАЗУ после пачки — подхватывает
@@ -21973,7 +21907,6 @@ const ALBUMS_KEY = 'devo_albums';
 const ALBUM_DEMO_KEY = 'devo_demo_album_done';
 let ALBUM_MAP = {};   /* id -> { id, name, ts, fileIds: [String] } */
 let ALBUM_VIEW = null;
-let PENDING_ALBUM = null;   /* { id, name, fileIds: [] } — собирается во время загрузки */
 try { loadAlbums(); } catch (e) {}
 
 initCustomColors();
@@ -25717,6 +25650,10 @@ async def miniapp_files_get(request):
         "bg_live": _bg_live_out(_uid),
         # ВОЛНА 22.65: недогруженное — восстановление панели после обновления
         "pending": _pend,
+        # ВОЛНА 22.87: очередь «ждёт отправки» (файлы, присланные боту в чат)
+        # — мини-апп показывает кнопку «📤 Отправить (N)» и запускает заливку
+        # сам, без похода в чат. Только имена/размер — секретного ничего нет.
+        "bg_queue": _bg_pending_out(user),
     })
 
 
@@ -30458,6 +30395,9 @@ def mount_miniapp_routes(app):
     # ВОЛНА 22.62: пометка «файлы передаются через Telegram» (автопередача
     # из мини-аппа: системная панель «поделиться» → чат бота)
     app.router.add_post("/api/upload/tg_mark", miniapp_upload_tg_mark)
+    # ВОЛНА 22.87: «📤 Отправить» из мини-аппа — залить очередь «ждёт
+    # отправки» (файлы, присланные боту в чат) без похода в чат
+    app.router.add_post("/api/upload/queue_send", miniapp_queue_send)
     # ВОЛНА 22.50: статус сессии загрузки — честный успех вместо фантомных ошибок
     app.router.add_get("/api/upload/status", miniapp_upload_status)
     # ВОЛНА 22.54: имя «догоняет» уже летящую загрузку (предохранка)
