@@ -4437,7 +4437,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.87"
+BOT_BUILD = "22.88"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -12570,7 +12570,7 @@ html.low-end .confirm-actions {
   justify-content: center;
   min-height: 110px;
   position: relative;
-  transition: transform 0.2s var(--ease-spring);
+  transition: transform 0.2s var(--ease-spring), background 0.2s, border-color 0.2s;
   margin-bottom: 12px;
   touch-action: manipulation;
 }
@@ -12580,9 +12580,33 @@ html.low-end .confirm-actions {
   background: var(--drop-active);
 }
 
-/* ВОЛНА 22.86: кнопка выбора файлов удалена — зона грузится только как
-   индикатор прогресса. Видимость управляет JS: showDropLoader показывает
-   зону мягко (класс .uploading + keyframes), resetUploadUI прячет её. */
+/* drag&drop-подсветка: зона подсвечивается, когда над ней файл */
+.drop-zone.drag-over {
+  background: var(--drop-active);
+  border-color: var(--btn-bg);
+  transform: scale(1.02);
+}
+
+/* ВОЛНА 22.86→REVERT: зона СНОВА всегда видна. Два состояния:
+   • idle — видно .drop-prompt (приглашение загрузить)
+   • uploading — скрыто .drop-prompt, видно .download-progress-wrap */
+.drop-prompt {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+}
+
+.drop-prompt .dp-icon {
+  margin-bottom: 4px;
+}
+
+/* uploading-состояние: прячем приглашение, показываем прогресс */
+.drop-zone.uploading .drop-prompt {
+  display: none;
+}
+
 .drop-zone.uploading {
   display: flex;
   animation: softFadeIn 0.45s var(--ease-smooth) both;
@@ -15393,12 +15417,23 @@ body.vp-lock {
     <i data-lucide="send" style="width:18px;height:18px;flex-shrink:0"></i>
   </button>
 
-  <!-- ВОЛНА 22.86: зона загрузки — ТОЛЬКО индикатор прогресса.
-       «Загрузить файлы… нажмите или перетащите» (кнопка выбора файлов)
-       удалена по решению пользователя: файлы теперь загружаются через
-       бота (чат). Зона скрыта, пока ничего не грузится, появляется мягко
-       на время передачи (см. showDropLoader/resetUploadUI). -->
-  <div class="drop-zone" id="dropZone" style="display:none">
+  <!-- ВОЛНА 22.86→REVERT: зона загрузки СНОВА видна всегда — пользователь
+       попросил вернуть загрузку файлов прямо в мини-аппе (не только через
+       чат бота). Зона совмещает два состояния:
+         • idle — приглашение «Загрузить файлы…», клик / drag&drop открывает
+           выбор файлов;
+         • uploading — кольцо прогресса, имя файла, пауза/отмена.
+       Видимостью внутреннего состояния управляет JS: showDropLoader прячет
+       prompt, resetUploadUI возвращает его обратно. -->
+  <div class="drop-zone" id="dropZone" onclick="handleDropZoneClick(event)">
+    <div class="drop-prompt" id="dropPrompt">
+      <div class="dp-icon">
+        <i data-lucide="upload-cloud" style="width:26px;height:26px;color:var(--text-color);opacity:.55"></i>
+      </div>
+      <p style="font-weight:800;font-size:14px;color:var(--text-color);margin:0">Загрузить файлы</p>
+      <p style="font-size:12px;color:var(--subtext-color);margin:2px 0 0">Нажмите или перетащите сюда</p>
+    </div>
+
     <div class="upload-filename" id="uploadFilename"></div>
 
     <div class="download-progress-wrap" id="progressWrap">
@@ -15419,6 +15454,8 @@ body.vp-lock {
     </div>
   </div>
 
+  <input type="file" id="fileInput" multiple style="display:none">
+
   <div class="files-container">
     <section id="filesList" style="display:flex;flex-direction:column;gap:10px"></section>
 
@@ -15428,7 +15465,7 @@ body.vp-lock {
       </div>
 
       <p id="emptyTitle" style="font-weight:800;font-size:16px;color:var(--text-color)">Облако пусто</p>
-      <p id="emptySub" style="font-weight:600;font-size:13px;color:var(--subtext-color);margin-top:2px">Пришлите файлы боту в чат — они появятся здесь</p>
+      <p id="emptySub" style="font-weight:600;font-size:13px;color:var(--subtext-color);margin-top:2px">Нажмите «Загрузить файлы» выше или пришлите их боту в чат</p>
     </section>
   </div>
 
@@ -19455,9 +19492,51 @@ document.addEventListener('pointerdown', (e) => {
   }
 });
 
-/* ВОЛНА 22.86: handleDropZoneClick удалён вместе с кнопкой выбора файлов —
-   зона загрузки больше не открывает окно отправки, она только показывает
-   прогресс (её видимостью управляют showDropLoader/resetUploadUI). */
+/* ВОЛНА 22.86→REVERT: handleDropZoneClick и uploadFiles ВЕРНУЛИСЬ.
+   Зона загрузки снова служит кнопкой выбора файлов + drag&drop.
+   handleLoaderClick ниже по коду по-прежнему управляет паузой/отменой
+   во время загрузки. */
+
+function handleDropZoneClick(e) {
+  if (e) {
+    /* клик по внутреннему лоадеру во время загрузки — его собственный
+       onclick сам поймает событие, не открываем выбор файла */
+    const target = e.target;
+    if (target && target.closest && target.closest('#dropLoader')) return;
+  }
+
+  /* если идёт загрузка — не открываем окно выбора */
+  if (isUploading) return;
+
+  const fi = document.getElementById('fileInput');
+  if (fi) {
+    try { fi.value = ''; } catch (e2) {}
+    fi.click();
+  }
+}
+
+/* Файлы из <input type=file> или drag&drop — складываем в pendingFiles
+   и открываем окно «Отправка файлов» (пароль / «Отправить»). */
+function uploadFiles(fileList) {
+  if (!fileList || !fileList.length) return;
+
+  /* Вне Telegram без входа — предлагаем войти */
+  if (!IS_TELEGRAM && !WEB_TOKEN) {
+    showToast('Войдите, чтобы загружать файлы');
+    setTimeout(openLoginModal, 400);
+    return;
+  }
+
+  const arr = Array.prototype.slice.call(fileList);
+
+  /* сбрасываем прошлую партию, если окно закрыли, но файлы остались */
+  pendingFiles = arr;
+
+  /* если в режиме «без шифрования» и пароль не нужен — можно сразу
+     уйти в загрузку, но всё-таки показываем модалку, чтобы пользователь
+     видел, ЧТО полетит боту (и мог отменить). */
+  openUploadModal();
+}
 
 function handleLoaderClick(e) {
   if (e) e.stopPropagation();
@@ -20083,9 +20162,9 @@ function refreshUploadModal() {
 
   if (info) {
     info.textContent = !has
-      /* ВОЛНА 22.86: выбор файлов удалён — окно открывается только с уже
-         выбранными (повторными/недокачанными) файлами. */
-      ? 'Файлы загружаются через бота: пришлите их в чат. Здесь вводится пароль и подтверждается отправка уже выбранных файлов.'
+      /* 22.86→REVERT: файлов нет в очереди, но мы снова умеем выбирать их
+         из мини-аппа. Подсказка указывает на зону загрузки вверху. */
+      ? 'Нажмите «Загрузить файлы» вверху или перетащите их туда. Здесь вводится пароль и подтверждается отправка уже выбранных файлов.'
       : pendingFiles.length === 1
         ? (pendingFiles[0].name || 'файл') + ' — ждёт отправки. Загрузка начнётся после нажатия кнопки «Отправить».'
         : 'Выбрано файлов: ' + pendingFiles.length + ' — все ждут отправки. Загрузка начнётся после нажатия кнопки «Отправить».';
@@ -20277,6 +20356,7 @@ function showDropLoader(files) {
   const bar = document.getElementById('progressBar');
   const checkmark = document.getElementById('checkmark');
   const squareStop = document.getElementById('squareStop');
+  const prompt = document.getElementById('dropPrompt');
 
   if (files.length === 1) {
     filenameEl.innerHTML = `Загружается:<br><b>${escapeHtml(files[0].uploadName || files[0].name)}</b>`;
@@ -20292,16 +20372,18 @@ function showDropLoader(files) {
   filenameEl.style.display = 'block';
   softReveal(filenameEl);   /* 22.59: имя файла появляется мягко */
 
-  /* 22.86: зона проявляется мягко (класс .uploading несёт keyframes
-     softFadeIn — играют при первом рендере). Отложенное скрытие предыдущей
-     пачки отменяем, чтобы гонка «прячу → показываю» не мигала зоной. */
+  /* 22.86→REVERT: зона была скрыта по умолчанию, теперь она всегда видна
+     (idle-состояние). При старте загрузки:
+       • прячем приглашение (.drop-prompt) добавлением класса .uploading;
+       • отменяем отложенное скрытие предыдущей пачки (гонка «прячу→показываю»);
+       • показываем прогресс-блок. */
   if (zone) {
     clearTimeout(_zoneHideT);
     _zoneHideT = null;
     zone.style.opacity = '';
     zone.style.transition = '';
     if (!zone.classList.contains('uploading')) {
-      zone.classList.add('uploading');   // анимация — только на ПЕРВОМ показе
+      zone.classList.add('uploading');   // анимация + прячем .drop-prompt
     }
     zone.style.display = 'flex';
   }
@@ -20607,22 +20689,23 @@ function resetUploadUI(bar, checkmark, squareStop) {
   wrap.classList.remove('active');
   filenameEl.style.display = 'none';
 
-  /* ВОЛНА 22.86: кнопки выбора файлов больше нет — после пачки зона
-     прогресса МЯГКО прячется целиком (opacity → display:none). Раньше
-     здесь «выскакивало» пустое приглашение «Загрузить файлы». */
+  /* 22.86→REVERT: зона ВСЕГДА видна. После пачки просто возвращаем её
+     в idle-состояние: снимаем .uploading — проявится обратно приглашение
+     «Загрузить файлы…». Саму зону НЕ прячем. */
   if (zone) {
     if (LOW_END || REDUCED_MOTION) {
       zone.classList.remove('uploading');
-      zone.style.display = 'none';
     } else {
+      /* плавный fade прогресса → резкое возвращение prompt,
+         чтобы не было «прыжков» содержимого */
       zone.style.transition = 'opacity 0.3s var(--ease-smooth)';
       zone.style.opacity = '0';
       _zoneHideT = setTimeout(() => {
         _zoneHideT = null;
         zone.classList.remove('uploading');
-        zone.style.display = 'none';
         zone.style.opacity = '';
         zone.style.transition = '';
+        /* prompt проявится через CSS (его дефолтный display: flex) */
       }, 320);
     }
   }
@@ -21885,14 +21968,64 @@ async function uploadEngine(bar) {
   }, 1200);
 }
 
-/* ═══ ВОЛНА 22.86: ВЫБОР ФАЙЛОВ В МИНИ-АППЕ УДАЛЁН ═══
-   Кнопка «Добавить файл»/«Добавить ещё», скрытый <input type=file>,
-   drag&drop и функции pickUploadFiles/addMoreUploadFiles/uploadFiles
-   (со сниффером devoSniffMime/devoFixFile) удалены по решению
-   пользователя: файлы загружаются через бота — «кнопка выбора файлов
-   больше не нужна, удали её полностью». Путь подтверждения (пароль +
-   «Отправить» → confirmUploadFiles) сохранён для повторной отправки
-   недокачанных файлов и ввода пароля после safe_locked. */
+/* ═══ ВОЛНА 22.86→REVERT: ВЫБОР ФАЙЛОВ В МИНИ-АППЕ ВЕРНУЛСЯ ═══
+   Кнопка выбора файлов, скрытый <input type=file>, drag&drop — всё на
+   месте. Зона #dropZone видна всегда (idle-состояние с приглашением),
+   клик / drop вызывает handleDropZoneClick → fileInput.click() →
+   uploadFiles(выбранные) → openUploadModal → confirmUploadFiles →
+   startActualUpload → proceedUpload. Сниффер MIME не возвращаем:
+   тип/имя для недокачанных чинит сервер (_miniapp_rec_out), а для новых
+   загрузок достаточно встроенных File.type / File.name. */
+
+(function wireFileInput() {
+  const fi = document.getElementById('fileInput');
+  if (fi) {
+    fi.addEventListener('change', (e) => {
+      if (e.target.files && e.target.files.length) {
+        uploadFiles(e.target.files);
+      }
+      /* сбрасываем, чтобы тот же файл можно было выбрать снова */
+      e.target.value = '';
+    });
+  }
+
+  const dz = document.getElementById('dropZone');
+  if (dz) {
+    /* drag&drop — предотвращаем дефолт (иначе браузер открыл бы файл) */
+    ['dragenter', 'dragover'].forEach((ev) =>
+      dz.addEventListener(ev, (e) => {
+        e.preventDefault();
+        if (!isUploading) dz.classList.add('drag-over');
+      })
+    );
+
+    ['dragleave', 'dragend'].forEach((ev) =>
+      dz.addEventListener(ev, (e) => {
+        e.preventDefault();
+        /* dragleave срабатывает при выходе за границы И при переходе на
+           дочерний элемент — упрощаем: убираем подсветку, проверяем related */
+        try {
+          if (e.relatedTarget && dz.contains(e.relatedTarget)) return;
+        } catch (e2) {}
+        dz.classList.remove('drag-over');
+      })
+    );
+
+    dz.addEventListener('drop', (e) => {
+      e.preventDefault();
+      dz.classList.remove('drag-over');
+
+      if (isUploading) {
+        showToast('⏳ Подождите: идёт загрузка');
+        return;
+      }
+
+      if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) {
+        uploadFiles(e.dataTransfer.files);
+      }
+    });
+  }
+})();
 
 const blobSpeedInput = document.getElementById('blobSpeedInput');
 if (blobSpeedInput) blobSpeedInput.value = blobIdleSpeed;
