@@ -4437,7 +4437,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.90"
+BOT_BUILD = "22.91"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -46205,7 +46205,18 @@ async def back_to_settings_handler(update: Update, context: ContextTypes.DEFAULT
 
 async def auto_reenter_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Автоматический повторный вход в главное меню, если ConversationHandler
-    завершился (по таймауту или ошибке). Не требует /start."""
+    завершился (по таймауту или ошибке). Не требует /start.
+
+    ВОЛНА 22.91 (ФИКС «звонки по дням и числам не поставить»): этот фолбэк
+    срабатывает КАЖДЫЙ раз, когда в состоянии разговора нет текстового
+    хендлера (ADMIN_PANEL, EDIT_BELLS — там только колбэки), и раньше СЪЕДАЛ
+    ЛЮБОЙ текст — в том числе ввод по персистентному флагу (список звонков,
+    дежурных, таймер классу, название класса). Глобальные приёмники вне FSM
+    при живом разговоре не получали апдейт ВООБЩЕ: ConversationHandler стоит
+    в группе 0 раньше них, а fallback срабатывает раньше внешних хендлеров.
+    Теперь текст по живому флагу отдаётся профильному приёмнику, а нажатия
+    кнопок меню приоритетнее ввода (_text_is_user_button — семантика 22.86:
+    «кнопка = действие, не данные»)."""
     # Не пытаемся обрабатывать callback-и здесь — они идут через handle_callback
     if not getattr(update, "message", None):
         return MAIN_MENU
@@ -46213,6 +46224,19 @@ async def auto_reenter_main_menu(update: Update, context: ContextTypes.DEFAULT_T
     user = get_user(user_id)
     if not user or not user.setup_completed:
         return await start(update, context)
+    raw = (update.message.text or "").strip()
+    _p_bells = isinstance(getattr(user, "bells_pending", None), dict)
+    _p_duty = isinstance(getattr(user, "duty_pending", None), dict)
+    _p_ct = isinstance(getattr(user, "ct_pending", None), dict)
+    _p_cls = isinstance(getattr(user, "cls_pending", None), dict)
+    if (_p_bells or _p_duty or _p_ct or _p_cls) and not _text_is_user_button(raw, user):
+        if _p_bells:
+            return await _bells_bulk_text_handler(update, context)
+        if _p_duty:
+            return await _duty_pending_text_handler(update, context)
+        if _p_ct:
+            return await _ct_pending_text_handler(update, context)
+        return await _cls_pending_text_handler(update, context)
     return await handle_main_menu(update, context)
 
 
@@ -47071,7 +47095,18 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Передаём user, чтобы время «сейчас» бралось по его локали.
         bells_info = get_bells_info(class_obj, user)
-        await update.message.reply_text(bells_info)
+        # ВОЛНА 22.91: админу — прямая кнопка редактирования прямо из
+        # «🔔 Звонки» (дни/числа ставятся в «Редактировать звонки» →
+        # «📅 По дням недели» / «📆 По числам»), админку искать не нужно.
+        _bells_kb = None
+        try:
+            if class_obj and is_user_class_admin(user_id):
+                _bells_kb = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✏️ Редактировать звонки",
+                                         callback_data="edit_bells")]])
+        except Exception:
+            _bells_kb = None
+        await update.message.reply_text(bells_info, reply_markup=_bells_kb)
         return MAIN_MENU
 
     elif message_text == "👨‍🏫 Учителя":
@@ -62243,6 +62278,20 @@ def _ct_list_kb(timers, class_code):
     return InlineKeyboardMarkup(kb)
 
 
+def _admin_class_for_uid(uid):
+    """ВОЛНА 22.91: класс, где uid — АДМИН (скан всех активных классов).
+    get_class_by_user ищет по students: соадмин, не входящий в students,
+    или админ другого класса фолбэком не находился — и постановка звонков
+    по дням/числам отваливалась с «Вы больше не админ класса»."""
+    try:
+        for co in load_classes().values():
+            if getattr(co, "is_active", True) and str(uid) in (co.admins or []):
+                return co
+    except Exception:
+        pass
+    return None
+
+
 def _ct_admin_class(query, context):
     """Класс, который админ настраивает: из FSM (current_admin_class) или
     единственный класс, где пользователь админ. None — не админ."""
@@ -62254,11 +62303,10 @@ def _ct_admin_class(query, context):
         code = None
     class_obj = get_class_by_code(code) if code else None
     if not class_obj or uid not in (class_obj.admins or []):
-        cand = get_class_by_user(uid)
-        if cand and uid in (cand.admins or []):
-            class_obj = cand
-        else:
+        cand = _admin_class_for_uid(uid)   # 22.91: скан админов, не students
+        if cand is None:
             return None
+        class_obj = cand
     return class_obj
 
 
@@ -63142,15 +63190,14 @@ async def _bells_bulk_text_handler(update: Update,
         code = None
     class_obj = get_class_by_code(code) if code else None
     if not class_obj or uid not in (class_obj.admins or []):
-        cand = get_class_by_user(uid)
-        if cand and uid in (cand.admins or []):
-            class_obj = cand
-        else:
+        cand = _admin_class_for_uid(uid)   # 22.91: скан админов, не students
+        if cand is None:
             user.bells_pending = None
             save_user(user)
             await update.message.reply_text(
                 "Вы больше не админ класса — замена звонков прервана.")
             return
+        class_obj = cand
     bells, errors = _parse_bells_bulk(raw)
     if not bells:
         user.bells_pending = None
@@ -63647,6 +63694,25 @@ async def _bells_ovr_route(update, context):
         return ADMIN_PANEL
 
     return ADMIN_PANEL
+
+
+async def _bells_buttons_global(update, context):
+    """ВОЛНА 22.91: глобальный роутер кнопок звонков (bells_* / edit_bells*)
+    ПОСЛЕ потери FSM — тот же паттерн, что duty (22.40) и ctm (22.41):
+    после рестарта/деплоя кнопки «📅 По дням недели» / «📆 По числам» и
+    подтверждение превью на старых сообщениях молчали (не отвечал никто)."""
+    data = update.callback_query.data or ""
+    if data == "edit_bells":
+        return await edit_bells_start(update, context)
+    if data == "edit_bells_bulk":
+        return await _bells_bulk_start_cb(update, context)
+    if data == "bells_photo_set":
+        return await bells_photo_set_start(update, context)
+    if data == "bells_photo_del":
+        return await bells_photo_del_cb(update, context)
+    if data in ("bells_bulk_ok", "bells_bulk_no"):
+        return await _bells_bulk_confirm_cb(update, context)
+    return await _bells_ovr_route(update, context)
 
 
 class _BellsBulkFilter(filters.MessageFilter):
@@ -73141,6 +73207,12 @@ def main():
         filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND
         & _CT_PENDING_FILTER,
         _ct_pending_text_handler))
+
+    # ВОЛНА 22.91: кнопки звонков (дни/числа/весь список/фото/подтверждение)
+    # вне FSM — переживают потерю состояния (тот же паттерн, что duty/ctm):
+    # после рестарта «📅 По дням недели» и «✅ Сохранить» молчали.
+    application.add_handler(CallbackQueryHandler(
+        _bells_buttons_global, pattern=r"^(bells_|edit_bells)"))
 
     # ВОЛНА 22.41: список звонков ЦЕЛИКОМ (кнопка «📜 Ввести весь список»)
     # тоже вне FSM — переживает потерю состояния (тот же паттерн).
