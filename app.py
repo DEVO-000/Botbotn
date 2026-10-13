@@ -14,7 +14,6 @@ if not WEB_ONLY:
     log.error("[app] WEB_ONLY=1 required on Render.")
     sys.exit(1)
 import telegram.ext
-_orig_run_polling = telegram.ext.Application.run_polling
 def _web_only_run_polling(self, *args, **kwargs):
     log.info("[app] WEB_ONLY: run_polling() перехвачен")
     try:
@@ -25,16 +24,29 @@ def _web_only_run_polling(self, *args, **kwargs):
     log.info("[app] Вызываю initialize() ...")
     loop.run_until_complete(self.initialize())
     log.info("[app] ✅ initialize() завершён (Bot готов)")
-    post_init = getattr(self, "_post_init", None)
+    post_init = getattr(self, "post_init", None)
     if post_init is None:
-        log.error("[app] _post_init не найден в application!")
+        for name in ("_post_init", "post_init_callback", "_post_init_coro"):
+            post_init = getattr(self, name, None)
+            if post_init is not None:
+                log.info("[app] post_init найден как %s", name)
+                break
+    if post_init is None:
+        log.error("[app] post_init не найден! Атрибуты application:")
+        for attr in sorted(dir(self)):
+            if 'post' in attr.lower() or 'init' in attr.lower():
+                try:
+                    val = getattr(self, attr)
+                    log.error("[app]   %s = %r", attr, val)
+                except Exception:
+                    pass
     else:
-        log.info("[app] Вызываю _post_init (база + веб-сервер) ...")
+        log.info("[app] Вызываю post_init (база + веб-сервер) ...")
         try:
             loop.run_until_complete(post_init(self))
-            log.info("[app] ✅ _post_init завершён — база восстановлена, веб-сервер запущен")
+            log.info("[app] ✅ post_init завершён — база восстановлена, веб-сервер запущен")
         except Exception as e:
-            log.exception("[app] _post_init failed: %s", e)
+            log.exception("[app] post_init failed: %s", e)
     log.info("[app] WEB_ONLY: polling НЕ запускается (он на HF Spaces)")
     log.info("[app] ✅ Mini App доступен по публичному URL Render")
     try:
