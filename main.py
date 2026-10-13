@@ -4437,7 +4437,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.92"
+BOT_BUILD = "22.94"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -11745,6 +11745,69 @@ if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.
   --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
 }
 
+/* ═══ LIQUID GLASS — "жидкое стекло" (по статье kube.io) ═══
+   • SVG фильтр #liquidGlass преломляет фон (refraction)
+   • backdrop-filter: blur() размывает фон
+   • spec-слой: ::before с градиентом (блик) + inset shadow (грань)
+   • Не transitions on backdrop-filter → закрытие без «дёргания» */
+.glass-liquid {
+  position: relative;
+  backdrop-filter: url(#liquidGlass) blur(28px) saturate(1.8) brightness(1.05);
+  -webkit-backdrop-filter: blur(28px) saturate(1.8) brightness(1.05);
+  background: rgba(18, 18, 24, 0.55);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  box-shadow:
+    0 8px 32px rgba(0, 0, 0, 0.4),
+    inset 0 1px 0 rgba(255, 255, 255, 0.18),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.15);
+  overflow: hidden;
+}
+
+.glass-liquid::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background:
+    linear-gradient(135deg,
+      rgba(255, 255, 255, 0.22) 0%,
+      rgba(255, 255, 255, 0.06) 18%,
+      transparent 38%,
+      transparent 62%,
+      rgba(255, 255, 255, 0.04) 82%,
+      rgba(255, 255, 255, 0.12) 100%);
+  border-radius: inherit;
+  pointer-events: none;
+  z-index: 1;
+  mix-blend-mode: overlay;
+}
+
+.glass-liquid::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 12%;
+  right: 12%;
+  height: 1px;
+  background: linear-gradient(to right,
+    transparent,
+    rgba(255, 255, 255, 0.4) 50%,
+    transparent);
+  pointer-events: none;
+  z-index: 2;
+}
+
+/* Лёгкая версия для слабых устройств: без SVG-фильтра (только blur) */
+html.low-end .glass-liquid {
+  backdrop-filter: blur(18px) saturate(1.5);
+  -webkit-backdrop-filter: blur(18px) saturate(1.5);
+}
+
+/* Слой для контента, чтобы быть выше ::before */
+.glass-liquid > * {
+  position: relative;
+  z-index: 3;
+}
+
 [data-theme="dark"] {
   --bg-color: #121212;
   --bg-gradient: none;
@@ -14314,9 +14377,14 @@ html.low-end #musicPlayer .art-container.mp-switch {
     transform 0.45s var(--ease-snap),
     opacity 0.35s var(--ease-smooth),
     visibility 0s linear 0.45s;
-  background: rgba(8, 8, 12, 0.78);
-  backdrop-filter: blur(40px) saturate(1.4);
-  -webkit-backdrop-filter: blur(40px) saturate(1.4);
+  /* LIQUID GLASS: SVG-фильтр преломляет фон плеера под панелью + blur */
+  background: rgba(8, 8, 14, 0.55);
+  backdrop-filter: url(#liquidGlass) blur(32px) saturate(1.7) brightness(1.04);
+  -webkit-backdrop-filter: blur(32px) saturate(1.7) brightness(1.04);
+  border-top: 1px solid rgba(255, 255, 255, 0.12);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.2),
+    0 -8px 40px rgba(0, 0, 0, 0.35);
   overflow: hidden;
 }
 
@@ -14329,6 +14397,20 @@ html.low-end #musicPlayer .art-container.mp-switch {
     transform 0.5s var(--ease-snap),
     opacity 0.35s var(--ease-smooth),
     visibility 0s;
+}
+
+/* blur-off: при закрытии снимаем backdrop-filter без transition,
+   чтобы фон не «дёргался» при рекомпозиции каждый кадр.
+   См. mpCloseLyrics() — добавляет класс, ждёт 2 rAF, снимает .open. */
+#mpLyricsPanel.blur-off {
+  backdrop-filter: blur(0px) saturate(100%);
+  -webkit-backdrop-filter: blur(0px) saturate(100%);
+  transition:
+    backdrop-filter 0s,
+    -webkit-backdrop-filter 0s,
+    transform 0.45s var(--ease-snap),
+    opacity 0.35s var(--ease-smooth),
+    visibility 0s linear 0.45s;
 }
 
 /* фоновая обложка, размытая за текстами — Apple Music vibe */
@@ -14399,7 +14481,9 @@ html.low-end #musicPlayer .art-container.mp-switch {
   stroke-linecap: round;
 }
 
-/* Тело с текстом — прокручивается */
+/* Тело с текстом — прокручивается.
+   mask-image: плавное затемнение сверху и снизу — текст появляется
+   снизу с лёгким размытием и исчезает сверху так же мягко. */
 #mpLyricsPanel .mp-lyrics-body {
   flex: 1;
   overflow-y: auto;
@@ -14407,6 +14491,27 @@ html.low-end #musicPlayer .art-container.mp-switch {
   -webkit-overflow-scrolling: touch;
   scrollbar-width: none;
   scroll-behavior: smooth;
+  /* Градиентная маска: прозрачные края → непрозрачный центр.
+     Верх и низ тела слегка «размываются» (fade) — текст мягко
+     появляется снизу и исчезает сверху, как в Apple Music. */
+  -webkit-mask-image: linear-gradient(
+    to bottom,
+    transparent 0%,
+    rgba(0, 0, 0, 0.4) 8%,
+    #000 18%,
+    #000 82%,
+    rgba(0, 0, 0, 0.4) 92%,
+    transparent 100%
+  );
+  mask-image: linear-gradient(
+    to bottom,
+    transparent 0%,
+    rgba(0, 0, 0, 0.4) 8%,
+    #000 18%,
+    #000 82%,
+    rgba(0, 0, 0, 0.4) 92%,
+    transparent 100%
+  );
 }
 
 #mpLyricsPanel .mp-lyrics-body::-webkit-scrollbar {
@@ -14474,7 +14579,9 @@ html.low-end #musicPlayer .art-container.mp-switch {
   position: absolute;
   top: 50%;
   left: 50%;
-  transform: translate(-50%, -50%);
+  /* margin-based centering — НЕ transform, иначе rotate-анимация
+     .pld-spin перебивает translate и спиннер улетает в сторону */
+  margin: -11px 0 0 -11px;
   display: none;
 }
 
@@ -14540,6 +14647,22 @@ html.low-end #mpLyricsPanel .mp-lyric-line.past {
 
 html.low-end #mpLyricsPanel .mp-lyrics-body {
   scroll-behavior: auto;
+  /* На слабых устройствах маска дороже — оставляем только лёгкий fade
+     сверху и снизу, без полной прозрачности */
+  -webkit-mask-image: linear-gradient(
+    to bottom,
+    rgba(0, 0, 0, 0.7) 0%,
+    #000 10%,
+    #000 90%,
+    rgba(0, 0, 0, 0.7) 100%
+  );
+  mask-image: linear-gradient(
+    to bottom,
+    rgba(0, 0, 0, 0.7) 0%,
+    #000 10%,
+    #000 90%,
+    rgba(0, 0, 0, 0.7) 100%
+  );
 }
 
 /* ═══ ВОЛНА 22.66: ДЕМО-РЕЖИМ + СВОЙ ТЕКСТ (тест/предпросмотр) ═══
@@ -14548,9 +14671,6 @@ html.low-end #mpLyricsPanel .mp-lyrics-body {
 
 /* Кнопка-меню в шапке панели текстов */
 .mp-lyrics-menu-btn {
-  position: absolute;
-  left: 20px;
-  top: 64px;
   width: 36px;
   height: 36px;
   border-radius: 9999px;
@@ -14564,7 +14684,6 @@ html.low-end #mpLyricsPanel .mp-lyrics-body {
   flex-shrink: 0;
   touch-action: manipulation;
   transition: transform 0.2s, background 0.2s;
-  z-index: 10;
 }
 
 .mp-lyrics-menu-btn:active {
@@ -14636,8 +14755,9 @@ html.low-end #mpLyricsPanel .mp-lyrics-body {
 /* Бейдж «свой текст» в шапке, когда текст пользовательский */
 .mp-lyrics-badge {
   position: absolute;
-  left: 60px;
-  top: 70px;
+  left: 50%;
+  top: 104px;
+  transform: translateX(-50%);
   background: rgba(80, 220, 120, 0.2);
   color: rgb(120, 240, 160);
   border: 1px solid rgba(80, 220, 120, 0.35);
@@ -14650,20 +14770,14 @@ html.low-end #mpLyricsPanel .mp-lyrics-body {
   z-index: 10;
   display: none;
   pointer-events: none;
+  white-space: nowrap;
 }
 
 #mpLyricsPanel.custom .mp-lyrics-badge {
   display: block;
 }
 
-#mpLyricsPanel.demo .mp-lyrics-badge {
-  display: block;
-  background: rgba(255, 180, 60, 0.2);
-  color: rgb(255, 200, 100);
-  border-color: rgba(255, 180, 60, 0.4);
-}
-
-/* ═══ Action sheet — выезжает снизу, как нативный ═══ */
+/* ═══ Action sheet — выезжает снизу, как нативный (LIQUID GLASS) ═══ */
 #mpLyricsSheet {
   position: fixed;
   inset: 0;
@@ -14671,14 +14785,34 @@ html.low-end #mpLyricsPanel .mp-lyrics-body {
   visibility: hidden;
   pointer-events: none;
   background: rgba(0, 0, 0, 0);
-  transition: background 0.3s var(--ease-smooth), visibility 0s linear 0.3s;
+  /* ВАЖНО: backdrop-filter НЕ в transition — иначе при закрытии каждый кадр
+     рекомпозитит размытие и анимация дёргается. Применяем/снимаем мгновенно. */
+  transition:
+    background-color 0.3s var(--ease-smooth),
+    visibility 0s linear 0.4s;
 }
 
 #mpLyricsSheet.open {
   visibility: visible;
   pointer-events: auto;
-  background: rgba(0, 0, 0, 0.55);
-  transition: background 0.3s var(--ease-smooth), visibility 0s;
+  background: rgba(0, 0, 0, 0.35);
+  backdrop-filter: url(#liquidGlass) blur(20px) saturate(1.6);
+  -webkit-backdrop-filter: blur(20px) saturate(1.6);
+  transition:
+    background-color 0.3s var(--ease-smooth),
+    visibility 0s;
+}
+
+/* blur-off: при закрытии сначала убираем backdrop-filter (без transition),
+   чтобы не дёргалось, потом снимаем .open. См. mpLyricsCloseSheet(). */
+#mpLyricsSheet.blur-off {
+  backdrop-filter: blur(0px) saturate(100%);
+  -webkit-backdrop-filter: blur(0px) saturate(100%);
+  transition:
+    backdrop-filter 0s,
+    -webkit-backdrop-filter 0s,
+    background-color 0.3s var(--ease-smooth),
+    visibility 0s linear 0.4s;
 }
 
 #mpLyricsSheet .sheet-card {
@@ -14686,14 +14820,37 @@ html.low-end #mpLyricsPanel .mp-lyrics-body {
   left: 0;
   right: 0;
   bottom: 0;
-  background: var(--card-bg, #1c1d24);
+  /* LIQUID GLASS CARD — полупрозрачное стекло с преломлением + бликом */
+  background: rgba(18, 18, 24, 0.5);
+  backdrop-filter: url(#liquidGlass) blur(30px) saturate(1.8) brightness(1.05);
+  -webkit-backdrop-filter: blur(30px) saturate(1.8) brightness(1.05);
   border-radius: 28px 28px 0 0;
   padding: 12px 20px calc(20px + env(safe-area-inset-bottom));
   transform: translateY(100%);
-  transition: transform 0.4s var(--ease-snap);
+  transition: transform 0.42s var(--ease-snap);
   max-height: 80vh;
   overflow-y: auto;
   -webkit-overflow-scrolling: touch;
+  box-shadow:
+    0 -8px 40px rgba(0, 0, 0, 0.5),
+    inset 0 1px 0 rgba(255, 255, 255, 0.18);
+  border-top: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+/* Блик на верхнем краю карточки */
+#mpLyricsSheet .sheet-card::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 15%;
+  right: 15%;
+  height: 1px;
+  background: linear-gradient(to right,
+    transparent,
+    rgba(255, 255, 255, 0.35) 50%,
+    transparent);
+  pointer-events: none;
+  z-index: 2;
 }
 
 #mpLyricsSheet.open .sheet-card {
@@ -14711,20 +14868,22 @@ html.low-end #mpLyricsPanel .mp-lyrics-body {
   width: 36px;
   height: 4px;
   border-radius: 9999px;
-  background: rgba(128, 128, 128, 0.4);
+  background: rgba(255, 255, 255, 0.25);
 }
 
 #mpLyricsSheet .sheet-title {
-  font-size: 18px;
+  font-size: 17px;
   font-weight: 800;
-  margin-bottom: 4px;
-  color: var(--text-color, #fff);
+  margin-bottom: 2px;
+  color: #ffffff;
+  letter-spacing: -0.3px;
 }
 
 #mpLyricsSheet .sheet-subtitle {
   font-size: 13px;
-  color: var(--subtext-color, rgba(255, 255, 255, 0.5));
-  margin-bottom: 14px;
+  color: rgba(255, 255, 255, 0.5);
+  margin-bottom: 12px;
+  font-weight: 600;
 }
 
 #mpLyricsSheet .sheet-action {
@@ -14732,17 +14891,18 @@ html.low-end #mpLyricsPanel .mp-lyrics-body {
   align-items: center;
   gap: 14px;
   width: 100%;
-  padding: 14px 4px;
+  padding: 15px 4px;
   background: none;
   border: none;
-  color: var(--text-color, #fff);
+  color: #ffffff;
   font-family: inherit;
   font-size: 15px;
-  font-weight: 700;
+  font-weight: 600;
   text-align: left;
   cursor: pointer;
-  border-top: 1px solid rgba(128, 128, 128, 0.15);
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
   touch-action: manipulation;
+  transition: background 0.15s ease;
 }
 
 #mpLyricsSheet .sheet-action:first-of-type {
@@ -14750,7 +14910,7 @@ html.low-end #mpLyricsPanel .mp-lyrics-body {
 }
 
 #mpLyricsSheet .sheet-action:active {
-  opacity: 0.6;
+  background: rgba(255, 255, 255, 0.06);
 }
 
 #mpLyricsSheet .sheet-action svg {
@@ -14762,7 +14922,7 @@ html.low-end #mpLyricsPanel .mp-lyrics-body {
   stroke-linecap: round;
   stroke-linejoin: round;
   flex-shrink: 0;
-  color: var(--subtext-color, rgba(255, 255, 255, 0.6));
+  color: rgba(255, 255, 255, 0.55);
 }
 
 #mpLyricsSheet .sheet-action .sheet-action-text {
@@ -14773,119 +14933,14 @@ html.low-end #mpLyricsPanel .mp-lyrics-body {
   display: block;
   font-size: 15px;
   margin-bottom: 2px;
+  color: #ffffff;
 }
 
 #mpLyricsSheet .sheet-action .sheet-action-desc {
   display: block;
   font-size: 12px;
-  color: var(--subtext-color, rgba(255, 255, 255, 0.5));
+  color: rgba(255, 255, 255, 0.4);
   font-weight: 600;
-}
-
-/* Модал для вставки текста */
-#mpLyricsPasteModal {
-  position: fixed;
-  inset: 0;
-  z-index: 230;
-  visibility: hidden;
-  pointer-events: none;
-  background: rgba(0, 0, 0, 0);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 24px;
-  transition: background 0.3s var(--ease-smooth), visibility 0s linear 0.3s;
-}
-
-#mpLyricsPasteModal.open {
-  visibility: visible;
-  pointer-events: auto;
-  background: rgba(0, 0, 0, 0.7);
-  transition: background 0.3s var(--ease-smooth), visibility 0s;
-}
-
-#mpLyricsPasteModal .paste-card {
-  width: 100%;
-  max-width: 460px;
-  max-height: 80vh;
-  background: var(--card-bg, #1c1d24);
-  border-radius: 24px;
-  padding: 20px;
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  transform: scale(0.92);
-  opacity: 0;
-  transition: transform 0.3s var(--ease-snap), opacity 0.25s var(--ease-smooth);
-}
-
-#mpLyricsPasteModal.open .paste-card {
-  transform: scale(1);
-  opacity: 1;
-}
-
-#mpLyricsPasteModal .paste-title {
-  font-size: 18px;
-  font-weight: 800;
-  color: var(--text-color, #fff);
-}
-
-#mpLyricsPasteModal .paste-hint {
-  font-size: 12px;
-  color: var(--subtext-color, rgba(255, 255, 255, 0.5));
-  line-height: 1.5;
-}
-
-#mpLyricsPasteModal .paste-textarea {
-  width: 100%;
-  min-height: 200px;
-  flex: 1;
-  padding: 14px;
-  border-radius: 14px;
-  border: 1px solid var(--border-color, rgba(128, 128, 128, 0.25));
-  background: rgba(0, 0, 0, 0.2);
-  color: var(--text-color, #fff);
-  font-family: 'Nunito', monospace;
-  font-size: 14px;
-  line-height: 1.5;
-  resize: vertical;
-  outline: none;
-  font-weight: 500;
-}
-
-#mpLyricsPasteModal .paste-textarea:focus {
-  border-color: rgba(255, 255, 255, 0.4);
-}
-
-#mpLyricsPasteModal .paste-actions {
-  display: flex;
-  gap: 10px;
-}
-
-#mpLyricsPasteModal .paste-btn {
-  flex: 1;
-  padding: 14px;
-  border-radius: 14px;
-  border: none;
-  font-family: inherit;
-  font-size: 15px;
-  font-weight: 800;
-  cursor: pointer;
-  touch-action: manipulation;
-}
-
-#mpLyricsPasteModal .paste-btn.cancel {
-  background: rgba(128, 128, 128, 0.15);
-  color: var(--text-color, #fff);
-}
-
-#mpLyricsPasteModal .paste-btn.save {
-  background: #fff;
-  color: #000;
-}
-
-#mpLyricsPasteModal .paste-btn:active {
-  transform: scale(0.97);
 }
 
 /* ═══════════════ ВИДЕОПЛЕЕР (все анимации сохранены + новые) ═══════════════ */
@@ -15232,10 +15287,150 @@ body.vp-lock {
   min-width: 64px;
   text-align: center;
 }
+
+/* ═══ РЕЖИМ РАЗРАБОТЧИКА / ТЕСТА — банер + кнопка «Добавить песни» ═══ */
+#devTestBanner {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 300;
+  background: #ffffff;
+  color: #1a1a1a;
+  font-family: 'Nunito', sans-serif;
+  padding: 10px 16px calc(10px + env(safe-area-inset-top)) 16px;
+  padding-top: calc(10px + env(safe-area-inset-top));
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transform: translateY(-100%);
+  transition: transform 0.4s var(--ease-snap, cubic-bezier(0.2, 0.8, 0.2, 1));
+  box-shadow: 0 1px 0 rgba(0, 0, 0, 0.08), 0 4px 16px rgba(0, 0, 0, 0.06);
+  pointer-events: none;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.06);
+}
+
+#devTestBanner.shown {
+  transform: translateY(0);
+  pointer-events: auto;
+}
+
+.devtest-banner-inner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: 500px;
+  width: 100%;
+}
+
+.devtest-icon {
+  font-size: 16px;
+  flex-shrink: 0;
+  opacity: 0.7;
+}
+
+.devtest-text {
+  flex: 1;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.3;
+  color: rgba(0, 0, 0, 0.65);
+}
+
+.devtest-text b {
+  font-weight: 800;
+  color: #1a1a1a;
+}
+
+.devtest-exit {
+  flex-shrink: 0;
+  background: rgba(0, 0, 0, 0.06);
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  color: rgba(0, 0, 0, 0.75);
+  font-family: 'Nunito', sans-serif;
+  font-size: 12px;
+  font-weight: 700;
+  padding: 6px 14px;
+  border-radius: 9999px;
+  cursor: pointer;
+  touch-action: manipulation;
+  transition: transform 0.2s, background 0.2s;
+}
+
+.devtest-exit:active {
+  transform: scale(0.92);
+  background: rgba(0, 0, 0, 0.1);
+}
+
+.devtest-add-btn {
+  position: fixed;
+  bottom: calc(88px + env(safe-area-inset-bottom));
+  left: 50%;
+  transform: translateX(-50%) translateY(80px);
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: #1a1a1a;
+  color: #ffffff;
+  border: none;
+  font-family: 'Nunito', sans-serif;
+  font-size: 15px;
+  font-weight: 700;
+  padding: 14px 28px;
+  border-radius: 9999px;
+  cursor: pointer;
+  touch-action: manipulation;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+  opacity: 0;
+  transition: transform 0.4s var(--ease-snap, cubic-bezier(0.2, 0.8, 0.2, 1)),
+              opacity 0.3s ease;
+  pointer-events: none;
+  will-change: transform, opacity;
+}
+
+.devtest-add-btn.shown {
+  transform: translateX(-50%) translateY(0);
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.devtest-add-btn:active {
+  transform: translateX(-50%) scale(0.94);
+}
+
+.devtest-add-btn svg {
+  flex-shrink: 0;
+}
+
+/* Сдвиг контента при активном тест-банере */
+body.dev-test-active .main-wrapper {
+  padding-top: 52px;
+}
 </style>
 </head>
 
 <body>
+
+<!-- ═══ LIQUID GLASS — SVG фильтр преломления (как в статье kube.io) ═══
+     feTurbulence создаёт мягкое поле шума → feDisplacementMap преломляет
+     фон за стеклом. В kombinatsii s backdrop-filter: blur() daet effekt
+     "жидкого стекла" s refraction краёв. -->
+<svg style="position:absolute;width:0;height:0;overflow:hidden;pointer-events:none" aria-hidden="true">
+  <defs>
+    <filter id="liquidGlass" color-interpolation-filters="sRGB" x="-10%" y="-10%" width="120%" height="120%">
+      <feTurbulence type="fractalNoise" baseFrequency="0.012 0.012" numOctaves="2" seed="7" stitchTiles="stitch" result="noise"/>
+      <feGaussianBlur in="noise" stdDeviation="3" result="softNoise"/>
+      <feDisplacementMap in="SourceGraphic" in2="softNoise" scale="22" xChannelSelector="R" yChannelSelector="G" result="displaced"/>
+      <feGaussianBlur in="displaced" stdDeviation="0.6" result="smoothed"/>
+    </filter>
+    <!-- Более лёгкий вариант для слабых устройств -->
+    <filter id="liquidGlassLite" color-interpolation-filters="sRGB" x="-10%" y="-10%" width="120%" height="120%">
+      <feTurbulence type="fractalNoise" baseFrequency="0.02 0.02" numOctaves="1" seed="7" stitchTiles="stitch" result="noise"/>
+      <feDisplacementMap in="SourceGraphic" in2="noise" scale="14" xChannelSelector="R" yChannelSelector="G"/>
+    </filter>
+  </defs>
+</svg>
 
 <div class="theme-flash" id="themeFlash"></div>
 
@@ -15361,16 +15556,17 @@ body.vp-lock {
   <div id="mpLyricsPanel">
     <div id="mpLyricsBg"></div>
 
-    <!-- Кнопка-меню: демо, загрузить свой, вставить текст, сбросить -->
-    <button class="mp-lyrics-menu-btn" id="mpLyricsMenuBtn" aria-label="Меню текста" title="Меню текста">
-      <svg viewBox="0 0 24 24"><circle cx="12" cy="5" r="1.6" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"/><circle cx="12" cy="19" r="1.6" fill="currentColor" stroke="none"/></svg>
-    </button>
-
-    <!-- Бейдж: показывается когда текст пользовательский или демо -->
+    <!-- Бейдж: показывается когда текст пользовательский -->
     <span class="mp-lyrics-badge" id="mpLyricsBadge">Свой текст</span>
 
     <div class="mp-lyrics-header">
+      <!-- Кнопка-меню: загрузить свой, вставить текст, сбросить -->
+      <button class="mp-lyrics-menu-btn" id="mpLyricsMenuBtn" aria-label="Меню текста" title="Меню текста">
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="5" r="1.6" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"/><circle cx="12" cy="19" r="1.6" fill="currentColor" stroke="none"/></svg>
+      </button>
+
       <span class="mp-lyrics-headtitle" id="mpLyricsTitle">Текст песни</span>
+
       <button class="mp-lyrics-close" id="mpLyricsClose" aria-label="Закрыть текст">
         <svg viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg>
       </button>
@@ -15385,17 +15581,9 @@ body.vp-lock {
       <span class="empty-title">Текст не найден</span>
       Для этого трека нет текста в открытых базах (lrclib.net, lyrics.ovh).
       <div class="mp-lyrics-actions">
-        <button class="mp-lyrics-action primary" id="mpLyricsDemoBtn">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3" fill="currentColor"/></svg>
-          Демо-анимация
-        </button>
-        <button class="mp-lyrics-action" id="mpLyricsUploadBtn">
+        <button class="mp-lyrics-action primary" id="mpLyricsUploadBtn">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
           Загрузить .lrc
-        </button>
-        <button class="mp-lyrics-action" id="mpLyricsPasteBtn">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><rect x="8" y="2" width="8" height="4" rx="1"/></svg>
-          Вставить текст
         </button>
       </div>
     </div>
@@ -15408,27 +15596,11 @@ body.vp-lock {
       <div class="sheet-title">Текст песни</div>
       <div class="sheet-subtitle" id="mpLyricsSheetSubtitle">Выберите действие</div>
 
-      <button class="sheet-action" id="mpLyricsSheetDemo">
-        <svg viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3" fill="currentColor" stroke="none"/></svg>
-        <span class="sheet-action-text">
-          <span class="sheet-action-title">Демо-анимация</span>
-          <span class="sheet-action-desc">Посмотреть, как выглядит синхронный текст (тест)</span>
-        </span>
-      </button>
-
       <button class="sheet-action" id="mpLyricsSheetUpload">
         <svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
         <span class="sheet-action-text">
           <span class="sheet-action-title">Загрузить .lrc</span>
           <span class="sheet-action-desc">Файл с тайм-кодами [mm:ss.xx] строк</span>
-        </span>
-      </button>
-
-      <button class="sheet-action" id="mpLyricsSheetPaste">
-        <svg viewBox="0 0 24 24"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><rect x="8" y="2" width="8" height="4" rx="1"/></svg>
-        <span class="sheet-action-text">
-          <span class="sheet-action-title">Вставить текст</span>
-          <span class="sheet-action-desc">Вставить LRC с тайм-кодами или простой текст</span>
         </span>
       </button>
 
@@ -15440,22 +15612,9 @@ body.vp-lock {
         </span>
       </button>
 
-      <button class="sheet-action" id="mpLyricsSheetCancel" style="justify-content:center;text-align:center;border-top:none;color:var(--subtext-color,rgba(255,255,255,0.7));font-weight:800">
+      <button class="sheet-action" id="mpLyricsSheetCancel" style="justify-content:center;text-align:center;border-top:none;color:rgba(255,255,255,0.6);font-weight:700">
         Отмена
       </button>
-    </div>
-  </div>
-
-  <!-- ═══ Модал вставки текста ═══ -->
-  <div id="mpLyricsPasteModal" onclick="if(event.target.id==='mpLyricsPasteModal') mpLyricsClosePaste()">
-    <div class="paste-card">
-      <div class="paste-title">Свой текст песни</div>
-      <div class="paste-hint">Вставьте текст в формате LRC с тайм-кодами (<b>[mm:ss.xx]</b> перед строкой) — будет синхронный показ.<br>Или вставьте простой текст — абзацы покажутся по очереди.</div>
-      <textarea class="paste-textarea" id="mpLyricsPasteArea" placeholder="[00:00.00] Первая строка&#10;[00:05.50] Вторая строка&#10;[00:11.20] Третья строка&#10;..." spellcheck="false"></textarea>
-      <div class="paste-actions">
-        <button class="paste-btn cancel" id="mpLyricsPasteCancel">Отмена</button>
-        <button class="paste-btn save" id="mpLyricsPasteSave">Сохранить</button>
-      </div>
     </div>
   </div>
 
@@ -17283,6 +17442,15 @@ function handleSoundSelect(e, id) {
 const IS_TELEGRAM = !!(tg && tg.initData);
 let WEB_TOKEN = localStorage.getItem('devo_web_token') || '';
 
+/* ═══ РЕЖИМ РАЗРАБОТЧИКА / ТЕСТА ═══
+   При вводе ID 33513511 и пароля 1234567х в окне входа —
+   вход в тест-режим без сервера: можно добавлять локальные песни
+   и тестировать плеер/тексты/обложки офлайн. */
+let DEV_TEST_MODE = (sessionStorage.getItem('devo_dev_test') === '1');
+const DEV_TEST_ID = '33513511';
+const DEV_TEST_PW = '1234567х';  /* кириллическое «х» как в запросе пользователя */
+let DEV_TEST_TRACKS = [];       /* локальные треки, добавленные в тест-режиме */
+
 /* ═══ ВОЛНА 22.66: КЭШ СПИСКА ФАЙЛОВ — «после обновления страницы всё
    сбрасывается и ничего не остаётся» — БОЛЬШЕ НЕ ДОЛЖНО. ═══
    При обновлении страницы список стартует пустым и наполняется только
@@ -17556,6 +17724,27 @@ async function webLogin() {
     return;
   }
 
+  /* ═══ РЕЖИМ РАЗРАБОТЧИКА: проверка тестовых кредентов ═══
+     ID 33513511 + пароль 1234567х → тест-режим без сервера.
+     Поддерживается и латинское 'x', и кириллическое 'х'. */
+  if (uid === DEV_TEST_ID && (pw === DEV_TEST_PW || pw === '1234567x' || pw === '1234567Х')) {
+    DEV_TEST_MODE = true;
+    try { sessionStorage.setItem('devo_dev_test', '1'); } catch (eSS) {}
+
+    document.getElementById('loginPassword').value = '';
+    closeLoginModal();
+
+    /* Очищаем ALL_FILES — тест-режим работает со своими треками */
+    ALL_FILES = [];
+    LAST_ERR = null;
+
+    showToast('🔧 Тест-режим включён. Добавьте песни для тестирования.');
+    devTestShowBanner();
+    renderAll({ animate: true });
+
+    return;
+  }
+
   const btn = document.getElementById('loginSubmitBtn');
   if (btn) btn.disabled = true;
 
@@ -17599,6 +17788,156 @@ async function webLogin() {
   } finally {
     if (btn) btn.disabled = false;
   }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   РЕЖИМ РАЗРАБОТЧИКА / ТЕСТА
+   • Показывает банер «Тест-режим» сверху
+   • Кнопка «Добавить песни» — выбор аудио файлов с устройства
+   • Выбранные файлы попадают в плеер как локальные треки
+   • Работает офлайн, без сервера
+   ═══════════════════════════════════════════════════════════════ */
+
+function devTestShowBanner() {
+  let banner = document.getElementById('devTestBanner');
+  if (!banner) {
+    banner = document.createElement('div');
+    banner.id = 'devTestBanner';
+    banner.innerHTML =
+      '<div class="devtest-banner-inner">' +
+        '<span class="devtest-icon">🔧</span>' +
+        '<span class="devtest-text"><b>Тест-режим</b> &mdash; сервер отключён</span>' +
+        '<button class="devtest-exit" onclick="devTestExit()">Выйти</button>' +
+      '</div>';
+    document.body.appendChild(banner);
+  }
+  banner.classList.add('shown');
+  document.body.classList.add('dev-test-active');
+
+  /* Показываем кнопку «Добавить песни» */
+  let addBtn = document.getElementById('devTestAddBtn');
+  if (!addBtn) {
+    addBtn = document.createElement('button');
+    addBtn.id = 'devTestAddBtn';
+    addBtn.className = 'devtest-add-btn';
+    addBtn.innerHTML =
+      '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">' +
+      '<path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>' +
+      '<span>Добавить песни</span>';
+    addBtn.addEventListener('click', devTestPickSongs);
+    document.body.appendChild(addBtn);
+  }
+  addBtn.classList.add('shown');
+
+  /* Скрытый input для файлов (если ещё нет) */
+  if (!document.getElementById('mpFileInput')) {
+    const fi = document.createElement('input');
+    fi.type = 'file';
+    fi.id = 'mpFileInput';
+    fi.accept = 'audio/*,.mp3,.wav,.ogg,.oga,.m4a,.aac,.flac';
+    fi.multiple = true;
+    fi.style.display = 'none';
+    fi.addEventListener('change', (e) => {
+      const files = Array.from(e.target.files || []);
+      if (files.length) devTestAddSongs(files);
+      e.target.value = '';
+    });
+    document.body.appendChild(fi);
+  }
+}
+
+function devTestHideBanner() {
+  const banner = document.getElementById('devTestBanner');
+  if (banner) banner.classList.remove('shown');
+  const addBtn = document.getElementById('devTestAddBtn');
+  if (addBtn) addBtn.classList.remove('shown');
+  document.body.classList.remove('dev-test-active');
+}
+
+function devTestExit() {
+  DEV_TEST_MODE = false;
+  DEV_TEST_TRACKS = [];
+  try { sessionStorage.removeItem('devo_dev_test'); } catch (eSS) {}
+  devTestHideBanner();
+  showToast('Тест-режим выключен');
+  openLoginModal();
+}
+
+function devTestPickSongs() {
+  const fi = document.getElementById('mpFileInput');
+  if (fi) {
+    fi.value = '';
+    fi.click();
+  }
+}
+
+function devTestAddSongs(files) {
+  const added = [];
+  files.forEach((file) => {
+    const okType = String(file.type || '').indexOf('audio') === 0;
+    const okName = /\.(mp3|wav|ogg|oga|m4a|aac|flac)$/i.test(String(file.name || ''));
+    if (!okType && !okName) return;
+
+    added.push({
+      id: 'devtest-' + Date.now().toString(36) + '-' + Math.floor(Math.random() * 1e5).toString(36),
+      title: String(file.name || 'Трек').replace(/\.[^/.]+$/, ''),
+      artist: 'Локальный файл',
+      url: '',
+      localFile: true,
+      file: file,
+      broken: false
+    });
+  });
+
+  if (!added.length) {
+    showToast('Нет аудиофайлов среди выбранных');
+    return;
+  }
+
+  DEV_TEST_TRACKS = DEV_TEST_TRACKS.concat(added);
+  showToast('Добавлено треков: ' + added.length);
+
+  /* Открываем плеер с новыми треками */
+  devTestOpenPlayer(added[0].id);
+}
+
+function devTestOpenPlayer(fileId) {
+  /* Если плеер уже открыт — просто добавим треки */
+  if (mpOpen) {
+    const startIdx = mpList.length;
+    DEV_TEST_TRACKS.forEach((t) => {
+      if (!mpList.find((x) => x.id === t.id)) mpList.push(t);
+    });
+    mpRenderDots();
+    if (!mpPlaying()) mpLoad(startIdx, true);
+    return;
+  }
+
+  mpCache();
+  mpBuildPlaylist();
+
+  if (!mpList.length) {
+    showToast('Нет аудиофайлов для воспроизведения');
+    return;
+  }
+
+  let start = mpList.findIndex((t) => t.id === fileId);
+  if (start < 0) start = 0;
+
+  mpOpen = true;
+  document.getElementById('musicPlayer').classList.add('open');
+  document.body.classList.add('mp-lock');
+
+  stopBlobAnimation();
+  mpBrokenStreak = 0;
+  mpLyricsReset();
+  mpLyricsToken++;
+  mpRenderDots();
+
+  if (!mpBeatRaf) mpBeatRaf = requestAnimationFrame(mpBeatLoop);
+  if (!mpTickRaf) mpTickRaf = requestAnimationFrame(mpTickLoop);
+
+  mpLoad(start, true);
 }
 
 let selectMode = false;
@@ -24272,7 +24611,12 @@ function mpCache() {
     });
   }
 
-  mpAudioEl.addEventListener('ended', () => mpNextTrack());
+  /* Когда песня заканчивается — автоматически включается следующая */
+  mpAudioEl.addEventListener('ended', () => {
+    /* Принудительно включаем автоплей следующего трека */
+    mpDeferredAutoplay = true;
+    mpNextTrack();
+  });
   mpAudioEl.addEventListener('play', mpSyncPlayIcon);
   mpAudioEl.addEventListener('pause', mpSyncPlayIcon);
   /* ВОЛНА 22.47: seek завершился — заливка снова живёт от currentTime */
@@ -24288,17 +24632,21 @@ function mpCache() {
     mpEl.mpDuration.textContent = mpFmtTime(mpAudioEl.duration || 0);
   });
 
-  /* Локальные треки через кнопку «Песни» — как в макете */
-  const fi = document.getElementById('mpFileInput');
+  /* Локальные треки через кнопку «Песни» — как в макете.
+     В тест-режиме файловый input обрабатывается отдельно (devTestAddSongs),
+     здесь не вмешиваемся. */
+  if (!DEV_TEST_MODE) {
+    const fi = document.getElementById('mpFileInput');
 
-  if (fi) {
-    fi.addEventListener('change', (e) => {
-      const files = Array.from(e.target.files || []);
+    if (fi) {
+      fi.addEventListener('change', (e) => {
+        const files = Array.from(e.target.files || []);
 
-      if (files.length) mpAddLocalTracks(files);
+        if (files.length) mpAddLocalTracks(files);
 
-      e.target.value = '';
-    });
+        e.target.value = '';
+      });
+    }
   }
 
   /* Клавиатура: пробел/стрелки — только когда плеер открыт */
@@ -24343,6 +24691,20 @@ function mpIsAudioFile(f) {
 let mpBrokenStreak = 0;   /* ВОЛНА 22.49: подряд битых треков (анти-шторм) */
 
 function mpBuildPlaylist() {
+  /* В тест-режиме плейлист строится только из добавленных локальных треков */
+  if (DEV_TEST_MODE) {
+    mpList = DEV_TEST_TRACKS.map((t) => ({
+      id: t.id,
+      title: t.title,
+      artist: t.artist,
+      url: '',
+      localFile: true,
+      file: t.file,
+      broken: false
+    }));
+    return;
+  }
+
   mpList = ALL_FILES.filter(mpIsAudioFile).map((f) => ({
     id: f.id,
     title: String(f.name || 'Трек').replace(/\.[^/.]+$/, ''),
@@ -24503,7 +24865,17 @@ async function mpFetchAppleCover(title, artist, token) {
       if (item.trackName) mpEl.mpTitle.textContent = item.trackName;
     }
   } catch (err) {
-    /* нет сети/нет совпадений — остаётся SVG-нота */
+    /* нет сети/нет совпадений — пробуем localStorage (кэш обложки для офлайна) */
+    try {
+      const dataUrl = mpCoverLSLoad({ title: title, artist: artist });
+      if (dataUrl && token === mpLoadToken) {
+        if (mpCoverUrl) {
+          try { URL.revokeObjectURL(mpCoverUrl); } catch (e1) {}
+        }
+        mpCoverUrl = dataUrl;
+        mpShowCover(dataUrl);
+      }
+    } catch (eLS) {}
   }
 }
 
@@ -24534,9 +24906,16 @@ async function mpReadTags(t, token) {
         try { URL.revokeObjectURL(mpCoverUrl); } catch (e) {}
       }
 
-      mpCoverUrl = URL.createObjectURL(new Blob([u8], { type: tags.picture.format || 'image/jpeg' }));
+      const coverBlob = new Blob([u8], { type: tags.picture.format || 'image/jpeg' });
+      mpCoverUrl = URL.createObjectURL(coverBlob);
 
       mpShowCover(mpCoverUrl);
+
+      /* Кэшируем встроенную обложку в localStorage для офлайна */
+      try {
+        const t = mpList[mpIndex];
+        if (t) mpCoverLSSave({ title: t.title, artist: t.artist }, coverBlob);
+      } catch (eLS) {}
     } else {
       appleFallback();
     }
@@ -25013,7 +25392,11 @@ function mpTogglePlay() {
 }
 
 function mpNextTrack() {
-  mpLoad(mpIndex + 1, mpPlaying() || mpOpen);
+  /* mpDeferredAutoplay = true означает «включить следующий трек после загрузки»
+     — выставляется при ended() или ручном «Вперёд». Если просто кликнули
+     «Вперёд» на паузе — mpOpen гарантирует загрузку без автовоспроизведения */
+  const autoplay = mpDeferredAutoplay || mpPlaying() || mpOpen;
+  mpLoad(mpIndex + 1, autoplay);
 }
 
 function mpPrevTrack() {
@@ -25164,6 +25547,60 @@ function mpCoverCacheKey(t) {
   return 'cover_' + norm(t && t.artist) + '__' + norm(t && t.title);
 }
 
+/* ═══ ВОЛНА: ДВОЙНОЙ КЭШ ТЕКСТОВ — localStorage + Cache API ═══
+   localStorage даёт мгновенный доступ без асинхронности и работает
+   даже если Cache API очищен системой. Cache API — для больших объёмов
+   и LRU-вытеснения. Оба слоя обеспечивают работу офлайн. */
+const MP_LYRICS_LS_PREFIX = 'devo-lyrics-ls-';
+
+/* Сохранить тексты в localStorage (вторичный кэш для офлайн) */
+function mpLyricsLSSave(t, data) {
+  try {
+    const raw = JSON.stringify(data);
+    /* лимит ~32КБ на текст — больше не пишем (превентим переполнение) */
+    if (raw.length > 32768) return;
+    localStorage.setItem(MP_LYRICS_LS_PREFIX + mpLyricsCacheKey(t), raw);
+  } catch (e) {
+    /* переполнение localStorage — тихо игнорируем, Cache API всё равно работает */
+  }
+}
+
+/* Прочитать тексты из localStorage (вторичный кэш) */
+function mpLyricsLSLoad(t) {
+  try {
+    const raw = localStorage.getItem(MP_LYRICS_LS_PREFIX + mpLyricsCacheKey(t));
+    if (!raw) return null;
+    const data = JSON.parse(raw);
+    if (data && (data.synced?.length || data.plain)) return data;
+  } catch (e) {}
+  return null;
+}
+
+/* ═══ ВОЛНА: ДВОЙНОЙ КЭШ ОБЛОЖЕК — сохраняем blob обложки в localStorage
+   как base64, чтобы обложки работали офлайн даже без Cache API ═══ */
+const MP_COVER_LS_PREFIX = 'devo-cover-ls-';
+const MP_COVER_LS_MAX = 256 * 1024;  /* до 256КБ base64 на обложку */
+
+async function mpCoverLSSave(t, blob) {
+  try {
+    if (!blob || blob.size > MP_COVER_LS_MAX) return;
+    const reader = new FileReader();
+    const dataUrl = await new Promise((resolve) => {
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = () => resolve(null);
+      reader.readAsDataURL(blob);
+    });
+    if (!dataUrl) return;
+    localStorage.setItem(MP_COVER_LS_PREFIX + mpCoverCacheKey(t), dataUrl);
+  } catch (e) {}
+}
+
+function mpCoverLSLoad(t) {
+  try {
+    return localStorage.getItem(MP_COVER_LS_PREFIX + mpCoverCacheKey(t));
+  } catch (e) { return null; }
+}
+
 /* ─── Парсер LRC: [mm:ss.xx]текст строки (несколько тайм-кодов на строку) ─── */
 function mpParseLRC(lrc) {
   if (!lrc || typeof lrc !== 'string') return [];
@@ -25297,10 +25734,17 @@ async function mpLoadLyrics(t, token) {
   }
 
   /* если был бейдж — снимаем */
-  if (mpLyricsEl.panel) mpLyricsEl.panel.classList.remove('custom', 'demo');
+  if (mpLyricsEl.panel) mpLyricsEl.panel.classList.remove('custom');
   if (mpLyricsEl.badge) mpLyricsEl.badge.textContent = 'Свой текст';
 
-  /* 1. Кэш на диске */
+  /* 1a. Кэш в localStorage — мгновенно, работает даже без Cache API */
+  const lsCached = mpLyricsLSLoad(t);
+  if (lsCached) {
+    if (token !== mpLyricsToken) return null;
+    return lsCached;
+  }
+
+  /* 1b. Кэш на диске (Cache API) */
   const key = mpLyricsCacheKey(t);
   try {
     const cached = await mediaCacheGet(key);
@@ -25309,7 +25753,11 @@ async function mpLoadLyrics(t, token) {
       if (token !== mpLyricsToken) return null;
       try {
         const data = JSON.parse(text);
-        if (data && (data.synced?.length || data.plain)) return data;
+        if (data && (data.synced?.length || data.plain)) {
+          /* дублируем в localStorage для надёжного офлайна */
+          mpLyricsLSSave(t, data);
+          return data;
+        }
       } catch (e) {}
     }
   } catch (e) {}
@@ -25340,12 +25788,14 @@ async function mpLoadLyrics(t, token) {
 
   if (token !== mpLyricsToken) return null;
 
-  /* 5. Кэшируем в Cache API — повторно без сети */
+  /* 5. Кэшируем в Cache API + localStorage — повторно без сети */
   if (result && (result.synced?.length || result.plain)) {
     try {
       const blob = new Blob([JSON.stringify(result)], { type: 'application/json' });
       await mediaCachePut(key, blob);
     } catch (e) {}
+    /* дублируем в localStorage для надёжного офлайна */
+    mpLyricsLSSave(t, result);
   }
 
   return result;
@@ -25356,16 +25806,9 @@ function mpLyricsReset() {
   mpLyricsData = null;
   mpLyricsActiveIdx = -1;
 
-  /* Останавливаем демо-таймер, если был */
-  mpLyricsDemoActive = false;
-  if (mpLyricsDemoTimer) {
-    clearInterval(mpLyricsDemoTimer);
-    mpLyricsDemoTimer = null;
-  }
-
   if (mpLyricsEl.body) mpLyricsEl.body.innerHTML = '';
   if (mpLyricsEl.panel) {
-    mpLyricsEl.panel.classList.remove('loading', 'empty', 'custom', 'demo');
+    mpLyricsEl.panel.classList.remove('loading', 'empty', 'custom');
   }
   if (mpLyricsFetchTimer) {
     clearTimeout(mpLyricsFetchTimer);
@@ -25516,7 +25959,19 @@ function mpToggleLyrics() {
 
 function mpCloseLyrics() {
   mpLyricsOpen = false;
-  mpLyricsEl.panel?.classList.remove('open');
+  /* Плавное закрытие: снимаем backdrop-filter без transition (blur-off),
+     затем убираем .open — фон не «дёргается» при рекомпозиции каждый кадр. */
+  if (mpLyricsEl.panel) {
+    mpLyricsEl.panel.classList.add('blur-off');
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        mpLyricsEl.panel.classList.remove('open');
+        setTimeout(() => {
+          mpLyricsEl.panel?.classList.remove('blur-off');
+        }, 500);
+      });
+    });
+  }
   mpLyricsEl.btn?.classList.remove('active');
 }
 
@@ -25601,7 +26056,7 @@ function mpScheduleLyricsPrefetch() {
 async function mpCachedCoverUrl(remoteUrl, cacheKey, token) {
   if (!remoteUrl) return null;
 
-  /* 1. Кэш на диске */
+  /* 1. Кэш на диске (Cache API) */
   try {
     const cached = await mediaCacheGet(cacheKey);
     if (cached) {
@@ -25619,8 +26074,23 @@ async function mpCachedCoverUrl(remoteUrl, cacheKey, token) {
 
     try { await mediaCachePut(cacheKey, blob); } catch (eC) {}
 
+    /* Дублируем в localStorage (base64) для офлайна */
+    try {
+      const t = mpList[mpIndex];
+      if (t) await mpCoverLSSave({ title: t.title, artist: t.artist }, blob);
+    } catch (eLS) {}
+
     return URL.createObjectURL(blob);
   } catch (e) {}
+
+  /* 3. Fallback: localStorage (если сеть недоступна, но раньше кэшировали) */
+  try {
+    const t = mpList[mpIndex];
+    if (t) {
+      const dataUrl = mpCoverLSLoad({ title: t.title, artist: t.artist });
+      if (dataUrl) return dataUrl;
+    }
+  } catch (eLS2) {}
 
   return null;
 }
@@ -25636,140 +26106,6 @@ async function mpCachedCoverUrl(remoteUrl, cacheKey, token) {
    • При mpLoadLyrics сначала проверяем свой текст, потом — кэш/сеть. */
 
 const MP_LYRICS_CUSTOM_PREFIX = 'devo-lyrics-custom-';
-let mpLyricsDemoTimer = null;
-let mpLyricsDemoStart = 0;
-let mpLyricsDemoActive = false;
-
-/* Демо-данные — фейковые синхронные строки (по 4.5с на строку) */
-function mpLyricsBuildDemo() {
-  const demoTexts = [
-    'Это демонстрация текста песни',
-    'Каждая строка подсвечивается в свой момент',
-    'Активная строка — крупная и яркая',
-    'Прошедшие строки — бледные и сжатые',
-    'Соседние — слегка приглушены',
-    'Тап по строке — перемотка к ней',
-    'Плавный авто-скролл к активной',
-    'Как в Apple Music, но бесплатно',
-    'Загрузи свой .lrc — будет так же',
-    'Или вставь текст через меню',
-    'Анимация работает везде — 60 кадров',
-    'Демо завершено. Нажми меню → сбросить.'
-  ];
-  const out = [];
-  for (let i = 0; i < demoTexts.length; i++) {
-    out.push({ time: i * 4.5, text: demoTexts[i] });
-  }
-  return out;
-}
-
-/* Запустить демо-режим */
-function mpLyricsStartDemo() {
-  mpLyricsCacheUI();
-  mpLyricsCloseSheet();
-
-  /* если есть активное аудио — синхронизируем по currentTime,
-     иначе запускаем фейковый таймер */
-  mpLyricsData = {
-    synced: mpLyricsBuildDemo(),
-    plain: null,
-    source: 'demo'
-  };
-
-  mpLyricsEl.panel.classList.remove('empty');
-  mpLyricsEl.panel.classList.add('demo');
-  if (mpLyricsEl.badge) mpLyricsEl.badge.textContent = 'Демо';
-
-  mpLyricsRender();
-  mpLyricsActiveIdx = -1;
-
-  /* если аудио не играет — запускаем свой таймер, чтобы строки «шли» */
-  const hasAudio = mpAudioEl && mpAudioEl.duration && isFinite(mpAudioEl.duration) && !mpAudioEl.paused;
-  if (!hasAudio) {
-    mpLyricsDemoStart = Date.now();
-    mpLyricsDemoActive = true;
-
-    if (mpLyricsDemoTimer) clearInterval(mpLyricsDemoTimer);
-
-    mpLyricsDemoTimer = setInterval(() => {
-      if (!mpLyricsOpen || !mpLyricsDemoActive) {
-        clearInterval(mpLyricsDemoTimer);
-        mpLyricsDemoTimer = null;
-        return;
-      }
-      mpLyricsUpdateActive();
-    }, 200);
-  } else {
-    /* аудио играет — синхронизация по currentTime (через mpTickLoop) */
-    mpLyricsDemoActive = false;
-  }
-
-  /* Подменяем «currentTime» для демо, когда нет аудио */
-  showToast('Демо-режим: показываю анимацию текста');
-
-  /* Первая активация — сразу покажем первую строку */
-  setTimeout(() => mpLyricsUpdateActive(), 100);
-}
-
-/* Остановить демо */
-function mpLyricsStopDemo() {
-  mpLyricsDemoActive = false;
-  if (mpLyricsDemoTimer) {
-    clearInterval(mpLyricsDemoTimer);
-    mpLyricsDemoTimer = null;
-  }
-  mpLyricsEl.panel?.classList.remove('demo');
-  if (mpLyricsEl.badge) mpLyricsEl.badge.textContent = 'Свой текст';
-}
-
-/* Демо переопределяет mpAudioEl.currentTime при отсутствии аудио */
-const _origMpLyricsUpdateActive = mpLyricsUpdateActive;
-mpLyricsUpdateActive = function () {
-  if (!mpLyricsOpen || !mpLyricsData) return;
-  if (!mpLyricsData.synced || !mpLyricsData.synced.length) return;
-
-  /* Для демо без аудио — используем фейковое время */
-  if (mpLyricsDemoActive && (!mpAudioEl || !mpAudioEl.duration || !isFinite(mpAudioEl.duration) || mpAudioEl.paused)) {
-    const fakeCur = (Date.now() - mpLyricsDemoStart) / 1000;
-    const lines = mpLyricsData.synced;
-    let idx = -1;
-    for (let i = 0; i < lines.length; i++) {
-      if (lines[i].time <= fakeCur + 0.08) idx = i;
-      else break;
-    }
-
-    /* демонстрация зациклена — через 60с начинаем сначала */
-    if (idx < 0 || fakeCur > lines[lines.length - 1].time + 6) {
-      mpLyricsDemoStart = Date.now();
-      idx = 0;
-    }
-
-    if (idx === mpLyricsActiveIdx) return;
-    mpLyricsActiveIdx = idx;
-
-    const allLines = mpLyricsEl.body.querySelectorAll('.mp-lyric-line');
-    if (!allLines.length) return;
-
-    allLines.forEach((el, i) => {
-      el.classList.toggle('active', i === idx);
-      el.classList.toggle('near', Math.abs(i - idx) === 1);
-      el.classList.toggle('past', i < idx - 1);
-    });
-
-    if (idx >= 0 && allLines[idx]) {
-      const target = allLines[idx];
-      const panel = mpLyricsEl.body;
-      const offset = target.offsetTop - panel.clientHeight / 2 + target.clientHeight / 2;
-      try { panel.scrollTo({ top: offset, behavior: 'smooth' }); } catch (e) {
-        panel.scrollTop = offset;
-      }
-    }
-    return;
-  }
-
-  /* иначе — оригинальная логика */
-  return _origMpLyricsUpdateActive.call(this);
-};
 
 /* Ключ для своего текста в localStorage — Unicode-safe */
 function mpLyricsCustomKey(t) {
@@ -25830,72 +26166,19 @@ function mpLyricsOpenSheet() {
 }
 
 function mpLyricsCloseSheet() {
-  mpLyricsEl.sheet?.classList.remove('open');
-}
-
-/* Открыть модалку вставки текста */
-function mpLyricsOpenPaste() {
-  mpLyricsCloseSheet();
-
-  /* Предзаполняем: если уже есть свой текст — показываем его */
-  const t = mpList[mpIndex];
-  if (t && mpLyricsEl.pasteArea) {
-    const custom = mpLyricsGetCustom(t);
-    if (custom) {
-      if (custom.synced?.length) {
-        /* восстанавливаем LRC-вид */
-        mpLyricsEl.pasteArea.value = custom.synced.map((l) =>
-          '[' + Math.floor(l.time / 60).toString().padStart(2, '0') + ':' +
-          (l.time % 60).toFixed(2).padStart(5, '0') + ']' + (l.text || '')
-        ).join('\n');
-      } else if (custom.plain) {
-        mpLyricsEl.pasteArea.value = custom.plain;
-      }
-    } else {
-      mpLyricsEl.pasteArea.value = '';
-    }
-  }
-
-  mpLyricsEl.pasteModal?.classList.add('open');
-  setTimeout(() => mpLyricsEl.pasteArea?.focus(), 300);
-}
-
-function mpLyricsClosePaste() {
-  mpLyricsEl.pasteModal?.classList.remove('open');
-}
-
-/* Сохранить вставленный текст */
-function mpLyricsSavePaste() {
-  const t = mpList[mpIndex];
-  if (!t) {
-    showToast('Сначала выберите трек');
-    return;
-  }
-
-  const raw = (mpLyricsEl.pasteArea?.value || '').trim();
-  if (!raw) {
-    showToast('Поле пустое — нечего сохранять');
-    return;
-  }
-
-  /* Останавливаем демо, если было */
-  mpLyricsStopDemo();
-
-  const ok = mpLyricsSaveCustom(t, raw);
-  if (!ok) return;
-
-  /* Применяем новый текст */
-  mpLyricsData = mpLyricsGetCustom(t);
-  mpLyricsActiveIdx = -1;
-  mpLyricsEl.panel.classList.remove('empty');
-  mpLyricsEl.panel.classList.add('custom');
-  if (mpLyricsEl.badge) mpLyricsEl.badge.textContent = 'Свой текст';
-
-  mpLyricsRender();
-  mpLyricsUpdateActive();
-
-  mpLyricsClosePaste();
-  showToast('Свой текст сохранён');
+  if (!mpLyricsEl.sheet) return;
+  /* Плавное закрытие: сначала убираем blur (без transition), чтобы фон
+     не «дёргался» при рекомпозиции backdrop каждый кадр. Затем карточка
+     уезжает, через 420мс снимаем .open полностью. */
+  mpLyricsEl.sheet.classList.add('blur-off');
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+      mpLyricsEl.sheet.classList.remove('open');
+      setTimeout(() => {
+        mpLyricsEl.sheet?.classList.remove('blur-off');
+      }, 450);
+    });
+  });
 }
 
 /* Загрузить .lrc файл с устройства */
@@ -25931,7 +26214,6 @@ async function mpLyricsHandleFile(file) {
       return;
     }
 
-    mpLyricsStopDemo();
     const ok = mpLyricsSaveCustom(t, text);
     if (!ok) return;
 
@@ -25957,10 +26239,9 @@ function mpLyricsResetCustom() {
   if (!t) return;
 
   mpLyricsDeleteCustom(t);
-  mpLyricsStopDemo();
   mpLyricsData = null;
   mpLyricsActiveIdx = -1;
-  mpLyricsEl.panel.classList.remove('custom', 'demo');
+  mpLyricsEl.panel.classList.remove('custom');
   mpLyricsEl.body.innerHTML = '';
 
   /* Загружаем заново из сети */
@@ -25978,30 +26259,20 @@ function mpLyricsResetCustom() {
 function mpLyricsCacheUIExtended() {
   mpLyricsEl.sheet = document.getElementById('mpLyricsSheet');
   mpLyricsEl.sheetSubtitle = document.getElementById('mpLyricsSheetSubtitle');
-  mpLyricsEl.pasteModal = document.getElementById('mpLyricsPasteModal');
-  mpLyricsEl.pasteArea = document.getElementById('mpLyricsPasteArea');
   mpLyricsEl.badge = document.getElementById('mpLyricsBadge');
   mpLyricsEl.menuBtn = document.getElementById('mpLyricsMenuBtn');
 
   /* Кнопки в пустом состоянии */
-  const demoBtn = document.getElementById('mpLyricsDemoBtn');
   const uploadBtn = document.getElementById('mpLyricsUploadBtn');
-  const pasteBtn = document.getElementById('mpLyricsPasteBtn');
 
-  if (demoBtn) demoBtn.addEventListener('click', mpLyricsStartDemo);
   if (uploadBtn) uploadBtn.addEventListener('click', mpLyricsOpenFilePicker);
-  if (pasteBtn) pasteBtn.addEventListener('click', mpLyricsOpenPaste);
 
   /* Кнопки в action sheet */
-  const sheetDemo = document.getElementById('mpLyricsSheetDemo');
   const sheetUpload = document.getElementById('mpLyricsSheetUpload');
-  const sheetPaste = document.getElementById('mpLyricsSheetPaste');
   const sheetReset = document.getElementById('mpLyricsSheetReset');
   const sheetCancel = document.getElementById('mpLyricsSheetCancel');
 
-  if (sheetDemo) sheetDemo.addEventListener('click', mpLyricsStartDemo);
   if (sheetUpload) sheetUpload.addEventListener('click', mpLyricsOpenFilePicker);
-  if (sheetPaste) sheetPaste.addEventListener('click', mpLyricsOpenPaste);
   if (sheetReset) sheetReset.addEventListener('click', mpLyricsResetCustom);
   if (sheetCancel) sheetCancel.addEventListener('click', mpLyricsCloseSheet);
 
@@ -26009,12 +26280,6 @@ function mpLyricsCacheUIExtended() {
   if (mpLyricsEl.menuBtn) {
     mpLyricsEl.menuBtn.addEventListener('click', mpLyricsOpenSheet);
   }
-
-  /* Модалка вставки */
-  const pasteCancel = document.getElementById('mpLyricsPasteCancel');
-  const pasteSave = document.getElementById('mpLyricsPasteSave');
-  if (pasteCancel) pasteCancel.addEventListener('click', mpLyricsClosePaste);
-  if (pasteSave) pasteSave.addEventListener('click', mpLyricsSavePaste);
 
   /* Скрытый input для файлов */
   const fileInput = document.getElementById('mpLrcFileInput');
@@ -27979,7 +28244,15 @@ async function quietStart() {
 }
 
 if (!IS_TELEGRAM) {
-  if (WEB_TOKEN) {
+  if (DEV_TEST_MODE) {
+    /* Тест-режим: показываем банер + кнопку, без сервера */
+    ALL_FILES = [];
+    LAST_ERR = null;
+    setTimeout(function () {
+      devTestShowBanner();
+      renderAll({ animate: true });
+    }, 300);
+  } else if (WEB_TOKEN) {
     /* 22.60: тихая проверка токена — сетевой сбой больше НЕ открывает
        окно входа (сервер мог просто просыпаться); войти заново просим
        только при честном 401/403 от самого сервера */
@@ -48789,24 +49062,11 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Вы заблокированы в этом классе.")
             return MAIN_MENU
 
-        # ВОЛНА 22.74: если админ добавил ФОТО звонков — показываем его;
-        # точный отсчёт «сколько осталось» по картинке невозможен.
-        _bphoto = str(getattr(class_obj, 'bells_photo', '') or '') if class_obj else ''
-        if _bphoto:
-            try:
-                await update.message.reply_photo(
-                    _bphoto,
-                    caption="🔔 Расписание звонков (фото от администратора).\n"
-                            "Точный отсчёт «сколько осталось» по фото недоступен.")
-                return MAIN_MENU
-            except Exception as e:
-                logger.warning(f"bells photo send fail: {e} — покажу текст")
-
-        # Передаём user, чтобы время «сейчас» бралось по его локали.
-        bells_info = get_bells_info(class_obj, user)
-        # ВОЛНА 22.91: админу — прямая кнопка редактирования прямо из
+        # ВОЛНА 22.91/22.93: админу — прямая кнопка редактирования прямо из
         # «🔔 Звонки» (дни/числа ставятся в «Редактировать звонки» →
         # «📅 По дням недели» / «📆 По числам»), админку искать не нужно.
+        # 22.93: кнопка вычисляется ДО ветки фото — раньше при установленном
+        # фото срабатывал ранний return, и кнопки редактирования не было ВООБЩЕ.
         _bells_kb = None
         try:
             if class_obj and is_user_class_admin(user_id):
@@ -48815,6 +49075,23 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                          callback_data="edit_bells")]])
         except Exception:
             _bells_kb = None
+
+        # ВОЛНА 22.74: если админ добавил ФОТО звонков — показываем его;
+        # точный отсчёт «сколько осталось» по картинке невозможен.
+        _bphoto = str(getattr(class_obj, 'bells_photo', '') or '') if class_obj else ''
+        if _bphoto:
+            try:
+                await update.message.reply_photo(
+                    _bphoto,
+                    caption="🔔 Расписание звонков (фото от администратора).\n"
+                            "Точный отсчёт «сколько осталось» по фото недоступен.",
+                    reply_markup=_bells_kb)
+                return MAIN_MENU
+            except Exception as e:
+                logger.warning(f"bells photo send fail: {e} — покажу текст")
+
+        # Передаём user, чтобы время «сейчас» бралось по его локали.
+        bells_info = get_bells_info(class_obj, user)
         await update.message.reply_text(bells_info, reply_markup=_bells_kb)
         return MAIN_MENU
 
@@ -58436,8 +58713,21 @@ async def edit_bells_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user:
         user = User(user_id)
 
+    # ВОЛНА 22.93: класс = FSM (current_admin_class) ИЛИ скан админов всех
+    # классов. Кнопка «✏️ Редактировать звонки» живёт прямо во «🔔 Звонки»,
+    # куда админ попадает БЕЗ входа в админку: current_admin_class не был
+    # выставлен, и редактор отвечал «Класс не найден.» — из-за этого «не
+    # работало изменение звонков по дням недели».
     class_code = context.user_data.get('current_admin_class')
     class_obj = get_class_by_code(class_code)
+    if not class_obj or user_id not in (class_obj.admins or []):
+        cand = _admin_class_for_uid(user_id)
+        class_obj = cand
+        if class_obj is not None:
+            try:
+                context.user_data['current_admin_class'] = class_obj.class_code
+            except Exception:
+                pass
 
     if not class_obj:
         await query.edit_message_text("Класс не найден.", reply_markup=get_admin_panel_keyboard())
@@ -58460,8 +58750,18 @@ async def edit_bell_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lesson_num = query.data.split("_")[2]
     context.user_data['editing_bell_lesson'] = lesson_num
 
+    # ВОЛНА 22.93: та же устойчивость, что в edit_bells_start — если FSM
+    # потерян, ищем класс сканом админов (и возвращаем в FSM).
     class_code = context.user_data.get('current_admin_class')
     class_obj = get_class_by_code(class_code)
+    if not class_obj or user_id not in (class_obj.admins or []):
+        cand = _admin_class_for_uid(user_id)
+        class_obj = cand
+        if class_obj is not None:
+            try:
+                context.user_data['current_admin_class'] = class_obj.class_code
+            except Exception:
+                pass
 
     if not class_obj:
         await query.edit_message_text("Класс не найден.", reply_markup=get_admin_panel_keyboard())
