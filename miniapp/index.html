@@ -4487,6 +4487,17 @@ body.dev-test-active .main-wrapper {
     <h3 style="font-weight:900;font-size:20px;margin-bottom:4px">Хранилище</h3>
     <p style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:12px">Куда попадают ваши файлы</p>
 
+    <!-- 22.95: заметка «очень рекомендуется свой канал как облако» — видна
+         всегда при нажатии на облако (окно «Хранилище») -->
+    <div style="display:flex;gap:10px;align-items:flex-start;padding:12px 14px;border-radius:14px;background:var(--card-bg);border:1px solid var(--border-color);margin-bottom:14px">
+      <i data-lucide="shield-check" style="width:20px;height:20px;flex-shrink:0;color:var(--text-color);opacity:.75;margin-top:2px"></i>
+      <p style="font-size:12px;font-weight:700;color:var(--text-color);line-height:1.55;margin:0">
+        Очень рекомендуется использовать в боте <b>свой канал</b> как облако:
+        подключите личный канал — и файлы будут храниться именно у вас,
+        приватно, надёжно и без ограничений на объём.
+      </p>
+    </div>
+
     <div id="storageStatus" style="padding:12px;background:var(--card-bg);border:1px solid var(--border-color);border-radius:14px;margin-bottom:14px;font-size:13px;font-weight:700;color:var(--subtext-color);line-height:1.5">
       Загружаю…
     </div>
@@ -4804,11 +4815,11 @@ body.dev-test-active .main-wrapper {
     </div>
 
     <div class="dev-rec-text">
-      <b>Совет разработчика</b>
-      <span>Создайте свой <b>частный канал</b> в Telegram и подключите его в боте
-      («Облако» → «Моё облако») — файлы будут храниться именно там, с максимальной
-      приватностью и безопасностью. DEVO+ — удобный коннектор к неограниченному
-      пространству хранения ваших файлов.</span>
+      <b>Очень рекомендуется: свой канал как облако</b>
+      <span>Используйте в боте <b>СВОЙ канал</b> как облако — создайте частный
+      канал в Telegram и подключите его («Облако» → «Моё облако»): файлы будут
+      храниться именно у вас, с максимальной приватностью и безопасностью.
+      DEVO+ — удобный коннектор к неограниченному пространству ваших файлов.</span>
 
       <div class="dev-rec-actions">
         <button class="dev-rec-btn" onclick="openStorageModal()">Подключить канал</button>
