@@ -4437,7 +4437,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.94"
+BOT_BUILD = "22.95"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -9733,6 +9733,292 @@ _BG_UPLOAD_LIVE = {}          # user_id(str) -> {key: {"name","size","stage","pc
 _BG_LIVE_TTL = 6 * 3600       # самозачистка зависших записей (страховка)
 _BG_LIVE_GC_AT = [0.0]        # когда последний раз бегала уборка (throttle 5 мин)
 
+# ═══ ВОЛНА 22.95: ЗАГРУЗКИ ПЕРЕЖИВАЮТ РЕСТАРТ БОТА ═══
+# Пачка, взятая кнопкой «📤 Отправить», до этой волны жила только в RAM:
+# рестарт посреди 15-минутной MTProto-заливки терял файлы молча («в облако
+# ничего не идёт»). Теперь активная пачка пишется на диск (bg_inflight.json,
+# атомарно, рядом с базой), и после подъёма бот САМ продолжает загрузку:
+# пользователю приходит сообщение со старой загрузкой («файл продолжает
+# грузиться»), а большой файл прямо в сообщении показывает, сколько осталось.
+_BG_INFLIGHT_FILE = _data_file("bg_inflight.json")
+_BG_INFLIGHT = {}                 # user_id(str) -> {"chat_id","ts","items":[...]}
+_BG_INFLIGHT_LOCK = threading.RLock()
+_BG_EDIT_TASKS = set()            # сильные ссылки на задачи правки прогресса
+
+
+def _bg_inflight_load():
+    """Читает активные пачки с диска (после рестарта). Битый файл = пусто."""
+    try:
+        with open(_BG_INFLIGHT_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        if not isinstance(raw, dict):
+            return
+        for uid, rec in raw.items():
+            if isinstance(rec, dict) and isinstance(rec.get("items"), list):
+                _BG_INFLIGHT[str(uid)] = rec
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        logger.warning(f"bg_inflight: не прочитал {_BG_INFLIGHT_FILE}: {e}")
+
+
+def _bg_inflight_save():
+    """Атомарная запись реестра активных пачек (tmp + os.replace — как 22.72)."""
+    try:
+        with _BG_INFLIGHT_LOCK:
+            data = json.dumps(_BG_INFLIGHT, ensure_ascii=False)
+        _ensure_parent_dir(_BG_INFLIGHT_FILE)
+        tmp = f"{_BG_INFLIGHT_FILE}.{os.getpid()}.{threading.get_ident()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(data)
+        os.replace(tmp, _BG_INFLIGHT_FILE)
+    except Exception as e:
+        logger.warning(f"bg_inflight: не записал: {e}")
+
+
+def _bg_inflight_begin(user_id, chat_id, items):
+    """Пачка поехала — фиксируем её на диске (рестарт её переживёт)."""
+    try:
+        clean = _bg_pending_sanitize_list(items)
+        if not clean:
+            return
+        with _BG_INFLIGHT_LOCK:
+            _BG_INFLIGHT[str(user_id)] = {
+                "chat_id": int(chat_id or 0),
+                "ts": time.time(),
+                "items": clean,
+            }
+            _bg_inflight_save()
+    except Exception:
+        pass
+
+
+def _bg_inflight_item_done(user_id, name, size, fuid=""):
+    """Один файл пачки довезён (спасён или честно отклонён) — снимаем его
+    с диска, чтобы рестарт посреди пачки продолжил только недовезённое."""
+    try:
+        with _BG_INFLIGHT_LOCK:
+            rec = _BG_INFLIGHT.get(str(user_id))
+            if not rec:
+                return
+            keep = []
+            for it in (rec.get("items") or []):
+                if fuid and str(it.get("fuid") or "") == str(fuid):
+                    continue
+                if (str(it.get("name") or "") == str(name or "")
+                        and int(it.get("size") or 0) == int(size or 0)):
+                    continue
+                keep.append(it)
+            rec["items"] = keep
+            rec["ts"] = time.time()
+            _bg_inflight_save()
+    except Exception:
+        pass
+
+
+def _bg_inflight_end(user_id):
+    """Пачка завершена штатно — снимаем её с диска полностью."""
+    try:
+        with _BG_INFLIGHT_LOCK:
+            if _BG_INFLIGHT.pop(str(user_id), None) is not None:
+                _bg_inflight_save()
+    except Exception:
+        pass
+
+
+def _fire_progress_edit(coro):
+    """Фоновое редактирование сообщения прогресса (колбэк Telethon синхронный —
+    задачу планируем в цикле; сильная ссылка — в _BG_EDIT_TASKS, от GC)."""
+    try:
+        _t = asyncio.get_running_loop().create_task(coro)
+        _BG_EDIT_TASKS.add(_t)
+        _t.add_done_callback(_BG_EDIT_TASKS.discard)
+    except Exception:
+        pass
+
+
+class _MultiBar:
+    """ВОЛНА 22.95: несколько адаптеров прогресса под одним интерфейсом
+    .edit(text, done, total) — живой реестр мини-аппа + сообщение-остаток."""
+
+    def __init__(self, *bars):
+        self._bars = [b for b in bars if b is not None]
+
+    async def edit(self, text, done=0, total=0):
+        for _b in self._bars:
+            try:
+                await _b.edit(text, done=done, total=total)
+            except Exception:
+                pass
+
+
+class _ResumeProgressEditor:
+    """ВОЛНА 22.95: «сколько осталось» в сообщении продолжения загрузки
+    после рестарта. Редактирует ОДНО сообщение не чаще раза в 4 секунды
+    (лимиты Telegram): «Сохраняю в облако: 80% — осталось 200 МБ из 1 ГБ»."""
+
+    def __init__(self, msg, total):
+        self._msg = msg
+        self._total = int(total or 0)
+        self._stage = "Качаю с Telegram"
+        self._last_edit = 0.0
+        self._last_text = ""
+
+    async def edit(self, text, done=0, total=0):
+        # адаптер под _mt_download_stream(progress=...)
+        if int(total or 0):
+            self._total = int(total)
+        await self._flush(int(done or 0))
+
+    async def up(self, cur, tot):
+        if int(tot or 0):
+            self._total = int(tot)
+        self._stage = "Сохраняю в облако"
+        await self._flush(int(cur or 0))
+
+    def _render(self, done):
+        tot = self._total
+        if tot <= 0:
+            return None
+        done = max(0, min(int(done), tot))
+        pct = done * 100 // tot
+        left = tot - done
+        return (f"♻️ Файл продолжает грузиться после рестарта сервера.\n"
+                f"{self._stage}: {pct}% — осталось {_fmt_bytes(left)} "
+                f"из {_fmt_bytes(tot)}")
+
+    async def _flush(self, done):
+        now = time.time()
+        if now - self._last_edit < 4.0 and 0 < done < self._total:
+            return
+        txt = self._render(done)
+        if not txt or txt == self._last_text:
+            return
+        self._last_edit = now
+        self._last_text = txt
+        try:
+            await self._msg.edit_text(txt, reply_markup=_upl_cancel_kb())
+        except Exception:
+            pass
+
+
+async def _bg_restore_notify_task(application, ents):
+    """ВОЛНА 22.95: письмо «старая загрузка не потеряна» тем, чьи сессии
+    мини-аппа оборвались рестартом за последние 6 часов (по одной сводке
+    на пользователя; обычные автодогрузки по-прежнему БЕЗУМНЫ — 22.60)."""
+    try:
+        await asyncio.sleep(5.0)
+        by_uid = {}
+        for e in ents:
+            by_uid.setdefault(str(e.get("uid") or ""), []).append(e)
+        for uid, lst in by_uid.items():
+            if not uid:
+                continue
+            lines = ["♻️ Сервер перезапускался — старые загрузки не потеряны."]
+            for e in lst[:5]:
+                left = max(0, int(e.get("size") or 0)
+                           - int(e.get("received") or 0))
+                if e.get("auto"):
+                    lines.append(
+                        f"📦 «{str(e.get('name'))[:48]}» — файл продолжает "
+                        f"грузиться в облако, осталось ≈ {_fmt_bytes(left)}.")
+                else:
+                    lines.append(
+                        f"📦 «{str(e.get('name'))[:48]}» — не докачано "
+                        f"{_fmt_bytes(left)}: откройте мини-апп — загрузка "
+                        "продолжится сама.")
+            if len(lst) > 5:
+                lines.append(f"…и ещё {len(lst) - 5} файл(ов).")
+            try:
+                await application.bot.send_message(chat_id=int(uid),
+                                                   text="\n".join(lines))
+            except Exception:
+                pass
+    except Exception as e:
+        logger.warning(f"bg restore notify: {e}")
+
+
+async def _bg_inflight_resume_task(application, uid, rec):
+    """ВОЛНА 22.95: продолжение пачки, оборванной рестартом. Сначала —
+    обещанное сообщение со старой загрузкой, затем та же заливка
+    (_bg_upload_items c resume=True): большой файл прямо в сообщении
+    показывает «сколько осталось», итог — обычный сводный список."""
+    items = [i for i in (rec.get("items") or []) if isinstance(i, dict)]
+    started = False
+    try:
+        if not items:
+            return
+        await asyncio.sleep(6.0)          # даём боту и сети подняться
+        if _upl_op_running(uid) or _vault_op_running(uid):
+            return                        # уже идёт свежая пачка — не мешаем
+        started = True
+        bot = application.bot
+        names = ", ".join("«" + str(i.get("name") or "файл")[:40] + "»"
+                          for i in items[:3])
+        if len(items) > 3:
+            names += f" …и ещё {len(items) - 3}"
+        try:
+            await bot.send_message(
+                chat_id=int(rec.get("chat_id") or int(uid) or 0),
+                text=("♻️ Сервер перезапускался — старая загрузка не потеряна.\n"
+                      f"📦 Продолжаю: {names}\n"
+                      "Файл продолжает грузиться в облако — ниже покажу, "
+                      "сколько осталось."),
+                reply_markup=_upl_cancel_kb())
+        except Exception:
+            pass
+        user = get_user(uid)
+        if user is None:
+            return
+        ud = application.user_data.setdefault(int(uid), {})
+        upd = _ApiQueueUpdate(bot, uid)
+        ctx = _ApiQueueContext(bot, ud)
+        await _bg_upload_items(upd, ctx, items, resume=True)
+    except Exception as e:
+        logger.error(f"bg inflight resume {uid}: {e}")
+        # Честный фолбэк: недовезённое возвращаем в персистентную очередь.
+        try:
+            _fresh = get_user(uid)
+            if _fresh is not None and items:
+                _bg_pending_add(_fresh, items)
+                save_user(_fresh)
+                await application.bot.send_message(
+                    chat_id=int(rec.get("chat_id") or int(uid) or 0),
+                    text="⚠️ Не удалось продолжить старую загрузку — файлы "
+                         "вернул в очередь: нажмите «📤 Отправить».")
+        except Exception:
+            pass
+    finally:
+        if started:
+            _bg_inflight_end(uid)
+
+
+def _bg_inflight_resume(application):
+    """ВОЛНА 22.95: вызывается в post_init — продолжает пачки, оборванные
+    рестартом (записи старше 24 часов честно снимаются). Возвращает число
+    файлов к продолжению."""
+    _bg_inflight_load()
+    if not _BG_INFLIGHT:
+        return 0
+    total = 0
+    now = time.time()
+    for uid in list(_BG_INFLIGHT.keys()):
+        rec = _BG_INFLIGHT.get(uid) or {}
+        items = [i for i in (rec.get("items") or []) if isinstance(i, dict)]
+        try:
+            _old = now - float(rec.get("ts") or 0) > 86400
+        except Exception:
+            _old = True
+        if not uid or _old or not items:
+            _bg_inflight_end(uid)
+            continue
+        try:
+            _spawn_bg_task(_bg_inflight_resume_task(application, uid, rec))
+            total += len(items)
+        except Exception as e:
+            logger.error(f"bg inflight resume plan {uid}: {e}")
+    return total
+
 
 def _bg_live_add(user_id, key, name, size, stage="recv", pct=0):
     """Файл из чата принят — начинаем показывать его статус в мини-аппе."""
@@ -9890,10 +10176,12 @@ def _bg_new_file_id(sent, kind):
 
 
 async def _bg_upload_big_mtproto(update, context, user, item, chat_msg, live=None,
-                                 upl_op=None):
+                                 upl_op=None, resume=False):
     """>49 МБ: качаем сообщение пользователя из личного чата ПОТОКОМ через
     MTProto во временный файл и заливаем в канал контейнером (до 2 ГБ).
     Возвращает rec-словарь или None (причина — в item['_why']).
+    ВОЛНА 22.95: resume=True — продолжение после рестарта: текст сообщения
+    «файл продолжает грузиться» + живой остаток («сколько осталось»).
     ВОЛНА 22.58: live=(user_id, key) — живые проценты для мини-аппа
     (реестр _BG_UPLOAD_LIVE: «качаю с Telegram 45%» → «загружаю 80%»).
     ВОЛНА 22.84: upl_op — операция честной отмены («❌ Отмена» на сообщении
@@ -9929,13 +10217,23 @@ async def _bg_upload_big_mtproto(update, context, user, item, chat_msg, live=Non
     if live:
         # ВОЛНА 22.58: сообщаем мини-аппу, что большой файл поехал потоком.
         _bg_live_set(live[0], live[1], "mt_dl", 0)
+    editor = None
     try:
         try:
             status = await context.bot.send_message(
                 chat_id=update.effective_chat.id,
-                text=(f"📦 «{item['name'][:48]}» ({_fmt_bytes(fsize)}) — "
-                      "большой: качаю с Telegram потоком и сохраняю в облако…"),
+                text=((f"♻️ Сервер перезапускался — старая загрузка не потеряна.\n"
+                       f"📦 «{item['name'][:48]}» ({_fmt_bytes(fsize)}) — файл "
+                       "продолжает грузиться в облако.\n"
+                       "⏳ Считаю, сколько осталось…")
+                      if resume else
+                      (f"📦 «{item['name'][:48]}» ({_fmt_bytes(fsize)}) — "
+                       "большой: качаю с Telegram потоком и сохраняю в облако…")),
                 reply_markup=_upl_cancel_kb())   # ВОЛНА 22.84: «Отмена» снизу
+            if resume and status is not None:
+                # ВОЛНА 22.95: «сколько осталось» редактируется по мере
+                # скачивания (⬇️) и заливки в канал (⬆️).
+                editor = _ResumeProgressEditor(status, fsize)
         except Exception:
             status = None
 
@@ -9953,7 +10251,9 @@ async def _bg_upload_big_mtproto(update, context, user, item, chat_msg, live=Non
 
             got = await _mt_download_stream(
                 client, doc, int(getattr(doc, "size", 0) or fsize), _sink,
-                progress=(_BgLiveProgressBar(live[0], live[1]) if live else None),
+                progress=(_MultiBar(
+                    _BgLiveProgressBar(live[0], live[1]) if live else None,
+                    editor)),
                 cancel_check=(_upl_cancel_check if upl_op is not None else None))
         finally:
             fh.close()
@@ -9961,14 +10261,18 @@ async def _bg_upload_big_mtproto(update, context, user, item, chat_msg, live=Non
             raise RuntimeError(f"скачано {got} из {fsize} байт")
 
         def _live_up(cur, tot, _uid=(live[0] if live else None),
-                     _key=(live[1] if live else None)):
+                     _key=(live[1] if live else None),
+                     _editor=(editor if resume else None)):
             # ВОЛНА 22.58: заливка контейнера в канал — живые проценты.
             # ВОЛНА 22.84: «❌ Отмена» — бросаем отмену прямо из колбэка
             # Telethon (тот же приём, что в заливке шифра Сейфа, волна 22.3).
+            # ВОЛНА 22.95: остаток дублируется в сообщении продолжения.
             if upl_op is not None and upl_op["event"].is_set():
                 raise _VaultCancelled()
             if _uid and tot:
                 _bg_live_set(_uid, _key, "mt_up", cur * 100 // tot)
+            if _editor is not None:
+                _fire_progress_edit(_editor.up(cur, tot))
 
         sent = await _mt_upload_container(
             client, tmp_path, os.path.getsize(tmp_path),
@@ -10119,10 +10423,12 @@ def _cloud_recent_dup(user, name, size):
 _TG_AUTOSHARE_MARK = {}
 
 
-async def _bg_upload_items(update, context, items):
+async def _bg_upload_items(update, context, items, resume=False):
     """Сохраняет пачку файлов из чата в облако и пишет ОДИН компактный итог.
     ВОЛНА 22.86: вызывается из bg_pending_send_cb (кнопка «📤 Отправить»);
-    раньше — из bg_chat_upload_receive (глобальный роутер 22.57)."""
+    раньше — из bg_chat_upload_receive (глобальный роутер 22.57).
+    ВОЛНА 22.95: resume=True — это продолжение пачки, оборванной рестартом
+    (пачка уже лежит на диске в bg_inflight.json — повторно не пишем)."""
     # ВОЛНА 22.86: кнопка «📤 Отправить» — это КОЛБЭК, у него нет
     # update.message; отвечать надо в тот же чат — берём сообщение,
     # под которым лежала очередь.
@@ -10157,6 +10463,12 @@ async def _bg_upload_items(update, context, items):
             "разработчика подключить канал, либо подключите СВОЙ: "
             "🔐 Сейф → 🔗 Моё облако.", disable_notification=_tg_silent)
         return
+    # ВОЛНА 22.95: пачка в работе — на диск. Рестарт посреди 15-минутной
+    # MTProto-заливки больше не теряет файлы молча: после подъёма бот сам
+    # продолжит пакет и пришлёт сообщение со старой загрузкой.
+    if not resume:
+        _bg_inflight_begin(
+            user_id, int(getattr(update.effective_chat, "id", 0) or 0), items)
 
     files = [f for f in (getattr(user, "cloud_files", []) or []) if isinstance(f, dict)]
     limit = get_price('cloud_max_files', 50)
@@ -10182,7 +10494,10 @@ async def _bg_upload_items(update, context, items):
     if len(items) > 1:
         try:
             _status = await msg.reply_text(
-                f"☁️ Сохраняю в облако: {len(items)} файл(ов)…",
+                (f"♻️ Продолжаю старую загрузку: {len(items)} файл(ов) — "
+                 "файл продолжает грузиться…"
+                 if resume else
+                 f"☁️ Сохраняю в облако: {len(items)} файл(ов)…"),
                 reply_markup=_upl_cancel_kb())
         except Exception:
             _status = None
@@ -10205,6 +10520,7 @@ async def _bg_upload_items(update, context, items):
         # ОДНИ И ТЕ ЖЕ файлы одновременно. Файл уже в облаке (или стрим
         # сохраняет его прямо сейчас) — второго не создаём, тихо пропускаем
         if _dup_claim(user_id, name, size):
+            _bg_inflight_item_done(user_id, name, size, item.get("fuid"))
             deduped.append(name)
             continue
         # ВОЛНА 22.58: живой статус файла для панели передач мини-аппа.
@@ -10227,6 +10543,7 @@ async def _bg_upload_items(update, context, items):
                 _bg_live_del(user_id, _lk)
                 _dup_release(user_id, name, size)
                 failed.append(f"{name[:40]}: Telegram не принял")
+                _bg_inflight_item_done(user_id, name, size, item.get("fuid"))
                 continue
             # ВОЛНА 22.84: залитое в канал — в реестр отмены (чтобы «❌
             # Отмена» могла это стереть).
@@ -10256,7 +10573,8 @@ async def _bg_upload_items(update, context, items):
                         else msg)
             rec = await _bg_upload_big_mtproto(
                 update, context, user, item, _src_msg, live=(user_id, _lk),
-                upl_op=_op)   # ВОЛНА 22.84: кнопка «Отмена» на прогрессе
+                upl_op=_op,   # ВОЛНА 22.84: кнопка «Отмена» на прогрессе
+                resume=resume)  # ВОЛНА 22.95: продолжение после рестарта
             if rec is None:
                 _bg_live_del(user_id, _lk)
                 _dup_release(user_id, name, size)
@@ -10279,6 +10597,7 @@ async def _bg_upload_items(update, context, items):
                                   "под временный файл")
                 else:
                     skipped_big.append(item)
+                _bg_inflight_item_done(user_id, name, size, item.get("fuid"))
                 continue
             # ВОЛНА 22.62: большая загрузка шла минутами — за это время
             # прямой стрим мог сохранить ЭТОТ ЖЕ файл. Проверяем свежий
@@ -10296,6 +10615,7 @@ async def _bg_upload_items(update, context, items):
                 pass
         _bg_live_del(user_id, _lk)
         _dup_saved(user_id, name, size)   # 22.62: анти-дубль: файл сохранён
+        _bg_inflight_item_done(user_id, name, size, item.get("fuid"))
         files.append(rec)
         saved.append(rec)
         # Подсказка про качество — ОДНА строка и один раз за пачку.
@@ -10303,6 +10623,9 @@ async def _bg_upload_items(update, context, items):
             warned_quality = True
     finally:
         _upl_op_end(user_id)
+        # ВОЛНА 22.95: пачка завершена (спасена/отменена/ошибки показаны) —
+        # снимаем её с диска. На диске остаётся только при crash-рестарте.
+        _bg_inflight_end(user_id)
 
     # ВОЛНА 22.84: честная отмена — стереть из канала всё, что успело
     # уехать, и НЕ сохранять записи (до «user.cloud_files = files» не доходим).
@@ -16066,6 +16389,17 @@ body.dev-test-active .main-wrapper {
     <h3 style="font-weight:900;font-size:20px;margin-bottom:4px">Хранилище</h3>
     <p style="font-size:13px;font-weight:700;color:var(--subtext-color);margin-bottom:12px">Куда попадают ваши файлы</p>
 
+    <!-- 22.95: заметка «очень рекомендуется свой канал как облако» — видна
+         всегда при нажатии на облако (окно «Хранилище») -->
+    <div style="display:flex;gap:10px;align-items:flex-start;padding:12px 14px;border-radius:14px;background:var(--card-bg);border:1px solid var(--border-color);margin-bottom:14px">
+      <i data-lucide="shield-check" style="width:20px;height:20px;flex-shrink:0;color:var(--text-color);opacity:.75;margin-top:2px"></i>
+      <p style="font-size:12px;font-weight:700;color:var(--text-color);line-height:1.55;margin:0">
+        Очень рекомендуется использовать в боте <b>свой канал</b> как облако:
+        подключите личный канал — и файлы будут храниться именно у вас,
+        приватно, надёжно и без ограничений на объём.
+      </p>
+    </div>
+
     <div id="storageStatus" style="padding:12px;background:var(--card-bg);border:1px solid var(--border-color);border-radius:14px;margin-bottom:14px;font-size:13px;font-weight:700;color:var(--subtext-color);line-height:1.5">
       Загружаю…
     </div>
@@ -16383,11 +16717,11 @@ body.dev-test-active .main-wrapper {
     </div>
 
     <div class="dev-rec-text">
-      <b>Совет разработчика</b>
-      <span>Создайте свой <b>частный канал</b> в Telegram и подключите его в боте
-      («Облако» → «Моё облако») — файлы будут храниться именно там, с максимальной
-      приватностью и безопасностью. DEVO+ — удобный коннектор к неограниченному
-      пространству хранения ваших файлов.</span>
+      <b>Очень рекомендуется: свой канал как облако</b>
+      <span>Используйте в боте <b>СВОЙ канал</b> как облако — создайте частный
+      канал в Telegram и подключите его («Облако» → «Моё облако»): файлы будут
+      храниться именно у вас, с максимальной приватностью и безопасностью.
+      DEVO+ — удобный коннектор к неограниченному пространству ваших файлов.</span>
 
       <div class="dev-rec-actions">
         <button class="dev-rec-btn" onclick="openStorageModal()">Подключить канал</button>
@@ -31912,6 +32246,21 @@ async def _upload_auto_complete_task(app, upid):
     user = get_user(uid)
     if not user:
         return
+    # ВОЛНА 22.95: сессия пережила рестарт — обещанное сообщение о старой
+    # загрузке. Обычные автодогрузки остаются БЕЗУМНЫМИ (22.60).
+    if s.get("restored") and not s.get("resume_notified"):
+        s["resume_notified"] = True
+        try:
+            _rb = getattr(app, "bot", None)
+            if _rb is not None:
+                await _rb.send_message(
+                    chat_id=int(uid),
+                    text=("♻️ Сервер перезапускался — старая загрузка не потеряна.\n"
+                          f"📦 «{(s.get('name') or 'файл')[:48]}» — файл продолжает "
+                          "грузиться в облако силами бота. Прогресс — в панели "
+                          "передач мини-аппа."))
+        except Exception:
+            pass
     ok, payload = await _miniapp_upload_finalize(
         user, uid, upid, s,
         pw_raw=str(s.get("vault_pw") or ""),
@@ -32115,10 +32464,12 @@ def _miniapp_restore_upload_sessions():
     «исчезали», а .part-ы становились сиротами (чистка 22.49). Теперь
     метаданные читаются с диска, сессии снова живы: клиент докачает только
     недостающие куски, а plain-сессии, где байты ВСЕ, бот догрузит сам.
-    Возвращает (сколько_восстановлено, [uploadId для автодогрузки]).
+    Возвращает (сколько_восстановлено, [uploadId для автодогрузки],
+               [свежие записи для уведомления 22.95]).
     Задачи автодогрузки создаёт ВЫЗЫВАЮЩИЙ (внутри event loop)."""
     restored = 0
     auto_upids = []
+    fresh_notify = []   # 22.95: свежие (≤6 ч) — для письма «не потеряны»
     try:
         d = _miniapp_tmpdir()
         now = time.time()
@@ -32164,6 +32515,19 @@ def _miniapp_restore_upload_sessions():
                     continue
                 _MINIAPP_UPLOADS[upid] = s
                 restored += 1
+                # ВОЛНА 22.95: свежие восстановленные (≤6 ч) — расскажем
+                # пользователю, что старая загрузка не потеряна.
+                try:
+                    if now - os.path.getmtime(jp) < 6 * 3600:
+                        fresh_notify.append({
+                            "uid": s["uid"], "name": s["name"],
+                            "size": int(s["size"] or 0),
+                            "received": int(s["received"] or 0),
+                            "auto": bool(s["plain"]
+                                         and s["received"] >= s["size"]),
+                        })
+                except Exception:
+                    pass
                 if s["plain"] and s["received"] >= s["size"]:
                     s["auto_scheduled"] = True
                     auto_upids.append(upid)
@@ -32174,7 +32538,7 @@ def _miniapp_restore_upload_sessions():
     if restored:
         logger.info(f"ВОЛНА 22.52: восстановлено сессий загрузки после "
                     f"рестарта: {restored} (автодогрузка: {len(auto_upids)})")
-    return restored, auto_upids
+    return restored, auto_upids, fresh_notify
 
 
 # === ВОЛНА 22.53: ПАРОЛЬ СЕЙФА ЧЕРЕЗ ЧАТ — ДОГРУЗКА «ЧЕРЕЗ САМОГО БОТА» ===
@@ -73562,14 +73926,30 @@ async def _post_init(application):
     # догружает plain-сессии, где все байты уже на сервере, а клиент
     # докачивает только недостающие куски (status → parts).
     try:
-        _restored, _auto_upids = _miniapp_restore_upload_sessions()
+        _restored, _auto_upids, _fresh_up = _miniapp_restore_upload_sessions()
         if _restored:
             logger.info(f"ВОЛНА 22.52: сессий загрузки восстановлено: {_restored}")
         for _a_upid in _auto_upids:
             # бот сам догружает plain-сессии, где все байты уже на сервере
             _spawn_bg_task(_upload_auto_complete_delayed(_a_upid, 3.0))
+        if _fresh_up:
+            # ВОЛНА 22.95: «старые загрузки не потеряны» — письмо тем, чьи
+            # сессии оборвались рестартом за последние 6 часов.
+            _spawn_bg_task(_bg_restore_notify_task(application, _fresh_up))
     except Exception as e2:
         logger.error(f"Не удалось восстановить сессии загрузки: {e2}")
+
+    # === ВОЛНА 22.95: загрузки ИЗ ЧАТА переживают рестарт. ===
+    # Пачка с кнопки «📤 Отправить» пишется на диск; после подъёма бот сам
+    # продолжает её: приходит сообщение со старой загрузкой («файл
+    # продолжает грузиться»), большой файл показывает, сколько осталось.
+    try:
+        _infl_n = _bg_inflight_resume(application)
+        if _infl_n:
+            logger.info(f"ВОЛНА 22.95: прерванных рестартом загрузок "
+                        f"продолжается: {_infl_n}")
+    except Exception as e2:
+        logger.error(f"Не удалось продолжить прерванные загрузки: {e2}")
 
     # === ВОЛНА 22.68: карта завершённых загрузок — с диска. ===
     # Повторный complete после рестарта отдаёт СОХРАНЁННЫЙ результат вместо
