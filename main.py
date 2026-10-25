@@ -14,6 +14,7 @@ import zipfile
 import collections  # ВОЛНА 22.35: окно очереди публикаций в канал (deque)
 from datetime import datetime, timedelta, timezone, time as dt_time, date
 import asyncio
+import telegram  # ВОЛНА 23.10.6: патч цветов кнопок (Bot/ExtBot, Bot API 9.4)
 try:
     # Python 3.9+: точные часовые пояса (IANA tzdata) без внешних сервисов.
     from zoneinfo import ZoneInfo
@@ -33,7 +34,7 @@ from telegram.error import (
     BadRequest as TGBadRequest, Forbidden as TGForbidden,
     RetryAfter as TGRetryAfter,
 )
-from functools import wraps
+from functools import wraps, lru_cache  # + lru_cache: кэш шрифта знака (23.03)
 from groq import AsyncGroq
 import aiohttp
 from aiohttp import web
@@ -312,6 +313,11 @@ NOTIFICATION_LOG_FILE = _data_file("notification_log.json")
 # Этот файл нужен ОТДЕЛЬНО от users.json, потому что подтверждение может
 # прийти ДО создания аккаунта (когда user-объекта ещё нет).
 SUBSCRIPTION_CONFIRMATIONS_FILE = _data_file("subscription_confirmations.json")
+# ВОЛНА 23.07: счётчик подрядных отказов API в гейте подписки («лестница
+# доверия»). Если Telegram API N раз подряд отказывает нажатию «✅ Я
+# подписался(ась)» — верим пользователю и пускаем (защита от ложных
+# отказов: гонка вступления, переименование канала, рассинхрон ссылки).
+SUB_GATE_FAILS_FILE = _data_file("sub_gate_fails.json")
 # Глобальные настройки разработчика (например, включены/выключены уведомления
 # разработчику о новых пользователях). Файл общий для всех админов с DEVELOPER_ID.
 DEV_SETTINGS_FILE = _data_file("dev_settings.json")
@@ -328,6 +334,10 @@ REFERRALS_FILE = _data_file("referrals.json")
 # с DEVORKS+ai терялся. Структура: { "<user_id>": [msg, ...] } (те же словари,
 # что и в памяти: role/content, system + последние 10 сообщений).
 AI_HIST_FILE = _data_file("ai_history.json")
+# ВОЛНА 23.10.10: подключаемые ИИ-провайдеры («много ии»): ключи, модели
+# по умолчанию, тоггл веб-поиска, кэш списков моделей. Ключи лежат в
+# DVF3-шифрованной БД, файл входит в снапшот канал-БД (ниже).
+AI_PROVIDERS_FILE = _data_file("ai_providers.json")
 # ВОЛНА 22.75 (M2): конфиг монитора расписаний сайтов (классы, ссылки,
 # автосинхронизация). Файл объявлен здесь (а не в блоке schmon ниже), потому
 # что входит в STORAGE_BACKUP_FILES — тот собирается раньше.
@@ -591,6 +601,23 @@ BELLS_PHOTO_WAIT = 160     # ждём ФОТО расписания звонко
 CREATE_PB_FILES_WAIT = 161 # файлы ЛИЧНОЙ кнопки
 CREATE_GB_FILES_WAIT = 162 # файлы ГЛОБАЛЬНОЙ кнопки (разработчик)
 CREATE_CB_FILES_WAIT = 163 # файлы кнопки КЛАССА (админ класса)
+
+# ВОЛНА 23.10.6: «✏️ Изменить» в базе решений — правка ДОБАВЛЕННОГО решения
+# (меняет автор или староста): предмет или полная замена файлов. Замена
+# файлов автором после публикации отправляет решение на ПОВТОРНУЮ
+# модерацию (чтобы нельзя было подсунуть другой файл после проверки).
+SOL_EDIT_SUBJECT = 168      # вводим НОВЫЙ предмет решения
+SOL_EDIT_FILES = 169        # принимаем НОВЫЕ файлы решения (до 6)
+
+# ВОЛНА 23.10.7 (по запросу пользователя): цвет КОНКРЕТНОЙ кнопки
+# (личное правило «текст кнопки → цвет», главнее базового цвета и
+# автоцвета), личные сообщения «админ класса → участник» и комментарии
+# под решениями (написать / изменить / удалить).
+# ВОЛНА 23.10.9: состояние BTN_OVR_WAIT_TEXT (170) УДАЛЕНО — ручной
+# ввод текста кнопки заменён панелью кнопок (_btn_panel_page_kb).
+ADMIN_DM_TEXT = 171        # админ класса пишет ЛИЧНОЕ сообщение участнику
+SOL_COMMENT_TEXT = 172     # участник пишет комментарий под решением
+SOL_COMMENT_EDIT = 173     # участник ИЗМЕНЯЕТ свой комментарий под решением
 
 # ВОЛНА 22.4: «🎙 Пульт» удалён ПОЛНОСТЬЮ по решению пользователя — кнопки,
 # состояний (бывшие 126–131), хендлеров и хранилищ стилей больше нет.
@@ -1497,6 +1524,9 @@ def _load_data_raw(filename, default=None):
 
     Добавлена ленивая инициализация Supabase (аналогично save_data).
     """
+    # ВОЛНА 23.10.3: маркер «только что был СБОЙ чтения этого файла» —
+    # используется load_users(), чтобы не кэшировать пустоту вместо базы
+    # (см. комментарий там). Ключ — имя файла, значение — time.time().
     # 1) Supabase
     supabase_available = _supabase_ready
     if not supabase_available and SUPABASE_URL and SUPABASE_KEY:
@@ -1546,6 +1576,15 @@ def _load_data_raw(filename, default=None):
         return default if default is not None else {}
     except Exception as e:
         logger.error(f"Ошибка при загрузке {filename}: {e}")
+        # ВОЛНА 23.10.3: фиксируем сбой чтения — load_users() по этому
+        # маркеру откажется кэшировать пустой результат поверх живого кэша
+        # (иначе на CACHE_TTL секунд ВСЕ пользователи становятся
+        # «не найденными» — жалоба: «Профиль не найден. Начните с /start»
+        # у уже зарегистрированных, а через минуту всё снова работает).
+        try:
+            _LOAD_FAILED_AT[str(filename)] = time.time()
+        except Exception:
+            pass
         return default if default is not None else {}
 
 
@@ -1934,6 +1973,19 @@ _cdb_flush_lock = None
 CDB_MIN_FLUSH_INTERVAL = 20
 _CDB_LAST_FLUSH_MONO = 0.0
 
+# ВОЛНА 23.02: гейт boot-восстановления + защита от «отравленного пина».
+# _CDB_BOOT_RESTORE_STARTED — restore на старте НАЧАЛСЯ: с этого момента
+#   сливы в канал блокируются (ранняя «грязь» не должна запинить пустой
+#   снапшот поверх хорошего — так бот «начинал базу с нуля» ночью).
+# _CDB_BOOT_RESTORE_DONE — restore ЗАВЕРШИЛСЯ (успех/неудача/дедлайн 900 с):
+#   сливы снова разрешены.
+# _CDB_EVER_SEEN_DATA — бот хотя бы раз видел живые данные (юзеров > 0):
+#   с этого момента слив ПОЛНОСТЬЮ пустой базы (0 юзеров и 0 классов)
+#   запрещён — последний хороший снапшот канала не затирается.
+_CDB_BOOT_RESTORE_STARTED = False
+_CDB_BOOT_RESTORE_DONE = False
+_CDB_EVER_SEEN_DATA = False
+
 # Префикс имени файла снапшота в канале (по нему узнаём «свой» пин).
 CDB_SNAPSHOT_PREFIX = "devorks_db_snapshot"
 
@@ -2056,6 +2108,29 @@ def _limit_str(value):
 # своей панели. По умолчанию все тогглы включены.
 DEV_SETTINGS_DEFAULTS = {
     "notify_new_users": True,
+    # ВОЛНА 23.06: тихое восстановление после рестарта — сообщений
+    # пользователям НЕ отправляем; тоггл «♻️ Восстановление» в панели
+    # управляет тихим возвратом меню при первом сообщении пользователя.
+    # autologin_last — метка последней РУЧНОЙ рассылки.
+    "autologin_enabled": True,
+    "autologin_last": "",
+    # ВОЛНА 23.04: канал подписки (панель → «📢 Канал подписки»). Пусто
+    # → дефолт REQUIRED_CHANNEL_* (devo_kanal). username нужен для
+    # get_chat_member; приватные ссылки (t.me/+…) вводятся без него.
+    "channel_url": "",
+    "channel_username": "",
+    # ВОЛНА 23.10: ГЛАВНЫЙ тоггл обязательной подписки на канал (панель →
+    # «🚪 Обязательная подписка»). False → бот НИКОГДА не просит подписаться:
+    # гейт пропускает всех, фоновый свип не запускается, кнопка «Я подписался»
+    # сообщает, что подписка не обязательна. True → обычный режим.
+    "sub_gate_enabled": True,
+    # ВОЛНА 23.05: повторная проверка подписки (панель → «🔁 Проверка
+    # подписки»). sub_recheck_last/sub_recheck_report — итог последнего свипа.
+    "sub_recheck_enabled": True,
+    "sub_recheck_hours": 6,
+    "sub_recheck_dm": True,
+    "sub_recheck_last": "",
+    "sub_recheck_report": "",
 }
 
 def load_dev_settings():
@@ -2082,6 +2157,216 @@ def toggle_dev_new_user_notifications():
     settings["notify_new_users"] = not bool(settings.get("notify_new_users", True))
     save_dev_settings(settings)
     return settings["notify_new_users"]
+
+
+# ==================================
+# === ВОЛНА 23.04: КАНАЛ ПОДПИСКИ И АВТОВХОД (настройки разработчика) ===
+# ==================================
+
+def _extract_channel_username(url):
+    """ВОЛНА 23.04: из ссылки/ника Telegram-канала достаёт username.
+
+    https://t.me/foo, http://t.me/foo/, t.me/foo, t.me/s/foo, @foo,
+    foo → "foo". Приватные ссылки (https://t.me/+hash, joinchat) и
+    произвольные URL → None: API-проверка по ним невозможна, бот будет
+    доверять кнопке «✅ Я подписался(ась)» (cannot_verify → trust)."""
+    if not url:
+        return None
+    u = str(url).strip()
+    if re.match(r"^@?[A-Za-z][A-Za-z0-9_]{2,63}$", u):
+        return u.lstrip("@")
+    m = re.match(
+        r"^(?:https?://)?t\.me/(?:s/)?([A-Za-z][A-Za-z0-9_]{2,63})/?$", u,
+        flags=re.IGNORECASE)
+    if m and m.group(1).lower() not in ("joinchat", "share", "addlist"):
+        return m.group(1)
+    return None
+
+
+def get_channel_url():
+    """Ссылка на канал подписки: настройка разработчика или дефолт."""
+    try:
+        s = load_dev_settings()
+        u = (s.get("channel_url") or "").strip()
+        if u:
+            return u
+    except Exception:
+        pass
+    return REQUIRED_CHANNEL_URL
+
+
+def _gate_channel_url():
+    """ВОЛНА 23.09: ссылка канала для инлайн-кнопок и текстов гейта.
+
+    Telegram принимает в URL-кнопку только http(s): битая настройка
+    разработчика (опечатка, «t.me/foo» без схемы) ломала ВСЁ требование
+    подписки — edit/send с такой кнопкой падал BadRequest «wrong HTTP
+    URL», и гейт выглядел мёртвым. Невалидная ссылка подменяется
+    дефолтом; клавиатуры и тексты гейта всегда согласованы между собой.
+    """
+    try:
+        u = (get_channel_url() or "").strip()
+        if u.lower().startswith(("http://", "https://")):
+            return u
+    except Exception:
+        pass
+    return REQUIRED_CHANNEL_URL
+
+
+def get_channel_username():
+    """@username канала для get_chat_member. Приватная ссылка
+    (channel_url задан, username пуст) → "" : API-проверка недоступна,
+    бот доверяет кнопке «Я подписался»."""
+    try:
+        s = load_dev_settings()
+        url_custom = (s.get("channel_url") or "").strip()
+        u = (s.get("channel_username") or "").strip().lstrip("@")
+        if url_custom and not u:
+            # Приватная ссылка задана разработчиком — НЕ проваливаемся
+            # в дефолтный канал, иначе «приватный» режим молча проверял
+            # бы старый канал.
+            return ""
+        if u:
+            return u
+    except Exception:
+        pass
+    return REQUIRED_CHANNEL_USERNAME
+
+
+def set_channel_link(url):
+    """ВОЛНА 23.04: разработчик меняет ссылку канала. Возвращает
+    (ok, message). Принимает https://t.me/foo, @foo и foo. Приватные
+    ссылки (t.me/+hash, joinchat) сохраняются как есть, без username —
+    API-проверка станет «cannot_verify» и бот будет доверять кнопке."""
+    raw = (url or "").strip()
+    if not raw:
+        return False, "Пришлите ссылку, например https://t.me/my_channel"
+    username = _extract_channel_username(raw)
+    if username:
+        link = f"https://t.me/{username}"
+    elif re.match(r"^(?:https?://)?t\.me/\+", raw, flags=re.IGNORECASE) \
+            or "joinchat" in raw.lower():
+        link = raw if raw.lower().startswith("http") else f"https://{raw}"
+        username = None
+    elif re.match(r"^https?://", raw, flags=re.IGNORECASE):
+        return False, ("Это не ссылка Telegram-канала вида "
+                       "https://t.me/имя_канала")
+    else:
+        return False, ("Не понял адрес. Пришлите ссылку вида "
+                       "https://t.me/имя_канала, @имя_канала "
+                       "или имя_канала")
+    settings = load_dev_settings()
+    settings["channel_url"] = link
+    settings["channel_username"] = username or ""
+    save_dev_settings(settings)
+    return True, link
+
+
+def reset_channel_link():
+    """Сброс ссылки канала на дефолтную (REQUIRED_CHANNEL_*)."""
+    settings = load_dev_settings()
+    settings["channel_url"] = ""
+    settings["channel_username"] = ""
+    save_dev_settings(settings)
+
+
+def is_dev_autologin_enabled():
+    """ВОЛНА 23.06: включено ли тихое восстановление после рестарта
+    (по умолчанию ВКЛ). Сообщений после рестарта не отправляем."""
+    return bool(load_dev_settings().get("autologin_enabled", True))
+
+
+def toggle_dev_autologin():
+    settings = load_dev_settings()
+    settings["autologin_enabled"] = not bool(
+        settings.get("autologin_enabled", True))
+    save_dev_settings(settings)
+    return settings["autologin_enabled"]
+
+
+# ==================================
+# === ВОЛНА 23.10: ГЛАВНЫЙ ТОГГЛ ОБЯЗАТЕЛЬНОЙ ПОДПИСКИ ===
+# ==================================
+
+def is_dev_sub_gate_enabled():
+    """ВОЛНА 23.10: включена ли ОБЯЗАТЕЛЬНАЯ подписка на канал (по умолчанию
+    ВКЛ). False — бот не проверяет подписку и не просит подписаться: гейт
+    пропускает всех пользователей, кнопка «✅ Я подписался(ась)» сообщает,
+    что подписка не обязательна, фоновый свип подписки не запускается."""
+    try:
+        return bool(load_dev_settings().get("sub_gate_enabled", True))
+    except Exception:
+        return True
+
+
+def toggle_dev_sub_gate():
+    """ВОЛНА 23.10: переключить обязательную подписку ВКЛ⇄ВЫКЛ."""
+    settings = load_dev_settings()
+    settings["sub_gate_enabled"] = not bool(
+        settings.get("sub_gate_enabled", True))
+    save_dev_settings(settings)
+    return settings["sub_gate_enabled"]
+
+
+# ==================================
+# === ВОЛНА 23.05: НАСТРОЙКИ ПОВТОРНОЙ ПРОВЕРКИ ПОДПИСКИ ===
+# ==================================
+
+def is_dev_sub_recheck_enabled():
+    """Включён ли фоновый свип подписки (по умолчанию ВКЛ)."""
+    try:
+        return bool(load_dev_settings().get("sub_recheck_enabled", True))
+    except Exception:
+        return True
+
+
+def toggle_dev_sub_recheck():
+    settings = load_dev_settings()
+    settings["sub_recheck_enabled"] = not bool(
+        settings.get("sub_recheck_enabled", True))
+    save_dev_settings(settings)
+    return settings["sub_recheck_enabled"]
+
+
+def is_dev_sub_recheck_dm_enabled():
+    """Слать ли отписавшимся напоминание «подпишитесь обратно»."""
+    try:
+        return bool(load_dev_settings().get("sub_recheck_dm", True))
+    except Exception:
+        return True
+
+
+def toggle_dev_sub_recheck_dm():
+    settings = load_dev_settings()
+    settings["sub_recheck_dm"] = not bool(settings.get("sub_recheck_dm", True))
+    save_dev_settings(settings)
+    return settings["sub_recheck_dm"]
+
+
+def get_sub_recheck_hours():
+    """Интервал свипа в часах (по умолчанию 6, зажат в 1..168)."""
+    try:
+        h = int(load_dev_settings().get("sub_recheck_hours", 6))
+    except Exception:
+        return 6
+    if h < 1:
+        return 1
+    if h > 168:
+        return 168
+    return h
+
+
+def cycle_dev_sub_recheck_hours():
+    """ВОЛНА 23.05: пресеты интервала без текстового ввода: 6 → 12 → 24 → 6."""
+    settings = load_dev_settings()
+    try:
+        current = int(settings.get("sub_recheck_hours", 6))
+    except Exception:
+        current = 6
+    next_h = {6: 12, 12: 24, 24: 6}.get(current, 12)
+    settings["sub_recheck_hours"] = next_h
+    save_dev_settings(settings)
+    return next_h
 
 # ==================================
 # === ХРАНИЛИЩЕ: КОНФИГ КАНАЛОВ ===
@@ -2452,6 +2737,8 @@ STORAGE_BACKUP_FILES = (
     SCHEDMON_FILE,
     # ВОЛНА 22.75 (M2/M4): история AI-диалогов + WAL облачных операций.
     AI_HIST_FILE, CLOUD_WAL_FILE,
+    # ВОЛНА 23.10.10: провайдеры ИИ (ключи API) — тоже в БД и снапшот.
+    AI_PROVIDERS_FILE,
     # ВОЛНА 22.28: активные помодоро-сессии переживают рестарт — тикер
     # продолжит прерванные фазы (работа/перерыв) автоматически.
     POMODORO_FILE,
@@ -2497,14 +2784,22 @@ def timeout(seconds):
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                logger.error(f"Handler {getattr(func, '__name__', 'unknown')} error: {e}")
+                # ВОЛНА 23.10: раньше в лог уходило только {e} без стека —
+                # причину сбоя приходилось угадывать. Логируем traceback.
+                import traceback as _tb
+                logger.error(
+                    f"Handler {getattr(func, '__name__', 'unknown')} error: {e}\n"
+                    f"{_tb.format_exc()}"
+                )
                 update = args[0] if args else None
                 context = args[1] if len(args) > 1 else None
                 if update is not None and context is not None:
                     try:
                         if getattr(update, "message", None):
                             await update.message.reply_text(
-                                "Попробуйте ещё раз или нажмите /start"
+                                "⚠️ Произошла ошибка. Попробуйте ещё раз — "
+                                "разговор не прерван. Нажмите /start, если "
+                                "ошибка повторится."
                             )
                         elif getattr(update, "callback_query", None):
                             try:
@@ -2630,6 +2925,10 @@ class User:
         # случай, если бот не админ канала и API проверка невозможна.
         # Формат: "YYYY-MM-DD HH:MM:SS" или None.
         self.subscription_confirmed_at = None
+        # ВОЛНА 23.05: когда пользователю последний раз отправляли сообщение
+        # «вы отписались — подпишитесь обратно» (анти-спам кулдаун свипа).
+        # Формат: "YYYY-MM-DD HH:MM:SS" или None.
+        self.sub_left_notified_at = None
         # Флаг: было ли отправлено уведомление разработчику о появлении этого
         # пользователя. Нужен, чтобы не дублировать уведомление, даже если
         # объект User по какой-то причине пересоздался.
@@ -2694,6 +2993,21 @@ class User:
         # "warm" — режим «тепло». Выбирается кнопками при входе в чат
         # (или действием set_ai_mode в автоматизации) и сохраняется навсегда.
         self.ai_persona = "normal"
+        # ВОЛНА 23.10.10: ЛИЧНАЯ модель ИИ (кнопка «🤖 Модель» в чате):
+        # None = модель по умолчанию; {"provider": pid, "model": str} — своя.
+        # ВОЛНА 23.10.11: поле больше НЕ используется (модель выбирает
+        # ТОЛЬКО разработчик); оставлено для старых записей базы.
+        self.ai_model = None
+        # ВОЛНА 23.10.11: СВОЙ API-ключ ИИ (кнопка «🔑 Свой API-ключ»):
+        # "" — работать с ключом разработчика; "sk-…" — запросы ИИ идут
+        # со счёта пользователя. Модель при этом остаётся выбранной
+        # разработчиком — переключать её пользователь не может.
+        self.ai_own_key = ""
+        # ВОЛНА 23.10.12: СВОЙ провайдер ИИ (сервис+ключ+модель; см.
+        # _ai_own_cfg_sanitize) и ВЫБОР ИИ разработчика (pid провайдера
+        # с закреплённой моделью; "" = ИИ по умолчанию).
+        self.ai_own_cfg = None
+        self.ai_provider_choice = ""
         # === Личное облако (приватный канал-хранилище) ===
         # Список указателей на файлы пользователя в приватном канале:
         # [{"id", "name", "kind" (document/photo/video/audio/voice),
@@ -2754,6 +3068,28 @@ class User:
         # True (по умолчанию) — приходит сообщение «📚 Новое решение…»;
         # тоггл: ⚙️ Настройки → «🔔 Уведомления о решениях».
         self.sol_notify = True
+        # === ВОЛНА 23.03: ВОДЯНОЙ ЗНАК на фото расписания ===
+        # True (по умолчанию) — фото расписания/звонков приходят со знаком
+        # «DEVORKS+ / @DEVO_WORKS_BOT». Тоггл: ⚙️ Настройки → «💧 Водяной знак».
+        self.watermark_enabled = True
+        # === ВОЛНА 23.10.6: ЦВЕТА INLINE-КНОПОК (Bot API 9.4, поле style) ===
+        # button_style — личный цвет ВСЕХ кнопок бота, как хочет пользователь:
+        #   "" (по умолчанию) — обычный вид,
+        #   "primary" — синий, "success" — зелёный, "danger" — красный.
+        # button_autocolor — автоцвет (по умолчанию ВКЛ): кнопки ОТМЕНЫ всегда
+        # красные, кнопки ПОДТВЕРЖДЕНИЯ всегда зелёные. Можно отключить.
+        # Тогглы: ⚙️ Настройки → «🎨 Цвет кнопок».
+        self.button_style = ""
+        self.button_autocolor = True
+        # === ВОЛНА 23.10.7: ЦВЕТ КОНКРЕТНОЙ КНОПКИ ===
+        # button_overrides — личные правила «текст кнопки → цвет» (dict).
+        # Правило ГЛАВНЕЕ базового цвета И автоцвета: можно принудительно
+        # покрасить любую кнопку (например, все «📅») или, наоборот, сделать
+        # «❌ Отмена» обычной при включённом автоцвете. Совпадение — по
+        # тексту кнопки без учёта регистра; правило красит ВСЕ кнопки, в
+        # тексте которых есть фраза правила. Пустой dict — правил нет.
+        # Настройка: ⚙️ → «🎨 Цвет кнопок» → «🎯 Цвет конкретной кнопки».
+        self.button_overrides = {}
         # === ВОЛНА 22.29: ВЕБ-ПАРОЛЬ (вход в 🌐 Веб-облако без Telegram) ===
         # web_password_hash — {"salt": hex, "iters": int, "verifier": hex}.
         # Сам пароль НИГДЕ не хранится: только PBKDF2-верификатор (см.
@@ -2860,6 +3196,7 @@ class User:
             'holiday_notifications': getattr(self, 'holiday_notifications', True),
             'birthday_notification_time': getattr(self, 'birthday_notification_time', '09:00'),
             'subscription_confirmed_at': getattr(self, 'subscription_confirmed_at', None),
+            'sub_left_notified_at': getattr(self, 'sub_left_notified_at', None),
             'dev_notified': getattr(self, 'dev_notified', False),
             # Реферальная система
             'referrer_id': getattr(self, 'referrer_id', None),
@@ -2883,6 +3220,17 @@ class User:
             'subscriptions': getattr(self, 'subscriptions', {}),
             # Режим личности ИИ-чата: normal / hamlo / warm
             'ai_persona': getattr(self, 'ai_persona', 'normal'),
+            # ВОЛНА 23.10.10: личная модель ИИ (или None).
+            'ai_model': (getattr(self, 'ai_model', None)
+                         if isinstance(getattr(self, 'ai_model', None), dict)
+                         else None),
+            # ВОЛНА 23.10.11: свой API-ключ ИИ (строка или пусто).
+            'ai_own_key': str(getattr(self, 'ai_own_key', '') or '')[:300],
+            # ВОЛНА 23.10.12: свой провайдер ИИ + выбор ИИ разработчика.
+            'ai_own_cfg': _ai_own_cfg_sanitize(
+                getattr(self, 'ai_own_cfg', None)),
+            'ai_provider_choice': str(
+                getattr(self, 'ai_provider_choice', '') or '')[:30],
             # Личное облако: указатели файлов в приватном канале
             'cloud_files': getattr(self, 'cloud_files', []),
             # Сейф: указатели зашифрованных файлов (без имён и паролей)
@@ -2899,6 +3247,15 @@ class User:
             'vault_kb_wipe': getattr(self, 'vault_kb_wipe', None),
             # ВОЛНА 22.12: уведомления о новых решениях класса.
             'sol_notify': getattr(self, 'sol_notify', True),
+            # ВОЛНА 23.03: водяной знак на фото расписания.
+            'watermark_enabled': bool(getattr(self, 'watermark_enabled', True)),
+            # ВОЛНА 23.10.6: цвета inline-кнопок (личная настройка).
+            'button_style': str(getattr(self, 'button_style', '') or ''),
+            'button_autocolor': bool(getattr(self, 'button_autocolor', True)),
+            # ВОЛНА 23.10.7: личные правила цвета КОНКРЕТНЫХ кнопок
+            # (санитизация гарантирует валидные стили и потолок записей).
+            'button_overrides': _btn_ovr_sanitize(
+                getattr(self, 'button_overrides', None)),
             # ВОЛНА 22.29: веб-пароль / ДР-канун / «не беспокоить».
             'web_password_hash': getattr(self, 'web_password_hash', None),
             'web_password_set_at': getattr(self, 'web_password_set_at', None),
@@ -3034,6 +3391,8 @@ class User:
             user.birthday_notification_time = "09:00"
         if not hasattr(user, 'subscription_confirmed_at'):
             user.subscription_confirmed_at = None
+        if not hasattr(user, 'sub_left_notified_at'):
+            user.sub_left_notified_at = None
         if not hasattr(user, 'dev_notified'):
             user.dev_notified = False
         # Бэк-совместимость: поля «реферальной системы», темы, поддержки.
@@ -3069,6 +3428,22 @@ class User:
         persona = getattr(user, 'ai_persona', None)
         if persona not in AI_PERSONA_MODES:
             user.ai_persona = "normal"
+        # ВОЛНА 23.10.10: личная модель ИИ — dict {provider, model} или None.
+        _am = getattr(user, 'ai_model', None)
+        if isinstance(_am, dict):
+            _am = {'provider': str(_am.get('provider') or '')[:20],
+                   'model': str(_am.get('model') or '')[:120]}
+            user.ai_model = _am if (_am['provider'] and _am['model']) else None
+        else:
+            user.ai_model = None
+        # ВОЛНА 23.10.11: свой API-ключ ИИ — строка ≤300 символов.
+        _aok = str(getattr(user, 'ai_own_key', '') or '').strip()
+        user.ai_own_key = _aok[:300]
+        # ВОЛНА 23.10.12: свой провайдер ИИ + выбор ИИ разработчика.
+        user.ai_own_cfg = _ai_own_cfg_sanitize(
+            getattr(user, 'ai_own_cfg', None))
+        user.ai_provider_choice = str(
+            getattr(user, 'ai_provider_choice', '') or '')[:30]
         # Бэк-совместимость: личное облако (список файлов).
         if not isinstance(getattr(user, 'cloud_files', None), list):
             user.cloud_files = []
@@ -3108,6 +3483,22 @@ class User:
         # Бэк-совместимость, волна 22.12: уведомления о решениях класса.
         if not isinstance(getattr(user, 'sol_notify', None), bool):
             user.sol_notify = True
+        # Бэк-совместимость, волна 23.03: водяной знак на фото расписания.
+        if not isinstance(getattr(user, 'watermark_enabled', None), bool):
+            user.watermark_enabled = True
+        # Бэк-совместимость, волна 23.10.6: цвета inline-кнопок (Bot API 9.4).
+        if str(getattr(user, 'button_style', '') or '') not in (
+                '', 'primary', 'success', 'danger'):
+            user.button_style = ''
+        if not isinstance(getattr(user, 'button_autocolor', None), bool):
+            user.button_autocolor = True
+        # Бэк-совместимость, волна 23.10.7: правила цвета конкретных кнопок
+        # (старые записи users.json поля не содержат — НЕ должны падать;
+        # битые значения молча выбрасываются санитизатором).
+        if not isinstance(getattr(user, 'button_overrides', None), dict):
+            user.button_overrides = {}
+        else:
+            user.button_overrides = _btn_ovr_sanitize(user.button_overrides)
         # Бэк-совместимость, волна 22.8: цель кнопки «❌ Отменить» из клавиатуры.
         _vkw = getattr(user, 'vault_kb_wipe', None)
         if not isinstance(_vkw, dict) or not _vkw.get("msg_id"):
@@ -3274,6 +3665,16 @@ class Class:
         # «📅 Сегодня» / «📅 Завтра» (чтобы расписание с сайта ставилось
         # автоматически). Тоггл — админ-панель → «🌐 Расписание с сайтов».
         self.sched_web_auto = True
+        # ВОЛНА 23.10.6: ИСТОРИЯ «Расписания с сайтов» — последние 2 дня.
+        # Список записей (поля как у schedule_web + ts_full/ts_epoch).
+        # Ученики видят её в «📅 Расписание» секцией «🗂 за последние 2 дня»;
+        # записи старше 2 дней чистит монитор (и показ перед выдачей).
+        self.schedule_web_history = []
+        # ВОЛНА 23.10.10: ОТДЕЛЬНОЕ расписание/фото на КОНКРЕТНУЮ дату
+        # («нельзя установить отдельное фото или расписание на отдельный
+        # день — нужно добавить»). {"YYYY-MM-DD": "текст" | {"image",
+        # "caption"}}; в эту дату главнее дня недели (паттерн bells_dates).
+        self.schedule_dates = {}
         # ВОЛНА 22.77: «❗ ВАЖНОЕ» — доска важных постов класса. Админ пишет
         # текст и/или прикрепляет фото/видео/любые файлы (каждый файл
         # ШИФРУЕТСЯ _seal_pack и живёт в канале-хранилище). Ученики открывают
@@ -3323,6 +3724,12 @@ class Class:
             'duty_custom': getattr(self, 'duty_custom', None),
             # ВОЛНА 22.67: «Расписание с сайтов» (последнее присланное классу)
             'schedule_web': getattr(self, 'schedule_web', None),
+            # ВОЛНА 23.10.6: история «Расписаний с сайтов» (последние 2 дня).
+            'schedule_web_history': list(getattr(self, 'schedule_web_history', []) or []),
+            # ВОЛНА 23.10.10: отдельные расписания по датам.
+            'schedule_dates': (getattr(self, 'schedule_dates', None)
+                              if isinstance(getattr(self, 'schedule_dates', None), dict)
+                              else {}),
             # ВОЛНА 22.73: авто-применение расписания с сайта в Сегодня/Завтра
             'sched_web_auto': bool(getattr(self, 'sched_web_auto', True)),
             # ВОЛНА 22.77: доска «❗ Важное» (текст + шифрованные файлы)
@@ -3383,6 +3790,26 @@ class Class:
                 if _cl:
                     _bd_clean[_sk] = _cl
         class_obj.bells_dates = _bd_clean
+        # ВОЛНА 23.10.10: отдельные расписания по датам — старые классы без
+        # поля не падают; мусор выбрасываем (валидный ISO-ключ, значение —
+        # текст ≤4000 или картинка {image ≤200, caption ≤800}, ≤60 дат).
+        _sd_raw = getattr(class_obj, 'schedule_dates', None)
+        if not isinstance(_sd_raw, dict):
+            _sd_raw = {}
+        _sd_clean = {}
+        for _k, _v in list(_sd_raw.items())[:_SCHDATE_MAX]:
+            _sk = str(_k)[:10]
+            if not _bells_date_ok(_sk):
+                continue
+            if isinstance(_v, dict):
+                _img = str(_v.get('image') or '')[:200]
+                if not _img:
+                    continue
+                _sd_clean[_sk] = {'image': _img,
+                                  'caption': str(_v.get('caption') or '')[:800]}
+            elif isinstance(_v, str) and _v.strip():
+                _sd_clean[_sk] = _v[:4000]
+        class_obj.schedule_dates = _sd_clean
         # ВОЛНА 22.67: «Расписание с сайтов» — старые классы без поля не падают.
         if not isinstance(getattr(class_obj, 'schedule_web', None), dict):
             class_obj.schedule_web = None
@@ -3402,10 +3829,45 @@ class Class:
                 # ВОЛНА 22.77: день, на который расписание
                 'day': str(class_obj.schedule_web.get('day') or '')[:10],
                 'day_label': str(class_obj.schedule_web.get('day_label') or '')[:60],
+                # ВОЛНА 23.10.6: фото уже с водяным знаком (не подписывать дважды)
+                'wm': bool(class_obj.schedule_web.get('wm', False)),
             }
             if not (class_obj.schedule_web['text']
                     or class_obj.schedule_web['name']):
                 class_obj.schedule_web = None
+        # ВОЛНА 23.10.6: история «Расписаний с сайтов» — старые классы без
+        # поля не падают; мусор выбрасываем, потолок — 20 записей.
+        _swh = getattr(class_obj, 'schedule_web_history', None)
+        if not isinstance(_swh, list):
+            _swh = []
+        _swh_clean = []
+        for _e in _swh[:_SCHWEB_HIST_MAX * 2]:
+            if not isinstance(_e, dict):
+                continue
+            _rec = {
+                'text': str(_e.get('text') or '')[:4000],
+                'kind': str(_e.get('kind') or 'text'),
+                'name': str(_e.get('name') or '')[:120],
+                'url': str(_e.get('url') or '')[:500],
+                'host': str(_e.get('host') or '')[:120],
+                'title': str(_e.get('title') or '')[:200],
+                'ts': str(_e.get('ts') or '')[:16],
+                'file_id': str(_e.get('file_id') or '')[:200],
+                'file_kind': str(_e.get('file_kind') or '')[:16],
+                'day': str(_e.get('day') or '')[:10],
+                'day_label': str(_e.get('day_label') or '')[:60],
+                'wm': bool(_e.get('wm', False)),
+                'ts_full': str(_e.get('ts_full') or '')[:16],
+                'ts_epoch': float(_e.get('ts_epoch') or 0),
+                # ВОЛНА 23.10.9: календарный день записи — ключ «тот же
+                # день» (изменение расписания не создаёт новый день).
+                'day_key': str(_e.get('day_key')
+                               or str(_e.get('ts_full')
+                                      or _e.get('ts') or '')[:10])[:10],
+            }
+            if _rec['text'] or _rec['name']:
+                _swh_clean.append(_rec)
+        class_obj.schedule_web_history = _swh_clean[-_SCHWEB_HIST_MAX:]
         # ВОЛНА 22.73: тоггл авто-применения к Сегодня/Завтра — по умолчанию ВКЛ.
         if not isinstance(getattr(class_obj, 'sched_web_auto', None), bool):
             class_obj.sched_web_auto = True
@@ -3530,6 +3992,11 @@ class GlobalButton:
 # === ОПТИМИЗИРОВАННАЯ РАБОТА С ДАННЫМИ (КЭШИРОВАНИЕ) ===
 # ==================================
 
+# ВОЛНА 23.10.3: маркеры сбоев чтения (filename -> time.time()); заполняется
+# в _load_data_raw, читается в load_users(). Определено до первого использования.
+_LOAD_FAILED_AT = {}
+
+
 def load_users():
     global _users_cache
     current_time = time.time()
@@ -3539,11 +4006,34 @@ def load_users():
 
     data = load_data(USERS_FILE, expect="dict")
     users = {}
+    _bad_entries = 0
     for user_id, user_data in data.items():
         try:
             users[user_id] = User.from_dict(user_data)
         except Exception as e:
+            _bad_entries += 1
             logger.error(f"Ошибка при загрузке пользователя {user_id}: {e}")
+
+    # ВОЛНА 23.10.3: сбой чтения хранилища (битый JSON при параллельной
+    # записи, недописанный файл, диск моргнул) раньше кэшировал ПУСТУЮ базу
+    # на CACHE_TTL (60 c): все зарегистрированные становились «Профиль не
+    # найден. Начните с /start», через минуту всё «само чинилось». Теперь:
+    # если чтение только что упало (или ВСЕ записи нечитаемы), а в кэше ещё
+    # живы данные — обслуживаем кэш (устаревшие на секунды данные лучше
+    # пустой базы) и НЕ запоминаем пустоту: следующий вызов повторит
+    # попытку чтения. Легитимная пустая база (новая установка) кэшируется
+    # как раньше — guard срабатывает только при живом непустом кэше.
+    _failed_at = _LOAD_FAILED_AT.get(str(USERS_FILE), 0)
+    _read_failed = current_time - _failed_at < CACHE_TTL
+    _all_entries_corrupt = bool(data) and not users and _bad_entries == len(data)
+    if (not users and _users_cache and (_read_failed or _all_entries_corrupt)):
+        logger.warning(
+            "load_users: чтение хранилища не удалось (сбой %.1f с назад, "
+            "нечитаемых записей %d/%d) — обслуживаю предыдущий кэш "
+            "(%d пользователей), пустоту не кэширую.",
+            current_time - _failed_at, _bad_entries, len(data),
+            len(_users_cache))
+        return _users_cache
 
     _users_cache = users
     _cache_last_update['users'] = current_time
@@ -3653,6 +4143,35 @@ _recently_removed_users = {}
 _REMOVED_USER_TTL = 600.0
 
 
+def _tombstone_blocks_recreate(uid, rec) -> bool:
+    """ВОЛНА 23.10.5 (аудит «я зарегистрировался — а бот просит
+    регистрироваться заново»): надгробие remove_user не должно душить
+    ЛЕГИТИМНУЮ повторную регистрацию. Если запись СОЗДАНА ПОСЛЕ удаления
+    (joined_date новее надгробия) — это свежий профиль с нового /start,
+    а не «воскрешение» устаревшей копии параллельной корутины (у той
+    joined_date старый). Минутная точность joined_date трактуется в
+    пользу пользователя: совпадающая минута = «новее»."""
+    try:
+        _rm_ts = _recently_removed_users.get(str(uid), 0)
+        if not _rm_ts:
+            return False
+        joined = None
+        if isinstance(rec, dict):
+            joined = rec.get("joined_date")
+        elif rec is not None:
+            joined = getattr(rec, "joined_date", None)
+        if not joined:
+            return True   # даты нет — играем по старым правилам (блокируем)
+        joined_dt = datetime.strptime(str(joined), "%Y-%m-%d %H:%M")
+        # Надгробие усекаем до минуты: joined_date секунд не хранит, и без
+        # усечения запись, созданная В ТУ ЖЕ минуту после удаления, всегда
+        # выглядела бы «старше» удаления (11:39:00 < 11:39:37).
+        rm_dt = datetime.fromtimestamp(_rm_ts).replace(second=0, microsecond=0)
+        return joined_dt < rm_dt
+    except Exception:
+        return True
+
+
 def save_users(users):
     """Сохраняет пользователей.
 
@@ -3677,11 +4196,16 @@ def save_users(users):
         # ВОЛНА 22.72: ключи, удалённые через remove_user в последние минуты,
         # НЕ реанимируем из «полного» словаря вызывающего — иначе параллельная
         # корутина, начатая ДО удаления, воскресит пользователя.
+        # ВОЛНА 23.10.5: НО запись, созданная ПОСЛЕ удаления (повторная
+        # регистрация), проходит — иначе «Удалить мои данные» + /start =
+        # профиль молча не сохраняется 10 минут, и каждый /start просит
+        # регистрацию заново.
         try:
             _now = time.time()
             for _uid in list(data):
                 if _now - _recently_removed_users.get(str(_uid), 0) < _REMOVED_USER_TTL:
-                    data.pop(_uid, None)
+                    if _tombstone_blocks_recreate(_uid, data.get(_uid)):
+                        data.pop(_uid, None)
         except Exception:
             pass
         try:
@@ -3713,9 +4237,10 @@ def save_users(users):
             _now = time.time()
             for _uid, _u in users.items():
                 if _now - _recently_removed_users.get(str(_uid), 0) < _REMOVED_USER_TTL:
-                    cache.pop(str(_uid), None)
-                else:
-                    cache[_uid] = _u
+                    if _tombstone_blocks_recreate(_uid, _u):
+                        cache.pop(str(_uid), None)
+                        continue
+                cache[_uid] = _u
             _users_cache = cache
             _cache_last_update['users'] = time.time()
         except Exception:
@@ -4437,7 +4962,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "22.95"
+BOT_BUILD = "23.10.12"
 
 INSTRUCTIONS_VERSION = "2.5"
 
@@ -4455,7 +4980,7 @@ def _default_instructions_text():
         '6. **Утренние и вечерние уведомления** — настройте удобное время и свой текст для «доброе утро» и «спокойной ночи».\n'
         '7. **День рождения** — бот сам поздравит вас в этот день и (по желанию) напомнит классу.\n'
         '8. **Погода и праздники** — прогноз по вашему городу и ЛЮБОМУ городу мира (попробуйте в AI Agent: «погода в Париже»), напоминания о праздниках.\n'
-        '9. **DEVORKS+ai** — умный помощник: задайте любой вопрос и получите ответ. Всегда отвечает честно. Три режима: Обычный, 😈 Хамло и 🥰 Тепло (переключаются кнопками при входе в чат). AI принимает только ТЕКСТ — фото он не читает.\n'
+        '9. **DEVORKS+ai** — умный помощник: задайте любой вопрос и получите ответ. Всегда отвечает честно. Три режима: Обычный, 😈 Хамло и 🥰 Тепло (переключаются кнопками при входе в чат). Фото тоже понимает — просто пришлите картинку. ИИ знает ваше расписание и домашку — спросите «что задано?». Несколько ИИ — кнопка «🔀 Выбор ИИ» (модели ставит разработчик); свой ИИ (ключ+модель) — кнопка «🔑 Свой ИИ», подключение пошаговое.\n'
         '10. **Анонимные сообщения** — отправляйте одноклассникам анонимные сообщения и отвечайте на них.\n'
         '11. **Личные и классные кнопки** — создавайте свои кнопки (ссылки/текст) и делайте меню удобным.\n'
         '12. **🪄 AI Agent** — напишите обычным языком («русский на пятницу страница 45», «как зовут учителя по физре», «погода на завтра», «погода в Лондоне», «скрой кнопку Погода», «напиши анонимно Пете …») — бот сам выполнит. Про учителя КОНКРЕТНОГО предмета пришлёт только его, а не весь список. Управляет ВСЕМ: ДЗ, учителя, звонки, таймеры, кнопки, анонимки, погода (любой город мира), режимы ИИ, профиль, рефералы, праздники, состав класса — а разработчик может через ИИ загружать праздники оптом, делать рассылки, менять цены, создавать глобальные кнопки, блокировать и начислять звёзды.\n\n'
@@ -4466,10 +4991,10 @@ def _default_instructions_text():
         '• Переместить кнопки между рядами\n'
         '• 🎨 **Тема оформления кнопок** — настройки → «Тема кнопок». 12 цветов/иконок.\n\n'
         '**🆕 НОВЫЕ ВОЗМОЖНОСТИ:**\n'
-        '• 🔗 **Реферальная система** — кнопка «⭐ Звезды» → «Поделиться ссылкой». '
+        '• 🔗 **Реферальная система** — ⚙️ Настройки → «⭐ Звезды» → «Поделиться ссылкой». '
         'За каждого друга, кто перейдёт по вашей ссылке и зарегистрируется, '
         f'вам начислят +{REFERRAL_REWARD_STARS}⭐ на внутренний баланс.\n'
-        '• 💸 **Внутренние звёзды** — кнопка «⭐ Звезды» → «Потратить на функции». '
+        '• 💸 **Внутренние звёзды** — ⚙️ Настройки → «⭐ Звезды» → «Потратить на функции». '
         'Можно купить дополнительные слоты, премиум-тему и анонимные кредиты.\n'
         '• 💳 **Двойная оплата** — функции можно оплачивать как внутренней валютой, '
         'так и Telegram Stars (XTR). Если внутренних звёзд не хватает, бот предложит купить их за Telegram Stars.\n'
@@ -4730,6 +5255,27 @@ def save_user(user):
     users = load_users()
     users[user.user_id] = user
     return save_users(users)
+
+def _ensure_user_record(user_id, username="", first_name=""):
+    """ВОЛНА 23.10.3: вернуть профиль пользователя, а если запись пропала —
+    СОЗДАТЬ и сохранить на месте (с user_code, как на /start).
+
+    Зачем: запись может исчезнуть при живом разговоре — обнулённый диск при
+    деплое (Render), сбой чтения users.json, восстановление из канала ещё не
+    успело, удаление в age<13-ветке. Раньше Consent-цепочка в такой ситуации
+    показывала тупик «Профиль не найден. Начните с /start» (жалоба
+    пользователя), хотя кнопка могла спокойно продолжить регистрацию.
+    Используется обработчиками согласия (дисклеймер/ПДн/родители)."""
+    user = get_user(user_id)
+    if user is not None:
+        return user
+    user = User(user_id, username, first_name)
+    user.user_code = generate_user_code()
+    save_user_code(user.user_code, user_id)
+    save_user(user)
+    logger.info(f"_ensure_user_record: профиль {user_id} восстановлен "
+                f"на месте (user_code {user.user_code})")
+    return user
 
 def get_class_by_code(class_code):
     classes = load_classes()
@@ -5085,6 +5631,1165 @@ def get_day_name(day_index):
     days_ru = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
     return days_ru[day_index]
 
+# ═══════════════════════════════════════════════════════════════════════
+# ВОЛНА 23.03: ВОДЯНОЙ ЗНАК на фотографиях расписания.
+# Порт логики watermark_app (Pillow) БЕЗ веб-интерфейса: тёмный скруглённый
+# знак «DEVORKS+ / @DEVO_WORKS_BOT» сеткой по всему фото (прозрачность 15%,
+# размер 2% ширины, поворот 36°, плотность 10). Цвет каждой метки
+# подбирается под фон прямо под ней: на светлом — тёмные буквы с белым
+# ореолом, на тёмном — белые с чёрным, в серых местах метка чуть плотнее,
+# чтобы всегда читалась. Тоггл: ⚙️ Настройки → «💧 Водяной знак».
+# ═══════════════════════════════════════════════════════════════════════
+_WM_TITLE = "DEVORKS+"
+_WM_HANDLE = "@DEVO_WORKS_BOT"
+_WM_OPACITY = 0.15   # прозрачность знака
+_WM_SIZE = 0.02      # размер строки относительно ширины фото
+_WM_DENSITY = 10     # плотность сетки (1..10)
+_WM_ANGLE = 36.0     # поворот знака
+_WM_FONTS = (
+    "arialbd.ttf", "Arial Bold.ttf", "DejaVuSans-Bold.ttf",
+    "/system/fonts/Roboto-Bold.ttf", "/system/fonts/DroidSans-Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+)
+# Кэш: исходный file_id -> file_id УЖЕ подписанной копии. Первый показ
+# обрабатывает фото (скачать + наложить знак + отправить), повторные
+# показы летают мгновенно, без перекачки и обработки. LRU с лимитом.
+_WM_CACHE = collections.OrderedDict()
+_WM_CACHE_MAX = 32
+
+
+def _wm_pil():
+    """Ленивый импорт Pillow (нужен только водяному знаку)."""
+    from PIL import (Image, ImageChops, ImageDraw, ImageFilter, ImageFont,
+                     ImageOps, ImageStat)
+    return Image, ImageChops, ImageDraw, ImageFilter, ImageFont, ImageOps, ImageStat
+
+
+def _wm_resample():
+    """BICUBIC, совместимый с любым Pillow (10+ перенесли в Resampling)."""
+    Image, *_rest = _wm_pil()
+    return getattr(getattr(Image, "Resampling", Image), "BICUBIC", 3)
+
+
+@lru_cache(maxsize=64)
+def _wm_load_font(size):
+    """Жирный шрифт для знака: системный → DejaVu → встроенный."""
+    from PIL import ImageFont
+    for name in _WM_FONTS:
+        try:
+            return ImageFont.truetype(name, size)
+        except OSError:
+            continue
+    try:
+        return ImageFont.load_default(size)
+    except TypeError:  # старый Pillow без размера у дефолтного шрифта
+        return ImageFont.load_default()
+
+
+def _wm_tint(mask, col, a=255):
+    """Однотонный слой нужного цвета, видимый только через маску."""
+    Image, *_rest = _wm_pil()
+    layer = Image.new("RGBA", mask.size, tuple(col[:3]) + (255,))
+    layer.putalpha(mask.point(lambda v: v * a // 255))
+    return layer
+
+
+def _wm_blit(layer, st, x, y):
+    """alpha_composite, который умеет выходить за края картинки."""
+    W, H = layer.size
+    w, h = st.size
+    x0, y0, x1, y1 = max(x, 0), max(y, 0), min(x + w, W), min(y + h, H)
+    if x0 >= x1 or y0 >= y1:
+        return
+    layer.alpha_composite(st.crop((x0 - x, y0 - y, x1 - x, y1 - y)), (x0, y0))
+
+
+def _wm_build_stamp(width, scale, opacity, style):
+    """Скруглённый двухстрочный знак DEVORKS+ / @DEVO_WORKS_BOT.
+
+    style="dark"  — тёмные буквы с белым ореолом (для светлых участков);
+    style="light" — белые буквы с чёрным ореолом (для тёмных участков).
+    Скругление углов — программное: размытие + порог по маске."""
+    Image, ImageChops, ImageDraw, ImageFilter, *_rest = _wm_pil()
+    big = max(14, int(width * scale))
+    small = max(10, int(big * 0.55))
+    fbig, fsmall = _wm_load_font(big), _wm_load_font(small)
+    lines = [(_WM_TITLE, fbig), (_WM_HANDLE, fsmall)]
+
+    probe = ImageDraw.Draw(Image.new("L", (1, 1)))
+    metrics = []
+    for text, font in lines:
+        bb = probe.textbbox((0, 0), text, font=font)
+        metrics.append((text, font, bb[2] - bb[0], bb[3] - bb[1], bb[0], bb[1]))
+
+    gap = max(2, big // 6)
+    tw = max(m[2] for m in metrics)
+    th = sum(m[3] for m in metrics) + gap * (len(metrics) - 1)
+    pad = big
+    W, H = tw + pad * 2, th + pad * 2
+
+    def smooth(m, r):
+        # размытие + порог: углы букв становятся круглыми, края ровными
+        return m.filter(ImageFilter.GaussianBlur(r)).point(
+            lambda v: 0 if v < 118 else 255 if v > 138 else int((v - 118) * 255 / 20))
+
+    def render():
+        m = Image.new("L", (W, H), 0)
+        y = pad
+        for text, font, lw, lh, bx, by in metrics:
+            x = pad + (tw - lw) // 2 - bx
+            lm = Image.new("L", (W, H), 0)
+            ImageDraw.Draw(lm).text((x, y - by), text, font=font, fill=255)
+            fs = getattr(font, "size", big)
+            lm = smooth(lm, max(0.7, fs / 26))
+            m = ImageChops.lighter(m, lm)
+            y += lh + gap
+        return m
+
+    mask = render()
+    img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    off = max(1, big // 20)
+
+    if style == "light":
+        # белые буквы с чёрным ореолом (для тёмных участков фото)
+        glow = mask.filter(ImageFilter.GaussianBlur(off * 1.2))
+        img.alpha_composite(_wm_tint(glow, (0, 0, 0), 210))
+        img.alpha_composite(_wm_tint(mask, (255, 255, 255)))
+    else:
+        # тёмные буквы с белым ореолом (для светлых участков фото)
+        glow = mask.filter(ImageFilter.GaussianBlur(off * 1.2))
+        img.alpha_composite(_wm_tint(glow, (255, 255, 255), 210))
+        img.alpha_composite(_wm_tint(mask, (15, 15, 20)))
+
+    alpha = img.getchannel("A").point(lambda v: int(v * opacity))
+    img.putalpha(alpha)
+    bbox = alpha.getbbox()
+    return img.crop(bbox) if bbox else img
+
+
+def _wm_rotate(stamp, angle):
+    """Поворот знака с расширением холста."""
+    if angle % 360 == 0:
+        return stamp
+    return stamp.rotate(angle, expand=True, resample=_wm_resample())
+
+
+def _wm_apply_tile_adaptive(img, stamps, density):
+    """Сетка знаков по всему фото; вариант и плотность каждой метки
+    подбираются по яркости фона прямо под ней:
+    светлый фон → тёмные буквы, тёмный → белые, серый → метка плотнее."""
+    Image, ImageChops, ImageDraw, ImageFilter, ImageFont, ImageOps, ImageStat = _wm_pil()
+    W, H = img.size
+    gray = img.convert("L")
+    sw, sh = stamps[("dark", 0)].size
+    f = 2.6 - 0.17 * density            # density 1..10  ->  редко .. плотно
+    step_x, step_y = max(8, int(sw * f)), max(8, int(sh * f * 0.95))
+    layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    y, row = -step_y // 2, 0
+    while y < H:
+        x = -step_x + (step_x // 2 if row % 2 else 0)
+        while x < W:
+            box = (max(0, x), max(0, y), min(W, x + sw), min(H, y + sh))
+            if box[0] < box[2] and box[1] < box[3]:
+                lum = ImageStat.Stat(gray.crop(box)).mean[0]
+                variant = "light" if lum < 128 else "dark"
+                mid = 1 - min(1.0, abs(lum - 128) / 70)   # 1 = серый фон
+                level = 2 if mid > 0.66 else 1 if mid > 0.33 else 0
+                _wm_blit(layer, stamps[(variant, level)], x, y)
+            x += step_x
+        y += step_y
+        row += 1
+    return Image.alpha_composite(img, layer)
+
+
+def _wm_watermark_bytes(data):
+    """Накладывает водяной знак на байты изображения. -> (bytes, mime)."""
+    Image, ImageChops, ImageDraw, ImageFilter, ImageFont, ImageOps, ImageStat = _wm_pil()
+    img = Image.open(io.BytesIO(data))
+    fmt = (img.format or "JPEG").upper()
+    img = ImageOps.exif_transpose(img).convert("RGBA")
+    W = img.width
+
+    boost = (1.0, 1.3, 1.6)   # плотнее на средне-серых участках
+    stamps = {}
+    ss = 4 if W <= 2500 else 3 if W <= 4000 else 2   # суперсэмплинг для чёткости
+    for variant in ("dark", "light"):
+        full = _wm_build_stamp(W * ss, _WM_SIZE, 1.0, variant)
+        full = _wm_rotate(full, _WM_ANGLE)             # поворот на большом масштабе
+        full = full.resize((max(1, round(full.width / ss)),
+                            max(1, round(full.height / ss))), _wm_resample())
+        for lvl, k in enumerate(boost):
+            st = full.copy()
+            a = min(1.0, _WM_OPACITY * k)
+            st.putalpha(st.getchannel("A").point(lambda v, a=a: int(v * a)))
+            stamps[(variant, lvl)] = st
+    out = _wm_apply_tile_adaptive(img, stamps, _WM_DENSITY)
+
+    buf = io.BytesIO()
+    if fmt in ("PNG", "WEBP"):
+        out.save(buf, fmt)
+        ctype = "image/" + fmt.lower()
+    else:
+        out.convert("RGB").save(buf, "JPEG", quality=98, subsampling=0)
+        ctype = "image/jpeg"
+    return buf.getvalue(), ctype
+
+
+async def _wm_reply_schedule_photo(message, context, file_id, user=None,
+                                   caption=None, reply_markup=None):
+    """ВОЛНА 23.03: отправка фото расписания с водяным знаком.
+
+    Тоггл смотрим у получателя фото (это его чат): выключен — фото уходит
+    как есть, исходным file_id. Включён — один раз скачиваем, подписываем
+    знаком и отправляем; file_id уже подписанной копии попадает в кэш,
+    поэтому повторные показы мгновенны. Любая ошибка (Pillow недоступен,
+    файл не скачался, Telegram не принял) — честный фолбэк на исходный
+    file_id: расписание должно показаться в любом случае."""
+    if user is None:
+        try:
+            user = get_user(str(message.chat.id))
+        except Exception:
+            user = None
+    if not bool(getattr(user, "watermark_enabled", True)):
+        try:
+            return await message.reply_photo(file_id, caption=caption,
+                                             reply_markup=reply_markup)
+        except Exception:
+            return None
+
+    wm_fid = _WM_CACHE.get(file_id)
+    if wm_fid:
+        try:
+            return await message.reply_photo(wm_fid, caption=caption,
+                                             reply_markup=reply_markup)
+        except Exception:
+            _WM_CACHE.pop(file_id, None)   # не живёт — перекачаем ниже
+
+    try:
+        tg_file = await context.bot.get_file(file_id)
+        buf = bytes(await tg_file.download_as_bytearray())
+        out, _mime = _wm_watermark_bytes(buf)
+        sent = await message.reply_photo(out, caption=caption,
+                                         reply_markup=reply_markup)
+        try:
+            _photo = getattr(sent, "photo", None)
+            new_fid = _photo[-1].file_id if _photo else None
+            if new_fid:
+                _WM_CACHE[file_id] = new_fid
+                while len(_WM_CACHE) > _WM_CACHE_MAX:
+                    _WM_CACHE.popitem(last=False)
+        except Exception:
+            pass
+        return sent
+    except Exception as e:
+        logger.warning(f"watermark: фото не подписано ({e}) — шлю оригинал")
+        try:
+            return await message.reply_photo(file_id, caption=caption,
+                                             reply_markup=reply_markup)
+        except Exception:
+            return None
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# ВОЛНА 23.10.6: ЦВЕТА INLINE-КНОПОК (Bot API 9.4 — поле style).
+# Запрос пользователя: «перекраска кнопок как пользователь захочет, любой
+# цвет; все кнопки отмены — красные, подтверждения — зелёные, это можно
+# отключить». У Telegram всего ТРИ цвета inline-кнопок (плюс обычный вид):
+#   primary (синий), success (зелёный), danger (красный).
+# Реализация:
+#   1) каждый пользователь выбирает СВОЙ цвет всех кнопок
+#      (⚙️ Настройки → «🎨 Цвет кнопок»);
+#   2) автоцвет (по умолчанию ВКЛ): «Отмена/❌» → красный, «✅/Подтвердить»
+#      → зелёный — независимо от базового цвета; отключается там же;
+#   3) стиль доставляется центральным патчем методов Bot/ExtBot: перед
+#      отправкой клавиатура КОПИРУЕТСЯ и кнопкам ставится api_kwargs
+#      {"style": ...} — python-telegram-bot 21.6 честно отправляет
+#      неизвестные ему поля Bot API (проверено на исходниках RequestParameter
+#      → TelegramObject.to_dict: api_kwargs попадают в payload).
+# Старые клиенты Telegram без поддержки цветов показывают обычные кнопки —
+# это поведение самого Telegram, ошибки отправки НЕТ.
+# ═══════════════════════════════════════════════════════════════════════
+_BTN_STYLES_ALLOWED = ("", "primary", "success", "danger")
+_BTN_STYLE_LABELS = {
+    "": "⚪ Обычный",
+    "primary": "🔵 Синий",
+    "success": "🟢 Зелёный",
+    "danger": "🔴 Красный",
+}
+# Автоцвет: паттерны «отмены» (красный) и «подтверждения» (зелёный).
+_BTN_CANCEL_RE = re.compile(
+    r"отмен|не надо|не сейчас|позже|стоп\b|прервать|✖|❌", re.I)
+_BTN_CONFIRM_RE = re.compile(
+    r"подтверд|соглас|принимаю|принять|готово|сохранить|одобрить|"
+    r"опубликовать|отправить|подписал|прочитал|входить|войти\b|✅|✔", re.I)
+
+# Кэш личных настроек цвета (uid -> (style, autocolor, overrides, expires_ts)),
+# чтобы не читать базу на КАЖДУЮ отправку кнопки.
+_BTN_PREF_CACHE = {}
+_BTN_PREF_CACHE_TTL = 300.0
+
+# ВОЛНА 23.10.7: личные правила «цвет конкретной кнопки».
+_BTN_OVR_MAX = 30          # максимум правил на пользователя
+_BTN_OVR_TEXT_MAX = 64     # максимум символов в тексте правила
+
+# ═════════════════════════════════════════════════════════════
+# ВОЛНА 23.10.8–23.10.12: реестр ВСЕХ статических текстов
+# inline-кнопок бота — для панели покраски отдельных
+# кнопок. Собран автоматически из кода (scripts/
+# wave_2310_12_registry.py): чистые строковые литералы
+# InlineKeyboardButton("..."); динамические (f-строки) в
+# реестр не попадают. Каждая кнопка имеет КАТЕГОРИЮ по
+# статусу пользователя — _BTN_PANEL_ADMIN (только админам
+# класса и выше) и _BTN_PANEL_DEV (только разработчику); всё
+# остальное — обычные кнопки, доступные каждому. Панель
+# (_btn_panel_texts_for) показывает их смотря на статус.
+# ═════════════════════════════════════════════════════════════
+_BTN_PANEL_TEXTS = (
+    '+1',
+    '+10',
+    '+5',
+    '-1',
+    '-10',
+    '-5',
+    '1 день',
+    '1 ряд',
+    '1 час',
+    '10 мин',
+    '100 ⭐ - 100 XTR',
+    '1000 ⭐ - 1000 XTR',
+    '12 часов',
+    '15 мин',
+    '2 дня',
+    '2 ряд',
+    '2 часа',
+    '200 ⭐ - 200 XTR',
+    '3 ряд',
+    '3 часа',
+    '30 мин',
+    '4 ряд',
+    '5 мин',
+    '500 ⭐ - 500 XTR',
+    '6 часов',
+    '7 дней',
+    'Вправо ➡️',
+    'Перейти по ссылке',
+    'Пока пусто',
+    '↩️ Сбросить на дефолт',
+    '⏭ Пропустить',
+    '⏭ Пропустить этап',
+    '⏰ Запланировать',
+    '⏰ Изменить время',
+    '⏰ Таймер классу',
+    '⏱ 2 часа',
+    '⏱ Период',
+    '⏳ Срок действия',
+    '⏹ Остановить',
+    '⏹ Хватит',
+    '▶️ Запустить заново',
+    '▶️ Начать с этими настройками',
+    '☁️ Только облако (файлы)',
+    '☁️ Хранилище (канал)',
+    '☆ Убрать',
+    '☰ Ещё',
+    '☰ Меню',
+    '♻️ Восстановить данные бота (каналы)',
+    '♻️ Восстановить из бэкапа',
+    '♾ Навсегда',
+    '⚖️ Правовая информация',
+    '⚙️ Изменить время',
+    '⚙️ Настроить дежурных',
+    '⚙️ Управление кнопками',
+    '⚡ Один раз',
+    '✅ Восстановить',
+    '✅ Готово',
+    '✅ Да, восстановить',
+    '✅ Да, вспомнить всё',
+    '✅ Да, выйти',
+    '✅ Да, удалить',
+    '✅ Да, удалить все',
+    '✅ Да, удалить НАВСЕГДА',
+    '✅ Далее',
+    '✅ Купить кнопку',
+    '✅ Мои родители согласны',
+    '✅ Одобрить',
+    '✅ Опубликовать',
+    '✅ Отклонить жалобу',
+    '✅ Отправить',
+    '✅ Разблокировать пользователя',
+    '✅ Согласен(на) на обработку ПДн',
+    '✅ Создать ссылку',
+    '✅ Сохранить',
+    '✅ Я подписался(ась)',
+    '✅ Я прочитал(а) инструкцию',
+    '✅ Я согласен(на) с условиями',
+    '✉️ Написать участнику',
+    '✉️ Ответить',
+    '✍️ Ввести модель вручную',
+    '✍️ Задать расписание',
+    '✍️ Задать своё расписание',
+    '✍️ Написать',
+    '✍️ Свой срок',
+    '✏️',
+    '✏️ Варианты',
+    '✏️ Ввести значение',
+    '✏️ Вопрос',
+    '✏️ Изменить',
+    '✏️ Изменить ДЗ',
+    '✏️ Изменить названия кнопок',
+    '✏️ Изменить ссылку',
+    '✏️ Подписать',
+    '✏️ Редактировать звонки',
+    '✏️ Текст задания',
+    '✔️ Далее',
+    '✖️ Закрыть',
+    '❌ Выйти из ИИ',
+    '❌ Закрыть',
+    '❌ Назад',
+    '❌ Не подключать',
+    '❌ Не согласен(на)',
+    '❌ Оставить',
+    '❌ Отказаться',
+    '❌ Отклонить',
+    '❌ Отмена',
+    '❌ Согласия нет',
+    '❓ Как это работает',
+    '❓ Сменить секретные вопросы',
+    '❗ Важное',
+    '➕ Добавить важное',
+    '➕ Добавить дату',
+    '➕ Добавить день',
+    '➕ Добавить ДЗ',
+    '➕ Добавить кнопку',
+    '➕ Добавить личную кнопку',
+    '➕ Добавить предмет',
+    '➕ Добавить провайдера',
+    '➕ Добавить ссылку',
+    '➕ Добавить фото/файлы',
+    '➕ Ещё ДЗ',
+    '➕ Ещё один таймер',
+    '➕ Ещё файл',
+    '➕ Задать пароль',
+    '➕ Новый таймер',
+    '➕ Подключить мой канал',
+    '➕ Подключить новый канал',
+    '➕ Подключить свой ИИ',
+    '➕ Свой предмет',
+    '➕ Создать класс',
+    '➕ Создать кнопку',
+    '➡️',
+    '⬅️',
+    '⬅️ В админ-панель',
+    '⬅️ В главное меню',
+    '⬅️ В меню',
+    '⬅️ В меню базы',
+    '⬅️ В панель',
+    '⬅️ В панель разработчика',
+    '⬅️ В чат ИИ',
+    '⬅️ Влево',
+    '⬅️ К базе решений',
+    '⬅️ К выбору дня',
+    '⬅️ К датам',
+    '⬅️ К дням',
+    '⬅️ К звонкам',
+    '⬅️ К каналу подписки',
+    '⬅️ К моим анонимкам',
+    '⬅️ К настройкам ссылки',
+    '⬅️ К панели хранилища',
+    '⬅️ К правилам',
+    '⬅️ К предметам',
+    '⬅️ К провайдерам',
+    '⬅️ К провайдеру',
+    '⬅️ К расписанию',
+    '⬅️ К сервисам',
+    '⬅️ К списку',
+    '⬅️ К списку ДР',
+    '⬅️ К списку заданий',
+    '⬅️ К списку моделей',
+    '⬅️ К списку файлов',
+    '⬅️ К списку цен',
+    '⬅️ Назад',
+    '⬅️ Назад без изменений',
+    '⬅️ Назад в меню',
+    '⬅️ Назад к согласию',
+    '⬅️ Назад к списку',
+    '⬅️ Назад к таймерам',
+    '⬅️ Назад к файлам',
+    '⬅️ Нет',
+    '⬅️ Отмена',
+    '⬅️ Свернуть (к списку)',
+    '⬆️ Вверх',
+    '⬆️ Вверх (поменять с рядом выше)',
+    '⬇️ Вниз',
+    '⬇️ Вниз (поменять с рядом ниже)',
+    '⭐ Выбрать модель',
+    '⭐ Модели',
+    '⭐ Модель по умолчанию',
+    '⭐ Назначить дежурным сегодня',
+    '⭐ Начислить звёзды пользователю',
+    '⭐ Открыть Звезды',
+    '🆕 Управление кнопками',
+    '🇬🇧 English',
+    '🇷🇺 Русский',
+    '🌍 Создать глобальную кнопку',
+    '🌐 Веб-облако (Mini App)',
+    '🌐 Добавить внешнюю ссылку',
+    '🌐 Открыть веб-облако',
+    '🌐 Открыть облако',
+    '🌐 Расписание с сайтов',
+    '🌐 Рассылка всем',
+    '🌙 Открыть «Не беспокоить»',
+    '🌟 Мои кнопки',
+    '🌦 Настройки погоды',
+    '🍅 Таймер учёбы',
+    '🎂 ДР одноклассников',
+    '🎂 Настройки дня рождения',
+    '🎉 Назначить праздник',
+    '🎉 Настройки праздников',
+    '🎉 Установить каникулы',
+    '🏠 В главное меню',
+    '🏷 Назвать по одному',
+    '👀 Посмотреть ДЗ',
+    '👁 Скрыть/показать кнопки',
+    '👤 Личная кнопка (только для меня)',
+    '👤 Управление пользователями',
+    '👤 Управление учениками',
+    '👥 АКТИВНЫЕ УЧЕНИКИ:',
+    '👥 Кнопка для класса (для всех)',
+    '👥 Модели',
+    '👥 Модель для пользователей',
+    '👥 Нет активных учеников',
+    '👥 Пока некому написать',
+    '👥 Сколько в день',
+    '👥 Управление админами',
+    '👨\u200d🏫 Редактировать учителей',
+    '👨\u200d💼 АДМИНИСТРАТОРЫ:',
+    '💎 Купить звезды',
+    '💎 Купить звезды (Telegram Stars)',
+    '💡 Предложить функцию',
+    '💬 Написать пользователю',
+    '💬 Ответить анонимно',
+    '💬 Чат поддержки',
+    '💬 Чат поддержки (входящие)',
+    '💰 Изменить цены функций',
+    '💾 Слить базу в канал сейчас',
+    '💾 Снапшот базы мне в личку',
+    '📄 Изменить содержимое',
+    '📅 7 дней',
+    '📅 Дату задания',
+    '📅 Дни дежурств',
+    '📅 По дням недели',
+    '📅 Редактировать другой день',
+    '📅 Редактировать расписание',
+    '📅 Сегодня/Завтра с сайта: ВКЛ',
+    '📅 Сегодня/Завтра с сайта: ВЫКЛ',
+    '📅 Список с датами',
+    '📅 Текст расписания',
+    '📅 Узнать на 3 дня',
+    '📅 Указать дату и время',
+    '📅 Установить дату рождения',
+    '📆 Отдельный день (по дате)',
+    '📆 Указать дату вручную',
+    '📈 Итоги опросов',
+    '📈 Рост',
+    '📊 Опрос всем',
+    '📊 Опрос классу',
+    '📊 Статистика',
+    '📊 Статистика звезд',
+    '📋 Изменить ряд',
+    '📋 Мои напоминания',
+    '📋 Очередь и участники',
+    '📋 Скопировать общие звонки',
+    '📋 Стандартная',
+    '📋 Таймеры класса',
+    '📍 В конец',
+    '📎 Выбрать файлы',
+    '📎 Заменить файлы',
+    '📘 Изменить предмет',
+    '📚 База решений · настройки',
+    '📚 Быстрое добавление:',
+    '📚 Открыть базу',
+    '📜 Ввести весь список',
+    '📜 Журнал админов',
+    '📜 Политика ПДн',
+    '📜 Правила сообщества',
+    '📜 Праздники оптом (ИИ)',
+    '📝 Изменить название',
+    '📝 Изменить текст',
+    '📝 От моего имени',
+    '📝 Переименовать кнопку',
+    '📝 Редактировать инструкцию',
+    '📝 Текстовая кнопка',
+    '📝 Управление ДЗ',
+    '📢 Канал подписки',
+    '📢 Отправить сообщение классу',
+    '📢 Подписаться на канал',
+    '📤 Загрузить в Сейф',
+    '📤 Отправить в канал самому',
+    '📤 Отправить меню всем сейчас',
+    '📤 Отправить решение',
+    '📤 Отправить файл бэкапа вручную',
+    '📥 Достать',
+    '📥 Положить файл/текст',
+    '📥 Свой график (список/ИИ)',
+    '📦 ZIP',
+    '📦 Бэкап сейчас',
+    '📦 Вспомнить всё из канала',
+    '📦 Мои файлы',
+    '📦 Прислать всё',
+    '📨 Мои анонимные сообщения',
+    '📨 Сообщение классу',
+    '📩 Сообщение всем (без подписи)',
+    '📭 Ничего не нашлось',
+    '📭 Сейф пуст',
+    '📱 Компактная',
+    '📷 Добавить фото звонков',
+    '📷 Заменить фото звонков',
+    '🔀 Выбор ИИ',
+    '🔀 Выбор ИИ разработчика',
+    '🔀 И база, и облако',
+    '🔀 Перемешать заново',
+    '🔁 Каждый день',
+    '🔁 Сменить пароль',
+    '🔄 Ввести дату заново',
+    '🔄 Другая модель',
+    '🔄 Заменить канал',
+    '🔄 Изменить порядок',
+    '🔄 Изменить расположение',
+    '🔄 Изменить тип',
+    '🔄 Переместить кнопки',
+    '🔄 Проверить снова',
+    '🔄 Сменить класс',
+    '🔍 Искать снова',
+    '🔍 Поиск',
+    '🔍 Поиск класса',
+    '🔍 Поиск по файлам',
+    '🔍 Поиск пользователя',
+    '🔍 Проверить сейчас',
+    '🔎',
+    '🔐',
+    '🔐 Сейф (файлы под паролем)',
+    '🔑',
+    '🔑 Веб-пароль',
+    '🔑 Забыл пароль (восстановить)',
+    '🔑 Код класса',
+    '🔑 Показать код класса',
+    '🔑 Свой ИИ (свой ключ)',
+    '🔑 Управление своим ИИ',
+    '🔒 Включить шифрование файлов',
+    '🔒 Пароль (PIN)',
+    '🔓 Разблокироваться',
+    '🔓 Хранить файлы БЕЗ шифра',
+    '🔔 Настройки уведомлений',
+    '🔔 Редактировать звонки',
+    '🔔 Тест уведомления',
+    '🔔 Уведомления классу: ВКЛ',
+    '🔕 Выключить это уведомление',
+    '🔕 Уведомления классу: ВЫКЛ',
+    '🔗 Войти в класс',
+    '🔗 Дать каналы',
+    '🔗 Моё облако',
+    '🔗 Перейти по ссылке',
+    '🔗 Поделиться',
+    '🔗 Поделиться этим файлом',
+    '🔗 Ссылка',
+    '🔢 Лимит',
+    '🔢 Назвать по одному',
+    '🔥 Активность',
+    '🔧 Свой провайдер',
+    '🔧 Свой сервис',
+    '🕐 1 день',
+    '🕐 Дежурные',
+    '🕐 Изменить время',
+    '🕑 3 дня',
+    '🕵️ Анонимно',
+    '🖥️ Широкая',
+    '🗂 Мои активные ссылки',
+    '🗂 Удалить по одному',
+    '🗄 Проверка БД',
+    '🗄️ Только база данных (бэкапы)',
+    '🗑',
+    '🗑 Выключить свой график',
+    '🗑 Да, удалить',
+    '🗑 Да, удалить всё',
+    '🗑 Отключить мой канал',
+    '🗑 Очистить очередь',
+    '🗑 Убрать свой ИИ',
+    '🗑 Убрать своё (вернуть общие)',
+    '🗑 Убрать фото',
+    '🗑 Удалить',
+    '🗑 Удалить дату',
+    '🗑 Удалить день',
+    '🗑 Удалить мои данные',
+    '🗑 Удалить пароль',
+    '🗑 Удалить пост',
+    '🗑 Удалить правило',
+    '🗑 Удалить праздник',
+    '🗑 Удалить провайдера',
+    '🗑 Удалить это сообщение',
+    '🗑️ Очистить все',
+    '🗑️ Удалить',
+    '🗑️ Удалить глобальную кнопку',
+    '🗑️ Удалить ДЗ',
+    '🗑️ Удалить класс',
+    '🗑️ Удалить кнопки',
+    '🗑️ Удалить кнопку',
+    '🗑️ Удалить предмет',
+    '🗑️ Удалить учителя/предмет',
+    '🗓 30 дней',
+    '🙈 Скрыть',
+    '🚨 Пожаловаться',
+    '🚩 Начать с кого-то',
+    '🚪 Выйти из класса',
+    '🚫 Без пересылки',
+    '🚫 ЗАБЛОКИРОВАННЫЕ:',
+    '🚫 Заблокировать автора',
+    '🚫 Заблокировать пользователя',
+    '🚫 Нет заблокированных',
+    '🛡 Политика ПДн',
+    '🤒 Я болел(а)',
+    '🤒 Я заболел(а)',
+    '🤔 Забыл пароль — подтвердить по вопросам',
+    '🤖 В чат ИИ',
+    '🤖 ИИ по списку',
+    '🤖 Модели',
+    '🧠 ИИ-провайдеры',
+    '🧠 К провайдерам',
+    '🧩 Функции',
+    '🧪 Проверить доступ бота',
+    '🧹 Да, сбросить',
+    '🧹 Сбросить статистику Stars',
+)
+# Админские кнопки — добавляются в панель админам класса
+# (и разработчику). Волна 23.10.9, просьба пользователя:
+# «если админ — добавляются ещё кнопки админа».
+_BTN_PANEL_ADMIN = frozenset((
+    '⏰ Запланировать',
+    '⏰ Таймер классу',
+    '⚙️ Настроить дежурных',
+    '⚡ Один раз',
+    '✅ Отправить',
+    '✉️ Написать участнику',
+    '✍️ Задать расписание',
+    '✍️ Задать своё расписание',
+    '✏️ Варианты',
+    '✏️ Вопрос',
+    '✏️ Изменить ДЗ',
+    '✏️ Текст задания',
+    '✔️ Далее',
+    '✖️ Закрыть',
+    '➕ Добавить важное',
+    '➕ Добавить дату',
+    '➕ Добавить день',
+    '➕ Добавить ДЗ',
+    '➕ Добавить предмет',
+    '➕ Добавить ссылку',
+    '➕ Добавить фото/файлы',
+    '➕ Ещё ДЗ',
+    '➕ Новый таймер',
+    '⬅️ В админ-панель',
+    '⬅️ В меню',
+    '⬅️ К выбору дня',
+    '⬅️ К датам',
+    '⬅️ К дням',
+    '⬅️ К звонкам',
+    '⬅️ К предметам',
+    '⬅️ К расписанию',
+    '⬅️ К списку заданий',
+    '⬅️ Нет',
+    '⭐ Назначить дежурным сегодня',
+    '🆕 Управление кнопками',
+    '🌐 Расписание с сайтов',
+    '🎉 Установить каникулы',
+    '👀 Посмотреть ДЗ',
+    '👤 Личная кнопка (только для меня)',
+    '👤 Управление учениками',
+    '👥 АКТИВНЫЕ УЧЕНИКИ:',
+    '👥 Кнопка для класса (для всех)',
+    '👥 Нет активных учеников',
+    '👥 Пока некому написать',
+    '👥 Сколько в день',
+    '👥 Управление админами',
+    '👨\u200d🏫 Редактировать учителей',
+    '👨\u200d💼 АДМИНИСТРАТОРЫ:',
+    '📅 Дату задания',
+    '📅 Дни дежурств',
+    '📅 По дням недели',
+    '📅 Редактировать другой день',
+    '📅 Редактировать расписание',
+    '📅 Сегодня/Завтра с сайта: ВКЛ',
+    '📅 Сегодня/Завтра с сайта: ВЫКЛ',
+    '📅 Список с датами',
+    '📅 Текст расписания',
+    '📆 Отдельный день (по дате)',
+    '📆 Указать дату вручную',
+    '📈 Итоги опросов',
+    '📊 Опрос классу',
+    '📋 Очередь и участники',
+    '📋 Скопировать общие звонки',
+    '📋 Таймеры класса',
+    '📚 База решений · настройки',
+    '📚 Быстрое добавление:',
+    '📜 Ввести весь список',
+    '📝 Управление ДЗ',
+    '📢 Отправить сообщение классу',
+    '📥 Свой график (список/ИИ)',
+    '📦 Прислать всё',
+    '📷 Добавить фото звонков',
+    '📷 Заменить фото звонков',
+    '🔀 Перемешать заново',
+    '🔁 Каждый день',
+    '🔍 Искать снова',
+    '🔍 Поиск класса',
+    '🔍 Проверить сейчас',
+    '🔑 Показать код класса',
+    '🔔 Редактировать звонки',
+    '🔔 Тест уведомления',
+    '🔔 Уведомления классу: ВКЛ',
+    '🔕 Уведомления классу: ВЫКЛ',
+    '🗑 Выключить свой график',
+    '🗑 Да, удалить',
+    '🗑 Убрать своё (вернуть общие)',
+    '🗑 Убрать фото',
+    '🗑 Удалить дату',
+    '🗑 Удалить день',
+    '🗑 Удалить пост',
+    '🗑️ Удалить',
+    '🗑️ Удалить ДЗ',
+    '🗑️ Удалить кнопки',
+    '🗑️ Удалить учителя/предмет',
+    '🚩 Начать с кого-то',
+    '🚫 ЗАБЛОКИРОВАННЫЕ:',
+    '🚫 Нет заблокированных',
+    '🤖 ИИ по списку',
+))
+# Кнопки разработчика — только в панель DEVELOPER_ID.
+# Волна 23.10.9: «если разработчик — все кнопки».
+_BTN_PANEL_DEV = frozenset((
+    '+1',
+    '+10',
+    '+5',
+    '-1',
+    '-10',
+    '-5',
+    '↩️ Сбросить на дефолт',
+    '⏱ 2 часа',
+    '⏱ Период',
+    '☁️ Только облако (файлы)',
+    '☁️ Хранилище (канал)',
+    '♻️ Восстановить из бэкапа',
+    '♾ Навсегда',
+    '✅ Восстановить',
+    '✅ Да, восстановить',
+    '✅ Да, вспомнить всё',
+    '✅ Отклонить жалобу',
+    '✅ Разблокировать пользователя',
+    '✍️ Свой срок',
+    '✏️ Ввести значение',
+    '✏️ Изменить ссылку',
+    '❌ Назад',
+    '❌ Не подключать',
+    '➕ Добавить провайдера',
+    '➕ Подключить новый канал',
+    '⬅️ В панель',
+    '⬅️ В панель разработчика',
+    '⬅️ К каналу подписки',
+    '⬅️ К панели хранилища',
+    '⬅️ К провайдерам',
+    '⬅️ К провайдеру',
+    '⬅️ К списку цен',
+    '⬅️ Назад без изменений',
+    '⬅️ Отмена',
+    '⭐ Выбрать модель',
+    '⭐ Модели',
+    '⭐ Модель по умолчанию',
+    '⭐ Начислить звёзды пользователю',
+    '🌍 Создать глобальную кнопку',
+    '🌐 Веб-облако (Mini App)',
+    '🌐 Рассылка всем',
+    '🎉 Назначить праздник',
+    '👤 Управление пользователями',
+    '👥 Модели',
+    '👥 Модель для пользователей',
+    '💬 Написать пользователю',
+    '💬 Чат поддержки (входящие)',
+    '💰 Изменить цены функций',
+    '💾 Слить базу в канал сейчас',
+    '💾 Снапшот базы мне в личку',
+    '📅 7 дней',
+    '📈 Рост',
+    '📊 Опрос всем',
+    '📊 Статистика',
+    '📜 Журнал админов',
+    '📜 Праздники оптом (ИИ)',
+    '📝 Редактировать инструкцию',
+    '📢 Канал подписки',
+    '📤 Загрузить в Сейф',
+    '📤 Отправить меню всем сейчас',
+    '📤 Отправить файл бэкапа вручную',
+    '📦 ZIP',
+    '📦 Бэкап сейчас',
+    '📦 Вспомнить всё из канала',
+    '📨 Сообщение классу',
+    '📩 Сообщение всем (без подписи)',
+    '🔀 И база, и облако',
+    '🔄 Проверить снова',
+    '🔍 Поиск пользователя',
+    '🔐',
+    '🔐 Сейф (файлы под паролем)',
+    '🔗 Дать каналы',
+    '🔥 Активность',
+    '🔧 Свой провайдер',
+    '🕐 1 день',
+    '🕑 3 дня',
+    '🗄 Проверка БД',
+    '🗄️ Только база данных (бэкапы)',
+    '🗑 Удалить праздник',
+    '🗑 Удалить провайдера',
+    '🗑️ Удалить глобальную кнопку',
+    '🗑️ Удалить класс',
+    '🗓 30 дней',
+    '🚫 Заблокировать автора',
+    '🚫 Заблокировать пользователя',
+    '🧠 ИИ-провайдеры',
+    '🧠 К провайдерам',
+    '🧩 Функции',
+    '🧪 Проверить доступ бота',
+    '🧹 Да, сбросить',
+    '🧹 Сбросить статистику Stars',
+))
+
+
+def _btn_ovr_sanitize(ovr):
+    """Санитизация правил цвета кнопок: {текст -> стиль}.
+
+    Гарантирует: dict, ключи — непустые строки до _BTN_OVR_TEXT_MAX,
+    значения — только допустимые стили ("" = обычный вид), потолок
+    _BTN_OVR_MAX записей. Битые значения молча выбрасываются.
+    """
+    if not isinstance(ovr, dict):
+        return {}
+    out = {}
+    try:
+        for k, v in ovr.items():
+            try:
+                kk = str(k or "").strip()
+                if not kk or len(kk) > _BTN_OVR_TEXT_MAX:
+                    continue
+                vv = str(v or "")
+                if vv not in _BTN_STYLES_ALLOWED:
+                    vv = ""
+                out[kk] = vv
+                if len(out) >= _BTN_OVR_MAX:
+                    break
+            except Exception:
+                continue
+    except Exception:
+        return {}
+    return out
+
+
+def _btn_ovr_key(text):
+    """Нормализованный ключ правила: без пробелов по краям, нижний регистр."""
+    try:
+        return str(text or "").strip().casefold()
+    except Exception:
+        return ""
+
+
+def _btn_ovr_lookup(btn_text, overrides):
+    """Стиль личного правила для КОНКРЕТНОЙ кнопки (None — правила нет).
+
+    Совпадение: 1) точное (без учёта регистра/пробелов); 2) иначе фраза
+    правила содержится в тексте кнопки (пользователь ввёл «Отмена» для
+    кнопки «❌ Отмена»). При нескольких вхождениях побеждает САМОЕ ДЛИННОЕ
+    правило. Возвращает "" (обычный вид) тоже как законное значение —
+    оно перекрывает и автоцвет, и базовый цвет.
+    """
+    if not isinstance(overrides, dict) or not overrides:
+        return None
+    t = _btn_ovr_key(btn_text)
+    if not t:
+        return None
+    for k, v in overrides.items():
+        if _btn_ovr_key(k) == t:
+            return v
+    best_key, best_val = None, None
+    for k, v in overrides.items():
+        kk = _btn_ovr_key(k)
+        if kk and kk in t:
+            if best_key is None or len(kk) > len(_btn_ovr_key(best_key)):
+                best_key, best_val = k, v
+    return best_val
+
+
+def _btn_auto_style(text):
+    """Автоцвет одной кнопки по её тексту: danger/success/None."""
+    try:
+        t = str(text or "")
+        if not t:
+            return None
+        if _BTN_CANCEL_RE.search(t):
+            return "danger"
+        if _BTN_CONFIRM_RE.search(t):
+            return "success"
+    except Exception:
+        pass
+    return None
+
+
+def _btn_clone_styled(btn, style):
+    """Копия InlineKeyboardButton с полем style (api_kwargs, Bot API 9.4).
+
+    Копия, а не мутация: объекты кнопок бывают общими (модульные константы,
+    кэши) — стилем одного пользователя нельзя портить клавиатуру другому.
+    """
+    kwargs = {"text": btn.text}
+    for attr in ("url", "callback_data", "web_app", "login_url",
+                 "switch_inline_query", "switch_inline_query_current_chat",
+                 "callback_game", "pay"):
+        v = getattr(btn, attr, None)
+        if v is not None:
+            kwargs[attr] = v
+    if style:
+        kwargs["api_kwargs"] = {"style": str(style)}
+    try:
+        return InlineKeyboardButton(**kwargs)
+    except Exception:
+        return btn
+
+
+def _kb_style_copy(kb, base_style, autocolor, overrides=None):
+    """Клавиатура с цветами: копия всех строк/кнопок + style где нужно.
+
+    Приоритет цвета кнопки (ВОЛНА 23.10.7):
+      1) личное правило «цвет конкретной кнопки» (overrides) — главнее всех;
+      2) автоцвет (отмена → красный, подтверждение → зелёный);
+      3) базовый цвет пользователя.
+    """
+    try:
+        base_style = str(base_style or "")
+        if base_style not in _BTN_STYLES_ALLOWED:
+            base_style = ""
+        overrides = overrides if isinstance(overrides, dict) else None
+        rows = []
+        for row in (kb.inline_keyboard or []):
+            new_row = []
+            for btn in (row or []):
+                # Кнопки оплаты/игр не красим — у них свой системный вид.
+                if getattr(btn, "pay", None) or getattr(btn, "callback_game", None):
+                    new_row.append(btn)
+                    continue
+                style = base_style
+                if autocolor:
+                    auto = _btn_auto_style(btn.text)
+                    if auto:
+                        style = auto
+                ovr = _btn_ovr_lookup(btn.text, overrides)
+                if ovr is not None:
+                    style = ovr
+                new_row.append(_btn_clone_styled(btn, style))
+            rows.append(new_row)
+        return InlineKeyboardMarkup(rows)
+    except Exception:
+        return kb
+
+
+def _btn_prefs_for_chat(chat_id):
+    """(base_style, autocolor, overrides) получателя по chat_id (личка → профиль)."""
+    try:
+        cid = getattr(chat_id, "id", chat_id)
+        cid = int(cid)
+        if cid <= 0:
+            return ("", False, None)  # группы/каналы — не стилизуем
+        uid = str(cid)
+        now = time.time()
+        hit = _BTN_PREF_CACHE.get(uid)
+        if hit and hit[3] > now:
+            return (hit[0], hit[1], hit[2])
+        user = get_user(uid)
+        style = str(getattr(user, "button_style", "") or "")
+        if style not in _BTN_STYLES_ALLOWED:
+            style = ""
+        auto = bool(getattr(user, "button_autocolor", True)) if user else True
+        ovr = _btn_ovr_sanitize(
+            getattr(user, "button_overrides", None)) if user else {}
+        _BTN_PREF_CACHE[uid] = (style, auto, ovr, now + _BTN_PREF_CACHE_TTL)
+        if len(_BTN_PREF_CACHE) > 2000:
+            for k in list(_BTN_PREF_CACHE)[:1000]:
+                _BTN_PREF_CACHE.pop(k, None)
+        return (style, auto, ovr)
+    except Exception:
+        return ("", False, None)
+
+
+def _kb_style_for_chat(reply_markup, chat_id):
+    """Стилизовать клавиатуру под получателя. Не клавиатура — как есть."""
+    if not isinstance(reply_markup, InlineKeyboardMarkup):
+        return reply_markup
+    try:
+        base, autocolor, ovr = _btn_prefs_for_chat(chat_id)
+        if not base and not autocolor and not ovr:
+            return reply_markup   # пользователю цвета не нужны — экономим копию
+        return _kb_style_copy(reply_markup, base, autocolor, ovr)
+    except Exception:
+        return reply_markup
+
+
+def _btn_wrap_bot_method(name, orig, sig):
+    """Обёртка метода Bot: reply_markup (kwargs) раскрашивается под чат.
+
+    Любая ошибка стилизации глушится — отправка НЕ должна ломаться."""
+    @wraps(orig)
+    async def _styled_send(self, *args, **kwargs):
+        try:
+            rm = kwargs.get("reply_markup")
+            if isinstance(rm, InlineKeyboardMarkup):
+                bound = sig.bind(self, *args, **kwargs)
+                styled = _kb_style_for_chat(rm, bound.arguments.get("chat_id"))
+                if styled is not rm:
+                    kwargs = dict(kwargs)
+                    kwargs["reply_markup"] = styled
+        except Exception:
+            pass
+        return await orig(self, *args, **kwargs)
+    return _styled_send
+
+
+def _install_button_style_patches():
+    """Патчит telegram.Bot И telegram.ext.ExtBot (ExtBot переопределяет ВСЕ
+    send_*/edit_* методы — патч только Bot не сработал бы). Возвращает число
+    пропатченных методов; 0 — фича выключена (ничего не сломано)."""
+    import inspect as _inspect
+    try:
+        from telegram.ext import ExtBot as _ExtBot
+    except Exception:
+        _ExtBot = None
+    classes = [telegram.Bot] + ([_ExtBot] if _ExtBot is not None else [])
+    patched = 0
+    for cls in classes:
+        for name, fn in list(vars(cls).items()):
+            if name.startswith("_"):
+                continue
+            if not _inspect.iscoroutinefunction(fn):
+                continue
+            try:
+                sig = _inspect.signature(fn)
+            except (TypeError, ValueError):
+                continue
+            params = sig.parameters
+            if "reply_markup" not in params or "chat_id" not in params:
+                continue
+            try:
+                setattr(cls, name, _btn_wrap_bot_method(name, fn, sig))
+                patched += 1
+            except Exception as e:
+                logger.warning(f"btn style patch {cls.__name__}.{name}: {e}")
+    logger.info(f"ВОЛНА 23.10.6: цвета кнопок (Bot API 9.4) — пропатчено "
+                f"методов отправки: {patched}")
+    return patched
+
+
 def _schedule_day_view(class_obj, day_name):
     """ВОЛНА 22.4: возвращает представление расписания на день.
 
@@ -5221,14 +6926,25 @@ def _iter_assignment_media(homework_dict):
     """ВОЛНА 22.4: собирает непустые списки 'media' из пунктов ДЗ —
     чтобы кнопки-просмотры («📝 Домашнее задание», «📅 Сегодня»,
     «📅 Завтра») дослали файлы текстом списка. Пункты без вложений
-    молча пропускаются; мусорные записи не роняют вывод."""
+    молча пропускаются; мусорные записи не роняют вывод.
+    ВОЛНА 23.10.6: теперь отдаёт (media, subject, assignment) — вызывающим
+    нужны предмет и дата добавления для сборки фото в PDF-файл."""
     for subject, assignments in (homework_dict or {}).items():
         for a in (assignments or []):
             if not isinstance(a, dict):
                 continue
             m = a.get('media')
             if isinstance(m, list) and m:
-                yield m
+                yield m, subject, a
+
+
+def _hw_added_date(a):
+    """ВОЛНА 23.10.6: дата ДОБАВЛЕНИЯ пункта ДЗ (для имени PDF-файла).
+    Формат «ГГГГ-ММ-ДД»; если added_at нет — берём дату задания."""
+    s = str((a or {}).get('added_at') or '')[:10]
+    if len(s) == 10:
+        return s
+    return str((a or {}).get('date') or '')[:10]
 
 
 def _web_schedule_section(class_obj):
@@ -5285,6 +7001,21 @@ async def _send_day_schedule_screen(update, context, class_obj, day_name,
     файл (фото/PDF) по file_id последней отправки."""
     kind, payload = _schedule_day_view(class_obj, day_name)
     header = f"📅 Расписание на {when_word} ({day_name}, {when_str})"
+    # ВОЛНА 23.10.10: отдельный день ПО ДАТЕ главнее дня недели («нельзя
+    # установить отдельное фото или расписание на отдельный день — нужно
+    # добавить»): текст или картинка заменяют день недели в эту дату.
+    try:
+        _sd_all = getattr(class_obj, 'schedule_dates', None)
+        if isinstance(_sd_all, dict):
+            _sd_ovr = _sd_all.get(when_str)
+            if _schdate_value_ok(_sd_ovr):
+                if isinstance(_sd_ovr, dict):
+                    kind, payload = "image", _sd_ovr
+                else:
+                    kind, payload = "text", str(_sd_ovr)
+                header += " — 📌 отдельный день"
+    except Exception:
+        pass
     hw_text = format_homework(homework, when_word).replace("**", "") if homework else ""
     # ВОЛНА 22.73: секция «Расписание с сайтов» (текст + файл).
     _web_section, _web_file = _web_schedule_section(class_obj)
@@ -5295,7 +7026,10 @@ async def _send_day_schedule_screen(update, context, class_obj, day_name,
             cap += f"\n{payload['caption']}"
         try:
             # Лимит подписи Telegram — 1024 символа.
-            await update.message.reply_photo(payload["image"], caption=cap[:1024])
+            # ВОЛНА 23.03: фото расписания уходит с водяным знаком (если
+            # он не выключен в ⚙️ Настройки → «💧 Водяной знак»).
+            await _wm_reply_schedule_photo(
+                update.message, context, payload["image"], caption=cap[:1024])
         except Exception as e:
             logger.warning(f"schedule image send не прошёл ({day_name}): {e}")
             await update.message.reply_text(
@@ -5336,8 +7070,16 @@ async def _send_day_schedule_screen(update, context, class_obj, day_name,
             _wcap += f" — обновлено {_web_file['ts']}"
         try:
             if str(_web_file.get("file_kind") or "") == "photo":
-                await update.message.reply_photo(
-                    _web_file["file_id"], caption=_wcap[:1024])
+                # ВОЛНА 23.03: фото расписания с сайтов — тоже со знаком.
+                # ВОЛНА 23.10.6: wm=True — файл_id УЖЕ подписан при первой
+                # отправке: шлём как есть, второй знак не нужен.
+                if _web_file.get("wm"):
+                    await update.message.reply_photo(
+                        _web_file["file_id"], caption=_wcap[:1024])
+                else:
+                    await _wm_reply_schedule_photo(
+                        update.message, context, _web_file["file_id"],
+                        caption=_wcap[:1024])
             else:
                 await update.message.reply_document(
                     _web_file["file_id"], caption=_wcap[:1024])
@@ -5345,8 +7087,11 @@ async def _send_day_schedule_screen(update, context, class_obj, day_name,
             logger.warning(f"schedule_web file re-send (day screen): {e}")
 
     # Вложения ДЗ — в обоих вариантах (22.78: с анимацией загрузки).
-    for _m_list in _iter_assignment_media(homework):
-        await _hw_media_with_progress(context, update.effective_chat.id, _m_list)
+    # ВОЛНА 23.10.6: >2 фото пункта → один PDF-файл «Предмет_дата.pdf».
+    for _m_list, _subj, _asg in _iter_assignment_media(homework):
+        await _hw_media_with_progress(
+            context, update.effective_chat.id, _m_list,
+            subject=_subj, hw_date=_hw_added_date(_asg))
 
 
 def check_class_limit(class_code):
@@ -5362,6 +7107,9 @@ def check_class_limit(class_code):
 def get_admin_panel_keyboard():
     keyboard = [
         [InlineKeyboardButton("📢 Отправить сообщение классу", callback_data="send_class_message")],
+        # ВОЛНА 23.10.7: личное сообщение КОНКРЕТНОМУ участнику класса —
+        # админ выбирает, кому написать, бот доставляет адресату лично.
+        [InlineKeyboardButton("✉️ Написать участнику", callback_data="adm_msg_menu")],
         # ВОЛНА 22.41: таймер сообщений классу (один раз / каждый день /
         # по дням недели; также ставится через 🪄 AI Agent).
         [InlineKeyboardButton("⏰ Таймер классу", callback_data="ctm_open")],
@@ -5462,6 +7210,9 @@ def get_schedule_edit_keyboard():
     keyboard = []
     for i, day in enumerate(days):
         keyboard.append([InlineKeyboardButton(day, callback_data=f"edit_schedule_day_{i}")])
+    # ВОЛНА 23.10.10: отдельное расписание/фото на КОНКРЕТНУЮ дату.
+    keyboard.append([InlineKeyboardButton("📆 Отдельный день (по дате)",
+                                          callback_data="schdate_menu")])
     keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_to_admin")])
     return InlineKeyboardMarkup(keyboard)
 
@@ -5612,6 +7363,8 @@ def get_classes_keyboard(classes, action_prefix):
 def get_homework_management_keyboard(class_obj):
     keyboard = [
         [InlineKeyboardButton("➕ Добавить ДЗ", callback_data="add_homework")],
+        # ВОЛНА 23.10.6: правка добавленного ДЗ (текст/дата/вложения).
+        [InlineKeyboardButton("✏️ Изменить ДЗ", callback_data="edit_homework")],
         [InlineKeyboardButton("🗑️ Удалить ДЗ", callback_data="delete_homework")],
         [InlineKeyboardButton("👀 Посмотреть ДЗ", callback_data="view_homework")]
     ]
@@ -5928,7 +7681,14 @@ def get_main_menu_keyboard(user):
         # клавиатуры убери — файлы всегда должны быть в сейфе облака».
         # Маршрут остаётся: голос/автоматизация («сейф») открывают Сейф напрямую,
         # а в главном меню он теперь живёт внутри ☁️ Облако.
-        "⭐ Звезды", "🤖 DEVORKS+ai",
+        # ВОЛНА 23.01: «⭐ Звезды» ПЕРЕЕХАЛА с главного экрана в ⚙️ Настройки —
+        # по прямому требованию пользователя («кнопку звёзды которая сейчас на
+        # главном экране ... перенести в настройки»). В настройках она живёт с
+        # 23.00 («⭐ Звезды · баланс: N ⭐» → open_stars). Маршрут остаётся
+        # (паттерн «🔐 Сейф», ВОЛНА 9): голос («звезды»/«баланс») и старые
+        # клавиатуры открывают ТО ЖЕ stars_menu; ALL_MAIN_MENU_BUTTONS,
+        # QUICK_COMMANDS и ветка handle_main_menu не тронуты.
+        "🤖 DEVORKS+ai",
         "🪄 AI Agent",
         "🌦 Погода",
         # ПУНКТ 3: чат поддержки прямо из главного меню (всегда доступен).
@@ -6289,11 +8049,27 @@ def get_settings_keyboard(user=None):
         [InlineKeyboardButton(
             f"🔔 Уведомления о решениях: {'вкл' if getattr(user, 'sol_notify', True) else 'выкл'}",
             callback_data="sol_toggle_notify")],
+        # ВОЛНА 23.03: водяной знак на фото расписания — можно убрать.
+        [InlineKeyboardButton(
+            f"💧 Водяной знак: {'вкл' if getattr(user, 'watermark_enabled', True) else 'выкл'}",
+            callback_data="toggle_watermark")],
+        # ВОЛНА 23.10.6: цвета inline-кнопок (личная настройка, Bot API 9.4).
+        [InlineKeyboardButton(
+            "🎨 Цвет кнопок: " + _BTN_STYLE_LABELS.get(
+                str(getattr(user, 'button_style', '') or ''), "⚪ Обычный"),
+            callback_data="btn_style_menu")],
         # ВОЛНА 22.73: приватность в «📊 Статистика звезд» — топ трат.
         # ВКЛ = пользователя НЕ видно в топе по тратам.
         [InlineKeyboardButton(
             f"🚫 Скрывать меня в топе трат: {'вкл' if getattr(user, 'hide_spend_stats', False) else 'выкл'}",
             callback_data="toggle_spend_privacy")],
+        # ВОЛНА 23.00: «⭐ Звезды» доступна и из настроек (помимо главного
+        # меню, как «💬 Чат поддержки»). На кнопке сразу виден баланс.
+        [InlineKeyboardButton(
+            ("⭐ Звезды · баланс: "
+             f"{int(getattr(user, 'stars_balance', 0) or 0)} ⭐")
+            if user is not None else "⭐ Звезды",
+            callback_data="open_stars")],
         [InlineKeyboardButton("🌟 Мои кнопки", callback_data="personal_buttons")],
         [InlineKeyboardButton("💡 Предложить функцию", callback_data="suggest_function")],
         # ПУНКТ 3: чат поддержки доступен из настроек (помимо главного меню).
@@ -6447,6 +8223,26 @@ def get_developer_keyboard():
         [InlineKeyboardButton("📜 Журнал админов", callback_data="dev_adminlog")],
         # НОВОЕ: хранилище (приватный канал) — облако, авто-бэкапы, восстановление.
         [InlineKeyboardButton("☁️ Хранилище (канал)", callback_data="dev_storage")],
+        # ВОЛНА 23.04: канал подписки (ссылка меняется из панели).
+        [InlineKeyboardButton("📢 Канал подписки", callback_data="dev_channel")],
+        # ВОЛНА 23.10.10: «много ии» — подключаемые ИИ-провайдеры
+        # (OpenAI/Anthropic/Gemini/…): ключи, модель по умолчанию, веб-поиск.
+        [InlineKeyboardButton("🧠 ИИ-провайдеры", callback_data="dev_ai_menu")],
+        # ВОЛНА 23.10: главный тоггл обязательной подписки — одним нажатием
+        # включает/выключает требование подписки на канал у ВСЕХ пользователей.
+        [InlineKeyboardButton(
+            "🚪 Обязательная подписка: "
+            + ("ВКЛ" if is_dev_sub_gate_enabled() else "ВЫКЛ"),
+            callback_data="dev_subgate")],
+        # ВОЛНА 23.06: тихое восстановление после рестарта (без сообщений).
+        [InlineKeyboardButton(
+            "♻️ Восстановление: " + ("ВКЛ" if is_dev_autologin_enabled() else "ВЫКЛ"),
+            callback_data="dev_autologin")],
+        # ВОЛНА 23.05: повторная проверка подписки (свип + напоминания).
+        [InlineKeyboardButton(
+            "🔁 Проверка подписки: "
+            + ("ВКЛ" if is_dev_sub_recheck_enabled() else "ВЫКЛ"),
+            callback_data="dev_subrecheck")],
         [InlineKeyboardButton("❌ Отмена", callback_data="cancel_action")]
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -6686,6 +8482,336 @@ async def _ai_thinking_animation(context: ContextTypes.DEFAULT_TYPE, chat_id: in
         logger.warning(f"AI thinking animation failed: {e}")
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# ВОЛНА 23.10.11: АНИМАЦИИ ИИ КАК В РЕФЕРЕНСЕ — «ЖИВЫЕ ЧЕРНОВИКИ».
+# Bot API 9.3+ даёт метод sendMessageDraft: бот стримит ответ прямо в
+# чат пользователя — «💭 Думаю...», затем текст набирается на глазах
+# (как в ChatGPT), при работе инструментов — статусы «🔍 Ищу в
+# интернете...» / «📖 Читаю страницу...». Финал — обычное sendMessage
+# (черновик исчезает сам, дольше 30 секунд он не живёт). Метода нет
+# (старый сервер Bot API / локальный сервер без поддержки) — работает
+# прежняя анимация сообщением с крутилкой, бот не ломается.
+# ═══════════════════════════════════════════════════════════════════════
+
+# Кастомное эмодзи для статуса (как CUSTOM_EMOJI_ID в референсе).
+# Рендерится, если у владельца бота есть Telegram Premium; иначе Telegram
+# показывает обычное эмодзи (при отказе повторяем запрос без entities).
+_AI_DRAFT_EMOJI_ID = os.environ.get(
+    "AI_DRAFT_EMOJI_ID", "5395546579631388253") or ""
+
+# Кэш доступности метода: "ok" — None (не проверяли) / True / False;
+# "emoji" — работает ли кастомное эмодзи (после первого отказа шлём
+# черновики без entities). Живёт до рестарта процесса.
+_AI_DRAFTS_STATE = {"ok": None, "emoji": True}
+
+# ВОЛНА 23.10.11: все фразы выхода из ИИ (главное меню). Выход работает
+# ВСЕГДА — даже если режим уже сброшен: после рестарта бота user_data
+# теряется, а кнопка «❌ Выход из ai» остаётся в чате, и раньше такой
+# клик улетал в автоматизацию («выйти из ai не работает»).
+_AI_EXIT_TRIGGERS_ALL = {
+    "❌ выход из ai", "выход из ai", "выйти из ai",
+    "❌ выход из ии", "выход из ии", "выйти из ии",
+    "выйти", "выход", "exit", "/exit", "stop", "/stop",
+    "стоп", "❌ стоп",
+}
+
+
+# ═══ ВОЛНА 23.10.12: ОСТАНОВКА ГЕНЕРАЦИИ И ВЫХОД «ПОКА ИИ ДУМАЕТ» ═══
+# Жалоба: «если выйти из ИИ, пока он думает, анимация пропадает, а у поля
+# ввода (рядом с ГС и кружочками) так и висят «три точки» — будто он
+# думает, но в чате ничего нет». Причина: выход сбрасывал только флаг
+# ai_mode, а корутина генерации ПРОДОЛЖАЛА стримить черновик — Telegram
+# честно показывал «печатает». Теперь каждая генерация — tracked-task:
+# «⏹ Остановить», «❌ Выйти из ИИ», любая кнопка бота, текст «стоп» и
+# таймауты РЕАЛЬНО отменяют задачу, а следом отправляется обычное
+# сообщение — по Bot API именно sendMessage гасит черновик и индикатор.
+_AI_IDLE_TIMEOUT = max(
+    60, int(os.environ.get("AI_IDLE_TIMEOUT_MIN", "15") or 15)) * 60
+_AI_GEN_HARD_TIMEOUT = 240.0     # страховка: генерация не живёт дольше
+_AI_ACTIVE = {}                  # uid -> {"task","chat_id","ts",артефакты}
+_AI_LAST_ACT = {}                # uid -> ts последней активности в ИИ
+_AI_ALBUM_BATCHES = {}           # (uid, media_group_id) -> {"fids","caps"}
+_AI_MEDIA_INFLIGHT = {}          # uid -> {"file_ids","more","caption"}
+_AI_MAX_PHOTOS = 5               # фото за один запрос к ИИ
+
+
+def _ai_cancel_active(user_id):
+    """Отменить ТЕКУЩУЮ генерацию ИИ пользователя (если есть).
+    Возвращает True, если что-то отменяли. Черновик и «три точки» гасит
+    отправленное СЛЕДОМ обычное сообщение (Bot API: черновик исчезает
+    при sendMessage) — вызывающий код обязан что-то отправить после
+    отмены (меню, «остановлено» и т. п.)."""
+    entry = _AI_ACTIVE.pop(str(user_id), None)
+    if not entry:
+        return False
+    for _k in ("anim_task", "task"):
+        _t = entry.get(_k)
+        if _t is not None and not _t.done():
+            try:
+                _t.cancel()
+            except Exception:
+                pass
+    _dui = entry.get("draft_ui")
+    if _dui is not None:
+        try:
+            _dui.enabled = False   # стрим больше не постит черновики
+        except Exception:
+            pass
+    return True
+
+
+async def _ai_generation_guard(update, context, user_id, chat_id):
+    """Обёртка фоновой генерации: ловит отмену (⏹ / выход / таймаут) и
+    молча подчищает артефакты — сообщение об остановке уже отправил
+    инициатор отмены, «ошибок ИИ» после остановки быть не должно."""
+    _task = asyncio.current_task()
+    try:
+        await _ai_generation_body(update, context)
+    except asyncio.CancelledError:
+        return
+    except Exception as e:
+        logger.error(f"AI generation failed: {e}")
+        try:
+            await context.bot.send_message(
+                chat_id,
+                "⚠️ ИИ не ответил (внутренняя ошибка). Попробуйте ещё раз.")
+        except Exception:
+            pass
+    finally:
+        _cur = _AI_ACTIVE.get(user_id)
+        if _cur is not None and _cur.get("task") is _task:
+            _AI_ACTIVE.pop(user_id, None)
+
+
+async def handle_ai_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 23.10.12: генерация ИИ — ФОНОВАЯ задача с честной
+    остановкой. Пока ИИ думает, можно нажать «⏹ Остановить» (в том
+    числе РОДНУЮ кнопку в самом черновике — can_stop), «❌ Выйти из
+    ИИ» или любую кнопку бота — генерация отменяется, черновик гасится
+    сообщением. Второй вопрос подряд не запускает параллельную
+    генерацию (раньше два вопроса давали два перемешанных ответа и
+    двойной расход токенов)."""
+    user_id = str(update.effective_user.id)
+    chat_id = update.effective_chat.id
+    _AI_LAST_ACT[user_id] = time.time()
+    _act = _AI_ACTIVE.get(user_id)
+    if _act is not None and not _act.get("task").done():
+        try:
+            await update.message.reply_text(
+                "⏳ ИИ ещё отвечает. Подождите немного, нажмите «⏹ "
+                "Остановить» или «❌ Выйти из ИИ».")
+        except Exception:
+            pass
+        return MAIN_MENU
+    # Задачу создаём через application.create_task — PTB отслеживает её и
+    # корректно дождётся при остановке бота («голый» create_task при
+    # shutdown мог оборвать отправку ответа).
+    _task = context.application.create_task(
+        _ai_generation_guard(update, context, user_id, chat_id))
+    _AI_ACTIVE[user_id] = {"task": _task, "chat_id": chat_id,
+                           "ts": time.time()}
+    return MAIN_MENU
+
+
+async def _ai_on_stopped_generation(update, context):
+    """Bot API 9.3+: пользователь нажал РОДНУЮ кнопку остановки в самом
+    черновике (can_stop=True в sendMessageDraft). PTB 21.6 про этот
+    апдейт не знает, но честно кладёт неизвестные поля в api_kwargs —
+    забираем оттуда. Гасим генерацию и подтверждаем сообщением (оно же
+    убирает «три точки» у поля ввода)."""
+    try:
+        _smg = (getattr(update, "api_kwargs", None) or {}).get(
+            "stopped_message_generation")
+        if not isinstance(_smg, dict):
+            return
+        _chat = _smg.get("chat") or {}
+        _cid = _chat.get("id") or (_smg.get("from") or {}).get("id")
+        if not _cid:
+            return
+        _uid = str(_cid)
+        _AI_LAST_ACT[_uid] = time.time()
+        if _ai_cancel_active(_uid):
+            try:
+                await context.bot.send_message(
+                    int(_cid),
+                    "⏹ Генерация остановлена. Задайте новый вопрос — "
+                    "я на связи.",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("❌ Выйти из ИИ",
+                                             callback_data="ai_exit_now"),
+                        InlineKeyboardButton("☰ Меню",
+                                             callback_data="back_to_main"),
+                    ]]))
+            except Exception:
+                pass
+    except Exception as e:
+        logger.debug(f"stopped_message_generation: {e}")
+
+
+async def _ai_idle_sweeper(app):
+    """ВОЛНА 23.10.12: фоновый дворник режима ИИ:
+    • 15 минут бездействия (env AI_IDLE_TIMEOUT_MIN) — режим ИИ
+      выключается сам, с вежливым сообщением и главным меню («выйти из
+      ai, если долго не нажимать» — работает и само);
+    • генерация зависла дольше 4 минут — отмена (страховка от вечных
+      «трёх точек», если провайдер молчит)."""
+    while True:
+        try:
+            await asyncio.sleep(30)
+            _now = time.time()
+            for _uid, _ts in list(_AI_LAST_ACT.items()):
+                if _now - _ts <= _AI_IDLE_TIMEOUT:
+                    continue
+                _ud = None
+                try:
+                    _ud = (app.user_data.get(int(_uid))
+                           if _uid.isdigit() else None)
+                except Exception:
+                    _ud = None
+                if not (_ud and _ud.get("ai_mode")):
+                    _AI_LAST_ACT.pop(_uid, None)
+                    continue
+                _ud["ai_mode"] = False
+                _AI_LAST_ACT.pop(_uid, None)
+                _ai_cancel_active(_uid)
+                try:
+                    await app.bot.send_message(
+                        int(_uid),
+                        "😴 Режим ИИ выключился сам: вы не писали %d минут."
+                        " Возвращайтесь в любой момент — кнопка «🤖 "
+                        "DEVORKS+ai»." % (_AI_IDLE_TIMEOUT // 60),
+                        reply_markup=get_main_menu_keyboard(get_user(_uid)))
+                except Exception:
+                    pass
+            for _uid, _entry in list(_AI_ACTIVE.items()):
+                _t = _entry.get("task")
+                if (_t is not None and not _t.done()
+                        and _now - float(_entry.get("ts") or _now)
+                        > _AI_GEN_HARD_TIMEOUT):
+                    _ai_cancel_active(_uid)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.debug(f"ai sweeper: {e}")
+
+
+async def _ai_draft_post(bot, chat_id, draft_id, text, entities=None):
+    """Сырой вызов sendMessageDraft через Bot._post (в PTB 21.6 обёртки
+    метода нет — шлём напрямую; вложенные dict/list сериализуются в JSON
+    автоматически, проверено по исходнику RequestData). Возвращает
+    True/False — доступен ли метод (False включает фолбэк на анимацию
+    сообщением)."""
+    if _AI_DRAFTS_STATE["ok"] is False:
+        return False
+    # ВОЛНА 23.10.12: can_stop=True — в самом черновике появляется РОДНАЯ
+    # кнопка остановки (Bot API 9.3+): пользователь жмёт её, бот получает
+    # апдейт stopped_message_generation (ловим через api_kwargs —
+    # _ai_on_stopped_generation) и честно отменяет генерацию.
+    payload = {"chat_id": chat_id, "draft_id": int(draft_id),
+               "text": str(text or "")[:3900], "can_stop": True}
+    if entities and _AI_DRAFTS_STATE["emoji"]:
+        payload["entities"] = entities
+    try:
+        await bot._post("sendMessageDraft", data=payload)
+        _AI_DRAFTS_STATE["ok"] = True
+        return True
+    except Exception as e:
+        # Кастомное эмодзи доступно не всем ботам — пробуем без него.
+        if entities and "entities" in payload:
+            try:
+                payload.pop("entities", None)
+                await bot._post("sendMessageDraft", data=payload)
+                _AI_DRAFTS_STATE["ok"] = True
+                _AI_DRAFTS_STATE["emoji"] = False
+                return True
+            except Exception:
+                pass
+        if _AI_DRAFTS_STATE["ok"] is None:
+            logger.info("sendMessageDraft недоступен (%s) — анимация ИИ "
+                        "работает через сообщение.", e)
+        _AI_DRAFTS_STATE["ok"] = False
+        return False
+
+
+class _AiDraftUI:
+    """Живой черновик ИИ — порт анимаций референса:
+      • status(text) — «💭 Думаю...» / «🔍 Ищу в интернете...»;
+      • stream(full) — текст ответа набирается по мере генерации
+        (троттлинг 0.25 с, обновление на границе слова — как в
+        референсе).
+    Один draft_id на запрос — изменения черновика анимируются, а не
+    заменяются. Финальный ответ отправляется обычным sendMessage —
+    черновик исчезает сам."""
+
+    INTERVAL = 0.25
+    ENDINGS = (" ", "\n", ".", ",", "!", "?", "…", ":", ";")
+
+    def __init__(self, bot, chat_id):
+        self.bot = bot
+        self.chat_id = chat_id
+        self.draft_id = random.randint(1, 2 ** 31 - 1)
+        self.enabled = _AI_DRAFTS_STATE["ok"] is not False
+        self._last_text = ""
+        self._last_ts = 0.0
+
+    async def status(self, text):
+        """Показать статус-черновик («💭 Думаю...»). True — черновики
+        работают; False — вызывающий код включает фолбэк-анимацию."""
+        if not self.enabled:
+            return False
+        entities = None
+        if _AI_DRAFT_EMOJI_ID:
+            entities = [{"type": "custom_emoji", "offset": 0, "length": 2,
+                         "custom_emoji_id": _AI_DRAFT_EMOJI_ID}]
+        ok = await _ai_draft_post(self.bot, self.chat_id, self.draft_id,
+                                  f"💭 {text}", entities)
+        if not ok:
+            self.enabled = False
+        return ok
+
+    async def stream(self, full_text):
+        """Живое обновление текста ответа (вызывается на каждом чанке
+        стриминга; троттлинг и граница слова — как в референсе)."""
+        if not self.enabled or not full_text:
+            return
+        now = time.monotonic()
+        if now - self._last_ts < self.INTERVAL or full_text == self._last_text:
+            return
+        if not full_text.endswith(self.ENDINGS):
+            return
+        if await _ai_draft_post(self.bot, self.chat_id, self.draft_id,
+                                full_text):
+            self._last_text = full_text
+            self._last_ts = now
+
+
+def _ai_text_is_menu_button(user, message_text):
+    """ВОЛНА 23.10.11: похож ли текст на ИЗВЕСТНУЮ кнопку бота —
+    стандартную, личную, глобальную или классную? В режиме ИИ такие тексты
+    (например, нажатие старой кнопки меню из истории чата) — работа бота,
+    а не вопрос ассистенту: выключаем режим и выполняем кнопку. Лечит
+    «ИИ иногда отвечает, когда я просто пользуюсь ботом»."""
+    if not message_text:
+        return False
+    try:
+        if message_text in QUICK_COMMANDS:
+            return True
+        if message_text in get_all_user_button_names(user):
+            return True
+        cls = get_class_by_user(str(user.user_id))
+        if cls is not None:
+            for b in get_class_custom_buttons(cls.class_code):
+                name = (b.name.replace("CLASS_", "")
+                        if b.name.startswith("CLASS_") else b.name)
+                if name == message_text:
+                    return True
+        if message_text in ("📋 Ещё",):
+            return True
+    except Exception:
+        return False
+    return False
+
+
 async def _deepseek_chat(messages, timeout=60, temperature=0.2, force_json=False,
                           max_tokens=None, return_meta=False):
     """Низкоуровневый запрос к DeepSeek (OpenAI-совместимый API).
@@ -6748,6 +8874,72 @@ async def _deepseek_chat(messages, timeout=60, temperature=0.2, force_json=False
         return (None, None) if return_meta else None
 
 
+async def _deepseek_chat_stream(messages, timeout=90, temperature=0.6,
+                                max_tokens=450, on_text=None):
+    """ВОЛНА 23.10.11: СТРИМИНГОВЫЙ DeepSeek (SSE) — порт анимаций
+    референса: ответ набирается в черновике sendMessageDraft на глазах
+    у пользователя. Возвращает (text, finish_reason); (None, None) при
+    ошибке — вызывающий код честно уйдёт в обычный _deepseek_chat."""
+    if not DEEPSEEK_API_KEY:
+        return None, None
+    payload = {
+        "model": DEEPSEEK_MODEL,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": int(max_tokens),
+        "stream": True,
+    }
+    headers = {
+        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    try:
+        session = _aio_session()
+        async with session.post(
+                f"{DEEPSEEK_API_BASE}/chat/completions",
+                json=payload,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=timeout),
+        ) as resp:
+            if resp.status != 200:
+                body = ""
+                try:
+                    body = (await resp.text())[:200]
+                except Exception:
+                    pass
+                logger.error(f"DeepSeek stream: статус {resp.status}: {body}")
+                return None, None
+            text = ""
+            finish = None
+            # SSE: строки «data: {json}», финал — «data: [DONE]».
+            async for raw in resp.content:
+                line = raw.decode("utf-8", "ignore").strip()
+                if not line.startswith("data:"):
+                    continue
+                chunk_s = line[5:].strip()
+                if chunk_s == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(chunk_s)
+                except Exception:
+                    continue
+                choice = (obj.get("choices") or [{}])[0]
+                delta = choice.get("delta") or {}
+                if delta.get("content"):
+                    text += delta["content"]
+                    if on_text is not None:
+                        try:
+                            await on_text(text)
+                        except Exception:
+                            pass
+                if choice.get("finish_reason"):
+                    finish = choice.get("finish_reason")
+            return text, finish
+    except Exception as e:
+        logger.error(f"Ошибка стриминга DeepSeek: {e}")
+        return None, None
+
+
 def _extract_json_dict(raw_text):
     """Аккуратно вытаскивает первый JSON-объект из ответа модели.
 
@@ -6796,6 +8988,1174 @@ def _extract_json_dict(raw_text):
     return None
 
 
+# ==================================
+# === ВОЛНА 23.10.10: МНОГО ИИ — ПОДКЛЮЧАЕМЫЕ ПРОВАЙДЕРЫ ===
+# ==================================
+# Просьба пользователя: «нужно добавить много ии у разработчика и если
+# пользователь захочет то и пользователь может». Порт мульти-провайдерного
+# движка из референс-бота пользователя: протоколы OpenAI / Anthropic /
+# Gemini, 13 готовых пресетов + свой провайдер, выбор модели, фото
+# (vision), веб-поиск (DuckDuckGo) и чтение страниц, Markdown-ответы.
+# Настройка — ТОЛЬКО у разработчика (🛠️ Панель разработчика → «🧠
+# ИИ-провайдеры»); пользуются ВСЕ: чат «🤖 DEVORKS+ai» работает через
+# выбранную модель, каждый может выбрать себе СВОЮ кнопкой «🤖 Модель».
+# Из референса ПО ЖЕЛАНИЮ ПОЛЬЗОВАТЕЛЯ УБРАНЫ команды /id и /get_id —
+# в боте нет ни одной ID-команды, управление полностью кнопками.
+# Не настроено ничего — чат работает как раньше (DeepSeek/Groq).
+
+import html as _ai_html
+from urllib.parse import unquote as _ai_unquote
+
+AI_PRESETS = {
+    "openrouter": {"name": "OpenRouter", "protocol": "openai",
+                   "base_url": "https://openrouter.ai/api/v1",
+                   "hint": "Сотни моделей одним ключом",
+                   "where": "openrouter.ai/settings/keys"},
+    "openai": {"name": "OpenAI", "protocol": "openai",
+               "base_url": "https://api.openai.com/v1",
+               "hint": "GPT-4o, GPT-4.1, o3",
+               "where": "platform.openai.com/api-keys"},
+    "anthropic": {"name": "Anthropic", "protocol": "anthropic",
+                  "base_url": "https://api.anthropic.com",
+                  "hint": "Claude Opus / Sonnet / Haiku",
+                  "where": "console.anthropic.com/settings/keys"},
+    "google": {"name": "Google Gemini", "protocol": "gemini",
+               "base_url": "https://generativelanguage.googleapis.com",
+               "hint": "Gemini 2.5 Pro / Flash",
+               "where": "aistudio.google.com/apikey"},
+    "zai": {"name": "Z.AI (Zhipu)", "protocol": "openai",
+            "base_url": "https://api.z.ai/api/paas/v4",
+            "hint": "GLM-4.6, GLM-4.5",
+            "where": "z.ai/manage-apikey/apikey"},
+    "groq": {"name": "Groq", "protocol": "openai",
+             "base_url": "https://api.groq.com/openai/v1",
+             "hint": "Llama, Qwen — быстрый инференс",
+             "where": "console.groq.com/keys"},
+    "deepseek": {"name": "DeepSeek", "protocol": "openai",
+                 "base_url": "https://api.deepseek.com/v1",
+                 "hint": "DeepSeek-V3, R1",
+                 "where": "platform.deepseek.com/api_keys"},
+    "mistral": {"name": "Mistral AI", "protocol": "openai",
+                "base_url": "https://api.mistral.ai/v1",
+                "hint": "Mistral Large / Medium",
+                "where": "console.mistral.ai/api-keys"},
+    "xai": {"name": "xAI (Grok)", "protocol": "openai",
+            "base_url": "https://api.x.ai/v1",
+            "hint": "Grok-4, Grok-3",
+            "where": "console.x.ai"},
+    "moonshot": {"name": "Moonshot (Kimi)", "protocol": "openai",
+                 "base_url": "https://api.moonshot.ai/v1",
+                 "hint": "Kimi K2",
+                 "where": "platform.moonshot.ai/console/api-keys"},
+    "together": {"name": "Together AI", "protocol": "openai",
+                 "base_url": "https://api.together.xyz/v1",
+                 "hint": "Open-source модели",
+                 "where": "api.together.ai/settings/api-keys"},
+    "fireworks": {"name": "Fireworks AI", "protocol": "openai",
+                  "base_url": "https://api.fireworks.ai/inference/v1",
+                  "hint": "Хостинг open-source",
+                  "where": "fireworks.ai/account/api-keys"},
+    "cerebras": {"name": "Cerebras", "protocol": "openai",
+                 "base_url": "https://api.cerebras.ai/v1",
+                 "hint": "Сверхбыстрый инференс",
+                 "where": "cloud.cerebras.ai"},
+}
+
+AI_PROVIDER_ALIASES = {
+    "gpt": "openai", "chatgpt": "openai", "claude": "anthropic",
+    "gemini": "google", "googleai": "google", "googlegemini": "google",
+    "glm": "zai", "zhipu": "zai", "zai": "zai", "grok": "xai",
+    "kimi": "moonshot", "mistralai": "mistral", "togetherai": "together",
+    "fireworksai": "fireworks",
+}
+
+AI_PROTOCOLS = ("openai", "anthropic", "gemini")
+AI_MODELS_CACHE_TTL = 300.0        # секунд живёт кэш списка моделей
+AI_MAX_TOKENS_ANTHROPIC = 1500        # ВОЛНА 23.10.12: экономия токенов
+AI_TOOL_ROUNDS = 3                 # макс. раундов веб-инструментов
+
+AI_TOOLS_SPEC = [
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Поиск в интернете (DuckDuckGo). Возвращает "
+                           "заголовки, ссылки и сниппеты.",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string",
+                                         "description": "Поисковый запрос"}},
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_url",
+            "description": "Открыть веб-страницу и получить её текст.",
+            "parameters": {
+                "type": "object",
+                "properties": {"url": {"type": "string"}},
+                "required": ["url"],
+            },
+        },
+    },
+]
+
+_AI_UA = {"User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/120 Mobile Safari/537.36"}
+
+
+def _ai_find_preset(name):
+    """Найти пресет по имени (id, название или псевдоним)."""
+    key = re.sub(r"[^a-z0-9а-я]", "", str(name or "").lower())
+    if not key:
+        return None
+    if key in AI_PROVIDER_ALIASES:
+        return AI_PROVIDER_ALIASES[key]
+    for pid, p in AI_PRESETS.items():
+        if key == re.sub(r"[^a-z0-9а-я]", "", pid.lower()):
+            return pid
+        if key == re.sub(r"[^a-z0-9а-я]", "", p["name"].lower()):
+            return pid
+    return None
+
+
+def _ai_detect_protocol(url):
+    """Протокол API по ссылке: anthropic / gemini / openai."""
+    u = (url or "").lower()
+    if "anthropic" in u:
+        return "anthropic"
+    if ("generativelanguage" in u or "gemini" in u
+            or "aiplatform.googleapis" in u):
+        return "gemini"
+    return "openai"
+
+
+def _ai_parse_provider_spec(raw):
+    """«пресет:ключ» или «Имя|протокол|URL|ключ» (протокол auto — по URL)."""
+    raw = str(raw or "").strip()
+    if not raw:
+        return None
+    if "|" not in raw and ":" in raw:
+        preset_id, _, key = raw.partition(":")
+        pid = preset_id.strip().lower()
+        if pid == "gemini":
+            pid = "google"
+        preset = AI_PRESETS.get(pid)
+        if preset and preset.get("base_url"):
+            return {"name": preset["name"], "protocol": preset["protocol"],
+                    "base_url": preset["base_url"], "api_key": key.strip()}
+    parts = raw.split("|")
+    if len(parts) >= 3:
+        name, proto, url = parts[0].strip(), parts[1].strip().lower(), parts[2].strip()
+        key = parts[3].strip() if len(parts) > 3 else ""
+        if proto == "google":
+            proto = "gemini"
+        if proto == "auto":
+            proto = _ai_detect_protocol(url)
+        if proto in AI_PROTOCOLS and url.startswith(("http://", "https://")):
+            return {"name": name[:60] or "Мой провайдер", "protocol": proto,
+                    "base_url": url.rstrip("/"), "api_key": key}
+    return None
+
+
+def ai_providers_config():
+    """Конфиг провайдеров ИИ (DVF3-БД, ключи зашифрованы)."""
+    try:
+        cfg = load_data(AI_PROVIDERS_FILE, None)
+    except Exception:
+        cfg = None
+    if not isinstance(cfg, dict):
+        cfg = {}
+    if not isinstance(cfg.get("providers"), dict):
+        cfg["providers"] = {}
+    for pid, p in list(cfg["providers"].items()):
+        if not isinstance(p, dict):
+            cfg["providers"].pop(pid, None)
+            continue
+        p["name"] = str(p.get("name") or pid)[:60]
+        p["protocol"] = str(p.get("protocol") or "openai")
+        if p["protocol"] not in AI_PROTOCOLS:
+            p["protocol"] = "openai"
+        p["base_url"] = str(p.get("base_url") or "").rstrip("/")[:300]
+        p["api_key"] = str(p.get("api_key") or "")[:500]
+        p["enabled"] = bool(p.get("enabled", True))
+    d = cfg.get("default")
+    if not (isinstance(d, dict) and isinstance(d.get("provider"), str)
+            and d["provider"] in cfg["providers"]):
+        cfg["default"] = None
+    else:
+        cfg["default"] = {"provider": str(d["provider"])[:20],
+                          "model": str(d.get("model") or "")[:120]}
+        if not cfg["default"]["model"]:
+            cfg["default"] = None
+    if not isinstance(cfg.get("web_tools"), bool):
+        cfg["web_tools"] = False    # по умолчанию ВЫКЛ — ответы быстрее
+    if not isinstance(cfg.get("models_cache"), dict):
+        cfg["models_cache"] = {}
+    return cfg
+
+
+def ai_providers_save(cfg):
+    save_data(AI_PROVIDERS_FILE, cfg)
+
+
+def _ai_target_for_user(user):
+    """ВОЛНА 23.10.12: какой ИИ работает для пользователя. Приоритет:
+      1) СВОЙ ИИ (user.ai_own_cfg: сервис+ключ+модель) — только для
+         него, на его ключе («удобное подключение своего провайдера»);
+      2) выбранный кнопкой «🔀 Выбор ИИ» провайдер разработчика (модель
+         та, что закрепил разработчик: user_model или дефолт);
+      3) свой ключ-строка (легаси 23.10.11) поверх дефолтного провайдера;
+      4) модель по умолчанию от разработчика.
+    Возвращает (pid, provider-dict, model) или None (настройки нет)."""
+    try:
+        cfg = ai_providers_config()
+        own_cfg = _ai_own_cfg_sanitize(getattr(user, "ai_own_cfg", None))
+        if own_cfg is not None:
+            return "own", dict(own_cfg), own_cfg["model"]
+        choice = str(getattr(user, "ai_provider_choice", "") or "").strip()
+        if choice and choice in cfg["providers"]:
+            p = cfg["providers"][choice]
+            if p.get("enabled", True):
+                d0 = cfg.get("default") or {}
+                model = ""
+                if choice == d0.get("provider"):
+                    model = str(d0.get("model") or "")
+                if not model:
+                    model = str(p.get("user_model") or "").strip()
+                if model:
+                    # Свой ключ-строка (легаси 23.10.11) работает и с
+                    # ВЫБРАННЫМ ИИ разработчика: пользователь вводил его
+                    # под этот же сервис.
+                    pc = dict(p)
+                    own0 = str(getattr(user, "ai_own_key", "") or "").strip()
+                    if own0:
+                        pc["api_key"] = own0[:300]
+                    return choice, pc, model
+        d = cfg.get("default")
+        if not d:
+            return None
+        pid = d["provider"]
+        model = d["model"]
+        if (pid not in cfg["providers"]
+                or not cfg["providers"][pid].get("enabled", True)):
+            return None
+        p = dict(cfg["providers"][pid])
+        own = str(getattr(user, "ai_own_key", "") or "").strip()
+        if own:
+            p["api_key"] = own[:300]
+        return pid, p, model
+    except Exception as e:
+        logger.debug(f"_ai_target_for_user: {e}")
+        return None
+
+
+def _ai_any_provider_enabled():
+    try:
+        cfg = ai_providers_config()
+        return any(p.get("enabled", True)
+                   for p in cfg["providers"].values())
+    except Exception:
+        return False
+
+
+# ═══ ВОЛНА 23.10.12: поддержка ФОТО («если api этого ии поддерживает
+# и это должно показываться») и подбор модели для своего ИИ ═══
+_VISION_MODEL_RE = re.compile(
+    r"vision|(?<![a-z])vl(?![a-z])|-vl-|gpt-4o|gpt-4\.1|gpt-4-turbo|gpt-5|"
+    r"(?<![a-z0-9])o3(?![a-z0-9])|o4-mini|gemini|claude-3|claude-sonnet|"
+    r"claude-opus|claude-haiku|grok-4|grok-2-vision|llama-3\.2-90b|"
+    r"llama-3\.2-11b|pixtral|qvq|qwen.*vl|glm-4v|glm-4\.[56]v|kimi-latest|"
+    r"internvl|minicpm-v|moondream|llava|phi-3\.5-vision|phi-4-multimodal|"
+    r"medgemma|granite-vision|mistral-small-3", re.I)
+
+
+def _ai_model_supports_vision(model):
+    """Эвристика: умеет ли модель смотреть фото (по имени). Честная:
+    «не знаем» = не умеет — лучше предупредить, чем молча выкинуть
+    картинки из запроса."""
+    m = str(model or "").lower()
+    if not m:
+        return False
+    return bool(_VISION_MODEL_RE.search(m))
+
+
+_AI_BAD_MODEL_RE = re.compile(
+    r"embed|whisper|tts|rerank|guard|moderation|image-gen|dall|stable|"
+    r"video|audio|sora|veo|imagen|flux|kling|speech|caption|ocr-|bge-|"
+    r"voice|realtime|computer-use", re.I)
+
+
+def _ai_pick_default_model(pid, models):
+    """Понятная модель по умолчанию для СВОЕГО ИИ (визард пользователя)
+    и для «модели для пользователей» у разработчика: сначала известные
+    «любимые» id, потом первый id без мусора (embed/tts/...)."""
+    prefer = {
+        "deepseek": ["deepseek-chat"],
+        "openai": ["gpt-4o-mini", "gpt-4.1-mini", "gpt-4o", "gpt-4.1"],
+        "google": ["gemini-2.0-flash", "gemini-2.5-flash",
+                   "gemini-flash-latest"],
+        "groq": ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"],
+        "zai": ["glm-4.6", "glm-4.5-air", "glm-4-flash"],
+        "anthropic": ["claude-sonnet-4-5", "claude-3-5-haiku-latest",
+                      "claude-3-5-sonnet-latest"],
+        "mistral": ["mistral-small-latest", "mistral-large-latest"],
+        "xai": ["grok-4-fast", "grok-3-mini"],
+        "moonshot": ["kimi-k2-0905-preview", "moonshot-v1-8k"],
+        "openrouter": ["deepseek/deepseek-chat",
+                       "google/gemini-2.0-flash-001"],
+        "together": ["meta-llama/Llama-3.3-70B-Instruct-Turbo"],
+        "fireworks": ["accounts/fireworks/models/llama-v3p3-70b-instruct"],
+        "cerebras": ["llama-3.3-70b", "llama3.1-8b"],
+    }.get(str(pid or ""), [])
+    low = [str(m).lower() for m in (models or [])]
+    for p in prefer:
+        for i, m in enumerate(low):
+            if m == p:
+                return models[i]
+    for i, m in enumerate(low):
+        if not _AI_BAD_MODEL_RE.search(m):
+            return models[i]
+    return str(models[0]) if models else ""
+
+
+def _ai_own_cfg_sanitize(cfg):
+    """ВОЛНА 23.10.12: СВОЙ провайдер ИИ пользователя — dict
+    {name, protocol, base_url, model, api_key, preset} или None."""
+    if not isinstance(cfg, dict):
+        return None
+    proto = str(cfg.get("protocol") or "openai")
+    if proto == "google":
+        proto = "gemini"
+    if proto not in AI_PROTOCOLS:
+        proto = "openai"
+    base = str(cfg.get("base_url") or "").strip().rstrip("/")[:300]
+    model = str(cfg.get("model") or "").strip()[:120]
+    key = str(cfg.get("api_key") or "").strip()[:500]
+    name = str(cfg.get("name") or "").strip()[:60]
+    preset = str(cfg.get("preset") or "").strip()[:30]
+    if not (base.startswith(("http://", "https://")) and model and key):
+        return None
+    return {"name": name or "Мой ИИ", "protocol": proto, "base_url": base,
+            "model": model, "api_key": key, "preset": preset}
+
+
+def _ai_safe_json(s):
+    try:
+        obj = json.loads(s or "{}")
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+
+def _ai_tools_for(proto):
+    if proto == "anthropic":
+        return [{"name": t["function"]["name"],
+                 "description": t["function"]["description"],
+                 "input_schema": t["function"]["parameters"]}
+                for t in AI_TOOLS_SPEC]
+    if proto == "gemini":
+        return [{"functionDeclarations": [
+            {"name": t["function"]["name"],
+             "description": t["function"]["description"],
+             "parameters": t["function"]["parameters"]}
+            for t in AI_TOOLS_SPEC]}]
+    return AI_TOOLS_SPEC
+
+
+def _ai_openai_content(c):
+    """Контент сообщения → формат OpenAI (строка или блоки image_url)."""
+    if isinstance(c, str):
+        return c
+    out = []
+    for p in c:
+        if p.get("type") == "text":
+            out.append({"type": "text", "text": p.get("text", "")})
+        elif p.get("type") == "image":
+            out.append({"type": "image_url", "image_url": {
+                "url": "data:%s;base64,%s" % (
+                    p.get("media_type", "image/jpeg"), p.get("data", ""))}})
+    return out
+
+
+def _ai_anth_content(c):
+    if isinstance(c, str):
+        return [{"type": "text", "text": c}]
+    out = []
+    for p in c:
+        if p.get("type") == "text":
+            out.append({"type": "text", "text": p.get("text", "")})
+        elif p.get("type") == "image":
+            out.append({"type": "image", "source": {
+                "type": "base64",
+                "media_type": p.get("media_type", "image/jpeg"),
+                "data": p.get("data", "")}})
+    return out
+
+
+def _ai_gem_parts(c):
+    if isinstance(c, str):
+        return [{"text": c}]
+    out = []
+    for p in c:
+        if p.get("type") == "text":
+            out.append({"text": p.get("text", "")})
+        elif p.get("type") == "image":
+            out.append({"inline_data": {
+                "mime_type": p.get("media_type", "image/jpeg"),
+                "data": p.get("data", "")}})
+    return out
+
+
+def _ai_flatten_tools(conv):
+    """Свернуть вызовы инструментов в текст — для повтора без tools
+    (Anthropic/Gemini ругаются на tool-блоки, если tools не переданы)."""
+    out = []
+    results = []
+    for m in conv:
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            continue
+        if m.get("role") == "tool":
+            results.append("[%s]\n%s" % (m.get("name", "tool"),
+                                         m.get("content", "")))
+            continue
+        out.append(m)
+    if results:
+        out.append({"role": "user",
+                    "content": "Результаты инструментов:\n\n"
+                               + "\n\n".join(results)
+                               + "\n\nОтветь пользователю на основе этих "
+                                 "данных, коротко укажи источники."})
+    return out
+
+
+def _ai_is_tools_error(err):
+    low = (err or "").lower()
+    mentions = any(m in low for m in ("tools", "tool_use", "function",
+                                      "functioncall"))
+    broken = any(m in low for m in ("not support", "unsupported", "unknown",
+                                    "unrecognized", "invalid", "unexpected",
+                                    "400"))
+    return mentions and broken
+
+
+async def ai_provider_chat(provider, model, messages, tools=False,
+                           timeout=120):
+    """НЕстриминговый запрос к провайдеру (3 протокола; порт stream_chat
+    референса без SSE). Возвращает (text, calls, err):
+    text — ответ модели, calls — [{id, name, args}], err — текст ошибки
+    или None. Ошибки НЕ бросаем — возвращаем."""
+    proto = provider.get("protocol", "openai")
+    base = str(provider.get("base_url") or "").rstrip("/")
+    key = str(provider.get("api_key") or "")
+    system = "\n\n".join(m["content"] for m in messages
+                         if m.get("role") == "system"
+                         and isinstance(m.get("content"), str))
+    rest = [m for m in messages if m.get("role") != "system"]
+    calls_out = []
+    try:
+        if proto == "openai":
+            urls = [f"{base}/chat/completions"]
+            if not re.search(r"/v\d+$", base):
+                urls.append(f"{base}/v1/chat/completions")
+            headers = {"Content-Type": "application/json"}
+            if key:
+                headers["Authorization"] = f"Bearer {key}"
+            if "openrouter.ai" in base:
+                headers["HTTP-Referer"] = "https://t.me/devorks_bot"
+                headers["X-Title"] = "DEVORKS+"
+            msgs = []
+            for m in rest:
+                if m.get("role") == "assistant" and m.get("tool_calls"):
+                    msgs.append({
+                        "role": "assistant",
+                        "content": m.get("content") or None,
+                        "tool_calls": [
+                            {"id": c["id"], "type": "function",
+                             "function": {"name": c["name"],
+                                          "arguments": c["args"] or "{}"}}
+                            for c in m["tool_calls"]],
+                    })
+                elif m.get("role") == "tool":
+                    msgs.append({"role": "tool",
+                                 "tool_call_id": m.get("tool_call_id", ""),
+                                 "content": str(m.get("content") or "")})
+                else:
+                    msgs.append({"role": m["role"],
+                                 "content": _ai_openai_content(m.get("content"))})
+            if system:
+                msgs.insert(0, {"role": "system", "content": system})
+            payload = {"model": model, "messages": msgs, "stream": False,
+                       # ВОЛНА 23.10.12: экономия токенов — потолок ответа.
+                       "max_tokens": 1000}
+            if tools:
+                payload["tools"] = _ai_tools_for(proto)
+        elif proto == "anthropic":
+            v1 = "" if re.search(r"/v\d$", base) else "/v1"
+            url = f"{base}{v1}/messages"
+            headers = {"Content-Type": "application/json",
+                       "anthropic-version": "2023-06-01"}
+            if key:
+                headers["x-api-key"] = key
+            a_msgs = []
+            pend = []
+
+            def flush_tools():
+                if pend:
+                    a_msgs.append({"role": "user", "content": [
+                        {"type": "tool_result",
+                         "tool_use_id": t.get("tool_call_id", ""),
+                         "content": str(t.get("content") or "")}
+                        for t in pend]})
+                    pend.clear()
+
+            for m in rest:
+                if m.get("role") == "assistant" and m.get("tool_calls"):
+                    flush_tools()
+                    blocks = []
+                    if m.get("content"):
+                        blocks.append({"type": "text",
+                                       "text": str(m["content"])})
+                    for c in m["tool_calls"]:
+                        blocks.append({"type": "tool_use", "id": c["id"],
+                                       "name": c["name"],
+                                       "input": _ai_safe_json(c.get("args"))})
+                    a_msgs.append({"role": "assistant", "content": blocks})
+                elif m.get("role") == "tool":
+                    pend.append(m)
+                else:
+                    flush_tools()
+                    a_msgs.append({"role": m["role"],
+                                   "content": _ai_anth_content(m.get("content"))})
+            flush_tools()
+            payload = {"model": model, "max_tokens": AI_MAX_TOKENS_ANTHROPIC,
+                       "messages": a_msgs}
+            if system:
+                payload["system"] = system
+            if tools:
+                payload["tools"] = _ai_tools_for(proto)
+            urls = [url]
+        elif proto == "gemini":
+            vb = "" if re.search(r"/v\d\w*$", base) else "/v1beta"
+            url = f"{base}{vb}/models/{model}:generateContent"
+            headers = {"Content-Type": "application/json"}
+            if key:
+                headers["x-goog-api-key"] = key
+            g_msgs = []
+            pend_g = []
+
+            def flush_tools_g():
+                if pend_g:
+                    g_msgs.append({"role": "user", "parts": [
+                        {"functionResponse": {
+                            "name": t.get("name", "tool"),
+                            "response": {"result": str(t.get("content") or "")}}}
+                        for t in pend_g]})
+                    pend_g.clear()
+
+            for m in rest:
+                if m.get("role") == "assistant" and m.get("tool_calls"):
+                    flush_tools_g()
+                    parts = []
+                    if m.get("content"):
+                        parts.append({"text": str(m["content"])})
+                    for c in m["tool_calls"]:
+                        parts.append({"functionCall": {
+                            "name": c["name"],
+                            "args": _ai_safe_json(c.get("args"))}})
+                    g_msgs.append({"role": "model", "parts": parts})
+                elif m.get("role") == "tool":
+                    pend_g.append(m)
+                else:
+                    flush_tools_g()
+                    g_msgs.append({
+                        "role": "model" if m.get("role") == "assistant" else "user",
+                        "parts": _ai_gem_parts(m.get("content"))})
+            flush_tools_g()
+            payload = {"contents": g_msgs}
+            if system:
+                payload["systemInstruction"] = {"parts": [{"text": system}]}
+            if tools:
+                payload["tools"] = _ai_tools_for(proto)
+            urls = [url]
+        else:
+            return None, [], f"Неизвестный протокол: {proto}"
+
+        session = _aio_session()
+        resp = None
+        try:
+            for i, u in enumerate(urls):
+                r = await session.post(
+                    u, json=payload, headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=timeout))
+                if (r.status == 404 and i < len(urls) - 1):
+                    r.close()
+                    continue
+                resp = r
+                break
+            if resp is None:
+                return None, [], "Нет ответа провайдера"
+            async with resp:
+                if resp.status >= 400:
+                    text = ""
+                    try:
+                        text = (await resp.text())[:300].replace("\n", " ")
+                    except Exception:
+                        pass
+                    return None, [], f"HTTP {resp.status}: {text}"
+                try:
+                    obj = await resp.json(content_type=None)
+                except Exception:
+                    return None, [], f"HTTP {resp.status}: ответ не JSON"
+                if not isinstance(obj, dict):
+                    return None, [], "Ответ провайдера не объект"
+                body = ""
+                if proto == "openai":
+                    ch = (obj.get("choices") or [{}])[0]
+                    mm = ch.get("message") or {}
+                    body = mm.get("content") or ""
+                    for i, tc in enumerate(mm.get("tool_calls") or []):
+                        fn = tc.get("function") or {}
+                        calls_out.append({
+                            "id": tc.get("id") or f"call{i}",
+                            "name": fn.get("name", ""),
+                            "args": fn.get("arguments") or "{}"})
+                elif proto == "anthropic":
+                    for b in obj.get("content") or []:
+                        if b.get("type") == "text":
+                            body += b.get("text", "")
+                        elif b.get("type") == "tool_use":
+                            calls_out.append({
+                                "id": b.get("id", ""),
+                                "name": b.get("name", ""),
+                                "args": json.dumps(b.get("input") or {},
+                                                   ensure_ascii=False)})
+                else:
+                    for cand in obj.get("candidates") or []:
+                        for part in ((cand.get("content") or {}).get("parts") or []):
+                            if part.get("thought"):
+                                continue
+                            if part.get("text"):
+                                body += part["text"]
+                            if part.get("functionCall"):
+                                fc = part["functionCall"]
+                                calls_out.append({
+                                    "id": f"call{len(calls_out)}",
+                                    "name": fc.get("name", ""),
+                                    "args": json.dumps(fc.get("args") or {},
+                                                       ensure_ascii=False)})
+                return body, calls_out, None
+        finally:
+            if resp is not None and not resp.closed:
+                resp.close()
+    except asyncio.TimeoutError:
+        return None, [], "Таймаут запроса к провайдеру"
+    except Exception as e:
+        return None, [], f"Ошибка запроса: {e}"
+
+
+async def _ai_web_search(query, limit=6):
+    """Порт web_search референса: DuckDuckGo (html + lite)."""
+    if not str(query or "").strip():
+        return "Пустой запрос."
+    page = ""
+    session = _aio_session()
+    try:
+        async with session.post(
+                "https://html.duckduckgo.com/html/",
+                data={"q": query, "kl": "ru-ru"}, headers=_AI_UA,
+                timeout=aiohttp.ClientTimeout(total=15)) as r:
+            if r.status < 400:
+                page = await r.text(errors="ignore")
+    except Exception:
+        page = ""
+    links = re.findall(r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
+                       page, re.S)
+    snippets = re.findall(r'class="result__snippet"[^>]*>(.*?)</a>', page, re.S)
+    if not links:
+        try:
+            async with session.get(
+                    "https://lite.duckduckgo.com/lite/", params={"q": query},
+                    headers=_AI_UA,
+                    timeout=aiohttp.ClientTimeout(total=15)) as r:
+                page = await r.text(errors="ignore")
+        except Exception as e:
+            return f"Ошибка поиска: {e}"
+        links = re.findall(r'class="result-link"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
+                           page, re.S)
+        snippets = re.findall(r'class="result-snippet"[^>]*>(.*?)</td>',
+                              page, re.S)
+
+    def _clean(s):
+        return _ai_html.unescape(re.sub(r"<[^>]+>", "", s)).strip()
+
+    out = []
+    for i, (href, title) in enumerate(links[:limit]):
+        m = re.search(r"uddg=([^&]+)", href)
+        url = _ai_unquote(m.group(1)) if m else href
+        snip = _clean(snippets[i]) if i < len(snippets) else ""
+        out.append(f"{i + 1}. {_clean(title)}\n{url}\n{snip}")
+    return "\n\n".join(out) or "Ничего не найдено."
+
+
+async def _ai_read_url(url):
+    """Порт read_url референса: текст страницы (без скриптов/стилей)."""
+    if not str(url or "").startswith(("http://", "https://")):
+        return "Неверная ссылка."
+    try:
+        async with _aio_session().get(
+                url, headers=_AI_UA,
+                timeout=aiohttp.ClientTimeout(total=15)) as r:
+            page = await r.text(errors="ignore")
+    except Exception as e:
+        return f"Не удалось открыть: {e}"
+    page = re.sub(r"(?is)<(script|style|noscript|svg|header|footer|nav).*?</\1>",
+                  " ", page)
+    text = _ai_html.unescape(
+        re.sub(r"<[^>]+>", "", re.sub(r"(?s)<[^>]+>", " ", page))).strip()
+    text = re.sub(r"\s+", " ", text)
+    return text[:4000] or "Страница пустая."
+
+
+async def _ai_run_tool(name, args_json):
+    args = _ai_safe_json(args_json)
+    if name == "web_search":
+        return await _ai_web_search(args.get("query", ""))
+    if name == "read_url":
+        return await _ai_read_url(args.get("url", ""))
+    return "Неизвестный инструмент."
+
+
+async def ai_provider_chat_flow(provider, model, messages, web_tools=False):
+    """Цикл с веб-инструментами: модель может позвать web_search/read_url
+    (до AI_TOOL_ROUNDS раундов), затем отвечает текстом.
+    Возвращает (text, err)."""
+    conv = [dict(m) if isinstance(m, dict) else m for m in messages]
+    use_tools = bool(web_tools)
+    for _round in range(AI_TOOL_ROUNDS):
+        text, calls, err = await ai_provider_chat(
+            provider, model, conv, tools=use_tools)
+        if err is not None:
+            if use_tools and _ai_is_tools_error(err):
+                # Модель не умеет инструменты — честный повтор без них.
+                use_tools = False
+                conv = _ai_flatten_tools(conv)
+                continue
+            return None, err
+        if not calls:
+            return (text or ""), None
+        conv.append({"role": "assistant", "content": text or "",
+                     "tool_calls": calls})
+        for c in calls[:4]:
+            res = await _ai_run_tool(c.get("name", ""), c.get("args") or "{}")
+            conv.append({"role": "tool",
+                         "tool_call_id": c.get("id", ""),
+                         "name": c.get("name", ""),
+                         "content": str(res)[:6000]})
+    return None, ("ИИ не закончил ответ за %d шагов инструментов — "
+                  "попробуйте ещё раз." % AI_TOOL_ROUNDS)
+
+
+async def ai_provider_chat_stream(provider, model, messages, tools=False,
+                                  timeout=120, on_text=None):
+    """ВОЛНА 23.10.11: СТРИМИНГОВЫЙ запрос к провайдеру (SSE, протокол
+    openai — DeepSeek, Groq, OpenRouter и т. д.). Порт цикла чанков из
+    референса: delta.content → on_text (живой черновик), delta.tool_calls
+    → накопление вызовов инструментов. Протокол anthropic/gemini или сбой
+    стрима — честный фолбэк на НЕстриминговый ai_provider_chat.
+    Возвращает (text, calls, err, streamed)."""
+    proto = provider.get("protocol", "openai")
+    if proto != "openai" or on_text is None:
+        text, calls, err = await ai_provider_chat(provider, model, messages,
+                                                  tools, timeout)
+        return text, calls, err, False
+    base = str(provider.get("base_url") or "").rstrip("/")
+    key = str(provider.get("api_key") or "")
+    system = "\n\n".join(m["content"] for m in messages
+                         if m.get("role") == "system"
+                         and isinstance(m.get("content"), str))
+    rest = [m for m in messages if m.get("role") != "system"]
+    headers = {"Content-Type": "application/json"}
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    if "openrouter.ai" in base:
+        headers["HTTP-Referer"] = "https://t.me/devorks_bot"
+        headers["X-Title"] = "DEVORKS+"
+    msgs = []
+    for m in rest:
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            msgs.append({
+                "role": "assistant",
+                "content": m.get("content") or None,
+                "tool_calls": [
+                    {"id": c["id"], "type": "function",
+                     "function": {"name": c["name"],
+                                  "arguments": c["args"] or "{}"}}
+                    for c in m["tool_calls"]],
+            })
+        elif m.get("role") == "tool":
+            msgs.append({"role": "tool",
+                         "tool_call_id": m.get("tool_call_id", ""),
+                         "content": str(m.get("content") or "")})
+        else:
+            msgs.append({"role": m["role"],
+                         "content": _ai_openai_content(m.get("content"))})
+    if system:
+        msgs.insert(0, {"role": "system", "content": system})
+    payload = {"model": model, "messages": msgs, "stream": True,
+               # ВОЛНА 23.10.12: экономия токенов — потолок ответа.
+               "max_tokens": 1000}
+    if tools:
+        payload["tools"] = _ai_tools_for(proto)
+    urls = [f"{base}/chat/completions"]
+    if not re.search(r"/v\d+$", base):
+        urls.append(f"{base}/v1/chat/completions")
+    try:
+        session = _aio_session()
+        resp = None
+        try:
+            for i, u in enumerate(urls):
+                r = await session.post(
+                    u, json=payload, headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=timeout))
+                if (r.status == 404 and i < len(urls) - 1):
+                    r.close()
+                    continue
+                resp = r
+                break
+            if resp is None:
+                return None, [], "Нет ответа провайдера", False
+            async with resp:
+                if resp.status >= 400:
+                    body = ""
+                    try:
+                        body = (await resp.text())[:300]
+                    except Exception:
+                        pass
+                    # Стрим не поддерживается — обычный запрос.
+                    text, calls, err = await ai_provider_chat(
+                        provider, model, messages, tools, timeout)
+                    if err is None:
+                        return text, calls, None, False
+                    return None, [], (f"HTTP {resp.status}: {body}"), False
+                text = ""
+                calls = {}
+                async for raw in resp.content:
+                    line = raw.decode("utf-8", "ignore").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    chunk_s = line[5:].strip()
+                    if chunk_s == "[DONE]":
+                        break
+                    try:
+                        obj = json.loads(chunk_s)
+                    except Exception:
+                        continue
+                    choice = (obj.get("choices") or [{}])[0]
+                    delta = choice.get("delta") or {}
+                    if delta.get("content"):
+                        text += delta["content"]
+                        try:
+                            await on_text(text)
+                        except Exception:
+                            pass
+                    for tc in (delta.get("tool_calls") or []):
+                        idx = tc.get("index", 0)
+                        c = calls.setdefault(idx, {"id": "", "name": "",
+                                                   "args": ""})
+                        if tc.get("id"):
+                            c["id"] = tc["id"]
+                        fn = tc.get("function") or {}
+                        if fn.get("name"):
+                            c["name"] += fn["name"]
+                        if fn.get("arguments"):
+                            c["args"] += fn["arguments"]
+            calls_out = []
+            for i, c in sorted(calls.items()):
+                calls_out.append({"id": c["id"] or f"call{i}",
+                                  "name": c["name"],
+                                  "args": c["args"] or "{}"})
+            return text, calls_out, None, True
+        finally:
+            if resp is not None and not resp.closed:
+                resp.close()
+    except Exception as e:
+        # Стрим сорвался (в том числе на середине) — честный фолбэк.
+        text, calls, err = await ai_provider_chat(provider, model, messages,
+                                                  tools, timeout)
+        if err is None:
+            return text, calls, None, False
+        return None, [], f"Ошибка запроса: {e}", False
+
+
+async def ai_provider_chat_flow_stream(provider, model, messages,
+                                       web_tools=False, on_text=None,
+                                       on_status=None):
+    """ВОЛНА 23.10.11: цикл веб-инструментов СО СТРИМИНГОМ и статусами
+    «🔍 Ищу в интернете...» / «📖 Читаю страницу...» (как в референсе).
+    Возвращает (text, err)."""
+    conv = [dict(m) if isinstance(m, dict) else m for m in messages]
+    use_tools = bool(web_tools)
+    for _round in range(AI_TOOL_ROUNDS):
+        text, calls, err, _streamed = await ai_provider_chat_stream(
+            provider, model, conv, tools=use_tools, on_text=on_text)
+        if err is not None:
+            if use_tools and _ai_is_tools_error(err):
+                # Модель не умеет инструменты — честный повтор без них.
+                use_tools = False
+                conv = _ai_flatten_tools(conv)
+                continue
+            return None, err
+        if not calls:
+            return (text or ""), None
+        conv.append({"role": "assistant", "content": text or "",
+                     "tool_calls": calls})
+        for c in calls[:4]:
+            if on_status is not None:
+                label = ("🔍 Ищу в интернете..."
+                         if c.get("name") == "web_search"
+                         else "📖 Читаю страницу...")
+                try:
+                    await on_status(label)
+                except Exception:
+                    pass
+            res = await _ai_run_tool(c.get("name", ""), c.get("args") or "{}")
+            conv.append({"role": "tool",
+                         "tool_call_id": c.get("id", ""),
+                         "name": c.get("name", ""),
+                         "content": str(res)[:6000]})
+    return None, ("ИИ не закончил ответ за %d шагов инструментов — "
+                  "попробуйте ещё раз." % AI_TOOL_ROUNDS)
+
+
+async def ai_fetch_models(pid, provider, no_cache=False):
+    """Список моделей провайдера (порт fetch_models) с кэшем в конфиге.
+    no_cache=True — онлайн-проверка ЧУЖОГО ключа (визарды «Свой ИИ» у
+    пользователя и разработчика): не читаем и не пишем общий кэш, чтобы
+    ключ одного человека не «одалживал» модели другому.
+    Возвращает (список_id, err)."""
+    cfg = ai_providers_config()
+    cache = cfg.get("models_cache") or {}
+    rec = cache.get(pid)
+    if (not no_cache and isinstance(rec, dict)
+            and isinstance(rec.get("models"), list)
+            and (time.time() - float(rec.get("ts") or 0)) < AI_MODELS_CACHE_TTL
+            and rec.get("models")):
+        return [str(m) for m in rec["models"]], None
+
+    proto = provider.get("protocol", "openai")
+    base = str(provider.get("base_url") or "").rstrip("/")
+    key = str(provider.get("api_key") or "")
+    out = []
+    err = None
+    try:
+        session = _aio_session()
+        if proto == "gemini":
+            vb = "" if re.search(r"/v\d\w*$", base) else "/v1beta"
+            headers = {}
+            if key:
+                headers["x-goog-api-key"] = key
+            async with session.get(
+                    f"{base}{vb}/models?pageSize=200", headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=30)) as r:
+                if r.status >= 400:
+                    err = f"HTTP {r.status}"
+                else:
+                    data = await r.json(content_type=None)
+            if err is None:
+                for m in (data or {}).get("models", []):
+                    methods = m.get("supportedGenerationMethods") or []
+                    if methods and "generateContent" not in methods:
+                        continue
+                    name = m.get("name", "")
+                    mid = (name[len("models/"):]
+                           if name.startswith("models/") else name)
+                    if mid:
+                        out.append(str(mid))
+        elif proto == "anthropic":
+            headers = {"anthropic-version": "2023-06-01"}
+            if key:
+                headers["x-api-key"] = key
+            v1 = "" if re.search(r"/v\d$", base) else "/v1"
+            async with session.get(
+                    f"{base}{v1}/models?limit=1000", headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=30)) as r:
+                if r.status >= 400:
+                    err = f"HTTP {r.status}"
+                else:
+                    data = await r.json(content_type=None)
+            if err is None:
+                for m in (data or {}).get("data", []):
+                    mid = m.get("id") or m.get("name")
+                    if mid:
+                        out.append(str(mid))
+        else:
+            headers = {}
+            if key:
+                headers["Authorization"] = f"Bearer {key}"
+            candidates = [f"{base}/models"]
+            if not re.search(r"/v\d+$", base):
+                candidates.append(f"{base}/v1/models")
+            data = {}
+            got = False
+            for i, u in enumerate(candidates):
+                async with session.get(
+                        u, headers=headers,
+                        timeout=aiohttp.ClientTimeout(total=30)) as r:
+                    if r.status == 404 and i < len(candidates) - 1:
+                        continue
+                    if r.status >= 400:
+                        err = f"HTTP {r.status}"
+                    else:
+                        try:
+                            data = await r.json(content_type=None)
+                        except Exception:
+                            err = "ответ не JSON"
+                    got = True
+                    break
+            if err is None and got:
+                items = (data or {}).get("data") or (data or {}).get("models") or []
+                for m in items:
+                    mid = m.get("id") or m.get("name")
+                    if mid:
+                        out.append(str(mid))
+    except Exception as e:
+        err = f"Ошибка: {e}"
+
+    if out and err is None and not no_cache:
+        try:
+            cfg.setdefault("models_cache", {})[pid] = {
+                "ts": time.time(), "models": out[:400]}
+            ai_providers_save(cfg)
+        except Exception as e:
+            logger.debug(f"ai models cache save: {e}")
+        return out, None
+    return [], (err or "Список моделей пуст")
+
+
+# --- Оформление ответов: Markdown → Telegram HTML (порт референса) ---
+
+_AI_SEP_ROW = re.compile(r"^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$")
+
+
+def _ai_table_to_text(block):
+    rows = []
+    for ln in block.strip("\n").split("\n"):
+        if _AI_SEP_ROW.match(ln):
+            continue
+        cells = [re.sub(r"\*\*|`", "", c).strip()
+                 for c in ln.strip().strip("|").split("|")]
+        rows.append(cells)
+    if not rows:
+        return block
+    n = max(len(r) for r in rows)
+    for r in rows:
+        r.extend([""] * (n - len(r)))
+    w = [max(len(r[i]) for r in rows) for i in range(n)]
+    lines = [" │ ".join(r[i].ljust(w[i]) for i in range(n)).rstrip()
+             for r in rows]
+    if len(lines) > 1:
+        lines.insert(1, "─┼─".join("─" * x for x in w))
+    return "\n".join(lines)
+
+
+def _ai_md_to_html(text, pretty=False):
+    """Markdown → Telegram HTML (порт md_to_html референса). Код и таблицы
+    прячутся в заглушки, чтобы разметка внутри не ломалась."""
+    stash = []
+
+    def keep(s):
+        stash.append(s)
+        return "\x00%d\x00" % (len(stash) - 1)
+
+    text = str(text or "").replace("\x00", "")
+
+    def fence(m):
+        lang, body = m.group(1), _ai_html.escape(m.group(2).rstrip("\n"),
+                                                  quote=False)
+        if lang:
+            return keep('<pre><code class="language-%s">%s</code></pre>'
+                        % (lang, body))
+        return keep("<pre>%s</pre>" % body)
+
+    text = re.sub(r"```([\w+#.\-]*)[ \t]*\n?(.*?)```", fence, text, flags=re.S)
+    text = re.sub(r"`([^`\n]+)`",
+                  lambda m: keep("<code>"
+                                 + _ai_html.escape(m.group(1), quote=False)
+                                 + "</code>"), text)
+    text = re.sub(r"(?:^[ \t]*\|[^\n]*\|[ \t]*(?:\n|$)){2,}",
+                  lambda m: keep("<pre>"
+                                 + _ai_html.escape(_ai_table_to_text(m.group(0)),
+                                                   quote=False)
+                                 + "</pre>\n"), text, flags=re.M)
+
+    text = _ai_html.escape(text, quote=False)
+
+    def quote(m):
+        raw = m.group(0)
+        inner = "\n".join(re.sub(r"^&gt;[ \t]?", "", ln)
+                          for ln in raw.rstrip("\n").split("\n"))
+        return "<blockquote>%s</blockquote>" % inner + (
+            "\n" if raw.endswith("\n") else "")
+
+    text = re.sub(r"(?:^&gt;[^\n]*(?:\n|$))+", quote, text, flags=re.M)
+    text = re.sub(r"\[([^\]\n]+)\]\((https?://[^)\s]+)\)",
+                  lambda m: '<a href="%s">%s</a>' % (
+                      m.group(2).replace(chr(34), "%22"), m.group(1)), text)
+    text = re.sub(r"^([ \t]*)[-*+][ \t]+",
+                  lambda m: m.group(1) + (
+                      "• " if len(m.group(1).replace("\t", "  ")) < 2 else "◦ "),
+                  text, flags=re.M)
+    text = re.sub(r"^[ \t]*([-*_])(?:[ \t]*\1){2,}[ \t]*$", "──────────",
+                  text, flags=re.M)
+    text = re.sub(r"^#{1,6}[ \t]+(.*?)[ \t]*#*$",
+                  lambda m: "<b>" + m.group(1).replace("**", "") + "</b>",
+                  text, flags=re.M)
+    text = re.sub(r"(?<![\w_])__(.+?)__(?!\w)", r"<b>\1</b>", text, flags=re.S)
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text, flags=re.S)
+    text = re.sub(r"(?<![\w*])\*(?!\s)([^*\n]+?)\*(?!\w)", r"<i>\1</i>", text)
+    text = re.sub(r"(?<!\w)_(?!\s)([^_\n]+?)_(?!\w)", r"<i>\1</i>", text)
+    text = re.sub(r"~~([^~\n]+)~~", r"<s>\1</s>", text)
+    text = re.sub(r"\|\|([^|\n]+)\|\|", r"<tg-spoiler>\1</tg-spoiler>", text)
+    text = re.sub(r"\x00(\d+)\x00",
+                  lambda m: stash[int(m.group(1))], text)
+    if pretty:
+        text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return text
+
+
+def _ai_split_text(text, limit):
+    """Разбить длинный ответ по строкам, сохраняя парность ``` (порт)."""
+    if len(text) <= limit:
+        return [text]
+    lines = []
+    for ln in text.split("\n"):
+        while len(ln) > limit:
+            lines.append(ln[:limit])
+            ln = ln[limit:]
+        lines.append(ln)
+    chunks = []
+    cur = ""
+    in_fence = False
+    lang = ""
+    for ln in lines:
+        if cur and len(cur) + len(ln) + 1 > limit:
+            if in_fence:
+                cur += "\n```"
+            chunks.append(cur)
+            cur = "```%s" % lang if in_fence else ""
+        cur = (cur + "\n" + ln) if cur else ln
+        if ln.strip().startswith("```"):
+            in_fence = not in_fence
+            lang = ln.strip()[3:].strip() if in_fence else ""
+    if cur.strip():
+        chunks.append(cur)
+    return chunks
+
+
 def _ai_chat_system_prompt():
     """Системный промпт чата DEVORKS+ai (базовый, режим «normal»).
 
@@ -6811,7 +10171,8 @@ def _ai_chat_system_prompt():
         "факты, ничего не выдумывай, не знаешь — так и скажи. Тему меняй "
         "мгновенно, отвечай точно по последнему сообщению. Понимай синонимы, "
         "сленг и опечатки. Пиши кратко, без воды, не длиннее 1000 символов, "
-        "всегда законченными предложениями."
+        "всегда законченными предложениями. Не трать токены зря: без "
+        "просьбы о подробностях — 3–6 предложений, вопрос не повторяй."
     )
     # Страховка требования «300–500 символов»: держим длину в диапазоне.
     return prompt[:500]
@@ -6851,6 +10212,146 @@ def _ai_chat_full_prompt(persona):
         f"{base}\n\nРЕЖИМ «{title}» — ВЫСШИЙ ПРИОРИТЕТ, СТРОГО СЛЕДУЙ: "
         f"{persona_text}"
     )
+
+
+def _ai_class_context_block(user):
+    """ВОЛНА 23.10.11: ЖИВОЙ КОНТЕКСТ бота для системного промпта ИИ —
+    класс, роль, расписание на сегодня/завтра (с приоритетом отдельного
+    дня), «расписание с сайтов» и ДЗ. Благодаря этому ИИ отвечает на
+    вопросы класса («что задано?», «какая завтра домашка?») по НАСТОЯЩИМ
+    данным бота, а не выдумывает. Работает во всех режимах — и в простом
+    чате, и с веб-инструментами."""
+    try:
+        now = datetime.now()
+        days = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница",
+                "Суббота", "Воскресенье"]
+        today_iso = now.strftime("%Y-%m-%d")
+        tomorrow = now + timedelta(days=1)
+        tmrw_iso = tomorrow.strftime("%Y-%m-%d")
+        lines = ["ДАННЫЕ ПОЛЬЗОВАТЕЛЯ И КЛАССА (живой контекст бота):"]
+        lines.append("Сегодня: %s (%s)."
+                     % (now.strftime("%d.%m.%Y"), days[now.weekday()]))
+        _nm = str(getattr(user, "first_name", "") or "").strip()
+        if _nm:
+            lines.append("Пользователь: %s." % _nm[:40])
+        cls = None
+        cc = getattr(user, "class_code", None)
+        if cc:
+            cls = get_class_by_code(cc)
+        if cls is not None:
+            lines.append("Класс: %s." % str(cls.class_name)[:40])
+            try:
+                if str(user.user_id) in (cls.admins or []):
+                    lines.append("Роль: админ класса.")
+                elif str(user.user_id) == str(cls.creator_id):
+                    lines.append("Роль: создатель класса.")
+                else:
+                    lines.append("Роль: ученик.")
+            except Exception:
+                pass
+
+            def _day_txt(co, day_name, iso):
+                # Приоритет: отдельный день (schedule_dates) → день недели.
+                ov = (getattr(co, "schedule_dates", None) or {}).get(iso)
+                if ov:
+                    if isinstance(ov, dict):
+                        cap = (ov.get("caption") or "").strip()
+                        return ("📌 отдельный день: "
+                                + (cap or "картинка-расписание")[:200])
+                    return "📌 отдельный день: " + str(ov)[:200]
+                kind, payload = _schedule_day_view(co, day_name)
+                if kind == "text":
+                    return str(payload)[:300]
+                if kind == "image":
+                    cap = (payload.get("caption") or "").strip()
+                    return ("картинка-расписание"
+                            + (f" ({cap[:100]})" if cap else ""))
+                return "не установлено"
+
+            lines.append("Расписание на сегодня (%s): %s"
+                         % (days[now.weekday()],
+                            _day_txt(cls, days[now.weekday()], today_iso)))
+            lines.append("Расписание на завтра (%s): %s"
+                         % (days[tomorrow.weekday()],
+                            _day_txt(cls, days[tomorrow.weekday()], tmrw_iso)))
+            sw = getattr(cls, "schedule_web", None)
+            if isinstance(sw, dict) and (sw.get("text") or sw.get("url")):
+                _s = str(sw.get("text") or "")[:150]
+                _u = str(sw.get("url") or "")[:80]
+                _ts = str(sw.get("ts") or "")[:16]
+                _extra = f" (обновлено {_ts})" if _ts else ""
+                lines.append("Расписание с сайта: %s%s" % (_s or _u, _extra))
+            hw = getattr(cls, "homework", None) or {}
+            if hw:
+                rows_hw = []
+                for subject, items in hw.items():
+                    for a in (items or []):
+                        rows_hw.append((str(a.get("date") or "9999-99-99"),
+                                        str(subject),
+                                        (a.get("text") or "").strip()))
+                rows_hw.sort(key=lambda r: r[0])
+                future = [r for r in rows_hw if r[0] >= today_iso][:15]
+                if not future:
+                    future = rows_hw[-8:]
+                if future:
+                    lines.append("Домашнее задание класса:")
+                    for d, s, t in future:
+                        t2 = t if len(t) <= 110 else t[:110] + "…"
+                        lines.append("— %s (на %s): %s"
+                                     % (s[:24],
+                                        d if d != "9999-99-99" else "без даты",
+                                        t2 or "(без текста)"))
+                else:
+                    lines.append("Домашнее задание класса: не задано.")
+            else:
+                lines.append("Домашнее задание класса: не задано.")
+        else:
+            lines.append("Класс: пользователь не состоит в классе.")
+        lines.append(
+            "ВОЗМОЖНОСТИ БОТА (подсказывай, где что найти; сам кнопки "
+            "нажать не можешь — действия пользователя или через "
+            "🪄 AI Agent):\n"
+            "• Классы: создать, вступить по коду, выйти; роли — ученик, "
+            "админ класса, создатель, разработчик.\n"
+            "• 📅 Расписание: Сегодня / Завтра / Неделя; на отдельную "
+            "дату — текст или картинка; правка в тот же день обновляет "
+            "запись, а не создаёт новую; 🌐 расписание с сайтов + история "
+            "изменений за 2 дня; на фото — водяной знак.\n"
+            "• 📝 ДЗ: текст + фото; больше 2 фото — один PDF «Предмет_дата»; "
+            "правка и удаление.\n"
+            "• ✅ Решения: отправка решений ДЗ, проверка админами, "
+            "комментарии с правкой.\n"
+            "• 👨‍🏫 Учителя, 🔔 Звонки, ⏰ Таймер, 🌦 Погода, 🎉 Каникулы.\n"
+            "• 📢 Написать классу (админы), ✉️ личное сообщение ученику от "
+            "админа, 💬 Чат поддержки.\n"
+            "• 🕵️ Анонимные сообщения, ⭐ Звёзды, 🛍 Магазин, ☁️ Облако "
+            "(файлы), 🔐 Сейф (файлы под паролем).\n"
+            "• ⚙️ Настройки: 🎨 цвета кнопок (панель по статусу; отмена — "
+            "красная, подтверждение — зелёная, отключается), 🌟 Мои "
+            "кнопки, 📋 Ещё.\n"
+            "• 🪄 AI Agent: добавь ДЗ / измени расписание / поставь таймер "
+            "обычным текстом.\n"
+            "• 🤖 Этот чат (DEVORKS+ai): фото до 5 за раз (если модель "
+            "умеет), свой ИИ (ключ+модель), 🔀 выбор ИИ, выход кнопкой "
+            "или сам через 15 минут бездействия.\n"
+            "Вопросы про класс, расписание и ДЗ отвечай ТОЛЬКО по данным "
+            "выше и инструментам — ничего не выдумывай.")
+        return "\n".join(lines)[:2800]
+    except Exception as e:
+        logger.debug(f"_ai_class_context_block: {e}")
+        return ""
+
+
+def _ai_chat_system_prompt_with_context(user, persona="normal"):
+    """ВОЛНА 23.10.11: базовый промпт личности + живой контекст класса
+    (расписание, ДЗ) — ИИ «знает, что задано», и в простом чате, и в
+    агенте. Контекст обновляется при каждом сообщении (даты/ДЗ меняются),
+    поэтому дата в промпте никогда не устаревает."""
+    base = _ai_chat_full_prompt(persona)
+    ctx = _ai_class_context_block(user)
+    if not ctx:
+        return base
+    return base + "\n\n" + ctx
 
 
 def _ai_finish_guarantee(text, finish_reason=None, max_chars=1000):
@@ -7255,6 +10756,37 @@ def _set_message_text(update, text):
     except Exception as e:
         logger.error(f"STT: не удалось подставить текст в сообщение: {e}")
         return False
+
+
+# ==================================
+# === ВОЛНА 23.10: ПРАВКА СООБЩЕНИЯ = ПОВТОРНЫЙ ВВОД ===
+# ==================================
+# Жалоба: «при вводе дня рождения иногда вылетает ошибка "попробуйте ещё
+# раз или нажмите старт"». Причина: в python-telegram-bot 21.x MessageHandler
+# с filters.Text срабатывает И НА ПРАВКУ сообщения — фильтр смотрит в
+# update.effective_message, а у правки это edited_message. Но код обработчиков
+# почти всегда читает update.message.text, а update.message у правки равен
+# None → AttributeError ещё до try/except → generic-ошибка «Попробуйте ещё
+# раз или нажмите /start» (enter_birthday_handler, save_birthday_handler и
+# десятки других текстовых состояний). Пользователь при этом просто исправил
+# опечатку в дате. Решение: до всех обработчиков (группа -2 — раньше
+# voice-middleware из группы -1 и ConversationHandler из группы 0) кладём
+# правку на место обычного сообщения. Редактирование становится легальным
+# «отправить заново»: дата/город/время перепроверяются, а бот не пугает
+# ошибкой. update.edited_message остаётся на месте — существующие проверки
+# «это правка?» (voice-middleware, роутер загрузок) продолжают работать как
+# раньше. Присваивание — через object.__setattr__ (PTB запрещает обычный
+# setattr, см. _set_message_text).
+async def _edited_message_middleware(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if (getattr(update, "message", None) is None
+                and getattr(update, "edited_message", None) is not None):
+            object.__setattr__(update, "message", update.edited_message)
+    except Exception as e:
+        # даже если подмена не удалась — правка просто обработается как
+        # раньше (с вероятной ошибкой в конкретном хендлере), но сам бот
+        # не должен падать здесь.
+        logger.warning(f"edited_message middleware: {e}")
 
 
 async def _voice_transcription_middleware(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8317,6 +11849,36 @@ def _storage_restore_apply(payload: bytes, fallback_name: str = ""):
         _cache_last_update.clear()
     except Exception:
         pass
+    # ВОЛНА 22.99: цены — ЕДИНСТВЕННЫЙ датасет, кэшированный на уровне
+    # модуля: PRICES = load_prices() выполняется ОДИН раз при импорте,
+    # задолго до того, как фоновое восстановление на старте
+    # (_cdb_restore_on_boot → _cdb_recall → сюда) успеет достать снапшот
+    # из канала. На свежем сервере (пустой диск — Render Free, режим
+    # «База в канале») импорт читал ДЕФОЛТЫ, восстановленный prices.json
+    # ложился в хранилище, а глобальный PRICES оставался дефолтным на
+    # весь аптайм: разработчик видел «цены сбросились», а ЛЮБАЯ правка
+    # цены сохраняла дефолтный словарь (+правка), затирая остальные
+    # кастомные цены в хранилище навсегда. Перезачитываем цены из
+    # только что восстановленного хранилища — вместе с остальными кэшами.
+    # covers: boot-restore из канала, ручное «📦 Вспомнить всё»,
+    # Telethon-инжест снапшота и ручные восстановления в dev-панели.
+    try:
+        reload_prices()
+        logger.info(
+            "restore: цены перезачитаны из восстановленного хранилища "
+            f"({len(PRICES) if isinstance(PRICES, dict) else '?'} ключей).")
+    except Exception as _prices_reload_err:
+        logger.warning(
+            f"restore: не удалось перезачитать цены: {_prices_reload_err}")
+    # ВОЛНА 23.02: база ожила — пустые сливы в канал отныне запрещены
+    # (защита последнего хорошего снапшота; единая точка всех сценариев
+    # восстановления, как и reload_prices в 22.99).
+    try:
+        global _CDB_EVER_SEEN_DATA
+        if len(load_users() or {}) > 0:
+            _CDB_EVER_SEEN_DATA = True
+    except Exception:
+        pass
     return restored, problems
 
 
@@ -8338,13 +11900,24 @@ async def _cdb_flush(context, force: bool = False, reason: str = ""):
     «💾 Слить сейчас», включение режима, остановка бота).
 
     Возвращает (ok: bool, отчёт: str)."""
-    global _CDB_LAST_FLUSH_MONO
+    global _CDB_LAST_FLUSH_MONO, _CDB_EVER_SEEN_DATA
     cfg = load_storage_config()
     if not cfg.get("channel_db_enabled"):
         return False, "Режим «База в канале» выключен."
     db_ids = get_db_channel_ids()
     if not db_ids:
         return False, "Нет каналов в режиме 🗄️ База данных (или 🔀 Оба)."
+    # ВОЛНА 23.02: ГЕЙТ boot-восстановления. Restore стартует ФОНОМ, а любой
+    # ранний триггер «грязи» (открыл бота, _cdb_flush_soon после создания
+    # класса, тикер) успевал ЗАКРЕПИТЬ почти пустой снапшот ПОВЕРХ хорошего —
+    # boot-restore дочитывал закреп уже после этого и восстанавливал пустоту
+    # (ночной инцидент «база началась с нуля»). Пока boot-restore не
+    # завершён (или не истёк дедлайн 900 с) — сливы в канал заблокированы.
+    if _CDB_BOOT_RESTORE_STARTED and not _CDB_BOOT_RESTORE_DONE:
+        logger.warning(
+            "cdb flush: СКИП — boot-восстановление ещё не завершено; слив "
+            "заблокирован, чтобы пустая база не затёрла закреп канала (23.02).")
+        return False, "скип: boot-восстановление ещё не завершено (гейт 23.02)"
     if not _CDB_DIRTY and not force:
         return True, "Изменений нет — сливать нечего."
     if not force:
@@ -8360,6 +11933,28 @@ async def _cdb_flush(context, force: bool = False, reason: str = ""):
         payload, meta, files_n = await asyncio.to_thread(_storage_pack_payload)
         if not payload:
             return False, "Нет данных для снапшота."
+        # ВОЛНА 23.02: ЗАЩИТА ОТ ОТРАВЛЕННОГО ПИНА. Полностью пустую базу
+        # (0 юзеров И 0 классов) в канал не сливаем, если данные хотя бы раз
+        # были (_CDB_EVER_SEEN_DATA): новый пустой снапшот закрепился бы
+        # ПОВЕРХ последнего хорошего, и следующий старт потерял бы всё.
+        # Действует и для force (post_shutdown/«Слить сейчас»): сливать
+        # пустоту — всегда вред. Экстренный обход для ИНТЕНТ-сброса:
+        # env DEVORKS_ALLOW_EMPTY_FLUSH=1.
+        _u_n = int(meta.get("users", 0) or 0)
+        _c_n = int(meta.get("classes", 0) or 0)
+        if _u_n > 0:
+            _CDB_EVER_SEEN_DATA = True
+        elif _u_n == 0 and _c_n == 0 and _CDB_EVER_SEEN_DATA \
+                and os.environ.get("DEVORKS_ALLOW_EMPTY_FLUSH", ""
+                                   ).strip().lower() not in ("1", "true", "yes"):
+            logger.error(
+                "cdb flush: ЗАБЛОНИРОВАН слив ПУСТОЙ базы (0 юзеров, 0 "
+                "классов), хотя данные ранее были, — последний снапшот "
+                "канала сохранён (23.02). Если пустота интентна (полный "
+                "сброс), перезапустите с env DEVORKS_ALLOW_EMPTY_FLUSH=1.")
+            return False, ("слив ПУСТОЙ базы заблокирован (23.02): в памяти "
+                           "0 юзеров и 0 классов, а данные ранее были — "
+                           "снапшот канала не затирается")
         now = _utcnow()
         stamp = now.strftime("%Y-%m-%d_%H-%M-%S")
         fname = f"{CDB_SNAPSHOT_PREFIX}_{stamp}.zip"
@@ -8767,6 +12362,104 @@ async def _boot_dev_restore_hint(application, ok: bool, report: str = ""):
         logger.info(f"boot hint: сообщение разработчику не отправлено: {e}")
 
 
+async def _cdb_selfheal_empty(context):
+    """ВОЛНА 23.02: самолечение после ПУСТОГО boot-восстановления.
+
+    Сценарий ночного инцидента: закреп в канале уже был «отравлен» пустым
+    снапшотом (затёрт ранним сливом до завершения restore) — restore честно
+    применил пустоту. Последние ХОРОШИЕ снапшоты оставались в реестре
+    хранилища (cdb_registry: file_id + штамп + число юзеров на момент
+    слива) — они восстанавливаются storage_config.json'ом из самого
+    снапшота. Здесь: берём кандидатов от нового к старому, качаем по
+    file_id, проверяем _meta.json (юзеров > 0), применяем первый живой и
+    помечаем «грязь» — тикер перепинит хороший снапшот в канал.
+
+    Возвращает (ok: bool, отчёт: str). Никогда не бросает — только лог."""
+    global _CDB_EVER_SEEN_DATA
+    try:
+        if len(load_users() or {}) > 0:
+            return False, ""  # база не пуста — лечение не нужно
+    except Exception:
+        pass
+    try:
+        cfg = load_storage_config()
+    except Exception as e:
+        return False, f"самолечение: реестр хранилища недоступен ({e})"
+    reg = cfg.get("cdb_registry") or {}
+    cands = []
+    if isinstance(reg, dict):
+        for _ch, info in reg.items():
+            if not isinstance(info, dict):
+                continue
+            fid = info.get("file_id")
+            if not fid:
+                continue
+            cands.append((str(info.get("ts") or ""), str(_ch), str(fid)))
+    if not cands:
+        return False, "самолечение: в реестре нет снапшотов с file_id"
+    cands.sort(key=lambda t: t[0], reverse=True)
+    logger.warning(
+        f"cdb selfheal: база пуста после boot-restore — пробую "
+        f"{min(len(cands), 5)} предыдущих снапшотов из реестра (23.02).")
+    tried = 0
+    for ts, ch, fid in cands:
+        if tried >= 5:
+            break
+        tried += 1
+        try:
+            tg_file = await context.bot.get_file(fid)
+            buf = io.BytesIO()
+            await asyncio.wait_for(
+                tg_file.download_to_memory(out=buf), timeout=240,
+            )
+            payload = buf.getvalue()
+        except Exception as e:
+            logger.warning(f"cdb selfheal: кандидат {ts} ({ch}) не скачался: {e}")
+            continue
+        try:
+            zf = zipfile.ZipFile(io.BytesIO(payload))
+            try:
+                meta = json.loads(zf.read("_meta.json").decode("utf-8"))
+            finally:
+                zf.close()
+            if not isinstance(meta, dict) or int(meta.get("users") or 0) <= 0:
+                logger.info(
+                    f"cdb selfheal: кандидат {ts} пустой/битый "
+                    f"(юзеров: {(meta or {}).get('users') if isinstance(meta, dict) else '?'}) — скип.")
+                continue
+        except Exception as e:
+            logger.warning(f"cdb selfheal: кандидат {ts} не прочитан: {e}")
+            continue
+        try:
+            async with _get_cdb_flush_lock():
+                restored, problems = _storage_restore_apply(payload)
+        except Exception as e:
+            logger.warning(f"cdb selfheal: кандидат {ts} не применился: {e}")
+            continue
+        if not restored:
+            logger.warning(
+                f"cdb selfheal: кандидат {ts}: ничего не восстановлено "
+                f"({'; '.join((problems or [])[:2])}).")
+            continue
+        if len(load_users() or {}) > 0:
+            _CDB_EVER_SEEN_DATA = True
+            try:
+                _cdb_mark_dirty("users.json")  # тикер перепинит хороший снапшот
+            except Exception:
+                pass
+            logger.warning(
+                f"cdb selfheal: УСПЕХ — применён предыдущий снапшот "
+                f"(от {ts}, канал {ch}): юзеров {meta.get('users')}, "
+                f"классов {meta.get('classes')}.")
+            return True, (f"восстановлен предыдущий снапшот из реестра "
+                          f"(от {ts or '?'}): юзеров {meta.get('users')}, "
+                          f"классов {meta.get('classes')} — перепин "
+                          f"хорошего снапшота выполнится автоматически")
+        # применился, но юзеров так и нет — ищем дальше
+    return False, (f"самолечение: живых снапшотов в реестре не найдено "
+                   f"(проверено: {tried})")
+
+
 async def _cdb_restore_on_boot(application):
     """ВОЛНА 8/10: восстановление базы ИЗ КАНАЛА при старте.
 
@@ -8780,12 +12473,43 @@ async def _cdb_restore_on_boot(application):
     Если каналов нет или в них нет закреплённого снапшота — работаем на
     локальном кэше, как раньше; при первом же изменении база уйдёт в канал.
 
-    Вызывается из _post_init в фоне, чтобы не мешать старту."""
+    Вызывается из _post_init в фоне, чтобы не мешать старту.
+
+    ВОЛНА 23.02 (харденинг после ночного инцидента «база началась с нуля»):
+    • ГЕЙТ слива: с этого момента и до завершения restore (или дедлайна
+      900 с) все _cdb_flush заблокированы — ранняя «грязь» не успеет
+      запинить пустой снапшот поверх хорошего;
+    • «пустая база» теперь = файла users.json НЕТ ИЛИ юзеров в нём 0
+      (пустой {}, созданный ранней записью, больше не маскирует пустоту);
+    • если после restore база всё ещё пуста — самолечение из реестра
+      (_cdb_selfheal_empty): предыдущие снапшоты по file_id, первый
+      живой (юзеров > 0) применяется, тикер перепинивает его в канал."""
+    global _CDB_BOOT_RESTORE_STARTED, _CDB_BOOT_RESTORE_DONE, _CDB_EVER_SEEN_DATA
+    _CDB_BOOT_RESTORE_STARTED = True
+
+    def _boot_gate_release():
+        # Дедлайн-страховка: даже если restore завис навсегда, сливы
+        # разблокируются через 900 с (штатный restore — секунды-минуты).
+        global _CDB_BOOT_RESTORE_DONE
+        if not _CDB_BOOT_RESTORE_DONE:
+            _CDB_BOOT_RESTORE_DONE = True
+            logger.warning("cdb boot: гейт слива снят по дедлайну 900 с "
+                           "(restore не завершился штатно).")
+
     try:
+        asyncio.get_running_loop().call_later(900, _boot_gate_release)
+    except Exception:
+        pass
+    try:
+        if len(load_users() or {}) > 0:
+            _CDB_EVER_SEEN_DATA = True
         cfg = load_storage_config()
         enabled = bool(cfg.get("channel_db_enabled"))
-        # Пустая база = файла пользователей нет вовсе (свежий сервер/диск).
-        empty_base = not os.path.exists(str(USERS_FILE))
+        # ВОЛНА 23.02: пустая база = файла пользователей нет ИЛИ юзеров 0
+        # (пустой {}, успевший создаться до завершения restore, больше не
+        # считается «базой на месте»).
+        empty_base = (not os.path.exists(str(USERS_FILE))) or \
+            (len(load_users() or {}) == 0)
         if not enabled and not empty_base:
             logger.info("cdb boot: режим выключен, локальная база на месте — скип.")
             return
@@ -8804,6 +12528,20 @@ async def _cdb_restore_on_boot(application):
             bot = application.bot
         ok, report = await _cdb_recall(_CtxStub(), suppress_dirty=True,
                                        freshness_guard=True)
+        # ВОЛНА 23.02: САМОЛЕЧЕНИЕ — если после restore база всё ещё ПУСТА
+        # (в т.ч. случай «закреп уже отравлен пустым снапшотом»), пробуем
+        # предыдущие снапшоты из реестра хранилища.
+        try:
+            if len(load_users() or {}) == 0:
+                _sh_ok, _sh_rep = await _cdb_selfheal_empty(_CtxStub())
+                if _sh_ok:
+                    ok = True
+                    if _sh_rep:
+                        report = f"{report}\n🩺 Самолечение 23.02: {_sh_rep}"
+                elif _sh_rep:
+                    report = f"{report}\n🩺 {_sh_rep}"
+        except Exception as _sh_err:
+            logger.warning(f"cdb boot: самолечение упало: {_sh_err}")
         if ok:
             logger.info(f"cdb boot: ВСПОМНИЛИ ВСЁ ИЗ КАНАЛА:\n{report}")
             if empty_base:
@@ -8819,6 +12557,11 @@ async def _cdb_restore_on_boot(application):
                 await _boot_dev_restore_hint(application, ok=False, report=report)
     except Exception as e:
         logger.error(f"cdb boot crashed: {e}")
+    finally:
+        # ВОЛНА 23.02: гейт слива снимается в ЛЮБОМ исходе — иначе одна
+        # неудача restore навсегда заблокировала бы зеркалирование базы.
+        _CDB_BOOT_RESTORE_DONE = True
+        logger.info("cdb boot: завершено — гейт слива снят (23.02).")
 
 
 async def _post_shutdown(application):
@@ -9186,6 +12929,17 @@ def _cloud_files_text(user):
     return "\n".join(lines)
 
 
+# ВОЛНА 22.96: облако пока «в разработке» — внутрь пускаем ТОЛЬКО
+# разработчика (DEVELOPER_ID). Остальные видят честное уведомление.
+_CLOUD_WIP_TEXT = ("🚧 Облако сейчас в разработке — скоро откроем. "
+                   "Следите за обновлениями!")
+
+
+def _cloud_dev_only(uid):
+    """ВОЛНА 22.96: True — облако разрешено (пока только разработчик)."""
+    return bool(DEVELOPER_ID) and str(uid) == str(DEVELOPER_ID)
+
+
 @timeout(CONVERSATION_TIMEOUT)
 async def cloud_menu_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Вход в облако кнопкой главного меню «☁️ Облако»."""
@@ -9193,6 +12947,10 @@ async def cloud_menu_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(user_id)
     if not user:
         await update.message.reply_text("Сначала зарегистрируйтесь — отправьте /start.")
+        return MAIN_MENU
+    # ВОЛНА 22.96: облако «в разработке» — внутрь пускаем только разработчика.
+    if not _cloud_dev_only(user_id):
+        await update.message.reply_text(_CLOUD_WIP_TEXT)
         return MAIN_MENU
     # Выход из режима загрузки (если ранее был включён).
     context.user_data.pop('cloud_file_mode', None)
@@ -9206,6 +12964,10 @@ async def cloud_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     user = get_user(str(query.from_user.id))
     if not user:
         await query.answer("Сначала зарегистрируйтесь — /start", show_alert=True)
+        return MAIN_MENU
+    # ВОЛНА 22.96: облако «в разработке» — внутрь пускаем только разработчика.
+    if not _cloud_dev_only(str(query.from_user.id)):
+        await query.answer(_CLOUD_WIP_TEXT, show_alert=True)
         return MAIN_MENU
     context.user_data.pop('cloud_file_mode', None)
     try:
@@ -11084,6 +14846,47 @@ async def bg_chat_upload_receive(update: Update, context: ContextTypes.DEFAULT_T
     # Страховка: в режимах загрузки файлы забирает FSM — сюда они не дошли бы.
     if context.user_data.get('cloud_file_mode') or context.user_data.get('vault_put_mode'):
         return None
+    # ВОЛНА 23.10.10/23.10.12: фото в режиме ИИ (ai_mode) уходит в ИИ-чат,
+    # а не в облако («фото с подписью в режиме ИИ — к ИИ, не в хранилище»):
+    # модели с vision видят картинку сами, Groq-путь использует OCR/BLIP.
+    # АЛЬБОМЫ собираются в пачку по media_group_id (дебаунс 1.3 с) и уходят
+    # ОДНИМ запросом — до 5 фото за раз, подпись берём с любого фото пачки.
+    if context.user_data.get('ai_mode'):
+        _doc0 = getattr(msg, "document", None)
+        if msg.photo or (_doc0 is not None and str(
+                getattr(_doc0, "mime_type", "") or "").startswith("image/")):
+            _ai_fid = None
+            _ai_mime = "image/jpeg"
+            if msg.photo:
+                _ai_fid = msg.photo[-1].file_id
+            else:
+                _ai_fid = _doc0.file_id
+                _ai_mime = str(getattr(_doc0, "mime_type", "")
+                               or "image/jpeg")
+            _ai_cap = (msg.caption or "").strip()
+            _mg = getattr(msg, "media_group_id", None)
+            if _mg:
+                _key = (str(update.effective_user.id), str(_mg))
+                _batch = _AI_ALBUM_BATCHES.setdefault(
+                    _key, {"fids": [], "caps": []})
+                _batch["fids"].append((_ai_fid, _ai_mime))
+                _batch["caps"].append(_ai_cap)
+                await asyncio.sleep(1.3)
+                _cur = _AI_ALBUM_BATCHES.get(_key)
+                if _cur is not _batch:
+                    return None      # пачку забрал последний дебаунс
+                _AI_ALBUM_BATCHES.pop(_key, None)
+                _fids = _batch["fids"]
+                _caps = [c for c in _batch["caps"] if c]
+            else:
+                _fids = [(_ai_fid, _ai_mime)]
+                _caps = [_ai_cap] if _ai_cap else []
+            _AI_MEDIA_INFLIGHT[str(update.effective_user.id)] = {
+                "file_ids": _fids,
+                "more": max(0, len(_fids) - _AI_MAX_PHOTOS),
+                "caption": (_caps[0] if _caps else ""),
+            }
+            return await handle_ai_message(update, context)
     user_id = str(update.effective_user.id)
     user = get_user(user_id)
     if not user:
@@ -38685,6 +42488,10 @@ async def vault_menu_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user:
         await update.message.reply_text("Сначала зарегистрируйтесь — отправьте /start.")
         return MAIN_MENU
+    # ВОЛНА 22.96: Сейф/облако «в разработке» — только разработчик.
+    if not _cloud_dev_only(user_id):
+        await update.message.reply_text(_CLOUD_WIP_TEXT)
+        return MAIN_MENU
     # ВОЛНА 11/12: если до этого была начата загрузка в Сейф — при входе в
     # меню стираем следы из чата. ВОЛНА 12: чистим ВСЕГДА (даже с пустой
     # пачкой) — персистентный след переживает рестарт и чистится здесь.
@@ -38719,6 +42526,10 @@ async def vault_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     user = get_user(str(query.from_user.id))
     if not user:
         await query.answer("Сначала зарегистрируйтесь — /start", show_alert=True)
+        return MAIN_MENU
+    # ВОЛНА 22.96: Сейф/облако «в разработке» — только разработчик.
+    if not _cloud_dev_only(str(query.from_user.id)):
+        await query.answer(_CLOUD_WIP_TEXT, show_alert=True)
         return MAIN_MENU
     # ВОЛНА 11/12: незавершённая пачка — следы файлов из чата стираем
     # (включая персистентный след — работает и после рестарта бота).
@@ -43589,7 +47400,1406 @@ async def dev_restore_do_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
-async def handle_ai_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ==================================
+# === ВОЛНА 23.10.10: ЭКРАНЫ «МНОГО ИИ» ===
+# ==================================
+# 1) 🛠️ Панель разработчика → «🧠 ИИ-провайдеры»: добавление (13 пресетов
+#    + свой), удаление, модель по умолчанию (загружается список), тоггл
+#    веб-поиска. Ключи приходят ТЕКСТОМ (шаг после кнопки пресета) —
+#    приёмчик живёт в dev_panel_text_router (флаг ai_prov_pending).
+# 2) Чат «🤖 DEVORKS+ai» → кнопка «🤖 Модель»: КАЖДЫЙ пользователь может
+#    выбрать себе модель из подключённых («если пользователь захочет —
+#    то и пользователь может»).
+# 3) _ai_provider_flow — полный цикл ответа через провайдера (фото/vision,
+#    веб-инструменты, Markdown→HTML), вшитый в handle_ai_message.
+
+_AI_MODELS_PER_PAGE = 12
+_AI_BTN_TEXT_MAX = 48
+
+
+def _ai_pid_next(cfg):
+    i = 1
+    while f"p{i}" in cfg["providers"]:
+        i += 1
+    return f"p{i}"
+
+
+def _ai_short(s, n=_AI_BTN_TEXT_MAX):
+    s = str(s or "")
+    return s if len(s) <= n else s[:n - 1] + "…"
+
+
+def _ai_default_label(cfg):
+    d = cfg.get("default")
+    if not d:
+        return "не задана"
+    p = cfg["providers"].get(d["provider"]) or {}
+    return "%s · %s" % (p.get("name") or d["provider"], d["model"])
+
+
+async def _dev_ai_route(update, context):
+    """ВОЛНА 23.10.10: маршрутизатор dev_ai_* (ТОЛЬКО разработчик).
+    data: dev_ai_menu | dev_ai_add | dev_ai_preset_<id> | dev_ai_custom |
+    dev_ai_prov_<pid> | dev_ai_del_<pid> | dev_ai_models_<pid>_<page> |
+    dev_ai_mdl_<pid>_<idx> | dev_ai_web | dev_ai_noop."""
+    query = update.callback_query
+    if str(query.from_user.id) != DEVELOPER_ID:
+        try:
+            await query.answer("Только для разработчика.", show_alert=True)
+        except Exception:
+            pass
+        return DEV_PANEL
+    data = query.data or ""
+    if data == "dev_ai_noop":
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        return DEV_PANEL
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    cfg = ai_providers_config()
+    chat_id = update.effective_chat.id
+
+    def _dev_ai_send(text, kb):
+        return _safe_edit_html(query, text, bot=context.bot,
+                               fallback_chat_id=chat_id, reply_markup=kb)
+
+    # ── Главное меню провайдеров ──────────────────────────────────────
+    if data == "dev_ai_menu":
+        context.user_data.pop("ai_prov_pending", None)
+        lines = ["🧠 <b>ИИ-провайдеры</b>\n"]
+        if not cfg["providers"]:
+            lines.append("Пока не подключено ни одного провайдера — чат "
+                         "«🤖 DEVORKS+ai» работает на Groq/DeepSeek.")
+        else:
+            lines.append("Подключено: %d. Модель по умолчанию: %s."
+                         % (len(cfg["providers"]), _html_esc(_ai_default_label(cfg))))
+            # ВОЛНА 23.10.11: модели у пользователей больше НЕ переключаются.
+            lines.append("Модель по умолчанию — у всех; другие ИИ "
+                         "пользователи выбирают кнопкой «🔀 Выбор ИИ» "
+                         "(закрепите им модель кнопкой «👥 Модель для "
+                         "пользователей»). Свои ИИ (ключ+модель) они "
+                         "подключают кнопкой «🔑 Свой ИИ» — пошагово.")
+        rows = []
+        for pid, p in sorted(cfg["providers"].items()):
+            is_def = (cfg.get("default") or {}).get("provider") == pid
+            rows.append([InlineKeyboardButton(
+                ("🏷 " + _ai_short(p["name"]) + (" ⭐" if is_def else "")),
+                callback_data=f"dev_ai_prov_{pid}")])
+        rows.append([InlineKeyboardButton("➕ Добавить провайдера",
+                                          callback_data="dev_ai_add")])
+        if cfg["providers"]:
+            rows.append([InlineKeyboardButton(
+                "🌐 Веб-поиск: " + ("ВКЛ" if cfg["web_tools"] else "ВЫКЛ"),
+                callback_data="dev_ai_web")])
+        rows.append([InlineKeyboardButton("⬅️ Назад",
+                                          callback_data="dev_panel_back")])
+        await _dev_ai_send("\n".join(lines), InlineKeyboardMarkup(rows))
+        return DEV_PANEL
+
+    # ── Выбор пресета для добавления ─────────────────────────────────
+    if data == "dev_ai_add":
+        context.user_data.pop("ai_prov_pending", None)
+        lines = ["➕ <b>Добавить ИИ-провайдера</b>\n",
+                 "Выберите готовый сервис — потом пришлю его ключ.",
+                 "Свой сервер — кнопка «🔧 Свой провайдер»."]
+        rows = []
+        row = []
+        for pid, p in AI_PRESETS.items():
+            row.append(InlineKeyboardButton(
+                _ai_short(p["name"], 20), callback_data=f"dev_ai_preset_{pid}"))
+            if len(row) >= 2:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+        rows.append([InlineKeyboardButton("🔧 Свой провайдер",
+                                          callback_data="dev_ai_custom")])
+        rows.append([InlineKeyboardButton("⬅️ К провайдерам",
+                                          callback_data="dev_ai_menu")])
+        await _dev_ai_send("\n".join(lines), InlineKeyboardMarkup(rows))
+        return DEV_PANEL
+
+    if data.startswith("dev_ai_preset_"):
+        preset_id = data[len("dev_ai_preset_"):]
+        preset = AI_PRESETS.get(preset_id)
+        if not preset:
+            await _dev_ai_send("Пресет не найден.", InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ К провайдерам",
+                                     callback_data="dev_ai_menu")]]))
+            return DEV_PANEL
+        context.user_data["ai_prov_pending"] = {"step": "key",
+                                                "preset": preset_id}
+        lines = ["🔑 <b>%s — шаг 2/2</b>\n" % _html_esc(preset["name"]),
+                 "Пришлите <b>только API-ключ</b> одним сообщением — "
+                 "проверю его онлайн и сохраню провайдера.",
+                 "Где взять: %s" % _html_esc(preset.get("where")
+                                             or preset.get("hint") or "—"),
+                 "",
+                 "«отмена» — выйти."]
+        await _dev_ai_send("\n".join(lines), InlineKeyboardMarkup([[
+            InlineKeyboardButton("⬅️ Назад", callback_data="dev_ai_add")]]))
+        return DEV_PANEL
+
+    if data == "dev_ai_custom":
+        context.user_data["ai_prov_pending"] = {"step": "name"}
+        lines = ["🔧 <b>Свой провайдер — 4 шага</b>\n",
+                 "<b>Шаг 1/4.</b> Как назвать провайдера?",
+                 "Например: «Домашний сервер», «LM Studio», «vLLM».",
+                 "",
+                 "Дальше бот сам спросит адрес API, ключ (с онлайн-"
+                 "проверкой) и предложит модели.",
+                 "«отмена» — выйти."]
+        await _dev_ai_send("\n".join(lines), InlineKeyboardMarkup([[
+            InlineKeyboardButton("⬅️ Назад", callback_data="dev_ai_add")]]))
+        return DEV_PANEL
+
+    # ── Экран одного провайдера ───────────────────────────────────────
+    if data.startswith("dev_ai_prov_"):
+        pid = data[len("dev_ai_prov_"):]
+        p = cfg["providers"].get(pid)
+        if not p:
+            await _dev_ai_send("Провайдер не найден.", InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ К провайдерам",
+                                     callback_data="dev_ai_menu")]]))
+            return DEV_PANEL
+        is_def = (cfg.get("default") or {}).get("provider") == pid
+        dmodel = (cfg.get("default") or {}).get("model") if is_def else None
+        _um = str(p.get("user_model") or "")
+        lines = ["🏷 <b>%s</b>%s" % (_html_esc(p["name"]),
+                                     " — модель по умолчанию" if is_def else ""),
+                 "Протокол: %s" % _html_esc(p["protocol"]),
+                 "Модель по умолчанию: %s"
+                 % _html_esc(dmodel or "не задана"),
+                 "👥 Модель для пользователей (🔀 Выбор ИИ): %s"
+                 % _html_esc(_um or "не задана — ИИ недоступен для выбора"),
+                 "", "Ключ: " + ("✅ задан" if p.get("api_key") else "⚠️ пустой")]
+        rows = [[InlineKeyboardButton("⭐ Модель по умолчанию",
+                                       callback_data=f"dev_ai_models_{pid}_0")]]
+        rows.append([InlineKeyboardButton("👥 Модель для пользователей",
+                                          callback_data=f"dev_ai_umodels_{pid}_0")])
+        rows.append([InlineKeyboardButton("🗑 Удалить провайдера",
+                                          callback_data=f"dev_ai_del_{pid}")])
+        rows.append([InlineKeyboardButton("⬅️ К провайдерам",
+                                          callback_data="dev_ai_menu")])
+        await _dev_ai_send("\n".join(lines), InlineKeyboardMarkup(rows))
+        return DEV_PANEL
+
+    if data.startswith("dev_ai_del_"):
+        pid = data[len("dev_ai_del_"):]
+        if pid in cfg["providers"]:
+            cfg["providers"].pop(pid, None)
+            if (cfg.get("default") or {}).get("provider") == pid:
+                cfg["default"] = None
+            cfg.get("models_cache", {}).pop(pid, None)
+            ai_providers_save(cfg)
+        rows = []
+        for pid2, p in sorted(cfg["providers"].items()):
+            rows.append([InlineKeyboardButton(
+                "🏷 " + _ai_short(p["name"]),
+                callback_data=f"dev_ai_prov_{pid2}")])
+        rows.append([InlineKeyboardButton("➕ Добавить провайдера",
+                                          callback_data="dev_ai_add")])
+        rows.append([InlineKeyboardButton("⬅️ Назад",
+                                          callback_data="dev_panel_back")])
+        await _dev_ai_send("🗑 Провайдер удалён.", InlineKeyboardMarkup(rows))
+        return DEV_PANEL
+
+    # ── Список моделей (пагинация) ───────────────────────────────────
+    if data.startswith("dev_ai_models_"):
+        try:
+            _, _, _, pid, page_s = data.split("_", 4)
+            page = max(0, int(page_s))
+        except ValueError:
+            pid, page = "", 0
+        p = cfg["providers"].get(pid)
+        if not p:
+            await _dev_ai_send("Провайдер не найден.", InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ К провайдерам",
+                                     callback_data="dev_ai_menu")]]))
+            return DEV_PANEL
+        try:
+            await query.answer("⏳ Загружаю модели…")
+        except Exception:
+            pass
+        models, err = await ai_fetch_models(pid, p)
+        if err or not models:
+            await _dev_ai_send("⚠️ Не удалось получить список моделей: %s\n\n"
+                       "Попробуйте позже или задайте модель в спецификации "
+                       "провайдера." % _html_esc(err or "пусто"),
+                       InlineKeyboardMarkup([[
+                           InlineKeyboardButton("⬅️ К провайдеру",
+                                                callback_data=f"dev_ai_prov_{pid}")]]))
+            return DEV_PANEL
+        cfg = ai_providers_config()
+        total = len(models)
+        pages = (total + _AI_MODELS_PER_PAGE - 1) // _AI_MODELS_PER_PAGE
+        page = min(page, max(0, pages - 1))
+        is_def = (cfg.get("default") or {}).get("provider") == pid
+        dmodel = (cfg.get("default") or {}).get("model") if is_def else None
+        lines = ["⭐ <b>Модель по умолчанию — %s</b>\n" % _html_esc(p["name"]),
+                 "Текущая: %s" % _html_esc(dmodel or "не задана"),
+                 "Всего моделей: %d (стр. %d/%d)" % (total, page + 1, pages)]
+        rows = []
+        row = []
+        for i in range(page * _AI_MODELS_PER_PAGE,
+                       min((page + 1) * _AI_MODELS_PER_PAGE, total)):
+            mid = models[i]
+            mark = "✅ " if (is_def and mid == dmodel) else ""
+            row.append(InlineKeyboardButton(
+                _ai_short(mark + mid), callback_data=f"dev_ai_mdl_{pid}_{i}"))
+            if len(row) >= 2:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("⬅️",
+                                            callback_data=f"dev_ai_models_{pid}_{page-1}"))
+        nav.append(InlineKeyboardButton("%d/%d" % (page + 1, pages),
+                                        callback_data="dev_ai_noop"))
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton("➡️",
+                                            callback_data=f"dev_ai_models_{pid}_{page+1}"))
+        if nav:
+            rows.append(nav)
+        rows.append([InlineKeyboardButton("⬅️ К провайдеру",
+                                          callback_data=f"dev_ai_prov_{pid}")])
+        await _dev_ai_send("\n".join(lines), InlineKeyboardMarkup(rows))
+        return DEV_PANEL
+
+    if data.startswith("dev_ai_mdl_"):
+        try:
+            _, _, _, pid, idx_s = data.split("_", 4)
+            idx = int(idx_s)
+        except ValueError:
+            pid, idx = "", -1
+        p = cfg["providers"].get(pid)
+        rec = (ai_providers_config().get("models_cache") or {}).get(pid) or {}
+        models = rec.get("models") or []
+        if not p or idx < 0 or idx >= len(models):
+            await _dev_ai_send("Кнопка устарела — откройте список заново.",
+                       InlineKeyboardMarkup([[
+                           InlineKeyboardButton("⭐ Модели",
+                                                callback_data=f"dev_ai_models_{pid}_0")]]))
+            return DEV_PANEL
+        cfg["default"] = {"provider": pid, "model": str(models[idx])}
+        ai_providers_save(cfg)
+        try:
+            await query.answer("✅ Модель по умолчанию выбрана!")
+        except Exception:
+            pass
+        lines = ["✅ Модель по умолчанию обновлена:\n",
+                 "🏷 %s\n🤖 %s" % (_html_esc(p["name"]),
+                                   _html_esc(models[idx])),
+                 "", "Теперь чат «🤖 DEVORKS+ai» отвечает через неё "
+                     "у всех пользователей."]
+        rows = [[InlineKeyboardButton("⬅️ К провайдеру",
+                                       callback_data=f"dev_ai_prov_{pid}")],
+                [InlineKeyboardButton("🧠 К провайдерам",
+                                      callback_data="dev_ai_menu")]]
+        await _dev_ai_send("\n".join(lines), InlineKeyboardMarkup(rows))
+        return DEV_PANEL
+
+    # ── ВОЛНА 23.10.12: модель для ВЫБОРА ПОЛЬЗОВАТЕЛЕЙ ─────────────
+    # Провайдеры с закреплённой «user_model» появляются у пользователей
+    # в «🔀 Выбор ИИ»; саму модель они переключать НЕ могут — только
+    # выбирать ИИ целиком («пользователи не должны переключать модели,
+    # которые поставил разработчик»).
+    if data.startswith("dev_ai_umodels_"):
+        try:
+            _, _, _, pid, page_s = data.split("_", 4)
+            page = max(0, int(page_s))
+        except ValueError:
+            pid, page = "", 0
+        p = cfg["providers"].get(pid)
+        if not p:
+            await _dev_ai_send("Провайдер не найден.", InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ К провайдерам",
+                                     callback_data="dev_ai_menu")]]))
+            return DEV_PANEL
+        try:
+            await query.answer("⏳ Загружаю модели…")
+        except Exception:
+            pass
+        models, err = await ai_fetch_models(pid, p)
+        if err or not models:
+            await _dev_ai_send(
+                "⚠️ Не удалось получить список моделей: %s"
+                % _html_esc(err or "пусто"),
+                InlineKeyboardMarkup([[
+                    InlineKeyboardButton("⬅️ К провайдеру",
+                                         callback_data=f"dev_ai_prov_{pid}")]]))
+            return DEV_PANEL
+        cfg = ai_providers_config()
+        total = len(models)
+        pages = (total + _AI_MODELS_PER_PAGE - 1) // _AI_MODELS_PER_PAGE
+        page = min(page, max(0, pages - 1))
+        um = str(p.get("user_model") or "")
+        lines = ["👥 <b>Модель для пользователей — %s</b>\n"
+                 % _html_esc(p["name"]),
+                 "Эту модель видят пользователи в «🔀 Выбор ИИ».",
+                 "Текущая: %s" % _html_esc(um or "не задана — ИИ недоступен "
+                                           "для выбора"),
+                 "Всего моделей: %d (стр. %d/%d)" % (total, page + 1, pages)]
+        rows = []
+        row = []
+        for i in range(page * _AI_MODELS_PER_PAGE,
+                       min((page + 1) * _AI_MODELS_PER_PAGE, total)):
+            mid = models[i]
+            mark = "✅ " if mid == um else ""
+            row.append(InlineKeyboardButton(
+                _ai_short(mark + mid), callback_data=f"dev_ai_umdl_{pid}_{i}"))
+            if len(row) >= 2:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(
+                "⬅️", callback_data=f"dev_ai_umodels_{pid}_{page-1}"))
+        nav.append(InlineKeyboardButton("%d/%d" % (page + 1, pages),
+                                        callback_data="dev_ai_noop"))
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton(
+                "➡️", callback_data=f"dev_ai_umodels_{pid}_{page+1}"))
+        if nav:
+            rows.append(nav)
+        rows.append([InlineKeyboardButton("⬅️ К провайдеру",
+                                          callback_data=f"dev_ai_prov_{pid}")])
+        await _dev_ai_send("\n".join(lines), InlineKeyboardMarkup(rows))
+        return DEV_PANEL
+
+    if data.startswith("dev_ai_umdl_"):
+        try:
+            _, _, _, pid, idx_s = data.split("_", 4)
+            idx = int(idx_s)
+        except ValueError:
+            pid, idx = "", -1
+        p = cfg["providers"].get(pid)
+        rec = (ai_providers_config().get("models_cache") or {}).get(pid) or {}
+        models = rec.get("models") or []
+        if not p or idx < 0 or idx >= len(models):
+            await _dev_ai_send(
+                "Кнопка устарела — откройте список заново.",
+                InlineKeyboardMarkup([[
+                    InlineKeyboardButton("👥 Модели",
+                                         callback_data=f"dev_ai_umodels_{pid}_0")]]))
+            return DEV_PANEL
+        p["user_model"] = str(models[idx])
+        ai_providers_save(cfg)
+        try:
+            await query.answer("✅ Модель для пользователей выбрана!")
+        except Exception:
+            pass
+        lines = ["✅ <b>Модель для пользователей обновлена</b>\n",
+                 "🏷 %s\n👥 %s" % (_html_esc(p["name"]),
+                                   _html_esc(models[idx])),
+                 "",
+                 "Теперь этот ИИ доступен пользователям в «🔀 Выбор ИИ». "
+                 "Саму модель они переключать не могут — только вы."]
+        rows = [[InlineKeyboardButton("⬅️ К провайдеру",
+                                       callback_data=f"dev_ai_prov_{pid}")],
+                [InlineKeyboardButton("🧠 К провайдерам",
+                                      callback_data="dev_ai_menu")]]
+        await _dev_ai_send("\n".join(lines), InlineKeyboardMarkup(rows))
+        return DEV_PANEL
+    if data == "dev_ai_web":
+        cfg["web_tools"] = not cfg.get("web_tools", False)
+        ai_providers_save(cfg)
+        rows = []
+        for pid, p in sorted(cfg["providers"].items()):
+            rows.append([InlineKeyboardButton(
+                "🏷 " + _ai_short(p["name"]),
+                callback_data=f"dev_ai_prov_{pid}")])
+        rows.append([InlineKeyboardButton("➕ Добавить провайдера",
+                                          callback_data="dev_ai_add")])
+        rows.append([InlineKeyboardButton(
+            "🌐 Веб-поиск: " + ("ВКЛ" if cfg["web_tools"] else "ВЫКЛ"),
+            callback_data="dev_ai_web")])
+        rows.append([InlineKeyboardButton("⬅️ Назад",
+                                          callback_data="dev_panel_back")])
+        await _dev_ai_send("🌐 Веб-поиск ИИ: %s." % (
+            "ВКЛ — модель сама ищет в интернете и читает страницы"
+            if cfg["web_tools"] else "ВЫКЛ — ответы без интернета"),
+            InlineKeyboardMarkup(rows))
+        return DEV_PANEL
+
+    return DEV_PANEL
+
+
+async def _ai_ownkey_route(update, context):
+    """ВОЛНА 23.10.12: «🔑 Свой ИИ» — ПОШАГОВОЕ подключение своего
+    провайдера. Просьба пользователя: «нужно удобное добавление, не всё
+    в строчку — бот сам каждый шаг делает удобным». Теперь бот ведёт за
+    руку: сервис → ключ (только ключ!) → модель (подбираем сами, можно
+    сменить). Свои сервис/ключ/модель действуют ТОЛЬКО для пользователя;
+    модели ИИ разработчика он по-прежнему переключать не может.
+    data: ai_ownkey_menu | ai_ownkey_start | ai_ownkey_preset_<pid> |
+    ai_ownkey_custom | ai_ownkey_models | ai_ownkey_mdlman |
+    ai_ownkey_mdl_<i> | ai_ownkey_save | ai_ownkey_del |
+    ai_pick_menu | ai_pick_noop | ai_pick_default | ai_pick_<pid> |
+    ai_pick_menu; легаси ai_ownkey_set/ai_model_* — совместимость."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    data = query.data or ""
+    chat_id = update.effective_chat.id
+    uid = str(query.from_user.id)
+    user = get_user(uid)
+    if user is None:
+        user = User(uid)
+    cfg = ai_providers_config()
+    # Легаси-кнопки «🤖 Модель» (волны 23.10.10/11) открывают новый экран
+    # «Свой ИИ» — старые сообщения в чатах продолжают работать.
+    if data.startswith("ai_model_"):
+        data = "ai_ownkey_menu"
+
+    def _send(text, kb):
+        return _safe_edit_html(query, text, bot=context.bot,
+                               fallback_chat_id=chat_id, reply_markup=kb)
+
+    def _own():
+        return _ai_own_cfg_sanitize(getattr(user, "ai_own_cfg", None))
+
+    # ── 🔀 Выбор ИИ разработчика ────────────────────────────────────
+    if data == "ai_pick_menu":
+        _text, _kb = _ai_pick_menu_kb(user, cfg)
+        await _send(_text, _kb)
+        return MAIN_MENU
+    if data == "ai_pick_noop":
+        return MAIN_MENU
+    if data == "ai_pick_default":
+        user.ai_provider_choice = ""
+        save_user(user)
+        try:
+            await query.answer("✅ Выбран ИИ по умолчанию")
+        except Exception:
+            pass
+        _text, _kb = _ai_pick_menu_kb(user, ai_providers_config())
+        await _send(_text, _kb)
+        return MAIN_MENU
+    if data.startswith("ai_pick_"):
+        pid = data[len("ai_pick_"):]
+        p = cfg["providers"].get(pid)
+        _d = cfg.get("default") or {}
+        _model = ""
+        if pid == _d.get("provider"):
+            _model = str(_d.get("model") or "")
+        if not _model and p:
+            _model = str(p.get("user_model") or "")
+        if p and p.get("enabled", True) and _model:
+            user.ai_provider_choice = pid
+            save_user(user)
+            try:
+                await query.answer("✅ ИИ выбран: %s"
+                                   % _ai_short(p["name"], 30))
+            except Exception:
+                pass
+            _text, _kb = _ai_pick_menu_kb(user, ai_providers_config())
+            await _send(_text, _kb)
+        else:
+            try:
+                await query.answer("Кнопка устарела — список обновляю.",
+                                   show_alert=True)
+            except Exception:
+                pass
+            _text, _kb = _ai_pick_menu_kb(user, cfg)
+            await _send(_text, _kb)
+        return MAIN_MENU
+
+    # ── Главное меню «Свой ИИ» ──────────────────────────────────────
+    # Легаси-кнопка «➕ Подключить ключ» (23.10.11) сразу открывает визард.
+    if data == "ai_ownkey_set":
+        data = "ai_ownkey_start"
+    if data == "ai_ownkey_menu":
+        context.user_data.pop("ai_ownkey_pending", None)
+        lines = ["🔑 <b>Свой ИИ</b>\n"]
+        _own_cfg = _own()
+        if _own_cfg is not None:
+            lines.append("Свой ИИ: ✅ <b>%s</b> · %s%s"
+                         % (_html_esc(_own_cfg["name"]),
+                            _html_esc(_own_cfg["model"]),
+                            (" · 📸 фото"
+                             if _ai_model_supports_vision(_own_cfg["model"])
+                             else "")))
+        elif str(getattr(user, "ai_own_key", "") or "").strip():
+            lines.append("Свой ключ (старый формат): ✅ подключён")
+        else:
+            lines.append("Свой ИИ: не подключен.")
+        lines.append("Работает сейчас: %s"
+                     % _html_esc(_ai_current_target_label(user)))
+        if cfg["providers"]:
+            lines.append("ИИ разработчика: %s"
+                         % _html_esc(_ai_default_label(cfg)))
+        lines += ["",
+                  "Свой ИИ — ваш сервис, ваш ключ, ваша модель; действует "
+                  "только для вас.",
+                  "Модели ИИ разработчика переключать нельзя — их "
+                  "закрепляет разработчик."]
+        rows = []
+        if _own_cfg is not None:
+            rows.append([InlineKeyboardButton("🗑 Убрать свой ИИ",
+                                              callback_data="ai_ownkey_del")])
+        else:
+            rows.append([InlineKeyboardButton("➕ Подключить свой ИИ",
+                                              callback_data="ai_ownkey_start")])
+        if cfg["providers"]:
+            rows.append([InlineKeyboardButton("🔀 Выбор ИИ разработчика",
+                                              callback_data="ai_pick_menu")])
+        rows.append([InlineKeyboardButton("🤖 В чат ИИ",
+                                          callback_data="ai_go_chat")])
+        rows.append([InlineKeyboardButton("❌ Закрыть",
+                                          callback_data="cancel_action")])
+        await _send("\n".join(lines), InlineKeyboardMarkup(rows))
+        return MAIN_MENU
+
+    if data == "ai_ownkey_del":
+        user.ai_own_cfg = None
+        user.ai_own_key = ""
+        user.ai_provider_choice = ""
+        save_user(user)
+        context.user_data.pop("ai_ownkey_pending", None)
+        rows = [[InlineKeyboardButton("➕ Подключить свой ИИ",
+                                      callback_data="ai_ownkey_start")],
+                [InlineKeyboardButton("🔀 Выбор ИИ разработчика",
+                                      callback_data="ai_pick_menu")],
+                [InlineKeyboardButton("🤖 В чат ИИ",
+                                      callback_data="ai_go_chat")],
+                [InlineKeyboardButton("❌ Закрыть",
+                                      callback_data="cancel_action")]]
+        await _send("🗑 Свой ИИ отключён.\n\nТеперь работает ИИ "
+                    "разработчика: %s" % _html_esc(_ai_current_target_label(user)),
+                    InlineKeyboardMarkup(rows))
+        return MAIN_MENU
+
+    # ── Шаг 1/3: выбор сервиса ──────────────────────────────────────
+    if data == "ai_ownkey_start":
+        context.user_data.pop("ai_ownkey_pending", None)
+        lines = ["➕ <b>Свой ИИ — подключение за 3 шага</b>\n",
+                 "<b>Шаг 1/3.</b> Выберите сервис, от которого есть "
+                 "API-ключ:",
+                 "",
+                 "Свой сервер (OpenAI-совместимый, LM Studio, vLLM…) — "
+                 "кнопка «🔧 Свой сервис» внизу."]
+        rows = []
+        row = []
+        for pid, p in AI_PRESETS.items():
+            row.append(InlineKeyboardButton(
+                _ai_short(p["name"], 20),
+                callback_data=f"ai_ownkey_preset_{pid}"))
+            if len(row) >= 2:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+        rows.append([InlineKeyboardButton("🔧 Свой сервис",
+                                          callback_data="ai_ownkey_custom")])
+        rows.append([InlineKeyboardButton("⬅️ Назад",
+                                          callback_data="ai_ownkey_menu")])
+        await _send("\n".join(lines), InlineKeyboardMarkup(rows))
+        return MAIN_MENU
+
+    # ── Шаг 2/3: ключ выбранного пресета ────────────────────────────
+    if data.startswith("ai_ownkey_preset_"):
+        preset_id = data[len("ai_ownkey_preset_"):]
+        preset = AI_PRESETS.get(preset_id)
+        if not preset:
+            await _send("Сервис не найден.", InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ Назад",
+                                     callback_data="ai_ownkey_start")]]))
+            return MAIN_MENU
+        context.user_data["ai_ownkey_pending"] = {"step": "key",
+                                                  "preset": preset_id}
+        lines = ["🔑 <b>%s — шаг 2/3</b>\n" % _html_esc(preset["name"]),
+                 "Пришлите <b>только API-ключ</b> одним сообщением.",
+                 "Где взять: %s" % _html_esc(preset.get("where")
+                                             or preset.get("hint") or "—"),
+                 "",
+                 "Модель подберу сам на следующем шаге.",
+                 "Сообщение с ключом я сразу удалю из чата.",
+                 "«отмена» — выйти."]
+        await _send("\n".join(lines), InlineKeyboardMarkup([[
+            InlineKeyboardButton("⬅️ К сервисам",
+                                 callback_data="ai_ownkey_start")]]))
+        return MAIN_MENU
+
+    # ── Свой сервис: шаг 1/4 — название ─────────────────────────────
+    if data == "ai_ownkey_custom":
+        context.user_data["ai_ownkey_pending"] = {"step": "name"}
+        lines = ["🔧 <b>Свой сервис — 4 шага</b>\n",
+                 "<b>Шаг 1/4.</b> Как назвать этот ИИ?",
+                 "Например: «Домашний сервер», «LM Studio», «vLLM».",
+                 "",
+                 "«отмена» — выйти."]
+        await _send("\n".join(lines), InlineKeyboardMarkup([[
+            InlineKeyboardButton("⬅️ Назад",
+                                 callback_data="ai_ownkey_start")]]))
+        return MAIN_MENU
+
+    # ── Выбор модели из найденных ───────────────────────────────────
+    if data == "ai_ownkey_models":
+        pend = context.user_data.get("ai_ownkey_pending") or {}
+        _models = pend.get("models") or []
+        if not _models:
+            await _send("Список моделей не найден — начните подключение "
+                        "заново.", InlineKeyboardMarkup([[
+                            InlineKeyboardButton("➕ Подключить свой ИИ",
+                                                 callback_data="ai_ownkey_start")]]))
+            return MAIN_MENU
+        pend["step"] = "model"
+        context.user_data["ai_ownkey_pending"] = pend
+        _text, _kb = _ai_ownkey_models_kb(pend)
+        await _send(_text, _kb)
+        return MAIN_MENU
+
+    if data == "ai_ownkey_mdlman":
+        pend = context.user_data.get("ai_ownkey_pending") or {}
+        pend["step"] = "model"
+        context.user_data["ai_ownkey_pending"] = pend
+        await _send("🤖 <b>Шаг 3/3 — модель</b>\n\n"
+                    "Впишите название модели вручную (например, "
+                    "<code>llama-3.1-8b-instruct</code>).",
+                    InlineKeyboardMarkup([[
+                        InlineKeyboardButton("⬅️ К списку моделей",
+                                             callback_data="ai_ownkey_models")]]))
+        return MAIN_MENU
+
+    if data.startswith("ai_ownkey_mdl_"):
+        pend = context.user_data.get("ai_ownkey_pending") or {}
+        _models = pend.get("models") or []
+        try:
+            _idx = int(data[len("ai_ownkey_mdl_"):])
+        except ValueError:
+            _idx = -1
+        if 0 <= _idx < len(_models):
+            return await _ai_ownkey_finalize(update, context, user, pend,
+                                             str(_models[_idx]))
+        await _send("Кнопка устарела — откройте список заново.",
+                    InlineKeyboardMarkup([[
+                        InlineKeyboardButton("🤖 Модели",
+                                             callback_data="ai_ownkey_models")]]))
+        return MAIN_MENU
+
+    if data == "ai_ownkey_save":
+        pend = context.user_data.get("ai_ownkey_pending") or {}
+        _cfgd = pend.get("cfg") or {}
+        _model = str(pend.get("model") or "").strip()
+        if not _model:
+            _model = _ai_pick_default_model(_cfgd.get("preset"),
+                                            pend.get("models") or [])
+        return await _ai_ownkey_finalize(update, context, user, pend, _model)
+
+    await _send("Кнопка не найдена.", InlineKeyboardMarkup([[
+        InlineKeyboardButton("⬅️ Назад", callback_data="ai_ownkey_menu")]]))
+    return MAIN_MENU
+
+
+def _ai_current_target_label(user):
+    """Короткая подпись ИИ, который сейчас отвечает пользователю."""
+    try:
+        _t = _ai_target_for_user(user)
+        if _t is None:
+            return "базовый (Groq/DeepSeek)"
+        _pid, _p, _m = _t
+        _nm = "Свой ИИ" if _pid == "own" else str(_p.get("name") or "ИИ")
+        return "%s · %s" % (_ai_short(_nm, 24), _ai_short(_m, 32))
+    except Exception:
+        return "базовый (Groq/DeepSeek)"
+
+
+def _ai_key_mask(key):
+    """Маска ключа для экранов: sk-…f3x (первые 4 и последние 3)."""
+    _k = str(key or "")
+    if len(_k) <= 8:
+        return "•••"
+    return "%s…%s" % (_k[:4], _k[-3:])
+
+
+def _ai_ownkey_models_kb(pend):
+    """Клавиатура выбора модели своего ИИ (первые 24 найденных)."""
+    models = pend.get("models") or []
+    _show = models[:_AI_MODELS_PER_PAGE * 2]
+    lines = ["🤖 <b>Выберите модель</b>\n",
+             "Найдено моделей: %d." % len(models),
+             "Подходящие для чата — наверху списка.",
+             "",
+             "Не нашли свою — кнопка «✍️ Ввести модель вручную»."]
+    rows = []
+    row = []
+    for i, m in enumerate(_show):
+        row.append(InlineKeyboardButton(
+            _ai_short(m, 22), callback_data=f"ai_ownkey_mdl_{i}"))
+        if len(row) >= 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("✍️ Ввести модель вручную",
+                                      callback_data="ai_ownkey_mdlman")])
+    rows.append([InlineKeyboardButton("❌ Отмена",
+                                      callback_data="ai_ownkey_menu")])
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+def _ai_pick_menu_kb(user, cfg):
+    """Экран «🔀 Выбор ИИ»: провайдеры разработчика (у которых закреплена
+    модель для пользователей) + свой ИИ. 📸 — модель умеет фото."""
+    own = _ai_own_cfg_sanitize(getattr(user, "ai_own_cfg", None))
+    choice = str(getattr(user, "ai_provider_choice", "") or "").strip()
+    d = cfg.get("default") or {}
+    dpid = d.get("provider") or ""
+    lines = ["🔀 <b>Выбор ИИ</b>\n"]
+    rows = []
+    if own is not None:
+        lines.append("✅ Работает всегда: <b>Свой ИИ</b> · %s%s"
+                     % (_html_esc(own["model"]),
+                        (" · 📸"
+                         if _ai_model_supports_vision(own["model"]) else "")))
+        lines.append("(свой ИИ главнее выбора — кнопка «🔑 Свой ИИ»)")
+    if dpid and dpid in cfg["providers"]:
+        p = cfg["providers"][dpid]
+        mark = "✅ " if (not choice or choice == dpid) else "⭐ "
+        rows.append([InlineKeyboardButton(
+            "%s%s · %s%s" % (mark, _ai_short(p["name"], 18),
+                             _ai_short(d.get("model", ""), 20),
+                             (" 📸" if _ai_model_supports_vision(d.get("model"))
+                              else "")),
+            callback_data="ai_pick_default")])
+    for pid, p in sorted(cfg["providers"].items()):
+        if pid == dpid or not p.get("enabled", True):
+            continue
+        um = str(p.get("user_model") or "").strip()
+        if not um:
+            continue
+        mark = "✅ " if choice == pid else ""
+        rows.append([InlineKeyboardButton(
+            "%s%s · %s%s" % (mark, _ai_short(p["name"], 18),
+                             _ai_short(um, 20),
+                             (" 📸" if _ai_model_supports_vision(um) else "")),
+            callback_data=f"ai_pick_{pid}")])
+    if not rows and own is None:
+        lines.append("Разработчик ещё не подключил ИИ-провайдеров — чат "
+                     "работает на базовой модели (Groq/DeepSeek).")
+    lines += ["", "📸 — модель умеет смотреть фото (до 5 за раз).",
+              "Модели закрепляет разработчик — переключать их нельзя."]
+    rows.append([InlineKeyboardButton("🔑 Свой ИИ (свой ключ)",
+                                      callback_data="ai_ownkey_menu")])
+    rows.append([InlineKeyboardButton("⬅️ В чат ИИ",
+                                      callback_data="ai_go_chat")])
+    rows.append([InlineKeyboardButton("❌ Закрыть",
+                                      callback_data="cancel_action")])
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+async def _ai_ownkey_finalize(update, context, user, pend, model):
+    """Финал визарда: сохранить свой ИИ и показать экран успеха."""
+    cfgd = pend.get("cfg") or {}
+    own = _ai_own_cfg_sanitize({
+        "name": str(cfgd.get("name") or "Мой ИИ")[:60],
+        "protocol": str(cfgd.get("protocol") or "openai"),
+        "base_url": str(cfgd.get("base_url") or ""),
+        "model": str(model or "").strip()[:120],
+        "api_key": str(cfgd.get("api_key") or ""),
+        "preset": str(cfgd.get("preset") or ""),
+    })
+    if own is None:
+        context.user_data.pop("ai_ownkey_pending", None)
+        _err = ("❌ Не получилось сохранить: не хватает данных о сервисе. "
+                "Начните подключение заново.")
+        query = update.callback_query
+        try:
+            if query is not None:
+                await _safe_edit_html(query, _err, bot=context.bot,
+                                      fallback_chat_id=update.effective_chat.id)
+            else:
+                await update.effective_chat.send_message(_err)
+        except Exception:
+            pass
+        return MAIN_MENU
+    user.ai_own_cfg = own
+    user.ai_provider_choice = ""
+    save_user(user)
+    context.user_data.pop("ai_ownkey_pending", None)
+    lines = ["✅ <b>Свой ИИ подключён!</b>\n",
+             "🏷 %s" % _html_esc(own["name"]),
+             "🤖 %s%s" % (_html_esc(own["model"]),
+                          (" · 📸 фото"
+                           if _ai_model_supports_vision(own["model"]) else "")),
+             "🔑 Ключ: %s" % _html_esc(_ai_key_mask(own["api_key"])),
+             "",
+             "Запросы ИИ теперь идут с вашего ключа и вашей модели — "
+             "только для вас.",
+             "Модели ИИ разработчика по-прежнему ставит только "
+             "разработчик."]
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🤖 В чат ИИ", callback_data="ai_go_chat")],
+        [InlineKeyboardButton("🔑 Управление своим ИИ",
+                              callback_data="ai_ownkey_menu")],
+    ])
+    query = update.callback_query
+    try:
+        if query is not None:
+            await _safe_edit_html(query, "\n".join(lines), bot=context.bot,
+                                  fallback_chat_id=update.effective_chat.id,
+                                  reply_markup=kb)
+        else:
+            await update.effective_chat.send_message(
+                "\n".join(lines), reply_markup=kb, parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
+    return MAIN_MENU
+
+
+async def _ai_ownkey_text_receive(update, context):
+    """ВОЛНА 23.10.12: пошаговый приём ответов визарда «Свой ИИ» (флаг
+    ai_ownkey_pending). Шаги: name → url → key (с онлайн-проверкой
+    ключа) → model. Сообщение с ключом стирается из чата сразу."""
+    user_id = str(update.effective_user.id)
+    pend = context.user_data.get("ai_ownkey_pending") or {}
+    if pend is True:
+        # ЛЕГАСИ-экран 23.10.11 («Пришлите ключ»): ключ подключается к
+        # ИИ по умолчанию от разработчика — старые сообщения работают.
+        pend = {"step": "key", "legacy_default": True}
+    elif not isinstance(pend, dict):
+        pend = {}
+    # Нормализуем формат в user_data (легаси-bool → dict со шагом).
+    context.user_data["ai_ownkey_pending"] = pend
+    step = str(pend.get("step") or "")
+    text = (update.message.text or "").strip()
+    if _GLOBAL_CANCEL_RE.match(text):
+        context.user_data.pop("ai_ownkey_pending", None)
+        await update.message.reply_text("Подключение своего ИИ отменено.")
+        return MAIN_MENU
+    if not text:
+        await update.message.reply_text(
+            "Пришлите ответ одним сообщением либо «отмена».")
+        return MAIN_MENU
+    user = get_user(user_id)
+    if user is None:
+        user = User(user_id)
+
+    def _cancel_kb():
+        return InlineKeyboardMarkup([[
+            InlineKeyboardButton("❌ Отмена",
+                                 callback_data="ai_ownkey_menu")]])
+
+    # ── Свой сервис, шаг 1/4: название ──────────────────────────────
+    if step == "name":
+        pend.update({"step": "url", "name": text[:60]})
+        context.user_data["ai_ownkey_pending"] = pend
+        await update.message.reply_text(
+            "🔧 <b>Свой сервис — шаг 2/4</b>\n\n"
+            "Пришлите ссылку на API (base URL).\n"
+            "Например: <code>https://api.example.com/v1</code>\n\n"
+            "Протокол определю сам: OpenAI-совместимый, Anthropic или "
+            "Gemini.\n«отмена» — выйти.",
+            parse_mode=ParseMode.HTML, reply_markup=_cancel_kb())
+        return MAIN_MENU
+
+    # ── Свой сервис, шаг 2/4: адрес API ─────────────────────────────
+    if step == "url":
+        url = text.strip().rstrip("/")
+        if not url.startswith(("http://", "https://")) or len(url) > 300:
+            await update.message.reply_text(
+                "❌ Это не похоже на ссылку. Пример: "
+                "<code>https://api.example.com/v1</code>",
+                parse_mode=ParseMode.HTML)
+            return MAIN_MENU
+        pend.update({"step": "key", "base_url": url[:300],
+                     "protocol": _ai_detect_protocol(url)})
+        context.user_data["ai_ownkey_pending"] = pend
+        await update.message.reply_text(
+            "🔑 <b>Свой сервис — шаг 3/4</b>\n\n"
+            "Пришлите <b>API-ключ</b> одним сообщением.\n"
+            "Сообщение с ключом я сразу удалю из чата.\n\n"
+            "«отмена» — выйти.",
+            parse_mode=ParseMode.HTML, reply_markup=_cancel_kb())
+        return MAIN_MENU
+
+    # ── Шаг 2/3 (пресет) или 3/4 (свой): ключ ───────────────────────
+    if step == "key":
+        key = text
+        # Легаси-формат «пресет:ключ» тоже принимаем.
+        if ":" in key:
+            spec = _ai_parse_provider_spec(key)
+            if spec and str(spec.get("api_key") or "").strip():
+                key = str(spec["api_key"]).strip()
+        if len(key) < 8 or len(key) > 500 or " " in key:
+            await update.message.reply_text(
+                "❌ Это не похоже на API-ключ. Пришлите ключ одним "
+                "сообщением (например, sk-…), либо «отмена».")
+            return MAIN_MENU
+        preset_id = str(pend.get("preset") or "")
+        if pend.get("legacy_default"):
+            _cfg0 = ai_providers_config()
+            _d0 = _cfg0.get("default") or {}
+            _p0 = _cfg0["providers"].get(_d0.get("provider")) or {}
+            prov = {"name": str(_p0.get("name") or "ИИ по умолчанию")[:60],
+                    "protocol": str(_p0.get("protocol") or "openai"),
+                    "base_url": str(_p0.get("base_url") or ""),
+                    "preset": ""}
+        elif preset_id and preset_id in AI_PRESETS:
+            pr = AI_PRESETS[preset_id]
+            prov = {"name": pr["name"], "protocol": pr["protocol"],
+                    "base_url": pr["base_url"], "preset": preset_id}
+        else:
+            prov = {"name": str(pend.get("name") or "Мой ИИ")[:60],
+                    "protocol": str(pend.get("protocol") or "openai"),
+                    "base_url": str(pend.get("base_url") or ""),
+                    "preset": ""}
+        prov["api_key"] = key
+        if not str(prov["base_url"]).startswith(("http://", "https://")):
+            context.user_data.pop("ai_ownkey_pending", None)
+            await update.message.reply_text(
+                "❌ Не задан адрес API — начните подключение заново "
+                "(кнопка «🔑 Свой ИИ»).")
+            return MAIN_MENU
+        # Приватность: стираем сообщение с ключом ДО проверки.
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+        wait = await update.message.reply_text("⏳ Проверяю ключ…")
+        models, err = await ai_fetch_models("own_probe", prov, no_cache=True)
+        if err or not models:
+            try:
+                await wait.edit_text(
+                    "❌ Ключ не подошёл: %s\n\n"
+                    "Проверьте ключ и пришлите его ещё раз.\n"
+                    "«отмена» — выйти."
+                    % _html_esc(str(err or "список моделей пуст")[:200]))
+            except Exception:
+                pass
+            return MAIN_MENU              # шаг «key» остаётся активным
+        pend["cfg"] = prov
+        pend["models"] = models[:_AI_MODELS_PER_PAGE * 2]
+        if preset_id or pend.get("legacy_default"):
+            # Удобство: модель подбираем сами (легаси — модель по
+            # умолчанию от разработчика); можно сменить кнопкой.
+            if pend.get("legacy_default"):
+                _dm = str((ai_providers_config().get("default") or {})
+                          .get("model") or "")
+                model = (_dm if _dm in models
+                         else _ai_pick_default_model("", models))
+            else:
+                model = _ai_pick_default_model(preset_id, models)
+            pend["step"] = "confirm"
+            pend["model"] = model
+            context.user_data["ai_ownkey_pending"] = pend
+            try:
+                await wait.edit_text(
+                    "✅ <b>Ключ работает!</b>\n\n"
+                    "Сервис: %s\nМодель (подобрал сам): %s\n\n"
+                    "Сохранить свой ИИ?"
+                    % (_html_esc(prov["name"]), _html_esc(model)),
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("✅ Сохранить",
+                                              callback_data="ai_ownkey_save")],
+                        [InlineKeyboardButton("🔄 Другая модель",
+                                              callback_data="ai_ownkey_models")],
+                        [InlineKeyboardButton("❌ Отмена",
+                                              callback_data="ai_ownkey_menu")]]))
+            except Exception:
+                pass
+            return MAIN_MENU
+        pend["step"] = "model"
+        context.user_data["ai_ownkey_pending"] = pend
+        try:
+            await wait.edit_text("✅ Ключ работает! Найдено моделей: %d."
+                                 % len(models))
+        except Exception:
+            pass
+        _text, _kb = _ai_ownkey_models_kb(pend)
+        try:
+            await update.message.reply_text(_text, reply_markup=_kb,
+                                            parse_mode=ParseMode.HTML)
+        except Exception:
+            await update.message.reply_text(_text, reply_markup=_kb)
+        return MAIN_MENU
+
+    # ── Шаг подтверждения (пресет): ждём кнопки ─────────────────────
+    if step == "confirm":
+        await update.message.reply_text(
+            "Нажмите кнопку: «✅ Сохранить» или «🔄 Другая модель».")
+        return MAIN_MENU
+
+    # ── Шаг 3/3 (или 4/4): модель ───────────────────────────────────
+    if step == "model":
+        model = text.strip()[:120]
+        if len(model) < 2:
+            await update.message.reply_text(
+                "❌ Впишите название модели (например, "
+                "llama-3.1-8b-instruct).")
+            return MAIN_MENU
+        return await _ai_ownkey_finalize(update, context, user, pend, model)
+
+    context.user_data.pop("ai_ownkey_pending", None)
+    await update.message.reply_text(
+        "Начните подключение заново: 🔑 Свой ИИ → ➕ Подключить свой ИИ.")
+    return MAIN_MENU
+
+
+async def _dev_ai_text_receive(update, context):
+    """ВОЛНА 23.10.12: ПОШАГОВОЕ добавление ИИ-провайдера в панели
+    разработчика (просьба пользователя: «нужное удобное добавление, не
+    всё в строчку»). Пресет — только ключ; свой сервер — название →
+    адрес API → ключ. Ключ ПРОВЕРЯЕТСЯ онлайн до сохранения. Старые
+    форматы «пресет:ключ» и «Имя|протокол|URL|ключ» тоже работают."""
+    pend = context.user_data.get("ai_prov_pending") or {}
+    text = (update.message.text or "").strip()
+    if _GLOBAL_CANCEL_RE.match(text):
+        context.user_data.pop("ai_prov_pending", None)
+        await update.message.reply_text("Добавление провайдера отменено.",
+                                        reply_markup=get_developer_keyboard())
+        return DEV_PANEL
+    if not text:
+        await update.message.reply_text(
+            "Пришлите ответ одним сообщением либо «отмена».")
+        return DEV_PANEL
+    step = str(pend.get("step") or ("key" if pend.get("preset") else ""))
+
+    # Легаси-строки: «пресет:ключ» / «Имя|протокол|URL|ключ».
+    if "|" in text or (":" in text and step == "key"):
+        spec = _ai_parse_provider_spec(text)
+        if spec and str(spec.get("api_key") or "").strip():
+            return await _dev_ai_save_provider(update, context, spec)
+
+    if step == "name":
+        pend.update({"step": "url", "name": text[:60]})
+        context.user_data["ai_prov_pending"] = pend
+        await update.message.reply_text(
+            "🔧 <b>Свой провайдер — шаг 2/4</b>\n\n"
+            "Пришлите адрес API (base URL).\n"
+            "Например: <code>https://api.example.com/v1</code>\n\n"
+            "Протокол определю сам: openai / anthropic / gemini.\n"
+            "«отмена» — выйти.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ Отмена",
+                                     callback_data="dev_ai_menu")]]))
+        return DEV_PANEL
+
+    if step == "url":
+        url = text.strip().rstrip("/")
+        if not url.startswith(("http://", "https://")) or len(url) > 300:
+            await update.message.reply_text(
+                "❌ Это не похоже на ссылку. Пример: "
+                "<code>https://api.example.com/v1</code>",
+                parse_mode=ParseMode.HTML)
+            return DEV_PANEL
+        pend.update({"step": "key", "base_url": url[:300],
+                     "protocol": _ai_detect_protocol(url)})
+        context.user_data["ai_prov_pending"] = pend
+        await update.message.reply_text(
+            "🔑 <b>Свой провайдер — шаг 3/4</b>\n\n"
+            "Пришлите <b>API-ключ</b> одним сообщением — проверю его онлайн "
+            "и сохраню провайдера.\n«отмена» — выйти.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ Отмена",
+                                     callback_data="dev_ai_menu")]]))
+        return DEV_PANEL
+
+    if step == "key":
+        key = text
+        if len(key) < 8 or len(key) > 500 or " " in key:
+            await update.message.reply_text(
+                "❌ Это не похоже на API-ключ. Пришлите ключ одним "
+                "сообщением (например, sk-…), либо «отмена».")
+            return DEV_PANEL
+        preset_id = str(pend.get("preset") or "")
+        if preset_id and preset_id in AI_PRESETS:
+            pr = AI_PRESETS[preset_id]
+            prov = {"name": pr["name"], "protocol": pr["protocol"],
+                    "base_url": pr["base_url"], "api_key": key,
+                    "preset": preset_id}
+        else:
+            prov = {"name": str(pend.get("name") or "Мой провайдер")[:60],
+                    "protocol": str(pend.get("protocol") or "openai"),
+                    "base_url": str(pend.get("base_url") or ""),
+                    "api_key": key, "preset": ""}
+        if not str(prov["base_url"]).startswith(("http://", "https://")):
+            context.user_data.pop("ai_prov_pending", None)
+            await update.message.reply_text(
+                "❌ Не задан адрес API — начните добавление заново "
+                "(🧠 ИИ-провайдеры → ➕ Добавить провайдера).")
+            return DEV_PANEL
+        wait = await update.message.reply_text("⏳ Проверяю ключ…")
+        models, err = await ai_fetch_models("own_probe", prov, no_cache=True)
+        if err or not models:
+            try:
+                await wait.edit_text(
+                    "❌ Ключ не подошёл: %s\n\n"
+                    "Проверьте ключ и пришлите его ещё раз.\n"
+                    "«отмена» — выйти."
+                    % _html_esc(str(err or "список моделей пуст")[:200]))
+            except Exception:
+                pass
+            return DEV_PANEL              # шаг «key» остаётся активным
+        try:
+            await wait.edit_text("✅ Ключ работает! Сохраняю провайдера…")
+        except Exception:
+            pass
+        return await _dev_ai_save_provider(update, context, prov,
+                                           probe_models=models)
+
+    context.user_data.pop("ai_prov_pending", None)
+    await update.message.reply_text(
+        "Начните добавление заново: 🛠️ Панель разработчика → 🧠 "
+        "ИИ-провайдеры → ➕ Добавить провайдера.",
+        reply_markup=get_developer_keyboard())
+    return DEV_PANEL
+
+
+async def _dev_ai_save_provider(update, context, spec, probe_models=None):
+    """Общий финал добавления провайдера: сохранить в конфиг и предложить
+    модели. probe_models — список, полученный при онлайн-проверке ключа
+    (из него сразу подбирается «модель для пользователей»)."""
+    cfg = ai_providers_config()
+    pid = _ai_pid_next(cfg)
+    base_name = str(spec.get("name") or "Мой провайдер")[:60] or "Мой провайдер"
+    name = base_name
+    n = 2
+    while any(p.get("name") == name for p in cfg["providers"].values()):
+        name = f"{base_name} {n}"
+        n += 1
+    rec = {
+        "name": name,
+        "protocol": str(spec.get("protocol") or "openai"),
+        "base_url": str(spec.get("base_url") or "").rstrip("/")[:300],
+        "api_key": str(spec.get("api_key") or "")[:500],
+        "enabled": True,
+    }
+    # Сразу подбираем «модель для пользователей» — чтобы ИИ появился в
+    # «🔀 Выбор ИИ» у пользователей без ручной настройки.
+    try:
+        if probe_models:
+            _um = _ai_pick_default_model(str(spec.get("preset") or ""),
+                                         probe_models)
+            if _um:
+                rec["user_model"] = _um
+    except Exception:
+        pass
+    cfg["providers"][pid] = rec
+    ai_providers_save(cfg)
+    context.user_data.pop("ai_prov_pending", None)
+    lines = [f"✅ Провайдер «{name}» добавлен!\n"]
+    if probe_models:
+        lines.append("Ключ проверен — моделей на аккаунте: %d."
+                     % len(probe_models))
+    if rec.get("user_model"):
+        lines.append("Модель для пользователей (кнопка «🔀 Выбор ИИ»): %s"
+                     % _html_esc(rec["user_model"]))
+    lines += ["",
+              "Теперь выберите МОДЕЛЬ ПО УМОЛЧАНИЮ — без неё чат «🤖 "
+              "DEVORKS+ai» продолжает работать на прежней модели."]
+    await update.message.reply_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⭐ Выбрать модель",
+                                  callback_data=f"dev_ai_models_{pid}_0")],
+            [InlineKeyboardButton("👥 Модель для пользователей",
+                                  callback_data=f"dev_ai_umodels_{pid}_0")],
+            [InlineKeyboardButton("🧠 К провайдерам",
+                                  callback_data="dev_ai_menu")],
+        ]))
+    return DEV_PANEL
+
+
+async def _ai_provider_flow(update, context, *, user_id, chat_id,
+                            user_message, has_photo, is_doc_image,
+                            doc_mime, thinking_msg, anim_task,
+                            system_prompt, target, draft_ui=None,
+                            photo_targets=None):
+    """ВОЛНА 23.10.10: полный цикл ответа через ИИ-провайдера — фото идёт
+    модели как vision-блоки, веб-поиск — инструментами, ответ — с разметкой
+    (Markdown → HTML, при сбое парсинга — чистым текстом). История общая с
+    Groq-путём (текстовые сводки), поэтому движки взаимозаменяемы."""
+    _pid, provider, model = target
+    try:
+        # 1) Фото (до 5, альбомы) → base64. Модель БЕЗ vision фото не
+        # получает — честно предупредим в ответе (ВОЛНА 23.10.12).
+        photos_b64 = []               # [(b64, mime)]
+        _targets = list(photo_targets or [])
+        if (has_photo or is_doc_image) and not _targets:
+            try:
+                msg = update.message
+                if has_photo:
+                    fid = msg.photo[-1].file_id
+                else:
+                    fid = msg.document.file_id
+                _targets = [(fid,
+                             doc_mime if is_doc_image else "image/jpeg")]
+            except Exception as e:
+                logger.warning(f"AI provider: не удалось взять фото: {e}")
+        _vision_ok = _ai_model_supports_vision(model)
+        for fid, mime in _targets[:_AI_MAX_PHOTOS]:
+            try:
+                tg_file = await context.bot.get_file(fid)
+                buf = io.BytesIO()
+                await tg_file.download_to_memory(out=buf)
+                buf.seek(0)
+                pb = _shrink_image_bytes(buf.read())
+                photos_b64.append(
+                    (base64.b64encode(pb).decode("ascii"),
+                     mime or "image/jpeg"))
+            except Exception as e:
+                logger.warning(f"AI provider: не удалось скачать фото: {e}")
+        if _targets and not _vision_ok:
+            _photo_note = ("⚠️ Этот ИИ (%s) не умеет смотреть фото — "
+                           "отвечаю по тексту. Фото понимают модели с "
+                           "vision (Gemini, GPT-4o и др.).\n\n"
+                           % _ai_short(model, 40))
+        else:
+            _photo_note = ""
+
+        # 2) История: в БД — ТЕКСТОВАЯ сводка (движки взаимозаменяемы).
+        conv = user_conversations.setdefault(str(user_id), [])
+        if not conv or conv[0].get("role") != "system":
+            conv.insert(0, {"role": "system", "content": system_prompt})
+        else:
+            conv[0]["content"] = system_prompt
+        if photos_b64:
+            _ph = ("[фото]" if len(photos_b64) == 1
+                   else "[фото x%d]" % len(photos_b64))
+            hist_text = _ph + (f" {user_message}" if user_message else "")
+        else:
+            hist_text = user_message
+        conv.append({"role": "user", "content": str(hist_text)[:6000]})
+        if len(conv) > 17:
+            conv[:] = [conv[0]] + conv[-16:]
+        _ai_hist_save(user_id)
+
+        # 3) Запрос: история без последнего + текущее сообщение блоками.
+        req = list(conv[:-1])
+        if photos_b64:
+            _parts = [{"type": "text", "text": user_message or
+                       "Опиши, что изображено на фото, и ответь на вопрос."}]
+            for _b64, _mime in photos_b64:
+                _parts.append({"type": "image", "data": _b64,
+                               "media_type": _mime})
+            req.append({"role": "user", "content": _parts})
+        else:
+            req.append({"role": "user", "content": user_message})
+
+        web_tools = bool(ai_providers_config().get("web_tools"))
+        # ВОЛНА 23.10.11: живой стриминг ответа в черновик (sendMessageDraft)
+        # + статусы «🔍 Ищу в интернете...» / «📖 Читаю страницу...» —
+        # как в референсе. Черновиков нет — прежний НЕстриминговый путь.
+        if draft_ui is not None:
+            text, err = await ai_provider_chat_flow_stream(
+                provider, model, req, web_tools,
+                on_text=draft_ui.stream, on_status=draft_ui.status)
+        else:
+            text, err = await ai_provider_chat_flow(provider, model, req,
+                                                    web_tools)
+
+        # 4) Останавливаем анимацию ДО подмены текста.
+        if anim_task and not anim_task.done():
+            anim_task.cancel()
+            try:
+                await anim_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        if err is not None:
+            _msg = ("⚠️ %s не ответил:\n%s\n\nПопробуйте ещё раз."
+                    % (provider.get("name", "Провайдер"), err[:300]))
+            try:
+                if thinking_msg:
+                    await context.bot.edit_message_text(
+                        chat_id=chat_id, message_id=thinking_msg.message_id,
+                        text=_msg[:4000])
+                else:
+                    await context.bot.send_message(chat_id=chat_id,
+                                                  text=_msg[:4000])
+            except Exception:
+                pass
+            return
+
+        text = _ai_finish_guarantee(text, None, 3500) or "(пустой ответ)"
+        conv.append({"role": "assistant", "content": text})
+        _ai_hist_save(user_id)
+
+        # 5) Ответ: Markdown → HTML (порт референса), фолбэк — чистый текст.
+        prefix = (_photo_note
+                  + f"🤖 DEVORKS+ai · {provider.get('name', 'ИИ')}:\n\n")
+        parts_md = _ai_split_text(text, 3500) or ["(пустой ответ)"]
+        # ВОЛНА 23.10.11: под ПОСЛЕДНЕЙ частью ответа — свежие кнопки
+        # выхода из ИИ (раньше кнопка была только в постоянной клавиатуре
+        # и «уезжала» далеко вверх по чату — «выйти не работает»).
+        _ai_exit_kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("❌ Выйти из ИИ", callback_data="ai_exit_now"),
+            InlineKeyboardButton("☰ Меню", callback_data="back_to_main"),
+        ]])
+        first_sent = False
+        for i, pmd in enumerate(parts_md):
+            body_html = (prefix if i == 0 else "") + _ai_md_to_html(pmd, pretty=True)
+            body_plain = (prefix if i == 0 else "") + pmd
+            if len(body_html) > 4000:
+                body_html = body_html[:4000]
+            if len(body_plain) > 4000:
+                body_plain = body_plain[:4000]
+            part_kb = _ai_exit_kb if i == len(parts_md) - 1 else None
+            done = False
+            try:
+                if i == 0 and thinking_msg and not first_sent:
+                    try:
+                        await context.bot.edit_message_text(
+                            chat_id=chat_id, message_id=thinking_msg.message_id,
+                            text=body_html, parse_mode=ParseMode.HTML,
+                            reply_markup=part_kb,
+                            link_preview_options=telegram.LinkPreviewOptions(
+                                is_disabled=True))
+                        done = True
+                    except Exception:
+                        pass
+                if not done:
+                    await context.bot.send_message(
+                        chat_id=chat_id, text=body_html,
+                        parse_mode=ParseMode.HTML, reply_markup=part_kb,
+                        link_preview_options=telegram.LinkPreviewOptions(
+                            is_disabled=True))
+                    done = True
+            except Exception:
+                done = False
+            if not done:
+                try:
+                    if i == 0 and thinking_msg and not first_sent:
+                        await context.bot.edit_message_text(
+                            chat_id=chat_id, message_id=thinking_msg.message_id,
+                            text=body_plain, reply_markup=part_kb)
+                    else:
+                        await context.bot.send_message(chat_id=chat_id,
+                                                       text=body_plain,
+                                                       reply_markup=part_kb)
+                except Exception as e2:
+                    logger.error(f"AI provider send: {e2}")
+            first_sent = True
+    except Exception as e:
+        logger.error(f"AI provider flow: {e}")
+        try:
+            _msg = "⚠️ ИИ-провайдер не ответил (внутренняя ошибка). Попробуйте ещё раз."
+            if thinking_msg:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id, message_id=thinking_msg.message_id,
+                    text=_msg)
+            else:
+                await context.bot.send_message(chat_id=chat_id, text=_msg)
+        except Exception:
+            pass
+
+
+async def _ai_generation_body(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка сообщения в режиме AI. Полностью защищён от исключений,
     чтобы бот не «замолкал» после нескольких сообщений.
 
@@ -43623,6 +48833,26 @@ async def handle_ai_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _persona_user:
         _persona_user = User(user_id)
     ai_persona = getattr(_persona_user, "ai_persona", "normal") or "normal"
+    # ВОЛНА 23.10.12: альбомы — до 5 фото за раз уходят в ИИ ОДНИМ
+    # запросом (пачку собирает bg_chat_upload_receive по media_group_id
+    # → _AI_MEDIA_INFLIGHT). Подпись с любого фото пачки = вопрос.
+    _infl = _AI_MEDIA_INFLIGHT.pop(user_id, None)
+    photo_targets = []               # [(file_id, mime)]
+    if _infl is not None:
+        for _f in (_infl.get("file_ids") or [])[:_AI_MAX_PHOTOS]:
+            photo_targets.append((str(_f[0]), str(_f[1] or "image/jpeg")))
+        _cap = str(_infl.get("caption") or "").strip()
+        if _cap:
+            user_message = _cap
+        if (_infl.get("more") or 0) > 0:
+            _note = ("(вы прислали %d фото — за раз смотрю не больше %d)"
+                     % (_AI_MAX_PHOTOS + int(_infl["more"]), _AI_MAX_PHOTOS))
+            user_message = (f"{user_message}\n{_note}"
+                            if user_message else _note)
+    elif has_photo:
+        photo_targets.append((msg.photo[-1].file_id, "image/jpeg"))
+    elif is_doc_image:
+        photo_targets.append((_doc.file_id, _doc_mime))
 
     # === Синхронизация цен: плата за генерацию DEVORKS+ai ===
     # Цена берётся из единого конфига PRICES['ai_generation'] в момент
@@ -43639,9 +48869,9 @@ async def handle_ai_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"⭐ Недостаточно звёзд для генерации.\n\n"
                     f"💰 Ваш баланс: {_ai_user.stars_balance} ⭐\n"
                     f"🤖 Стоимость генерации: {ai_price} ⭐\n\n"
-                    f"Пополните баланс: ⭐ Звезды → 💎 Купить звезды.",
+                    f"Пополните баланс: ⚙️ Настройки → ⭐ Звезды → 💎 Купить звезды.",
                     reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("⭐ Открыть Звезды", callback_data="back_to_main")],
+                        [InlineKeyboardButton("⭐ Открыть Звезды", callback_data="open_stars")],
                     ]),
                 )
             except Exception:
@@ -43660,23 +48890,56 @@ async def handle_ai_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.warning(f"send_chat_action failed: {e}")
 
-    # 2) Отправляем «думающее» сообщение и запускаем фоновую анимацию.
+    # 2) Анимация «думает»: сначала ЖИВОЙ ЧЕРНОВИК (sendMessageDraft,
+    # Bot API 9.3+) — «💭 Думаю...» с кастомным эмодзи и стримингом текста
+    # ответа на глазах (порт референса). Метод недоступен (старый сервер
+    # Bot API / локальный сервер) — прежняя анимация сообщением.
     thinking_msg = None
     anim_task = None
+    draft_ui = None
+    _dui = _AiDraftUI(context.bot, chat_id)
+    if await _dui.status("Думаю..."):
+        draft_ui = _dui
+    else:
+        try:
+            # ВОЛНА 23.10.12: под анимацией «думает» — кнопки остановки и
+            # выхода. edit_message_text анимации НЕ передаёт reply_markup —
+            # по Bot API кнопки сохраняются до самого ответа.
+            thinking_msg = await update.message.reply_text(
+                "🤖 DEVORKS+ai думает   ⏳",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("⏹ Остановить",
+                                         callback_data="ai_stop_gen"),
+                    InlineKeyboardButton("❌ Выйти из ИИ",
+                                         callback_data="ai_exit_now"),
+                ]]))
+            anim_task = asyncio.create_task(
+                _ai_thinking_animation(context, chat_id, thinking_msg.message_id)
+            )
+        except Exception as e:
+            logger.warning(f"Не удалось отправить thinking-сообщение: {e}")
+    # ВОЛНА 23.10.12: артефакты генерации — в реестр активной задачи: их
+    # погасит _ai_cancel_active при остановке/выходе «пока думает».
     try:
-        thinking_msg = await update.message.reply_text("🤖 DEVORKS+ai думает   ⏳")
-        anim_task = asyncio.create_task(
-            _ai_thinking_animation(context, chat_id, thinking_msg.message_id)
-        )
-    except Exception as e:
-        logger.warning(f"Не удалось отправить thinking-сообщение: {e}")
+        _ai_entry = _AI_ACTIVE.get(user_id)
+        if _ai_entry is not None:
+            _ai_entry["draft_ui"] = draft_ui
+            _ai_entry["anim_task"] = anim_task
+            _ai_entry["thinking_msg"] = thinking_msg
+    except Exception:
+        pass
 
     if user_id not in user_conversations:
         user_conversations[user_id] = []
 
     # Системный промпт всегда соответствует ТЕКУЩЕМУ режиму личности:
     # переключение режима кнопками действует мгновенно, даже внутри диалога.
-    current_system_prompt = _ai_chat_full_prompt(ai_persona)
+    # ВОЛНА 23.10.11: к промпту подшивается ЖИВОЙ КОНТЕКСТ бота (класс,
+    # расписание на сегодня/завтра, ДЗ, возможности) — ИИ отвечает «что
+    # задано?» по настоящим данным, а не выдумывает. Работает и в простом
+    # чате, и в агенте («обучи максимально всем функциям»).
+    current_system_prompt = _ai_chat_system_prompt_with_context(
+        _persona_user, ai_persona)
     if not user_conversations[user_id]:
         user_conversations[user_id].append({
             "role": "system",
@@ -43692,49 +48955,78 @@ async def handle_ai_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "content": current_system_prompt,
         }
 
+    # ВОЛНА 23.10.10: ДВИЖОК ИИ-ПРОВАЙДЕРОВ — если разработчик подключил
+    # провайдера и выбрал модель («много ии»), весь чат идёт через него:
+    # фото понимает сама модель (vision), веб-поиск — инструментами, ответ —
+    # с разметкой. Каждый пользователь может выбрать СВОЮ модель кнопкой
+    # «🤖 Модель». Настройки нет — работает прежний путь DeepSeek/Groq ниже.
+    _ai_tgt = _ai_target_for_user(_persona_user)
+    if _ai_tgt is not None:
+        await _ai_provider_flow(
+            update, context,
+            user_id=user_id, chat_id=chat_id,
+            user_message=user_message,
+            has_photo=has_photo, is_doc_image=is_doc_image,
+            doc_mime=_doc_mime,
+            thinking_msg=thinking_msg, anim_task=anim_task,
+            system_prompt=current_system_prompt, target=_ai_tgt,
+            draft_ui=draft_ui,
+            photo_targets=photo_targets,
+        )
+        return
+
     # Если пришло фото (или картинка-документ) — скачиваем; затем ПАРАЛЛЕЛЬНО
     # (бесплатно и безлимитно, локально):
     #   1) OCR — вытащить ТЕКСТ с фото (Tesseract/EasyOCR);
     #   2) BLIP — получить ОПИСАНИЕ того, что изображено (для DeepSeek).
     # Всё собранное уходит в текстовую модель DeepSeek единым блоком; если
     # данных с фото нет совсем — фото идёт в вижн-модель Groq напрямую.
+    # ВОЛНА 23.10.12: скачиваем ВСЕ фото пачки (до 5) — провайдеру с
+    # vision они уходят блоками, локально их понимает OCR/BLIP-движок.
     photo_data_url = None
+    photo_bytes = None
+    photo_data_urls = []
+    photo_bytes_list = []
     ocr_text = None
     caption_text = None
-    photo_bytes = None
-    if has_photo or is_doc_image:
+    if photo_targets:
         try:
-            if has_photo:
-                largest = msg.photo[-1]
-                tg_file = await context.bot.get_file(largest.file_id)
-            else:
-                tg_file = await context.bot.get_file(_doc.file_id)
-            buf = io.BytesIO()
-            await tg_file.download_to_memory(out=buf)
-            buf.seek(0)
-            photo_bytes = buf.read()
-            # Сжатие слишком больших картинок (Groq ограничивает размер
-            # запроса; скриншоты-документы бывают по 5–10 МБ).
-            photo_bytes = _shrink_image_bytes(photo_bytes)
-            b64 = base64.b64encode(photo_bytes).decode("ascii")
-            mime = _doc_mime if is_doc_image else "image/jpeg"
-            photo_data_url = f"data:{mime};base64,{b64}"
+            for _fid, _mime in photo_targets:
+                tg_file = await context.bot.get_file(_fid)
+                buf = io.BytesIO()
+                await tg_file.download_to_memory(out=buf)
+                buf.seek(0)
+                # Сжатие слишком больших картинок (Groq ограничивает размер
+                # запроса; скриншоты-документы бывают по 5–10 МБ).
+                pb = _shrink_image_bytes(buf.read())
+                b64 = base64.b64encode(pb).decode("ascii")
+                photo_data_urls.append(f"data:{_mime};base64,{b64}")
+                photo_bytes_list.append(pb)
         except Exception as e:
             logger.warning(f"AI: не удалось скачать фото: {e}")
-            photo_data_url = None
-            photo_bytes = None
-        if photo_bytes:
+        if photo_data_urls:
+            photo_data_url = photo_data_urls[0]
+            photo_bytes = photo_bytes_list[0]
+        if photo_bytes_list:
             # OCR и BLIP работают в отдельных потоках и не блокируют бота;
-            # запускаем их одновременно — суммарная задержка равна самой
-            # медленной, а не сумме.
-            ocr_text, caption_text = await asyncio.gather(
-                _ocr_image_text(photo_bytes),
-                _caption_image_text(photo_bytes),
-            )
+            # запускаем одновременно — суммарная задержка равна самой
+            # медленной, а не сумме. OCR — по всем фото, описание (BLIP) —
+            # по первому (он самый тяжёлый).
+            try:
+                _ocr_parts = await asyncio.gather(
+                    *[_ocr_image_text(pb) for pb in photo_bytes_list])
+                _ocr_all = [t for t in _ocr_parts if t]
+                ocr_text = "\n---\n".join(_ocr_all) if _ocr_all else None
+            except Exception:
+                ocr_text = None
+            try:
+                caption_text = await _caption_image_text(photo_bytes_list[0])
+            except Exception:
+                caption_text = None
 
     # История: пользовательское сообщение добавляем до запроса, но ограничиваем длину,
     # а при ошибке запроса — откатываем, чтобы не копить «висячие» user-сообщения.
-    if (has_photo or is_doc_image) and (ocr_text or caption_text):
+    if photo_targets and (ocr_text or caption_text):
         photo_bits = []
         if caption_text:
             cap_preview = (
@@ -43748,8 +49040,10 @@ async def handle_ai_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         history_text = f"[фото, {'; '.join(photo_bits)}]"
         if user_message:
             history_text = f"{history_text} {user_message}"
-    elif has_photo or is_doc_image:
-        history_text = "[фото]" if not user_message else f"[фото] {user_message}"
+    elif photo_targets:
+        _ph = ("[фото]" if len(photo_targets) == 1
+               else f"[фото x{len(photo_targets)}]")
+        history_text = _ph if not user_message else f"{_ph} {user_message}"
     else:
         history_text = user_message
     user_conversations[user_id].append(
@@ -43813,10 +49107,20 @@ async def handle_ai_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # на Groq ниже, так что чат не молчит никогда.
         # ВОЛНА 22.41: max_tokens=450 (экономия токенов) + return_meta —
         # finish_reason нужен гарантии законченного ответа.
-        _ds_answer, _ds_finish = await _deepseek_chat(
-            request_messages, timeout=90, temperature=0.6,
-            max_tokens=450, return_meta=True,
-        )
+        # ВОЛНА 23.10.11: если работает черновик — ответ СТРИМИТСЯ в
+        # него (текст набирается на глазах, как в референсе).
+        _ds_answer = None
+        _ds_finish = None
+        if draft_ui is not None and prefer_text_engine:
+            _ds_answer, _ds_finish = await _deepseek_chat_stream(
+                request_messages, timeout=90, temperature=0.6,
+                max_tokens=450, on_text=draft_ui.stream,
+            )
+        if _ds_answer is None:
+            _ds_answer, _ds_finish = await _deepseek_chat(
+                request_messages, timeout=90, temperature=0.6,
+                max_tokens=450, return_meta=True,
+            )
         if _ds_answer is not None:
             ai_response = _ds_answer
             ai_finish_reason = _ds_finish
@@ -43975,6 +49279,13 @@ async def handle_ai_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Отправляем ответ БЕЗ Markdown, чтобы не падать на не-парных *, _, ` и т.п.
     prefix = "🤖 DEVORKS+ai:\n\n"
     full_text = prefix + ai_response if ai_response else prefix + "(пустой ответ)"
+    # ВОЛНА 23.10.11: под ответом — всегда свежие кнопки выхода из ИИ
+    # (раньше кнопка была только в постоянной клавиатуре и «уезжала»
+    # далеко вверх по чату — «выйти из ai не работает»).
+    _ai_exit_kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("❌ Выйти из ИИ", callback_data="ai_exit_now"),
+        InlineKeyboardButton("☰ Меню", callback_data="back_to_main"),
+    ]])
     try:
         # Telegram лимит — 4096 символов на сообщение
         if len(full_text) <= 4096:
@@ -43984,11 +49295,14 @@ async def handle_ai_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         chat_id=chat_id,
                         message_id=thinking_msg.message_id,
                         text=full_text,
+                        reply_markup=_ai_exit_kb,
                     )
                 except Exception:
-                    await update.message.reply_text(full_text)
+                    await update.message.reply_text(full_text,
+                                                    reply_markup=_ai_exit_kb)
             else:
-                await update.message.reply_text(full_text)
+                await update.message.reply_text(full_text,
+                                                reply_markup=_ai_exit_kb)
         else:
             # Первая часть в thinking-сообщение, остальное — отдельными
             first_chunk = full_text[:4096]
@@ -44005,7 +49319,10 @@ async def handle_ai_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(first_chunk)
             remaining = full_text[4096:]
             for i in range(0, len(remaining), 4096):
-                await update.message.reply_text(remaining[i:i + 4096])
+                _is_last_part = i + 4096 >= len(remaining)
+                await update.message.reply_text(
+                    remaining[i:i + 4096],
+                    reply_markup=_ai_exit_kb if _is_last_part else None)
     except Exception as e:
         logger.error(f"Error sending AI response: {e}")
         try:
@@ -45377,7 +50694,7 @@ async def _automation_execute_action(update, context, user, class_obj, action):
                 if prepaid <= 0:
                     return (
                         f"🚫 Достигнут лимит личных кнопок ({len(existing)}/{limit}).\n"
-                        "Дополнительные слоты покупаются в ⭐ Звезды (кнопка покупки "
+                        "Дополнительные слоты покупаются в ⚙️ Настройках → ⭐ Звезды (кнопка покупки "
                         "кнопки). После оплаты скажите мне снова — создам кнопку.", True
                     )
                 # Оплаченный слот списываем — как в ручном создании кнопки.
@@ -45682,10 +50999,12 @@ async def _automation_execute_action(update, context, user, class_obj, action):
             if getattr(u_t, "is_blocked", False):
                 continue
             try:
-                await context.bot.send_message(
-                    chat_id=uid_t,
-                    text=f"📢 **Сообщение от разработчика:**\n\n{text}",
-                    parse_mode=ParseMode.MARKDOWN)
+                # ВОЛНА 23.08: HTML + экранирование — текст ИИ/разработчика
+                # с * _ ` & больше не даёт «Can't parse entities».
+                await _safe_send_html(
+                    context.bot, uid_t,
+                    "📢 <b>Сообщение от разработчика:</b>\n\n"
+                    + _html_esc(text))
                 sent_count += 1
             except asyncio.CancelledError:
                 raise
@@ -45694,10 +51013,11 @@ async def _automation_execute_action(update, context, user, class_obj, action):
                 if _ra:
                     await asyncio.sleep(min(float(_ra) + 0.5, 60))
                     try:
-                        await context.bot.send_message(
-                            chat_id=uid_t,
-                            text=f"📢 **Сообщение от разработчика:**\n\n{text}",
-                            parse_mode=ParseMode.MARKDOWN)
+                        # ВОЛНА 23.08: безопасная отправка (HTML+escape).
+                        await _safe_send_html(
+                            context.bot, uid_t,
+                            "📢 <b>Сообщение от разработчика:</b>\n\n"
+                            + _html_esc(text))
                         sent_count += 1
                     except Exception as e2:
                         logger.error(f"AI broadcast {uid_t}: {e2}")
@@ -45998,14 +51318,14 @@ async def _automation_execute_action(update, context, user, class_obj, action):
         except Exception:
             _bot_uname = ""
         ref_link = (f"https://t.me/{_bot_uname}?start=ref_{user.user_id}"
-                    if _bot_uname else "ссылка появится в «⭐ Звезды» → «🤝 Пригласить друга»")
+                    if _bot_uname else "ссылка появится в ⚙️ Настройках → «⭐ Звезды» → «🤝 Пригласить друга»")
         return ("\n".join([
             "🤝 Ваши рефералы:",
             f"• приглашено друзей: {ref_n};",
             "• за каждого друга, который зарегистрируется по вашей ссылке, "
             "начисляются звёзды автоматически;",
             f"• ваша ссылка-приглашение: {ref_link}",
-            "Поделиться: кнопка «⭐ Звезды» → «🤝 Пригласить друга».",
+            "Поделиться: ⚙️ Настройки → «⭐ Звезды» → «🤝 Пригласить друга».",
         ]), True)
 
     if name == "show_favorites":
@@ -47002,6 +52322,46 @@ def _fmt_sub_until(dt):
 REQUIRED_CHANNEL_USERNAME = "devo_kanal"
 REQUIRED_CHANNEL_URL = "https://t.me/devo_kanal"
 
+# ВОЛНА 23.04: текст и клавиатура подписки ЧИТАЮТ ссылку из настроек
+# разработчика (панель → «📢 Канал подписки» → set_channel_link).
+def _user_had_subscription_before(user_id) -> bool:
+    """ВОЛНА 23.05: True, если пользователь РАНЬШЕ уже подтверждал подписку
+    (метка в локальном файле или в User-записи). Значит, сейчас он видит
+    гейт, потому что ОТПИСАЛСЯ, а не потому, что ещё не подписывался, —
+    и текст должен это учитывать («подпишитесь ОБРАТНО»)."""
+    try:
+        if _read_subscription_confirmation(user_id):
+            return True
+    except Exception:
+        pass
+    try:
+        u = get_user(user_id)
+        return bool(u and getattr(u, "subscription_confirmed_at", None))
+    except Exception:
+        return False
+
+
+def subscription_required_text(user_id=None):
+    """ВОЛНА 23.05: у гейта два варианта текста. Для тех, кто ещё ни разу
+    не подписывался, — стандартный; для тех, кто уже подписывался и
+    отписался, — «подпишитесь обратно». Дефолт user_id=None сохраняет
+    старое поведение (легаси-вызовы без аргумента)."""
+    if user_id and _user_had_subscription_before(user_id):
+        return (
+            "🚪 Похоже, вы отписались от нашего канала.\n\n"
+            "📢 Чтобы бот снова заработал, подпишитесь обратно:\n"
+            f"{_gate_channel_url()}\n\n"
+            "После подписки нажмите «✅ Я подписался(ась)»."
+        )
+    return (
+        "📢 Чтобы пользоваться ботом, подпишитесь на наш Telegram-канал:\n"
+        f"{_gate_channel_url()}\n\n"
+        "После подписки нажмите «✅ Я подписался(ась)»."
+    )
+
+
+# Легаси-константа (до 23.04 текст был статичным). Оставлена для
+# совместимости: реальные сообщения собирает subscription_required_text().
 SUBSCRIPTION_REQUIRED_TEXT = (
     "📢 Чтобы пользоваться ботом, подпишитесь на наш Telegram-канал:\n"
     f"{REQUIRED_CHANNEL_URL}\n\n"
@@ -47011,7 +52371,7 @@ SUBSCRIPTION_REQUIRED_TEXT = (
 
 def _subscription_required_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📢 Подписаться на канал", url=REQUIRED_CHANNEL_URL)],
+        [InlineKeyboardButton("📢 Подписаться на канал", url=_gate_channel_url())],
         [InlineKeyboardButton("✅ Я подписался(ась)", callback_data="check_subscription")],
     ])
 
@@ -47034,9 +52394,17 @@ async def _check_subscription_via_api(user_id, context) -> str:
                             приватный, сетевой сбой). Сюда же попадает
                             «chat not found», когда у бота нет доступа к каналу.
     """
+    # ВОЛНА 23.04: приватная ссылка канала (без @username) — API-проверка
+    # невозможна, доверяем кнопке «Я подписался».
+    _ch_username = get_channel_username()
+    if not _ch_username:
+        return "cannot_verify"
+    # ВОЛНА 23.05: принимаем и CallbackContext, и Application, и голый Bot —
+    # фоновый свип подписки вызывает функцию без контекста колбэка.
+    _sub_bot = getattr(context, "bot", context)
     try:
-        member = await context.bot.get_chat_member(
-            chat_id=f"@{REQUIRED_CHANNEL_USERNAME}",
+        member = await _sub_bot.get_chat_member(
+            chat_id=f"@{_ch_username}",
             user_id=int(user_id),
         )
         status = getattr(member, "status", None)
@@ -47122,6 +52490,65 @@ def _has_recent_local_subscription_confirmation(user_id) -> bool:
     return False
 
 
+# ==================================
+# === ВОЛНА 23.07: «ЛЕСТНИЦА ДОВЕРИЯ» в гейте подписки ===
+# ==================================
+# «Я подписался а бот не пропускает»: API упорно отвечает not_subscribed,
+# хотя пользователь в канале (гонка вступления дольше ретраев, канал
+# переименован, ссылка и username проверки рассинхронизированы, сбои
+# Telegram). После SUB_GATE_FAILS_LIMIT подрядных отказов по кнопке верим
+# пользователю и пускаем, а разработчику уходит уведомление.
+
+SUB_GATE_FAILS_LIMIT = 3        # подряд отказов → верим кнопке
+SUB_GATE_FAILS_WINDOW_MIN = 30  # отказы считаются «подряд» в этом окне (мин)
+
+
+def _read_gate_fails(user_id):
+    """ВОЛНА 23.07: {"count": N, "last": "YYYY-mm-dd HH:MM:SS"} или {}."""
+    try:
+        return load_data(SUB_GATE_FAILS_FILE, {}, expect="dict").get(
+            str(user_id)) or {}
+    except Exception:
+        return {}
+
+
+def _record_gate_fail(user_id) -> int:
+    """ВОЛНА 23.07: фиксирует отказ API на кнопке «Я подписался».
+    Возвращает число ПОДРЯДНЫХ отказов: если с прошлого прошло больше
+    SUB_GATE_FAILS_WINDOW_MIN минут — счётчик начинается заново с 1."""
+    uid = str(user_id)
+    try:
+        data = load_data(SUB_GATE_FAILS_FILE, {}, expect="dict")
+    except Exception:
+        data = {}
+    prev = data.get(uid) or {}
+    now = datetime.now()
+    try:
+        last = datetime.strptime(prev.get("last", ""), "%Y-%m-%d %H:%M:%S")
+        count = int(prev.get("count", 0)) if (
+            now - last) < timedelta(minutes=SUB_GATE_FAILS_WINDOW_MIN) else 0
+    except Exception:
+        count = 0
+    count += 1
+    data[uid] = {"count": count, "last": now.strftime("%Y-%m-%d %H:%M:%S")}
+    try:
+        save_data(SUB_GATE_FAILS_FILE, data)
+    except Exception as e:
+        logger.error(f"_record_gate_fail save error: {e}")
+    return count
+
+
+def _clear_gate_fails(user_id):
+    """ВОЛНА 23.07: сбрасывает счётчик подрядных отказов (при пуске)."""
+    try:
+        data = load_data(SUB_GATE_FAILS_FILE, {}, expect="dict")
+        if str(user_id) in data:
+            data.pop(str(user_id), None)
+            save_data(SUB_GATE_FAILS_FILE, data)
+    except Exception as e:
+        logger.error(f"_clear_gate_fails error: {e}")
+
+
 async def is_user_subscribed(user_id, context) -> bool:
     """СТРОГАЯ проверка подписки на канал. Возвращает True ТОЛЬКО если:
 
@@ -47133,11 +52560,30 @@ async def is_user_subscribed(user_id, context) -> bool:
     Во ВСЕХ остальных случаях возвращает False — бот покажет требование
     подписаться на канал. Это и есть «fail-closed» поведение: лучше
     лишний раз попросить подписаться, чем по ошибке пропустить отписавшегося.
+
+    ВОЛНА 23.10: если разработчик ВЫКЛЮЧИЛ обязательную подписку (панель →
+    «🚪 Обязательная подписка»), пускаем ВСЕХ без единого запроса к API.
+
+    ВОЛНА 23.10.5 (аудит «не работает подписка на канал»): краткий кэш
+    результатов API. Раньше КАЖДЫЙ /start и КАЖДОЕ нажатие любой inline-
+    кнопки гоняли get_chat_member заново: при флуде Telegram (RetryAfter)
+    ДЕЙСТВИТЕЛЬНО подписанный пользователь получал ложное «подпишитесь»,
+    а гонка вступления в канал рвала регистрацию посередине. Теперь
+    положительный ответ живёт 10 минут, отрицательный — 2 минуты
+    (коротко, чтобы отписка ловилась быстро). Кнопка «✅ Я подписался»
+    проверяет БЕЗ кэша (см. check_subscription_handler).
     """
+    if not is_dev_sub_gate_enabled():
+        return True
+    _cached = _sub_check_cache_get(user_id)
+    if _cached is not None:
+        return _cached
     api_result = await _check_subscription_via_api(user_id, context)
     if api_result == "subscribed":
+        _sub_check_cache_put(user_id, True)
         return True
     if api_result == "not_subscribed":
+        _sub_check_cache_put(user_id, False)
         logger.info(f"Пользователь {user_id} НЕ подписан (API).")
         return False
     # api_result == "cannot_verify" — API не может ответить. Доверяем
@@ -47151,9 +52597,64 @@ async def is_user_subscribed(user_id, context) -> bool:
     return False
 
 
+# ВОЛНА 23.10.5: кэш результатов API-проверки подписки (см. докстринг
+# is_user_subscribed). Только окончательные ответы («subscribed» /
+# «not_subscribed»); cannot_verify НЕ кэшируется.
+_SUB_CHECK_CACHE = {}
+_SUB_CACHE_OK_TTL = 600.0     # «подписан» — 10 минут
+_SUB_CACHE_FAIL_TTL = 120.0   # «не подписан» — 2 минуты (гонка вступления)
+_SUB_CACHE_LOCK = threading.Lock()
+
+
+def _sub_check_cache_get(user_id):
+    """True/False из кэша, либо None (нет свежей записи)."""
+    try:
+        with _SUB_CACHE_LOCK:
+            ent = _SUB_CHECK_CACHE.get(str(user_id))
+            if not ent:
+                return None
+            ts, ok = ent
+            ttl = _SUB_CACHE_OK_TTL if ok else _SUB_CACHE_FAIL_TTL
+            if time.time() - ts < ttl:
+                return ok
+            _SUB_CHECK_CACHE.pop(str(user_id), None)
+            return None
+    except Exception:
+        return None
+
+
+def _sub_check_cache_put(user_id, ok):
+    try:
+        with _SUB_CACHE_LOCK:
+            if len(_SUB_CHECK_CACHE) > 10000:
+                cutoff = time.time() - max(_SUB_CACHE_OK_TTL,
+                                           _SUB_CACHE_FAIL_TTL)
+                for k in [k for k, v in _SUB_CHECK_CACHE.items()
+                          if v[0] < cutoff]:
+                    _SUB_CHECK_CACHE.pop(k, None)
+            _SUB_CHECK_CACHE[str(user_id)] = (time.time(), bool(ok))
+    except Exception:
+        pass
+
+
+def _sub_check_cache_invalidate(user_id):
+    """Сброс кэша пользователя (например, после отписки в свипе)."""
+    try:
+        with _SUB_CACHE_LOCK:
+            _SUB_CHECK_CACHE.pop(str(user_id), None)
+    except Exception:
+        pass
+
+
 async def send_subscription_required(update, context):
     """Показывает сообщение с требованием подписаться на канал."""
     kb = _subscription_required_keyboard()
+    # ВОЛНА 23.05: user_id нужен тексту, чтобы отличить «не подписывался»
+    # от «отписался» (разные тексты гейта).
+    _req_uid = None
+    _eu = getattr(update, "effective_user", None)
+    if _eu is not None:
+        _req_uid = _eu.id
     # callback_query — пришёл от inline-кнопки
     if getattr(update, "callback_query", None):
         try:
@@ -47162,7 +52663,7 @@ async def send_subscription_required(update, context):
             pass
         try:
             await update.callback_query.edit_message_text(
-                SUBSCRIPTION_REQUIRED_TEXT, reply_markup=kb
+                subscription_required_text(_req_uid), reply_markup=kb
             )
             return
         except Exception:
@@ -47170,7 +52671,7 @@ async def send_subscription_required(update, context):
         try:
             chat_id = update.callback_query.from_user.id
             await context.bot.send_message(
-                chat_id=chat_id, text=SUBSCRIPTION_REQUIRED_TEXT, reply_markup=kb
+                chat_id=chat_id, text=subscription_required_text(_req_uid), reply_markup=kb
             )
             return
         except Exception:
@@ -47178,7 +52679,7 @@ async def send_subscription_required(update, context):
     # обычное сообщение
     if getattr(update, "message", None):
         try:
-            await update.message.reply_text(SUBSCRIPTION_REQUIRED_TEXT, reply_markup=kb)
+            await update.message.reply_text(subscription_required_text(_req_uid), reply_markup=kb)
             return
         except Exception:
             pass
@@ -47186,7 +52687,7 @@ async def send_subscription_required(update, context):
         try:
             await context.bot.send_message(
                 chat_id=update.effective_user.id,
-                text=SUBSCRIPTION_REQUIRED_TEXT,
+                text=subscription_required_text(_req_uid),
                 reply_markup=kb,
             )
         except Exception:
@@ -47202,7 +52703,13 @@ async def ensure_subscribed(update, context) -> bool:
     не сможет проверить, корректно ли работает блокировка отписавшихся
     пользователей. Если разработчик хочет свободно пользоваться ботом — пусть
     он подпишется на свой канал, как и все остальные. Это всего лишь один клик.
+
+    ВОЛНА 23.10: гейт выключен разработчиком (панель → «🚪 Обязательная
+    подписка») — никого не проверяем и никаких сообщений о подписке не
+    отправляем: запуск, кнопки, восстановление сессии — всё работает свободно.
     """
+    if not is_dev_sub_gate_enabled():
+        return True
     user = getattr(update, "effective_user", None)
     if not user:
         return True
@@ -47222,35 +52729,104 @@ async def check_subscription_handler(update: Update, context: ContextTypes.DEFAU
          — доверяем нажатию кнопки и проставляем локальную метку доверия на
          SUBSCRIPTION_TRUST_HOURS часов. Так что если у владельца бота не
          настроен админ-доступ к каналу, бот всё равно работает.
+      4. ВОЛНА 23.07 «лестница доверия»: если API SUB_GATE_FAILS_LIMIT раз
+         ПОДРЯД отказал нажатию кнопки (в пределах окна) — верим пользователю
+         и пускаем, а разработчику уходит уведомление. Защита от ложных
+         отказов API: реальный подписчик больше не может застрять навсегда.
     """
     query = update.callback_query
     if not query:
         return
-    try:
-        await query.answer()
-    except Exception:
-        pass
+
+    # ВОЛНА 23.10: обязательная подписка выключена разработчиком — старые
+    # требования подписки (показанные до выключения) больше не должны
+    # отказывать. Отвечаем, что подписка не обязательна, и пускаем дальше.
+    if not is_dev_sub_gate_enabled():
+        await _safe_cb_answer(
+            query,
+            "Отлично! Обязательная подписка на канал сейчас выключена "
+            "разработчиком — пользуйтесь ботом.",
+            show_alert=True)
+        return
 
     user_id = str(query.from_user.id)
     api_result = await _check_subscription_via_api(user_id, context)
 
+    # ВОЛНА 23.04: гонка «только что вступил». Telegram иногда несколько
+    # секунд отдаёт устаревший статус left после вступления в канал —
+    # пользователь жмёт кнопку, получает отказ и думает, что бот сломался
+    # («нажимаю я подписался, а бот не реагирует»). Если первая проверка
+    # сказала «не подписан» — пауза и до двух повторных попыток.
     if api_result == "not_subscribed":
-        # Telegram явно сказал, что пользователя в канале нет.
-        try:
-            await query.answer(
-                "Подписка не найдена. Подпишитесь и попробуйте снова.",
-                show_alert=True,
-            )
-        except Exception:
-            pass
-        try:
-            await query.edit_message_text(
-                SUBSCRIPTION_REQUIRED_TEXT,
-                reply_markup=_subscription_required_keyboard(),
-            )
-        except Exception:
-            pass
-        return
+        for _attempt in range(2):
+            await asyncio.sleep(1.5)
+            api_result = await _check_subscription_via_api(user_id, context)
+            if api_result != "not_subscribed":
+                break
+
+    # ВОЛНА 23.07: «лестница доверия». Если API УПОРНО отказывает
+    # (SUB_GATE_FAILS_LIMIT нажатий подряд в пределах окна) — верим
+    # пользователю и пускаем: защита от ложных отказов (гонка вступления
+    # дольше ретраев, переименование канала, рассинхрон ссылки/username).
+    escalation = False
+    if api_result == "not_subscribed":
+        fails = _record_gate_fail(user_id)
+        if fails >= SUB_GATE_FAILS_LIMIT:
+            _clear_gate_fails(user_id)
+            escalation = True
+        else:
+            # Telegram явно сказал, что пользователя в канале нет.
+            # ИСПРАВЛЕНО (ВОЛНА 23.04): alert — первый и единственный
+            # answer (второй answer Telegram отбрасывал), метка времени
+            # в edit гарантирует применение. ВОЛНА 23.07: честная
+            # подсказка про «лестницу доверия».
+            try:
+                await query.answer(
+                    "Подписка не найдена. Подпишитесь на канал и нажмите "
+                    "кнопку ещё раз через пару секунд.",
+                    show_alert=True,
+                )
+            except Exception:
+                pass
+            try:
+                await query.edit_message_text(
+                    subscription_required_text(user_id)
+                    + "\n\n🕐 Проверено в "
+                    + datetime.now().strftime("%H:%M:%S")
+                    + ". Если вы уже подписались — нажмите кнопку ещё раз."
+                    + "\n\nℹ️ Если вы ТОЧНО подписаны: после "
+                    + str(SUB_GATE_FAILS_LIMIT)
+                    + " нажатий бот поверит вам без проверки.",
+                    reply_markup=_subscription_required_keyboard(),
+                )
+            except Exception:
+                # ВОЛНА 23.09: edit не прошёл (сообщение старое/удалено) —
+                # отказ всегда должен быть ВИДЕН: шлём требование подписки
+                # новым сообщением («нажал — и тишина» = «проверка не
+                # работает»).
+                try:
+                    await context.bot.send_message(
+                        chat_id=user_id,
+                        text=subscription_required_text(user_id)
+                        + "\n\n🕐 Проверено в "
+                        + datetime.now().strftime("%H:%M:%S")
+                        + ". Если вы уже подписались — нажмите кнопку ещё раз.",
+                        reply_markup=_subscription_required_keyboard(),
+                    )
+                except Exception:
+                    pass
+            return
+
+    # Пускаем дальше — молчаливый answer именно ЗДЕСЬ (колбэк ещё не
+    # отвечен; раньше отвечали до проверки и «съедали» alert).
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    _clear_gate_fails(user_id)
+    # ВОЛНА 23.10.5: кнопка подтвердила подписку — кладём в кэш гейта,
+    # чтобы ближайшие /start и клики не гоняли API заново (флуд-защита).
+    _sub_check_cache_put(user_id, True)
 
     # api_result in ("subscribed", "cannot_verify") — пускаем дальше.
     # При "cannot_verify" доверяем кнопке (бот не админ канала и т. п.).
@@ -47263,15 +52839,44 @@ async def check_subscription_handler(update: Update, context: ContextTypes.DEFAU
     user = get_user(user_id)
     if user:
         user.subscription_confirmed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # ВОЛНА 23.05: пользователь снова в канале — сбрасываем анти-спам
+        # метку, чтобы при СЛЕДУЮЩЕЙ отписке напоминание пришло снова.
+        user.sub_left_notified_at = None
         try:
             save_user(user)
         except Exception as e:
             logger.error(f"check_subscription_handler: save_user error: {e}")
 
-    try:
-        await query.edit_message_text("✅ Подписка подтверждена! Спасибо 🙏")
-    except Exception:
-        pass
+    if escalation:
+        # ВОЛНА 23.07: впустили вопреки API — честно говорим пользователю
+        # и сообщаем разработчику (пусть проверит канал в панели).
+        try:
+            await query.edit_message_text(
+                "⚠️ Не видим вашу подписку через API, но поверили вам — "
+                "пускаем!\n\nРазработчик получит уведомление и проверит "
+                "настройки канала.")
+        except Exception:
+            pass
+        try:
+            await context.bot.send_message(
+                chat_id=DEVELOPER_ID,
+                text=(
+                    "⚠️ Гейт подписки: пользователь " + user_id
+                    + " впущен по «лестнице доверия» — API "
+                    + str(SUB_GATE_FAILS_LIMIT)
+                    + " раза подряд не видел подписку в @"
+                    + (get_channel_username() or "—")
+                    + ". Проверьте: 🛠️ Панель → «📢 Канал подписки» → "
+                    "«🧪 Проверить доступ бота»."),
+            )
+        except Exception as e:
+            logger.error(f"gate escalation DM: {e}")
+    else:
+        try:
+            await query.edit_message_text(
+                "✅ Подписка подтверждена! Спасибо 🙏")
+        except Exception:
+            pass
 
     if not user:
         # Аккаунт ещё не создан — просим запустить /start, чтобы пройти регистрацию.
@@ -47681,10 +53286,25 @@ async def show_disclaimer(update, context):
         )])
     keyboard = InlineKeyboardMarkup(rows)
 
-    if hasattr(update, 'message') and update.message:
-        await update.message.reply_text(disclaimer_text, reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN)
-    else:
-        await update.callback_query.edit_message_text(disclaimer_text, reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN)
+    # ВОЛНА 23.10.2: показ дисклеймера больше не может оборвать регистрацию.
+    # Любой сбой Telegram (устаревшее сообщение, «Message is not modified»,
+    # сетевой сбой) гасится, текст досылается отдельным сообщением — раньше
+    # исключение уходило в error_handler, и пользователь видел
+    # «⚠️ Произошла ошибка. Попробуйте ещё раз…» вместо экрана согласия.
+    try:
+        if hasattr(update, 'message') and update.message:
+            await update.message.reply_text(disclaimer_text, reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN)
+        else:
+            await update.callback_query.edit_message_text(disclaimer_text, reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        logger.error(f"show_disclaimer: показ не удался ({e}); досылаю отдельно")
+        try:
+            await context.bot.send_message(
+                chat_id=update.effective_user.id,
+                text=disclaimer_text, reply_markup=keyboard,
+                parse_mode=ParseMode.MARKDOWN)
+        except Exception as e2:
+            logger.error(f"show_disclaimer: досыл не удался: {e2}")
 
 async def show_instructions(update, context):
     instructions = get_instructions()
@@ -47700,21 +53320,63 @@ async def show_instructions(update, context):
         )])
     keyboard = InlineKeyboardMarkup(rows)
 
-    if hasattr(update, 'callback_query') and update.callback_query:
-        await update.callback_query.edit_message_text(instructions, reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN)
-    elif hasattr(update, 'message') and update.message:
-        await update.message.reply_text(instructions, reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN)
+    # ВОЛНА 23.10.2: как в show_disclaimer — сбой показа не обрывает
+    # регистрацию, текст досылается отдельным сообщением.
+    try:
+        if hasattr(update, 'callback_query') and update.callback_query:
+            await update.callback_query.edit_message_text(instructions, reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN)
+        elif hasattr(update, 'message') and update.message:
+            await update.message.reply_text(instructions, reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        logger.error(f"show_instructions: показ не удался ({e}); досылаю отдельно")
+        try:
+            await context.bot.send_message(
+                chat_id=update.effective_user.id,
+                text=instructions, reply_markup=keyboard,
+                parse_mode=ParseMode.MARKDOWN)
+        except Exception as e2:
+            logger.error(f"show_instructions: досыл не удался: {e2}")
 
 @timeout(CONVERSATION_TIMEOUT)
 async def enter_birthday_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # ВОЛНА 23.10 (фикс «ошибка при вводе дня рождения»): берём
+    # effective_message вместо message — правка сообщения («исправил
+    # опечатку в дате») приходит с update.message=None, и старый код
+    # `update.message.text.strip()` падал с AttributeError ещё ДО try/except,
+    # отдавая пользователю generic «Попробуйте ещё раз или нажмите /start».
+    msg = getattr(update, "effective_message", None)
+    if msg is None or not getattr(msg, "text", None):
+        # стикер/фото/голос или апдейт вовсе без сообщения: не падаем,
+        # а вежливо просим текст и остаёмся в этом же состоянии.
+        try:
+            uid = update.effective_user.id if update.effective_user else None
+            kb = get_skip_birthday_keyboard()
+            hint = ("Пришлите дату рождения обычным СООБЩЕНИЕМ текстом в "
+                    "формате ГГГГ-ММ-ДД (например, 2005-04-15):")
+            if msg is not None:
+                await msg.reply_text(hint, reply_markup=kb)
+            elif uid is not None:
+                await context.bot.send_message(chat_id=uid, text=hint,
+                                               reply_markup=kb)
+        except Exception as e:
+            logger.error(f"enter_birthday_handler: ввод без текста: {e}")
+        return ENTER_BIRTHDAY
+
     user_id = str(update.effective_user.id)
     user = get_user(user_id)
-    birthday_str = update.message.text.strip()
+    if user is None:
+        # ВОЛНА 23.10: страховка — если запись пропала (сброс базы после
+        # рестарта, удаление в age<13-ветке при живом FSM-состоянии и т.п.),
+        # раньше падали на user.birthday = ... с AttributeError и пугали
+        # ошибкой «нажмите /start». Создаём пользователя на месте, как это
+        # уже делает save_birthday_handler.
+        user = User(user_id)
+    birthday_str = msg.text.strip()
 
     try:
         birthday = datetime.strptime(birthday_str, "%Y-%m-%d")
         if birthday > datetime.now():
-            await update.message.reply_text(
+            await msg.reply_text(
                 "Дата рождения не может быть в будущем. Введите ещё раз в формате ГГГГ-ММ-ДД:",
                 reply_markup=get_skip_birthday_keyboard())
             return ENTER_BIRTHDAY
@@ -47738,7 +53400,7 @@ async def enter_birthday_handler(update: Update, context: ContextTypes.DEFAULT_T
             # ВОЛНА 22.28: «есть кнопка старт чтобы перезапустить и кнопка
             # поддержки» — при опечатке в дате можно начать заново одной
             # кнопкой, либо написать в поддержку.
-            await update.message.reply_text(
+            await msg.reply_text(
                 "🚫 Бот не предназначен для детей младше 13 лет.\n\n"
                 "Регистрация не может быть продолжена. Если вы ошиблись в "
                 "дате — нажмите «🔄 Старт» и начните заново, или напишите "
@@ -47750,49 +53412,140 @@ async def enter_birthday_handler(update: Update, context: ContextTypes.DEFAULT_T
         user.birthday = birthday_str
         save_user(user)
 
-        await show_disclaimer(update, context)
+        # ВОЛНА 23.10: сбой сети/Telegram на экране дисклеймера больше НЕ
+        # обнуляет успешный ввод даты (она уже сохранена) и не показывает
+        # «Попробуйте ещё раз или нажмите /start». Пробуем показать экран
+        # штатно, при сбое — отправляем напрямую через context.bot.
+        try:
+            await show_disclaimer(update, context)
+        except Exception as e:
+            logger.error(f"enter_birthday_handler: show_disclaimer: {e}")
+            try:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=_LEGAL_TEXT,
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("✅ Я согласен(на) с условиями",
+                                             callback_data="accept_disclaimer")],
+                        [InlineKeyboardButton("❌ Отказаться",
+                                              callback_data="decline_disclaimer")]]))
+            except Exception as e2:
+                logger.error(f"enter_birthday_handler: show_disclaimer fallback: {e2}")
+                try:
+                    await msg.reply_text(
+                        "Дата рождения сохранена. Нажмите /start, чтобы продолжить регистрацию.")
+                except Exception:
+                    pass
         return SHOW_INSTRUCTIONS
 
     except ValueError:
-        await update.message.reply_text(
+        await msg.reply_text(
             "Введите дату в формате ГГГГ-ММ-ДД (например, 2005-04-15):",
             reply_markup=get_skip_birthday_keyboard())
         return ENTER_BIRTHDAY
 
 async def disclaimer_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # === ВОЛНА 23.10.2 (фикс «при нажатии “✅ Я согласен” — ⚠️ Ошибка») ===
+    # Первопричина: центральный handle_callback уже делает query.answer()
+    # (ВОЛНА 22.78, глушит «Query is too old»), а здесь стоял ВТОРОЙ
+    # answer() без try/except. Telegram отвечает на него BadRequest
+    # «Query is already answered», исключение улетало в error_handler —
+    # пользователь получал «⚠️ Произошла ошибка. Попробуйте ещё раз —
+    # нажмите /start…», согласие НЕ сохранялось (падение происходило до
+    # save_user), и после /start всё повторялось по кругу.
     query = update.callback_query
-    await query.answer()
+    try:
+        await query.answer()
+    except Exception:
+        # Повторный answer не критичен: спиннер уже погашен центральным
+        # answer'ом, а edit_message_text работает и без него.
+        pass
 
     user_id = str(query.from_user.id)
     user = get_user(user_id)
+    if user is None:
+        # ВОЛНА 23.10.3 (по жалобе «Профиль не найден. Начните с /start —
+        # можешь уже нормально сделать без ошибок»): пропавшая запись больше
+        # НЕ тупик. Профиль создаётся на месте (как на /start) — и нажатие
+        # «✅ Я согласен» продолжает регистрацию штатно: ПДн → город → меню.
+        try:
+            user = _ensure_user_record(
+                user_id,
+                username=query.from_user.username,
+                first_name=query.from_user.first_name)
+        except Exception as e:
+            logger.error(f"disclaimer_handler: не удалось восстановить "
+                         f"профиль {user_id}: {e}")
+            await _dev_safe_edit(query, "Профиль не найден. Начните с /start")
+            return ConversationHandler.END
 
     if query.data == "accept_disclaimer":
-        user.disclaimer_accepted = True
-        save_user(user)
+        # Согласие должно сохраниться даже при сбоях показа следующих экранов:
+        # сначала сохраняем, потом рисуем интерфейс.
+        try:
+            user.disclaimer_accepted = True
+            save_user(user)
+        except Exception as e:
+            logger.error(f"disclaimer_handler: не удалось сохранить согласие: {e}")
+            await _dev_safe_edit(query, "⚠️ Не удалось сохранить согласие. "
+                                  "Нажмите кнопку ещё раз.")
+            return None  # остаёмся в текущем состоянии — кнопка на месте
 
         # ВОЛНА 22.18 (152-ФЗ): следующий обязательный шаг — согласие
         # на обработку персональных данных (до ввода города и любых данных).
         if not user.pdn_accepted:
-            await show_pdn_consent(update, context)
+            # show_pdn_consent с 23.10.2 не бросает исключений (edit с
+            # фолбэком-досылом), но страховка не помешает: сбой показа не
+            # должен снова вернуть пользователя на этот экран через /start.
+            try:
+                await show_pdn_consent(update, context)
+            except Exception as e:
+                logger.error(f"disclaimer_handler: show_pdn_consent: {e}")
+                try:
+                    await context.bot.send_message(
+                        chat_id=user_id, text=_PDN_CONSENT_TEXT,
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("✅ Согласен(на) на обработку ПДн",
+                                                  callback_data="pdn_accept")],
+                            [InlineKeyboardButton("📜 Политика ПДн",
+                                                  callback_data="pdn_privacy_full")],
+                            [InlineKeyboardButton("❌ Не согласен(на)",
+                                                  callback_data="pdn_decline")],
+                        ]))
+                except Exception as e2:
+                    logger.error(f"disclaimer_handler: досыл ПДн: {e2}")
             return PDN_CONSENT_WAIT
 
         if not user.setup_completed:
             # ПУНКТ 10: ручной ввод времени убран — часовой пояс определяется
             # автоматически по введённому городу.
             # ПОЛИТИКА ПДн 1.2: город необязателен — есть «⏭ Пропустить».
-            await query.edit_message_text(
+            _city_text = (
                 "✅ Отлично!\n\n"
                 "🏙 Введите ваш город (например: Москва, Санкт-Петербург, Казань).\n"
                 "По нему я сам определю часовой пояс и настрою уведомления.\n\n"
-                "Указывать необязательно: нажмите «⏭ Пропустить», если не хотите.",
-                reply_markup=get_skip_city_keyboard()
+                "Указывать необязательно: нажмите «⏭ Пропустить», если не хотите."
             )
+            await _dev_safe_edit(query, _city_text,
+                           reply_markup=get_skip_city_keyboard())
             return ENTER_CITY
         else:
-            await show_main_menu(update, context, user)
+            try:
+                await show_main_menu(update, context, user)
+            except Exception as e:
+                logger.error(f"disclaimer_handler: show_main_menu: {e}")
+                try:
+                    await context.bot.send_message(
+                        chat_id=user_id,
+                        text=f"👋 Добро пожаловать в DEVORKS+, {user.first_name}!",
+                        reply_markup=get_main_menu_keyboard(user))
+                except Exception as e2:
+                    logger.error(f"disclaimer_handler: досыл меню: {e2}")
             return MAIN_MENU
     else:
-        await query.edit_message_text("Вы отказались от использования бота. Если передумаете — /start")
+        await _dev_safe_edit(query,
+                       "Вы отказались от использования бота. Если передумаете — /start")
         return ConversationHandler.END
 
 
@@ -47937,11 +53690,18 @@ async def show_pdn_consent(update, context):
         [InlineKeyboardButton("❌ Не согласен(на)",
                               callback_data="pdn_decline")],
     ])
+    # ВОЛНА 23.10.2: edit через _dev_safe_edit — «Message is not modified»
+    # (двойное нажатие) гасится молча, прочие сбои досылают текст отдельно.
+    # Раньше любое исключение здесь улетало в error_handler после нажатия
+    # «✅ Согласен(на)…».
     if hasattr(update, "callback_query") and update.callback_query:
-        await update.callback_query.edit_message_text(
-            _PDN_CONSENT_TEXT, reply_markup=keyboard)
+        await _dev_safe_edit(update.callback_query,
+                             _PDN_CONSENT_TEXT, reply_markup=keyboard)
     elif hasattr(update, "message") and update.message:
-        await update.message.reply_text(_PDN_CONSENT_TEXT, reply_markup=keyboard)
+        try:
+            await update.message.reply_text(_PDN_CONSENT_TEXT, reply_markup=keyboard)
+        except Exception as e:
+            logger.error(f"show_pdn_consent: reply не удался: {e}")
 
 
 async def show_parent_consent(update, context):
@@ -47952,37 +53712,56 @@ async def show_parent_consent(update, context):
         [InlineKeyboardButton("❌ Согласия нет",
                               callback_data="parent_consent_no")],
     ])
+    # ВОЛНА 23.10.2: защита показа — как в show_pdn_consent.
     if hasattr(update, "callback_query") and update.callback_query:
-        await update.callback_query.edit_message_text(
-            _PARENT_CONSENT_TEXT, reply_markup=keyboard)
+        await _dev_safe_edit(update.callback_query,
+                             _PARENT_CONSENT_TEXT, reply_markup=keyboard)
     elif hasattr(update, "message") and update.message:
-        await update.message.reply_text(_PARENT_CONSENT_TEXT, reply_markup=keyboard)
+        try:
+            await update.message.reply_text(_PARENT_CONSENT_TEXT, reply_markup=keyboard)
+        except Exception as e:
+            logger.error(f"show_parent_consent: reply не удался: {e}")
 
 
 async def _pdn_continue_after_consent(update, context, user):
     """Общий хвост согласия: город (первые шаги) или главное меню."""
+    # ВОЛНА 23.10.2: этот хвост вызывается сразу после нажатия «✅
+    # Согласен(на) на обработку ПДн» / «✅ Мои родители согласны» — сбой
+    # edit/reply здесь снова показывал пользователю «⚠️ Произошла ошибка…»,
+    # хотя согласие уже сохранено. Гасим и досылаем.
+    _city_text = (
+        "✅ Спасибо!\n\n"
+        "🏙 Введите ваш город (например: Москва, Санкт-Петербург, Казань).\n"
+        "По нему я сам определю часовой пояс и настрою уведомления.\n\n"
+        "Указывать необязательно: нажмите «⏭ Пропустить», если не хотите."
+    )
     if hasattr(update, "callback_query") and update.callback_query:
         if not user.setup_completed:
             # ПОЛИТИКА ПДн 1.2: город необязателен — есть «⏭ Пропустить».
-            await update.callback_query.edit_message_text(
-                "✅ Спасибо!\n\n"
-                "🏙 Введите ваш город (например: Москва, Санкт-Петербург, Казань).\n"
-                "По нему я сам определю часовой пояс и настрою уведомления.\n\n"
-                "Указывать необязательно: нажмите «⏭ Пропустить», если не хотите.",
-                reply_markup=get_skip_city_keyboard()
-            )
+            await _dev_safe_edit(update.callback_query, _city_text,
+                                 reply_markup=get_skip_city_keyboard())
             return ENTER_CITY
-        await show_main_menu(update, context, user)
+        try:
+            await show_main_menu(update, context, user)
+        except Exception as e:
+            logger.error(f"_pdn_continue_after_consent: show_main_menu: {e}")
+            try:
+                await context.bot.send_message(
+                    chat_id=update.effective_user.id,
+                    text=f"👋 Добро пожаловать в DEVORKS+, {user.first_name}!",
+                    reply_markup=get_main_menu_keyboard(user))
+            except Exception as e2:
+                logger.error(f"_pdn_continue_after_consent: досыл меню: {e2}")
         return MAIN_MENU
     # message-вариант (стартовали прямо из /start)
     if not user.setup_completed:
-        await update.message.reply_text(
-            "✅ Спасибо!\n\n"
-            "🏙 Введите ваш город (например: Москва, Санкт-Петербург, Казань).\n"
-            "По нему я сам определю часовой пояс и настрою уведомления.\n\n"
-            "Указывать необязательно: нажмите «⏭ Пропустить», если не хотите.",
-            reply_markup=get_skip_city_keyboard()
-        )
+        try:
+            await update.message.reply_text(
+                _city_text,
+                reply_markup=get_skip_city_keyboard()
+            )
+        except Exception as e:
+            logger.error(f"_pdn_continue_after_consent: reply города: {e}")
         return ENTER_CITY
     await show_main_menu(update, context, user)
     return MAIN_MENU
@@ -48000,8 +53779,17 @@ async def pdn_consent_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         pass
     user = get_user(str(query.from_user.id))
     if user is None:
-        await query.edit_message_text("Профиль не найден. Начните с /start")
-        return ConversationHandler.END
+        # ВОЛНА 23.10.3: пропавший профиль — НЕ тупик: создаём на месте
+        # и продолжаем штатно (см. _ensure_user_record).
+        try:
+            user = _ensure_user_record(str(query.from_user.id),
+                                       query.from_user.username,
+                                       query.from_user.first_name)
+        except Exception as e:
+            logger.error(f"pdn_consent_handler: не удалось восстановить "
+                         f"профиль: {e}")
+            await _dev_safe_edit(query, "Профиль не найден. Начните с /start")
+            return ConversationHandler.END
 
     if query.data == "pdn_privacy_full":
         keyboard = InlineKeyboardMarkup([[
@@ -48023,15 +53811,24 @@ async def pdn_consent_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         user.pdn_consent_at = datetime.now(timezone.utc).isoformat()
         user.pdn_policy_version = PDN_POLICY_VERSION
         age = _user_age_years(getattr(user, "birthday", None))
-        if age is not None and age < 18 and not getattr(user, "parent_consent", False):
+        # ВОЛНА 23.10.2: сбой записи не должен показывать «⚠️ Ошибка» —
+        # согласие можно нажать повторно, экран не трогаем.
+        try:
             save_user(user)
+        except Exception as e:
+            logger.error(f"pdn_consent_handler: save_user: {e}")
+            await _dev_safe_edit(query, "⚠️ Не удалось сохранить согласие. "
+                                  "Нажмите кнопку ещё раз.")
+            return None
+        if age is not None and age < 18 and not getattr(user, "parent_consent", False):
             await show_parent_consent(update, context)
             return PARENT_CONSENT_WAIT
-        save_user(user)
         return await _pdn_continue_after_consent(update, context, user)
 
     # pdn_decline
-    await query.edit_message_text(_PDN_DECLINE_TEXT)
+    # ВОЛНА 23.10.2: edit под защитой (устаревшее сообщение/сбой сети
+    # больше не превращаются в «⚠️ Произошла ошибка…»).
+    await _dev_safe_edit(query, _PDN_DECLINE_TEXT)
     return ConversationHandler.END
 
 
@@ -48046,18 +53843,37 @@ async def parent_consent_handler(update: Update, context: ContextTypes.DEFAULT_T
         pass
     user = get_user(str(query.from_user.id))
     if user is None:
-        await query.edit_message_text("Профиль не найден. Начните с /start")
-        return ConversationHandler.END
+        # ВОЛНА 23.10.3: пропавший профиль — НЕ тупик: создаём на месте
+        # и продолжаем штатно (см. _ensure_user_record).
+        try:
+            user = _ensure_user_record(str(query.from_user.id),
+                                       query.from_user.username,
+                                       query.from_user.first_name)
+        except Exception as e:
+            logger.error(f"parent_consent_handler: не удалось восстановить "
+                         f"профиль: {e}")
+            await _dev_safe_edit(query, "Профиль не найден. Начните с /start")
+            return ConversationHandler.END
     if query.data == "parent_consent_yes":
         user.parent_consent = True
         user.pdn_accepted = True
         user.pdn_consent_at = user.pdn_consent_at or datetime.now(
             timezone.utc).isoformat()
         user.pdn_policy_version = PDN_POLICY_VERSION
-        save_user(user)
+        # ВОЛНА 23.10.2: сбой записи — не «⚠️ Ошибка», а возможность
+        # нажать кнопку повторно.
+        try:
+            save_user(user)
+        except Exception as e:
+            logger.error(f"parent_consent_handler: save_user: {e}")
+            await _dev_safe_edit(query, "⚠️ Не удалось сохранить согласие. "
+                                  "Нажмите кнопку ещё раз.")
+            return None
         return await _pdn_continue_after_consent(update, context, user)
     # parent_consent_no
-    await query.edit_message_text(
+    # ВОЛНА 23.10.2: edit под защитой.
+    await _dev_safe_edit(
+        query,
         "❌ Регистрация не продолжится без согласия родителей: по 152-ФЗ "
         "бот не вправе обрабатывать данные несовершеннолетнего без него.\n\n"
         "Данные не обрабатываются. Если родители согласятся — /start.")
@@ -48123,7 +53939,12 @@ async def delete_my_data_yes(update: Update, context: ContextTypes.DEFAULT_TYPE)
     """ВОЛНА 22.18: полное удаление личных данных пользователя.
     Право на удаление/отзыв согласия — 152-ФЗ (ст. 9, 14, 21)."""
     query = update.callback_query
-    await query.answer()
+    # ВОЛНА 23.10.2: второй answer() (центральный уже был в handle_callback)
+    # поднимал BadRequest — гасим, как в disclaimer_handler.
+    try:
+        await query.answer()
+    except Exception:
+        pass
     uid = str(query.from_user.id)
 
     users = load_users()
@@ -48251,7 +54072,14 @@ async def delete_my_data_yes(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def instructions_read_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """ПУНКТ 1: После прочтения инструкции пользователь идёт по обычному пути регистрации."""
     query = update.callback_query
-    await query.answer()
+    # ВОЛНА 23.10.2: как в disclaimer_handler — центральный handle_callback
+    # уже ответил на колбэк, второй answer() поднимал BadRequest
+    # «Query is already answered» и обрывал обработку ДО каких-либо действий:
+    # кнопка «✅ Я прочитал(а) инструкцию» выдавала «⚠️ Произошла ошибка…».
+    try:
+        await query.answer()
+    except Exception:
+        pass
 
     user_id = str(query.from_user.id)
     user = get_user(user_id)
@@ -48262,14 +54090,18 @@ async def instructions_read_handler(update: Update, context: ContextTypes.DEFAUL
         save_user_code(user.user_code, user_id)
 
     user.instructions_read = True
-    save_user(user)
+    try:
+        save_user(user)
+    except Exception as e:
+        logger.error(f"instructions_read_handler: save_user: {e}")
 
     # Дальше — регистрация как раньше.
     # ВОЛНА 22.64: ДР спрашиваем ТОЛЬКО у незавершённой регистрации —
     # старые зарегистрированные пользователи без даты больше не получают
     # повторный запрос при каждом входе.
     if not user.birthday and not getattr(user, "setup_completed", False):
-        await query.edit_message_text(
+        await _dev_safe_edit(
+            query,
             "👋 Добро пожаловать в DEVORKS+! Давайте настроим ваш профиль.\n\n"
             "🎂 Введите вашу реальную дату рождения в формате ГГГГ-ММ-ДД (например, 2005-04-15):\n\n"
             "Дата рождения обязательна: по ней проверяется возраст 13+.\n"
@@ -48288,7 +54120,8 @@ async def instructions_read_handler(update: Update, context: ContextTypes.DEFAUL
         # ПУНКТ 10: ручной ввод времени убран — спрашиваем только город,
         # часовой пояс определяется автоматически.
         # ПОЛИТИКА ПДн 1.2: город необязателен — есть «⏭ Пропустить».
-        await query.edit_message_text(
+        await _dev_safe_edit(
+            query,
             "🏙 Введите ваш город (например: Москва, Санкт-Петербург, Казань).\n"
             "По нему я сам определю часовой пояс и настрою уведомления.\n\n"
             "Указывать необязательно: нажмите «⏭ Пропустить», если не хотите.",
@@ -48296,7 +54129,17 @@ async def instructions_read_handler(update: Update, context: ContextTypes.DEFAUL
         )
         return ENTER_CITY
     else:
-        await show_main_menu(update, context, user)
+        try:
+            await show_main_menu(update, context, user)
+        except Exception as e:
+            logger.error(f"instructions_read_handler: show_main_menu: {e}")
+            try:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=f"👋 Добро пожаловать в DEVORKS+, {user.first_name}!",
+                    reply_markup=get_main_menu_keyboard(user))
+            except Exception as e2:
+                logger.error(f"instructions_read_handler: досыл меню: {e2}")
         return MAIN_MENU
 
 @timeout(CONVERSATION_TIMEOUT)
@@ -48693,6 +54536,8 @@ async def _global_cancel_cleanup(update: Update, context: ContextTypes.DEFAULT_T
     for _key in _VAULT_SESSION_KEYS:
         context.user_data.pop(_key, None)
     context.user_data.pop('vault_chat_acks', None)
+    # ВОЛНА 23.10.11: отменяется и ввод своего API-ключа ИИ.
+    context.user_data.pop('ai_ownkey_pending', None)
     # 3) «Отмена» в чате с ИИ — тоже выход в меню (текст больше не уйдёт в ИИ).
     _was_ai = bool(context.user_data.get('ai_mode'))
     if _was_ai:
@@ -48907,6 +54752,12 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _GLOBAL_CANCEL_RE.match((message_text or "").strip()):
         return await global_cancel_handler(update, context)
 
+    # ВОЛНА 23.10.11: приём СВОЕГО API-ключа ИИ (кнопка «🔑 Свой API-ключ»
+    # на экране входа в DEVORKS+ai) — ДО всего остального, чтобы ключ не
+    # ушёл ни в ИИ, ни в автоматизацию.
+    if context.user_data.get('ai_ownkey_pending'):
+        return await _ai_ownkey_text_receive(update, context)
+
     # ВОЛНА 22.11/22.12: анти-гонка опросов. concurrent_updates(True): текст
     # вопроса, отправленный сразу после нажатия «📊 Опрос», может обогнать
     # колбэк и прийти, пока состояние ещё MAIN_MENU — тогда он молча уходил
@@ -48932,25 +54783,59 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if message_text == "📚 Решения":
         return await solutions_menu(update, context)
 
-    if context.user_data.get('ai_mode'):
-        # Любой вариант «выход» — гарантированно выходим из режима AI
-        lowered = (message_text or "").strip().lower()
-        exit_triggers = {
-            "❌ выход из ai", "выход из ai", "выйти из ai",
-            "выйти", "выход", "exit", "/exit", "stop", "/stop",
-        }
-        if lowered in exit_triggers:
-            context.user_data['ai_mode'] = False
-            # Чистим историю диалога с AI, чтобы следующий вход начинался «с чистого листа»
-            user_conversations.pop(user_id, None)
+    # ВОЛНА 23.10.11: выход из ИИ работает ВСЕГДА — даже когда режим уже
+    # сброшен. После рестарта бота user_data теряется, а кнопка «❌ Выход
+    # из ai» остаётся в чате: раньше такой клик улетал в автоматизацию
+    # («выйти из ai, если долго не нажимать, не работает»).
+    _ai_low = (message_text or "").strip().lower()
+    if _ai_low in _AI_EXIT_TRIGGERS_ALL:
+        _ai_was = bool(context.user_data.get('ai_mode'))
+        context.user_data['ai_mode'] = False
+        # ВОЛНА 23.10.12: если ИИ сейчас «думает» — отменяем генерацию
+        # по-настоящему (сообщение ниже гасит черновик и «три точки»).
+        _AI_LAST_ACT.pop(user_id, None)
+        _ai_cancel_active(user_id)
+        if _ai_was:
+            try:
+                user_conversations.pop(user_id, None)
+            except Exception:
+                pass
             await update.message.reply_text(
                 "👋 Вы вышли из режима ai.",
                 reply_markup=get_main_menu_keyboard(user),
             )
-            return MAIN_MENU
-        # Любой другой текст — передаём в AI. handle_ai_message сам ловит все ошибки.
-        await handle_ai_message(update, context)
+        else:
+            # Идемпотентный выход: просто возвращаем главное меню.
+            await update.message.reply_text(
+                "☰ Главное меню",
+                reply_markup=get_main_menu_keyboard(user),
+            )
         return MAIN_MENU
+
+    if context.user_data.get('ai_mode'):
+        # ВОЛНА 23.10.11 («ИИ иногда отвечает, когда я просто пользуюсь
+        # ботом»): если текст совпадает с ИЗВЕСТНОЙ кнопкой бота — это
+        # работа бота, а не вопрос ИИ. Выключаем режим и выполняем кнопку
+        # (код ниже сам найдёт нужную ветку). Раньше нажатие старой кнопки
+        # из истории чата уходило в ИИ.
+        if _ai_text_is_menu_button(user, message_text):
+            context.user_data['ai_mode'] = False
+            # ВОЛНА 23.10.12: отменяем идущую генерацию (см.
+            # _ai_cancel_active) — кнопка бота важнее ответа ИИ.
+            _AI_LAST_ACT.pop(user_id, None)
+            _ai_cancel_active(user_id)
+            try:
+                await update.message.reply_text(
+                    "🤖 Режим ИИ выключен — открыта кнопка бота.",
+                    reply_markup=get_main_menu_keyboard(user),
+                )
+            except Exception:
+                pass
+            # НЕ возвращаемся: текст обработается ниже как обычная кнопка.
+        else:
+            # Любой другой текст — передаём в AI. handle_ai_message сам ловит все ошибки.
+            await handle_ai_message(update, context)
+            return MAIN_MENU
 
     personal_buttons = get_personal_buttons(user_id)
     for button in personal_buttons:
@@ -49153,6 +55038,7 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif message_text == "🤖 DEVORKS+ai":
         context.user_data['ai_mode'] = True
+        _AI_LAST_ACT[user_id] = time.time()   # ВОЛНА 23.10.12: автовыход
         # Режим личности ИИ: обычный / хамло / тепло (хранится в профиле).
         _ai_user = get_user(user_id) or user
         _persona = getattr(_ai_user, "ai_persona", "normal") or "normal"
@@ -49173,13 +55059,46 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 callback_data="ai_persona_warm",
             )],
         ]
+        # ВОЛНА 23.10.11/23.10.12: модель выбирает ТОЛЬКО разработчик.
+        # Пользователь может выбрать ИИ кнопкой «🔀 Выбор ИИ» (модель
+        # закреплена разработчиком) и подключить СВОЙ ИИ (сервис+ключ+
+        # модель — только для себя, пошагово).
+        _ai_extra = ""
+        if _ai_any_provider_enabled():
+            _ai_tgt = _ai_target_for_user(_ai_user)
+            _m_label = (_ai_short(_ai_tgt[2], 40)
+                        if _ai_tgt is not None else "по умолчанию")
+            _own_cfg = _ai_own_cfg_sanitize(
+                getattr(_ai_user, "ai_own_cfg", None))
+            _has_own = (_own_cfg is not None or bool(
+                str(getattr(_ai_user, "ai_own_key", "") or "").strip()))
+            _vis = (_ai_model_supports_vision(_ai_tgt[2])
+                    if _ai_tgt is not None else False)
+            _persona_kb.append([InlineKeyboardButton(
+                "🔀 Выбор ИИ", callback_data="ai_pick_menu")])
+            _persona_kb.append([InlineKeyboardButton(
+                "🔑 Свой ИИ: " + ("подключён ✅" if _has_own else "не задан"),
+                callback_data="ai_ownkey_menu")])
+            _ai_extra = ("\n📷 Фото: до 5 за раз — "
+                         + ("этот ИИ их видит ✅" if _vis
+                            else "этот ИИ фото не видит (без vision)")
+                         + ".\n📚 Я знаю ваше расписание и домашку — спросите "
+                           "«что задано?»."
+                         "\n🤖 Модель ИИ: " + _m_label
+                         + " (модель закрепляет разработчик).")
+        else:
+            _ai_extra = ("\n📷 Фото: просто пришлите картинку — я её разберу."
+                         "\n📚 Я знаю ваше расписание и домашку — спросите "
+                         "«что задано?».")
         await update.message.reply_text(
             "🤖 **Режим ai активирован!**\n\n"
             "Теперь все ваши сообщения будут отправляться DEVORKS+ai.\n"
             "Я всегда отвечаю на русском языке и всегда говорю только правду!\n\n"
             f"🎭 Текущий режим ИИ: *{_persona_row['title']}* — {_persona_row['description']}.\n"
             "Можно сменить режим в любой момент — ответ сразу изменится:\n\n"
-            "Напишите ваш вопрос или нажмите '❌ Выход из ai' для выхода.",
+            "Напишите ваш вопрос.\n"
+            "Выход — кнопка «❌ Выход из ai» под клавиатурой или «❌ Выйти из ИИ» под моим ответом."
+            + _ai_extra,
             reply_markup=InlineKeyboardMarkup(_persona_kb),
             parse_mode=ParseMode.MARKDOWN
         )
@@ -49332,6 +55251,31 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "\n🌐 Расписание с сайтов — 📄 " + _wname +
                     (f" (обновлено {_when})" if _when else ""))
 
+        # ВОЛНА 23.10.10: «📌 ОТДЕЛЬНЫЕ ДНИ» — расписание/фото на конкретные
+        # даты (главнее дня недели). В секцию попадают сегодня и будущее.
+        _sd_img_days = []
+        try:
+            _sd_today = get_local_time(user).strftime("%Y-%m-%d")
+        except Exception:
+            _sd_today = datetime.now().strftime("%Y-%m-%d")
+        _sd_rows = []
+        for _iso, _sdv in _schdate_sorted(class_obj):
+            if _iso < _sd_today:
+                continue
+            _sd_view = _schdate_view(_iso, _sdv)
+            if not _sd_view:
+                continue
+            _dd, _wd, _kind = _sd_view
+            if isinstance(_sdv, dict):
+                _sd_cap = str(_sdv.get("caption") or "").strip()[:120]
+                _sd_rows.append(f"📌 {_dd} ({_wd}): 🖼 картинкой"
+                                + (f" — {_sd_cap}" if _sd_cap else ""))
+                _sd_img_days.append((_dd, _sdv))
+            else:
+                _sd_rows.append(f"📌 {_dd} ({_wd}):\n{str(_sdv).strip()[:600]}")
+        if _sd_rows:
+            parts.append("\n📌 ОТДЕЛЬНЫЕ ДНИ (по датам):\n" + "\n".join(_sd_rows))
+
         full_text = "\n".join(parts)
 
         # У Telegram есть лимит ~4096 символов на сообщение. Если расписание
@@ -49357,12 +55301,27 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if _img.get("caption"):
                 _cap += f"\n{_img['caption']}"
             try:
-                await update.message.reply_photo(_img["image"], caption=_cap[:1024])
+                # ВОЛНА 23.03: картинка дня — с водяным знаком.
+                await _wm_reply_schedule_photo(
+                    update.message, context, _img["image"], user=user,
+                    caption=_cap[:1024])
             except Exception as e:
                 logger.warning(f"week schedule image send не прошёл ({_day}): {e}")
                 await update.message.reply_text(
                     f"🖼 Картинка расписания на {_day} не открылась — админ может "
                     "перезалить её через «📅 Редактировать расписание».")
+
+        # ВОЛНА 23.10.10: картинки отдельных дней — следом (с водяным знаком).
+        for _dd, _sdv in _sd_img_days:
+            _sd_cap = f"📌 Расписание на {_dd} — отдельный день"
+            if str(_sdv.get("caption") or "").strip():
+                _sd_cap += f"\n{_sdv['caption']}"
+            try:
+                await _wm_reply_schedule_photo(
+                    update.message, context, _sdv["image"], user=user,
+                    caption=_sd_cap[:1024])
+            except Exception as e:
+                logger.warning(f"schdate image send ({_dd}): {e}")
 
         # ВОЛНА 22.68: и САМ файл «Расписания с сайтов» — картинкой или
         # документом (file_id первой отправки; перекачки с сайта нет).
@@ -49374,8 +55333,16 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 _wcap += f" — обновлено {_web_file['ts']}"
             try:
                 if str(_web_file.get("file_kind") or "") == "photo":
-                    await update.message.reply_photo(
-                        _web_file["file_id"], caption=_wcap[:1024])
+                    # ВОЛНА 23.03: фото расписания с сайтов — тоже со знаком.
+                    # ВОЛНА 23.10.6: wm=True — файл_id УЖЕ подписан при
+                    # первой отправке, второй знак не нужен.
+                    if _web_file.get("wm"):
+                        await update.message.reply_photo(
+                            _web_file["file_id"], caption=_wcap[:1024])
+                    else:
+                        await _wm_reply_schedule_photo(
+                            update.message, context, _web_file["file_id"],
+                            user=user, caption=_wcap[:1024])
                 else:
                     await update.message.reply_document(
                         _web_file["file_id"], caption=_wcap[:1024])
@@ -49384,6 +55351,47 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(
                     "🌐 Файл расписания с сайтов не открылся — админ может "
                     "прислать его заново через «🌐 Расписание с сайтов».")
+
+        # ВОЛНА 23.10.6: ИСТОРИЯ «Расписаний с сайтов» за последние 2 дня.
+        # Просьба: «расписания, которые были до этого, должны сохраняться —
+        # чтобы посмотреть, какое расписание было на сегодня». Чистим
+        # просроченное прямо перед показом и рисуем кнопки-записи.
+        try:
+            if _schweb_history_cleanup(class_obj):
+                classes = load_classes()
+                classes[class_obj.class_code] = class_obj
+                save_classes(classes)
+            _hist = _schweb_history_list(class_obj)
+            if len(_hist) >= 2:
+                _rows = []
+                for _hi in range(len(_hist) - 1, -1, -1):   # новые сверху
+                    if len(_rows) >= _SCHWEB_HIST_SHOW:
+                        break
+                    _e = _hist[_hi]
+                    _when = str(_e.get("ts_full")
+                                or _e.get("ts") or "")[:16]
+                    if len(_when) >= 10:
+                        _when = _when[:10]                  # дата
+                    _host = str(_e.get("host") or "").strip()
+                    _kind_icon = ("🖼" if str(_e.get("kind")) == "file"
+                                  and str(_e.get("file_kind")) == "photo"
+                                  else "📄" if str(_e.get("kind")) == "file"
+                                  else "📅")
+                    _label = f"🗂 {_kind_icon} {_when}"
+                    if _host:
+                        _label += f" · {_host[:24]}"
+                    _dl = str(_e.get("day_label") or "").strip()
+                    if _dl:
+                        _label += f" · на {_dl[:12]}"
+                    _rows.append([InlineKeyboardButton(
+                        _label[:60], callback_data=f"schwh:{_hi}")])
+                if _rows:
+                    await update.message.reply_text(
+                        "🗂 Расписания за последние 2 дня — можно открыть "
+                        "любое из них ещё раз:",
+                        reply_markup=InlineKeyboardMarkup(_rows))
+        except Exception as e:
+            logger.warning(f"schedule history buttons: {e}")
         return MAIN_MENU
 
     elif message_text == "📝 Домашнее задание":
@@ -49415,8 +55423,11 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await update.message.reply_text(buf, parse_mode="Markdown")
             # ВОЛНА 22.4: досылаем вложения ВСЕХ пунктов ДЗ после текста.
             # ВОЛНА 22.78: выдача с анимацией загрузки (статус + спиннер).
-            for _m_list in _iter_assignment_media(class_obj.homework):
-                await _hw_media_with_progress(context, update.effective_chat.id, _m_list)
+            # ВОЛНА 23.10.6: >2 фото пункта → один PDF-файл «Предмет_дата.pdf».
+            for _m_list, _subj, _asg in _iter_assignment_media(class_obj.homework):
+                await _hw_media_with_progress(
+                    context, update.effective_chat.id, _m_list,
+                    subject=_subj, hw_date=_hw_added_date(_asg))
         else:
             await update.message.reply_text("Вы не состоите в классе.")
         return MAIN_MENU
@@ -49445,8 +55456,9 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _bphoto = str(getattr(class_obj, 'bells_photo', '') or '') if class_obj else ''
         if _bphoto:
             try:
-                await update.message.reply_photo(
-                    _bphoto,
+                # ВОЛНА 23.03: фото звонков = фото расписания — со знаком.
+                await _wm_reply_schedule_photo(
+                    update.message, context, _bphoto, user=user,
                     caption="🔔 Расписание звонков (фото от администратора).\n"
                             "Точный отсчёт «сколько осталось» по фото недоступен.",
                     reply_markup=_bells_kb)
@@ -53528,7 +59540,9 @@ async def handle_week_schedule(update: Update, context: ContextTypes.DEFAULT_TYP
         # в этих ветках картинки не будет.
         if kind == "image":
             try:
-                await query.message.reply_photo(payload["image"])
+                # ВОЛНА 23.03: картинка дня — с водяным знаком.
+                await _wm_reply_schedule_photo(
+                    query.message, context, payload["image"], user=user)
             except Exception as e:
                 logger.warning(f"week_schedule day image ({day_name}): {e}")
                 await query.message.reply_text(
@@ -54420,43 +60434,97 @@ class _SchmonResult:
     совместимость всех старых `if await schmon_send_item(…)`), но ещё несёт
     file_id последней успешной отправки и её тип ("photo"/"document") —
     чтобы запомнить расписание В КЛАССЕ и переигрывать его из кнопки
-    «📅 Расписание» без перекачки с сайта."""
-    __slots__ = ("ok", "file_id", "kind")
+    «📅 Расписание» без перекачки с сайта.
+    ВОЛНА 23.10.6: + wm — фото отправлено УЖЕ с водяным знаком (флаг
+    пишется в класс/историю, чтобы кнопки НЕ подписывали его второй раз)."""
+    __slots__ = ("ok", "file_id", "kind", "wm")
 
-    def __init__(self, ok, file_id="", kind=""):
+    def __init__(self, ok, file_id="", kind="", wm=False):
         self.ok = bool(ok)
         self.file_id = str(file_id or "")
         self.kind = str(kind or "")
+        self.wm = bool(wm)
 
     def __bool__(self):
         return self.ok
+
+
+# ВОЛНА 23.10.6: кэш подписанных водяным знаком копий расписаний с сайтов.
+# Ключ — md5 исходных байтов, значение — подписанные байты (одинаковые фото
+# классу из N человек подписываются ОДИН раз, а не N).
+_SCHMON_WM_CACHE = collections.OrderedDict()
+_SCHMON_WM_CACHE_MAX = 8
+
+
+async def _schmon_wm_bytes_for_chat(bot, chat_id, data):
+    """ВОЛНА 23.10.6: байты фото расписания С водяным знаком для получателя.
+
+    Жалоба: «когда бот отправляет расписание по ссылке — оно без водяного
+    знака, а нужно со знаком». Раньше знак ставился только в кнопках
+    «📅 Расписание»/«📅 Сегодня» (переигрывание по file_id), а ПЕРВАЯ
+    отправка (авторассылка классу и выбор админа) уходила как есть.
+    Теперь: получатель выключил знак в ⚙️ Настройках — оригинал; включён —
+    один раз подписываем и кэшируем. Любая ошибка (нет Pillow, битые
+    байты) — честный возврат ОРИГИНАЛА: расписание должно дойти всегда."""
+    try:
+        u = get_user(str(chat_id))
+        if u is not None and not bool(getattr(u, "watermark_enabled", True)):
+            return data
+    except Exception:
+        pass
+    key = hashlib.md5(data).hexdigest()
+    cached = _SCHMON_WM_CACHE.get(key)
+    if cached is not None:
+        return cached
+    try:
+        out, _mime = await asyncio.to_thread(_wm_watermark_bytes, data)
+        if out:
+            _SCHMON_WM_CACHE[key] = out
+            while len(_SCHMON_WM_CACHE) > _SCHMON_WM_CACHE_MAX:
+                _SCHMON_WM_CACHE.popitem(last=False)
+            return out
+    except Exception as e:
+        logger.warning(f"schmon watermark: фото не подписано ({e}) — шлю оригинал")
+    return data
 
 
 async def schmon_send_item(bot, chat_id, src_url, data, name, host,
                            day_label=""):
     """Отправить один источник расписания: картинку — фото, документ — файлом.
     ВОЛНА 22.68: возвращает _SchmonResult (truthy как раньше) с file_id.
-    ВОЛНА 22.77: + день, на который расписание (day_label) — в подписи."""
+    ВОЛНА 22.77: + день, на который расписание (day_label) — в подписи.
+    ВОЛНА 23.10.6: фото-расписания уходят С ВОДЯНЫМ ЗНАКОМ (как и все
+    остальные фото расписаний бота, волна 23.03)."""
     _dayline = ("\n🗓 Расписание на: %s" % day_label) if day_label else ""
     try:
         if (schmon_image_kind(src_url) or schmon_image_kind(name)):
             if len(data) < SCHEDMON_MIN_IMAGE_BYTES:
                 return _SchmonResult(False)  # иконка/мусор — не шлём
             if len(data) <= SCHEDMON_MAX_PHOTO_MB * 1024 * 1024:
+                # ВОЛНА 23.10.6: знак ставим под получателя (его тоггл).
+                _wdata = await _schmon_wm_bytes_for_chat(bot, chat_id, data)
+                _was_wm = _wdata is not data
                 try:
+                    m = await bot.send_photo(
+                        chat_id=chat_id,
+                        photo=InputFile(_wdata, filename=name or "photo.jpg"),
+                        caption=("🖼 Расписание\n%s%s" % (host, _dayline))[:1024])
+                except Exception as e:
+                    # Подписанная копия не прошла (редко) — повтор оригиналом.
+                    logger.warning(f"schmon_send_item wm photo {chat_id}: {e}")
+                    _wdata = data
+                    _was_wm = False
                     m = await bot.send_photo(
                         chat_id=chat_id,
                         photo=InputFile(data, filename=name or "photo.jpg"),
                         caption=("🖼 Расписание\n%s%s" % (host, _dayline))[:1024])
+                _fid = ""
+                try:
+                    _fid = (m.photo[-1].file_id if getattr(m, "photo", None)
+                            else "") or ""
+                except Exception:
                     _fid = ""
-                    try:
-                        _fid = (m.photo[-1].file_id if getattr(m, "photo", None)
-                                else "") or ""
-                    except Exception:
-                        _fid = ""
-                    return _SchmonResult(True, _fid, "photo")
-                except Exception as e:
-                    logger.warning(f"schmon_send_item photo→doc {chat_id}: {e}")
+                return _SchmonResult(True, _fid, "photo", _was_wm)
             m = await bot.send_document(
                 chat_id=chat_id,
                 document=InputFile(data, filename=name or "image.jpg"),
@@ -54552,8 +60620,131 @@ def schmon_dayauto_enabled(class_obj):
         return True
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# ВОЛНА 23.10.6: ИСТОРИЯ «РАСПИСАНИЙ С САЙТОВ» (последние 2 дня).
+# Просьба пользователя: «расписания, которые были до этого, должны
+# сохраняться, если админ указал боту ссылку на расписание — чтобы
+# ученик мог посмотреть, какое расписание было НА СЕГОДНЯ; хранится 2 дня,
+# потом удаляется». Хранение: class_obj.schedule_web_history — список
+# записей (те же поля, что schedule_web, + ts_full/ts_epoch). Показ:
+# кнопка «📅 Расписание» → секция «🗂 Расписания за последние 2 дня».
+# ═══════════════════════════════════════════════════════════════════════
+_SCHWEB_HIST_KEEP_H = 48      # сколько живёт запись истории (2 дня)
+_SCHWEB_HIST_MAX = 20         # потолок записей на класс (защита от раздутия)
+_SCHWEB_HIST_SHOW = 8         # сколько показываем кнопками (новые сверху)
+_SCHWEB_LAST_CLEANUP = 0.0    #epoch последней чистки (тик монитора)
+
+
+def _schweb_history_list(class_obj):
+    """Список истории класса (мусоротустойчиво)."""
+    h = getattr(class_obj, "schedule_web_history", None)
+    return h if isinstance(h, list) else []
+
+
+def _schweb_hist_dedup_key(rec):
+    """Ключ «одинаковости» записи: текст или file_id/имя файла."""
+    if str(rec.get("text") or "").strip():
+        return "t:" + str(rec.get("text"))[:500]
+    if str(rec.get("file_id") or "").strip():
+        return "f:" + str(rec.get("file_id"))
+    return "n:" + str(rec.get("name") or "")[:120] + "|" + str(rec.get("kind") or "")
+
+
+def _schweb_hist_day_key(e):
+    """ВОЛНА 23.10.9: календарный день записи истории («YYYY-MM-DD»).
+
+    Поле day_key пишется с 23.10.9; для старых записей день честно
+    восстанавливается из ts_epoch / ts_full — чтобы после обновления
+    бота «тот же день» определялся и по старой истории."""
+    if not isinstance(e, dict):
+        return ""
+    dk = str(e.get("day_key") or "").strip()
+    if dk:
+        return dk[:10]
+    try:
+        ts = float(e.get("ts_epoch") or 0)
+    except (TypeError, ValueError):
+        ts = 0.0
+    if ts > 0:
+        try:
+            return datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+        except (OverflowError, OSError, ValueError):
+            pass
+    return str(e.get("ts_full") or e.get("ts") or "")[:10]
+
+
+def _schweb_history_push(class_obj, rec, now=None):
+    """Добавить запись в историю «Расписаний с сайтов».
+
+    ВОЛНА 23.10.9 (просьба пользователя: «если расписание на сайте
+    изменяется, бот думает, что это уже на другой день, а это на тот же
+    — просто его изменили»): НОВАЯ запись создаётся только для нового
+    КАЛЕНДАРНОГО ДНЯ (или другой ссылки сайта). Если та же ссылка
+    изменилась В ТЕЧЕНИЕ ТОГО ЖЕ ДНЯ — перезаписываем запись этого дня
+    (новое содержимое + свежее время), а не плодим вторую запись,
+    «выглядящую» как расписание другого дня. Вызывается из
+    _schmon_store_web — уже внутри try вызывающего."""
+    try:
+        if class_obj is None or not isinstance(rec, dict):
+            return
+        now = now or datetime.now()
+        hist = getattr(class_obj, "schedule_web_history", None)
+        if not isinstance(hist, list):
+            hist = []
+        day_key = now.strftime("%Y-%m-%d")
+        url_key = str(rec.get("url") or "")[:500]
+        # Та же ссылка в тот же календарный день — расписание просто
+        # ИЗМЕНИЛИ: обновляем запись этого дня, новая не создаётся.
+        for i in range(len(hist) - 1, -1, -1):
+            e = hist[i]
+            if not isinstance(e, dict):
+                continue
+            if _schweb_hist_day_key(e) == day_key \
+                    and str(e.get("url") or "")[:500] == url_key:
+                entry = dict(rec)
+                entry["ts_full"] = now.strftime("%Y-%m-%d %H:%M")
+                entry["ts_epoch"] = now.timestamp()
+                entry["day_key"] = day_key
+                hist[i] = entry
+                class_obj.schedule_web_history = hist[-_SCHWEB_HIST_MAX:]
+                return
+        entry = dict(rec)
+        entry["ts_full"] = now.strftime("%Y-%m-%d %H:%M")
+        entry["ts_epoch"] = now.timestamp()
+        entry["day_key"] = day_key
+        hist.append(entry)
+        class_obj.schedule_web_history = hist[-_SCHWEB_HIST_MAX:]
+    except Exception as e:
+        logger.warning(f"schweb_history_push: {e}")
+
+
+def _schweb_history_cleanup(class_obj):
+    """Удалить записи истории старше 2 дней. True — были изменения."""
+    try:
+        if class_obj is None:
+            return False
+        hist = _schweb_history_list(class_obj)
+        cutoff = time.time() - _SCHWEB_HIST_KEEP_H * 3600
+        keep = []
+        for e in hist:
+            try:
+                ts = float(e.get("ts_epoch") or 0)
+            except (TypeError, ValueError):
+                ts = 0.0
+            if ts >= cutoff:
+                keep.append(e)
+        keep = keep[-_SCHWEB_HIST_MAX:]
+        if len(keep) != len(hist):
+            class_obj.schedule_web_history = keep
+            return True
+        return False
+    except Exception as e:
+        logger.warning(f"schweb_history_cleanup: {e}")
+        return False
+
+
 def _schmon_store_web(class_obj, url, info, text="", kind="text", name="",
-                      file_id="", file_kind=""):
+                      file_id="", file_kind="", wm=False):
     """ВОЛНА 22.67: запомнить в КЛАССЕ последнее «Расписание с сайтов».
 
     Просьба: «оно должно приходить В РАСПИСАНИЯ классу» — теперь выбранное
@@ -54562,24 +60753,33 @@ def _schmon_store_web(class_obj, url, info, text="", kind="text", name="",
     разлетается сообщениями (которые легко потерять в чате).
     ВОЛНА 22.68: для файловых расписаний запоминается ещё file_id первой
     успешной отправки (+file_kind "photo"/"document") — кнопка «📅 Расписание»
-    переигрывает САМ ФАЙЛ по file_id, без перекачки с сайта."""
+    переигрывает САМ ФАЙЛ по file_id, без перекачки с сайта.
+    ВОЛНА 23.10.6: + wm — файл_id УЖЕ подписан водяным знаком (фото);
+    кнопки тогда НЕ подписывают его повторно. + запись в ИСТОРИЮ
+    schedule_web_history (живёт 2 дня) — «какое расписание было сегодня»."""
     try:
         if class_obj is None:
             return
-        class_obj.schedule_web = {
+        now = datetime.now()
+        rec = {
             "text": str(text or "")[:4000],
             "kind": str(kind or "text"),
             "name": str(name or "")[:120],
             "url": str(url or "")[:500],
             "host": schmon_host_of(url)[:120],
             "title": str((info or {}).get("title") or "")[:200],
-            "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "ts": now.strftime("%Y-%m-%d %H:%M"),
             "file_id": str(file_id or "")[:200],
             "file_kind": str(file_kind or "")[:16],
             # ВОЛНА 22.77: на какой день это расписание (для Сегодня/Завтра)
             "day": str((info or {}).get("sched_day") or "")[:10],
             "day_label": str((info or {}).get("sched_label") or "")[:60],
+            # ВОЛНА 23.10.6: фото уже с водяным знаком (не подписывать дважды)
+            "wm": bool(wm),
         }
+        class_obj.schedule_web = rec
+        # ВОЛНА 23.10.6: та же запись — в историю (последние 2 дня).
+        _schweb_history_push(class_obj, rec, now)
         save_class(class_obj)
     except Exception as e:
         logger.warning(f"schmon_store_web: {e}")
@@ -54654,7 +60854,9 @@ async def schmon_notify(app, class_code, url, info, new_files=(),
                               file_id=(getattr(_first_res, "file_id", "")
                                        if (notif_on and _first_res) else ""),
                               file_kind=(getattr(_first_res, "kind", "")
-                                         if (notif_on and _first_res) else ""))
+                                         if (notif_on and _first_res) else ""),
+                              wm=(bool(getattr(_first_res, "wm", False))
+                                  if (notif_on and _first_res) else False))
             return True  # ровно ОДИН файл/фото за день!
 
     if handled:
@@ -54849,6 +61051,18 @@ async def schmon_monitor_loop(app):
         try:
             state = schmon_normalize(schmon_load())
             now = time.time()
+            # ВОЛНА 23.10.6: чистка истории расписаний — записи старше
+            # 2 дней удаляются (не чаще раза в 10 минут, по всем классам).
+            global _SCHWEB_LAST_CLEANUP
+            if now - _SCHWEB_LAST_CLEANUP > 600:
+                _SCHWEB_LAST_CLEANUP = now
+                for _cc in list(state.keys()):
+                    try:
+                        _co = get_class_by_code(str(_cc))
+                        if _co is not None and _schweb_history_cleanup(_co):
+                            save_class(_co)
+                    except Exception:
+                        pass
             jobs = []
             for class_code, entry in state.items():
                 for url, info in (entry.get("urls") or {}).items():
@@ -55334,7 +61548,8 @@ async def schmon_pick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _schmon_store_web(class_obj, url, info, kind="file",
                           name=(cands[idx][0] or "").rsplit("/", 1)[-1],
                           file_id=getattr(ok, "file_id", ""),
-                          file_kind=getattr(ok, "kind", ""))
+                          file_kind=getattr(ok, "kind", ""),
+                          wm=bool(getattr(ok, "wm", False)))
     schmon_merge_info(class_code, url, info)
     if not ok:
         try:
@@ -55426,6 +61641,7 @@ async def schmon_all_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _last_name = ""
     _last_fid = ""
     _last_fkind = ""
+    _last_wm = False
     for u, _k in (info.get("cand") or [])[:SCHEDMON_MAX_FILES_PER_NOTIFY]:
         _res = await _schmon_send_candidate_admin(context.bot, url, info, u, uid,
                                                   skip_dup=True,
@@ -55437,14 +61653,106 @@ async def schmon_all_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if getattr(_res, "file_id", ""):
                 _last_fid = _res.file_id
                 _last_fkind = _res.kind
+                _last_wm = bool(getattr(_res, "wm", False))
     if sent_any:
         _schmon_store_web(class_obj, url, info, kind="file", name=_last_name,
-                          file_id=_last_fid, file_kind=_last_fkind)
+                          file_id=_last_fid, file_kind=_last_fkind, wm=_last_wm)
     schmon_merge_info(class_code, url, info)
     if not sent_any:
         await schmon_send_text(context.bot, uid,
                                "⚠ Не удалось скачать файлы со страницы.")
     return ADMIN_PANEL
+
+
+async def schweb_history_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 23.10.6: schwh:<idx> — открыть запись из истории «Расписаний
+    с сайтов» (последние 2 дня). Доступно участникам класса; просроченные
+    записи чистятся прямо перед показом. Фото отдаётся с водяным знаком
+    (если file_id ещё не подписан — см. флаг wm), файлы — документом,
+    текст — сообщением."""
+    query = update.callback_query
+    try:
+        await query.answer("Открываю…")
+    except Exception:
+        pass
+    user = get_user(str(query.from_user.id))
+    class_obj = get_class_by_user(str(query.from_user.id)) if user else None
+    if not user or not class_obj:
+        try:
+            await query.answer("История доступна участникам класса.",
+                               show_alert=True)
+        except Exception:
+            pass
+        return MAIN_MENU
+    if is_user_class_blocked(str(query.from_user.id), class_obj.class_code):
+        try:
+            await query.answer("Вы заблокированы в классе.", show_alert=True)
+        except Exception:
+            pass
+        return MAIN_MENU
+    # Чистим просроченное (2 дня) прямо перед показом.
+    if _schweb_history_cleanup(class_obj):
+        classes = load_classes()
+        classes[class_obj.class_code] = class_obj
+        save_classes(classes)
+    hist = _schweb_history_list(class_obj)
+    try:
+        idx = int(str(query.data or "").split(":", 1)[1])
+    except (IndexError, TypeError, ValueError):
+        idx = -1
+    if not (0 <= idx < len(hist)):
+        try:
+            await query.answer("Запись уже удалена (старше 2 дней).",
+                               show_alert=True)
+        except Exception:
+            pass
+        return MAIN_MENU
+    e = hist[idx]
+    when = str(e.get("ts_full") or e.get("ts") or "")
+    host = str(e.get("host") or "").strip()
+    dl = str(e.get("day_label") or "").strip()
+    head = f"🗂 Расписание от {when}"
+    if host:
+        head += f" ({host})"
+    if dl:
+        head += f" — на {dl}"
+    chat_id = query.from_user.id
+    msg = query.message          # может быть None у очень старых сообщений
+    sent_any = False
+    try:
+        text = str(e.get("text") or "").strip()
+        if text:
+            await context.bot.send_message(
+                chat_id=chat_id, text=(head + ":\n\n" + text)[:4000])
+            sent_any = True
+        fid = str(e.get("file_id") or "").strip()
+        if fid:
+            if str(e.get("file_kind") or "") == "photo":
+                # Уже подписанное фото шлём как есть, свежее — подписываем.
+                if e.get("wm") or msg is None:
+                    await context.bot.send_photo(
+                        chat_id=chat_id, photo=fid, caption=head[:1024])
+                else:
+                    await _wm_reply_schedule_photo(
+                        msg, context, fid, user=user, caption=head[:1024])
+            else:
+                await context.bot.send_document(
+                    chat_id=chat_id, document=fid, caption=head[:1024])
+            sent_any = True
+        if not sent_any:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(head + ":\n📄 " + str(e.get("name") or "файл")
+                      + "\n\nСам файл уже недоступен (запись сделана до "
+                        "обновления бота) — попросите админа прислать "
+                        "расписание заново.")[:4000])
+    except Exception as ex:
+        logger.warning(f"schweb history view: {ex}")
+        try:
+            await query.answer("Не удалось открыть запись.", show_alert=True)
+        except Exception:
+            pass
+    return MAIN_MENU
 
 
 async def schmon_del_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -55858,6 +62166,271 @@ async def send_class_message_media_handler(update: Update,
 
     await update.message.reply_text(
         f"✅ Уведомление с файлом отправлено {sent_count} участникам класса!")
+    return await admin_panel(update, context)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# ВОЛНА 23.10.7: «✉️ Написать участнику» — админ класса может написать
+# ЛИЧНОЕ сообщение конкретному пользователю (текст или фото/файл/видео
+# с подписью). Сообщение приходит адресату от бота с честным заголовком
+# «от администратора класса». Права перепроверяются на КАЖДОМ шаге
+# (паттерн волны 22.72 — отозванный админ ничего не отправляет).
+# ═══════════════════════════════════════════════════════════════════════
+async def adm_msg_menu_cb(update: Update,
+                          context: ContextTypes.DEFAULT_TYPE):
+    """«✉️ Написать участнику» — выбор получателя (админ-панель класса)."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    uid = str(query.from_user.id)
+    class_code = context.user_data.get('current_admin_class')
+    if not class_code or not is_admin_of_class(uid, class_code):
+        context.user_data.pop('current_admin_class', None)
+        try:
+            await query.edit_message_text(
+                "⛔ Действие недоступно: вы больше не администратор "
+                "этого класса.")
+        except Exception:
+            pass
+        return MAIN_MENU
+    class_obj = get_class_by_code(class_code)
+    if not class_obj:
+        try:
+            await query.edit_message_text("Класс не найден.")
+        except Exception:
+            pass
+        return ADMIN_PANEL
+    rows = []
+    seen = set()
+    members = [str(m) for m in (list(class_obj.students or [])
+                                 + list(class_obj.admins or []))]
+    blocked = {str(b) for b in (class_obj.blocked_users or [])}
+    for m in members:
+        if m in seen or m == uid or m in blocked:
+            seen.add(m)
+            continue
+        seen.add(m)
+        mu = get_user(m)
+        if mu is None:
+            continue
+        name = (getattr(mu, 'first_name', '') or f"User {m}")
+        rows.append([InlineKeyboardButton(
+            f"👤 {str(name)[:40]}", callback_data=f"admmsg_{m}")])
+    if not rows:
+        rows.append([InlineKeyboardButton(
+            "👥 Пока некому написать", callback_data="no_action")])
+    rows.append([InlineKeyboardButton(
+        "⬅️ В админ-панель", callback_data="admin_panel")])
+    try:
+        await query.edit_message_text(
+            "✉️ ЛИЧНОЕ СООБЩЕНИЕ УЧАСТНИКУ\n\n"
+            f"Класс: {class_obj.class_name}\n\n"
+            "Выберите, кому написать — сообщение придёт этому участнику "
+            "лично от бота (с пометкой, что оно от администратора класса).",
+            reply_markup=InlineKeyboardMarkup(rows))
+    except Exception:
+        await context.bot.send_message(
+            chat_id=uid,
+            text=("✉️ ЛИЧНОЕ СООБЩЕНИЕ УЧАСТНИКУ\n\n"
+                  f"Класс: {class_obj.class_name}\n\n"
+                  "Выберите, кому написать — сообщение придёт этому "
+                  "участнику лично от бота (с пометкой, что оно от "
+                  "администратора класса)."),
+            reply_markup=InlineKeyboardMarkup(rows))
+    return ADMIN_PANEL
+
+
+async def adm_msg_pick_cb(update: Update,
+                         context: ContextTypes.DEFAULT_TYPE):
+    """admmsg_<user_id> — выбрали получателя, ждём текст (ADMIN_DM_TEXT)."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    uid = str(query.from_user.id)
+    to_uid = str(query.data or "")[len("admmsg_"):].strip()
+    class_code = context.user_data.get('current_admin_class')
+    if not class_code or not is_admin_of_class(uid, class_code):
+        context.user_data.pop('current_admin_class', None)
+        try:
+            await query.edit_message_text(
+                "⛔ Действие недоступно: вы больше не администратор "
+                "этого класса.")
+        except Exception:
+            pass
+        return MAIN_MENU
+    class_obj = get_class_by_code(class_code)
+    if not class_obj or not to_uid or not str(to_uid).lstrip("-").isdigit():
+        try:
+            await query.answer("Получатель не найден.", show_alert=True)
+        except Exception:
+            pass
+        return ADMIN_PANEL
+    members = {str(m) for m in (list(class_obj.students or [])
+                                + list(class_obj.admins or []))}
+    blocked = {str(b) for b in (class_obj.blocked_users or [])}
+    if to_uid not in members or to_uid in blocked:
+        try:
+            await query.answer(
+                "Этот участник недоступен (вышел из класса или "
+                "заблокирован).", show_alert=True)
+        except Exception:
+            pass
+        return await adm_msg_menu_cb(update, context)
+    context.user_data['adm_msg_pending'] = {
+        "to": to_uid, "class_code": class_code}
+    tu = get_user(to_uid)
+    tname = (getattr(tu, 'first_name', '') or f"User {to_uid}") if tu \
+        else f"User {to_uid}"
+    try:
+        await query.edit_message_text(
+            f"✉️ Напишите сообщение для {tname} — доставлю ему лично.\n\n"
+            f"Можно прислать текст, фото, файл или видео (текст — в "
+            "подписи к файлу). Адресат увидит, что сообщение от "
+            f"администратора класса «{class_obj.class_name}».",
+            reply_markup=get_cancel_keyboard())
+    except Exception:
+        pass
+    return ADMIN_DM_TEXT
+
+
+@timeout(CONVERSATION_TIMEOUT)
+async def admin_dm_text_handler(update: Update,
+                                context: ContextTypes.DEFAULT_TYPE):
+    """Состояние ADMIN_DM_TEXT: текст личного сообщения админа участнику."""
+    msg = update.message
+    uid = str(update.effective_user.id)
+    pend = context.user_data.get('adm_msg_pending')
+    if not isinstance(pend, dict) or not pend.get("to"):
+        await msg.reply_text(
+            "Сессия потеряна — начните заново из админ-панели «✉️».")
+        return await admin_panel(update, context)
+    class_code = str(pend.get("class_code") or "")
+    to_uid = str(pend.get("to") or "")
+    class_obj = get_class_by_code(class_code) if class_code else None
+    if not class_obj or not is_admin_of_class(uid, class_code):
+        context.user_data.pop('adm_msg_pending', None)
+        await msg.reply_text(
+            "⛔ Вы больше не администратор этого класса — сообщение не "
+            "отправлено.")
+        return MAIN_MENU
+    members = {str(m) for m in (list(class_obj.students or [])
+                                + list(class_obj.admins or []))}
+    blocked = {str(b) for b in (class_obj.blocked_users or [])}
+    if to_uid not in members or to_uid in blocked:
+        context.user_data.pop('adm_msg_pending', None)
+        await msg.reply_text(
+            "⛔ Получатель больше не в классе — сообщение не отправлено.")
+        return await admin_panel(update, context)
+    text_in = (msg.text or "").strip()
+    if not text_in:
+        await msg.reply_text(
+            "✉️ Пришлите текст сообщения (или «❌ Отмена»).",
+            reply_markup=get_cancel_keyboard())
+        return ADMIN_DM_TEXT
+    rejected = await reject_if_forbidden_chars(update, text_in, ADMIN_DM_TEXT)
+    if rejected is not None:
+        return rejected
+    admin_user = get_user(uid) or User(uid)
+    from_name = str(getattr(admin_user, 'first_name', '') or "Админ")
+    header = (f"✉️ Личное сообщение от администратора класса "
+              f"«{class_obj.class_name}» ({from_name}):")
+    try:
+        await context.bot.send_message(
+            chat_id=int(to_uid),
+            text=f"{header}\n\n{text_in[:3500]}")
+    except Exception as e:
+        logger.error(f"admin_dm: не доставлено {to_uid}: {e}")
+        context.user_data.pop('adm_msg_pending', None)
+        await msg.reply_text(
+            "❌ Не удалось доставить сообщение — возможно, пользователь "
+            "давно не открывал бота. Попробуйте позже.")
+        return await admin_panel(update, context)
+    context.user_data.pop('adm_msg_pending', None)
+    _log_admin_action(uid, class_code,
+                      f"Личное сообщение участнику {to_uid}",
+                      text_in[:200])
+    tu = get_user(to_uid)
+    tname = (getattr(tu, 'first_name', '') or to_uid) if tu else to_uid
+    await msg.reply_text(f"✅ Сообщение доставлено: {tname}")
+    return await admin_panel(update, context)
+
+
+@timeout(CONVERSATION_TIMEOUT)
+async def admin_dm_media_handler(update: Update,
+                                 context: ContextTypes.DEFAULT_TYPE):
+    """Состояние ADMIN_DM_TEXT: фото/файл/видео с подписью — адресату
+    лично (заголовок честно помечает отправителя-администратора)."""
+    msg = update.message
+    uid = str(update.effective_user.id)
+    pend = context.user_data.get('adm_msg_pending')
+    if not isinstance(pend, dict) or not pend.get("to"):
+        await msg.reply_text(
+            "Сессия потеряна — начните заново из админ-панели «✉️».")
+        return await admin_panel(update, context)
+    class_code = str(pend.get("class_code") or "")
+    to_uid = str(pend.get("to") or "")
+    class_obj = get_class_by_code(class_code) if class_code else None
+    if not class_obj or not is_admin_of_class(uid, class_code):
+        context.user_data.pop('adm_msg_pending', None)
+        await msg.reply_text(
+            "⛔ Вы больше не администратор этого класса — сообщение не "
+            "отправлено.")
+        return MAIN_MENU
+    members = {str(m) for m in (list(class_obj.students or [])
+                                + list(class_obj.admins or []))}
+    blocked = {str(b) for b in (class_obj.blocked_users or [])}
+    if to_uid not in members or to_uid in blocked:
+        context.user_data.pop('adm_msg_pending', None)
+        await msg.reply_text(
+            "⛔ Получатель больше не в классе — сообщение не отправлено.")
+        return await admin_panel(update, context)
+    caption = (msg.caption or "").strip()
+    if caption:
+        rejected = await reject_if_forbidden_chars(
+            update, caption, ADMIN_DM_TEXT)
+        if rejected is not None:
+            return rejected
+    admin_user = get_user(uid) or User(uid)
+    from_name = str(getattr(admin_user, 'first_name', '') or "Админ")
+    header = (f"✉️ Личное сообщение от администратора класса "
+              f"«{class_obj.class_name}» ({from_name}):")
+    full_caption = (header + ("\n\n" + caption if caption else ""))[:1024]
+    try:
+        if msg.photo:
+            await context.bot.send_photo(
+                chat_id=int(to_uid), photo=msg.photo[-1].file_id,
+                caption=full_caption)
+        elif msg.video:
+            await context.bot.send_video(
+                chat_id=int(to_uid), video=msg.video.file_id,
+                caption=full_caption, supports_streaming=True)
+        elif msg.document:
+            await context.bot.send_document(
+                chat_id=int(to_uid), document=msg.document.file_id,
+                caption=full_caption)
+        else:
+            await msg.reply_text(
+                "❌ Пришлите текст, фото, файл или видео — или «❌ Отмена».",
+                reply_markup=get_cancel_keyboard())
+            return ADMIN_DM_TEXT
+    except Exception as e:
+        logger.error(f"admin_dm (медиа): не доставлено {to_uid}: {e}")
+        context.user_data.pop('adm_msg_pending', None)
+        await msg.reply_text(
+            "❌ Не удалось доставить сообщение — возможно, пользователь "
+            "давно не открывал бота. Попробуйте позже.")
+        return await admin_panel(update, context)
+    context.user_data.pop('adm_msg_pending', None)
+    _log_admin_action(
+        uid, class_code, f"Личное сообщение участнику {to_uid} (файл)",
+        (caption or "файл")[:200])
+    tu = get_user(to_uid)
+    tname = (getattr(tu, 'first_name', '') or to_uid) if tu else to_uid
+    await msg.reply_text(f"✅ Сообщение доставлено: {tname}")
     return await admin_panel(update, context)
 
 
@@ -56533,16 +63106,31 @@ async def set_birthday_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
 @timeout(CONVERSATION_TIMEOUT)
 async def save_birthday_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # ВОЛНА 23.10 (фикс «ошибка при вводе дня рождения»): как и в
+    # enter_birthday_handler — effective_message вместо message (правка
+    # сообщения = повторный ввод) и guard на сообщения без текста.
+    msg = getattr(update, "effective_message", None)
+    if msg is None or not getattr(msg, "text", None):
+        try:
+            uid = update.effective_user.id if update.effective_user else None
+            hint = "Пришлите дату текстом в формате ГГГГ-ММ-ДД (например, 2005-04-15):"
+            if msg is not None:
+                await msg.reply_text(hint)
+            elif uid is not None:
+                await context.bot.send_message(chat_id=uid, text=hint)
+        except Exception as e:
+            logger.error(f"save_birthday_handler: ввод без текста: {e}")
+        return SET_BIRTHDAY
     user_id = str(update.effective_user.id)
     user = get_user(user_id)
     if not user:
         user = User(user_id)
-    birthday_str = update.message.text.strip()
+    birthday_str = msg.text.strip()
 
     try:
         birthday = datetime.strptime(birthday_str, "%Y-%m-%d")
         if birthday > datetime.now():
-            await update.message.reply_text("Дата не может быть в будущем. Введите ещё раз:")
+            await msg.reply_text("Дата не может быть в будущем. Введите ещё раз:")
             return SET_BIRTHDAY
 
         # ПОЛИТИКА ПДн 1.2 (возрастной порог): дата, дающая возраст меньше
@@ -56550,7 +63138,7 @@ async def save_birthday_handler(update: Update, context: ContextTypes.DEFAULT_TY
         # обходится через настройки.
         age = _user_age_years(birthday_str)
         if age is not None and age < 13:
-            await update.message.reply_text(
+            await msg.reply_text(
                 "🚫 Бот не предназначен для детей младше 13 лет: такая дата "
                 "рождения не может быть установлена.\n\n"
                 "Если это ошибка — введите другую дату или нажмите «❌ Отмена». "
@@ -56567,11 +63155,24 @@ async def save_birthday_handler(update: Update, context: ContextTypes.DEFAULT_TY
         except Exception as e:
             logger.error(f"Не удалось перепланировать birthday job: {e}")
 
-        await update.message.reply_text(f"✅ Дата рождения установлена: {birthday_str}")
-        return await user_settings(update, context)
+        await msg.reply_text(f"✅ Дата рождения установлена: {birthday_str}")
+        # ВОЛНА 23.10: дата УЖЕ сохранена — сбой отрисовки меню настроек
+        # (сеть/Telegram/«message is not modified») не должен показывать
+        # «Попробуйте ещё раз или нажмите /start» поверх успеха.
+        try:
+            return await user_settings(update, context)
+        except Exception as e:
+            logger.error(f"save_birthday_handler: user_settings после установки ДР: {e}")
+            try:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text="✅ Дата рождения сохранена. Откройте «⚙️ Настройки» заново.")
+            except Exception:
+                pass
+            return ConversationHandler.END
 
     except ValueError:
-        await update.message.reply_text("Введите дату в формате ГГГГ-ММ-ДД (например, 2005-04-15):")
+        await msg.reply_text("Введите дату в формате ГГГГ-ММ-ДД (например, 2005-04-15):")
         return SET_BIRTHDAY
 
 async def toggle_birthday_countdown(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -56645,15 +63246,31 @@ async def set_birthday_notification_time_start(update: Update, context: ContextT
 
 @timeout(CONVERSATION_TIMEOUT)
 async def save_birthday_notification_time_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # ВОЛНА 23.10: effective_message + guard — правка сообщения или вложение
+    # без текста больше не роняют хендлер с AttributeError («Попробуйте ещё
+    # раз или нажмите /start»).
+    msg = getattr(update, "effective_message", None)
+    if msg is None or not getattr(msg, "text", None):
+        try:
+            uid = update.effective_user.id if update.effective_user else None
+            hint = "Пришлите время текстом в формате ЧЧ:ММ (например, 09:00):"
+            if msg is not None:
+                await msg.reply_text(hint, reply_markup=get_cancel_keyboard())
+            elif uid is not None:
+                await context.bot.send_message(chat_id=uid, text=hint,
+                                               reply_markup=get_cancel_keyboard())
+        except Exception as e:
+            logger.error(f"save_birthday_notification_time_handler: ввод без текста: {e}")
+        return SET_BIRTHDAY_NOTIFICATION_TIME
     user_id = str(update.effective_user.id)
     user = get_user(user_id)
     if not user:
         user = User(user_id)
-    time_str = (update.message.text or "").strip()
+    time_str = (msg.text or "").strip()
     try:
         datetime.strptime(time_str, "%H:%M")
     except ValueError:
-        await update.message.reply_text(
+        await msg.reply_text(
             "Введите время в формате ЧЧ:ММ (например, 09:00):",
             reply_markup=get_cancel_keyboard(),
         )
@@ -56670,13 +63287,13 @@ async def save_birthday_notification_time_handler(update: Update, context: Conte
             _save_notification_log(log)
     except Exception as e:
         logger.error(f"save_birthday_notification_time: log reset error: {e}")
-    await update.message.reply_text(
+    await msg.reply_text(
         f"✅ Время ДР-уведомления установлено: {time_str}",
     )
     # Возвращаемся в меню настроек ДР через эмуляцию callback'а.
     # birthday_settings_start ждёт callback_query — поэтому показываем
     # клавиатуру обычным сообщением с inline-разметкой.
-    await update.message.reply_text(
+    await msg.reply_text(
         "🎂 Настройки дня рождения:",
         reply_markup=get_birthday_settings_keyboard(user),
     )
@@ -56967,7 +63584,12 @@ async def class_management(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     user = get_user(user_id)
     if not user:
-        user = User(user_id)
+        # ВОЛНА 23.10.4: пропавший профиль — НЕ тупик: создаём на месте
+        # (с user_code), экран классов показывается штатно.
+        user = _ensure_user_record(
+            user_id,
+            getattr(update.effective_user, "username", ""),
+            getattr(update.effective_user, "first_name", ""))
 
     class_obj = get_class_by_user(user_id)
 
@@ -56975,9 +63597,14 @@ async def class_management(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if is_user_class_blocked(user_id, class_obj.class_code):
             text = "Вы заблокированы в этом классе."
             if hasattr(update, 'message') and update.message:
-                await update.message.reply_text(text)
+                try:
+                    await update.message.reply_text(text)
+                except Exception as e:
+                    logger.error(f"class_management: reply (блок): {e}")
             else:
-                await update.callback_query.edit_message_text(text)
+                # ВОЛНА 23.10.4: защищённый показ — сбой edit больше не
+                # улетает в error_handler («⚠️ Произошла ошибка»).
+                await _dev_safe_edit(update.callback_query, text)
             return MAIN_MENU
 
         text = f"🎓 **Управление классами**\n\n🏫 Текущий класс: {class_obj.class_name}\n🔑 Код: `{class_obj.class_code}`\n\nВыберите действие:"
@@ -56996,10 +63623,35 @@ async def class_management(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("⬅️ Назад", callback_data="back_to_main")]
         ]
 
+    # ВОЛНА 23.10.4: показ экрана классов под защитой. Раньше НЕЗАЩИЩЁННЫЙ
+    # edit_message_text(parse_mode="Markdown") ронял ЛЮБОЙ вход в этот экран,
+    # который не идеально совпал с ожиданиями Telegram: «Message is not
+    # modified» (двойное нажатие кнопки), «Can't parse entities» (название
+    # класса с _ /*/`), «Message to edit not found» (старое сообщение
+    # удалено) — пользователь видел «⚠️ Произошла ошибка» (в т.ч. при
+    # «⏭ Пропустить» город — жалоба волны 23.10.4). Теперь: «not modified»
+    # гасится, сбой parse — повтор без Markdown, прочее — досыл новым
+    # сообщением (_dev_safe_edit); текстовый путь тоже под защитой.
     if hasattr(update, 'message') and update.message:
-        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        try:
+            await update.message.reply_text(
+                text,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode="Markdown")
+        except Exception as e:
+            logger.error(f"class_management: reply не удался: {e}")
+            try:
+                await context.bot.send_message(
+                    chat_id=int(user_id),
+                    text=text,
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                    parse_mode="Markdown")
+            except Exception as e2:
+                logger.error(f"class_management: досыл меню классов: {e2}")
     else:
-        await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        await _dev_safe_edit(update.callback_query, text,
+                             reply_markup=InlineKeyboardMarkup(keyboard),
+                             parse_mode="Markdown")
     return CLASS_MANAGEMENT
 
 @timeout(CONVERSATION_TIMEOUT)
@@ -57168,6 +63820,33 @@ async def join_class_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("Класс с таким кодом не найден. Проверьте и попробуйте снова:")
         return JOIN_CLASS
 
+    # ВОЛНА 22.98: заблокированному админом класса вход в ЭТОТ класс закрыт.
+    # Раньше проверки не было вовсе: исключённый из класса мог вернуться по
+    # коду. Заодно само-чиним СТАРЫЕ блокировки (22.97 и раньше): тогда блок
+    # НЕ исключал из состава — убираем из students и чистим class_code, чтобы
+    # человек сразу мог создать новый класс или войти в другой.
+    if str(user_id) in [str(b) for b in (class_obj.blocked_users or [])]:
+        _legacy_member = str(user_id) in [str(s) for s in class_obj.students]
+        try:
+            if _legacy_member:
+                class_obj.students.remove(str(user_id))
+                classes = load_classes()
+                classes[class_code] = class_obj
+                save_classes(classes)
+        except Exception as _heal_err:
+            logger.error(f"join: не исключил заблокированного: {_heal_err}")
+        if _legacy_member or str(getattr(user, "class_code", "") or "") == str(class_code):
+            try:
+                user.class_code = None
+                save_user(user)
+            except Exception as _cc_err:
+                logger.error(f"join: не очистил class_code: {_cc_err}")
+        await update.message.reply_text(
+            "🚫 Вы заблокированы в этом классе администратором.\n\n"
+            "Вы можете создать новый класс («🎓 Управление классами» → "
+            "«➕ Создать класс») или войти в другой по коду класса.")
+        return JOIN_CLASS
+
     if str(user_id) in class_obj.students:
         await update.message.reply_text("✅ Вы уже состоите в этом классе!")
         return await class_management(update, context)
@@ -57215,6 +63894,16 @@ async def join_class_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             logger.error(f"Ошибка при уведомлении админа {admin_id}: {e}")
 
     await update.message.reply_text(f"✅ Вы присоединились к классу '{class_obj.class_name}'!")
+
+    # ВОЛНА 22.98: только что зашедшему СРАЗУ присылаем свежее главное меню —
+    # классные кнопки, созданные админом, должны быть у него уже сейчас, а не
+    # после /start. Тот же паттерн, что у создания класса и «🚪 Выйти из класса».
+    try:
+        await update.message.reply_text(
+            "📋 Меню обновлено:",
+            reply_markup=get_main_menu_keyboard(user))
+    except Exception as _kb_err:
+        logger.error(f"join: не обновил клавиатуру: {_kb_err}")
 
     # ВОЛНА 22.67: мгновенный слив снапшота — состав класса должен пережить
     # рестарт/деплой бота даже в первые 30 секунд после входа.
@@ -57347,6 +64036,414 @@ async def developer_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                    reply_markup=get_developer_keyboard(),
                                    parse_mode="Markdown")
     return DEV_PANEL
+
+
+# ==================================
+# === ВОЛНА 23.04: КАНАЛ ПОДПИСКИ + АВТОЗАПУСК ПОСЛЕ РЕСТАРТА ===
+# ==================================
+# «нужно чтобы разработчик мог поменять ссылку на канал» + «разработчик
+# настраивал когда это включать отключать и открывать и настраивать».
+
+async def dev_channel_cb(update, context):
+    """Экран «📢 Канал подписки»: текущая ссылка, изменение, сброс."""
+    query = update.callback_query
+    await _safe_cb_answer(query)
+    # Возврат на экран канала снимает режим ввода ссылки.
+    context.user_data.pop("awaiting_channel_link", None)
+    url = get_channel_url()
+    ch_un = get_channel_username()
+    ch_line = (f"@{ch_un}" if ch_un else
+               "приватная ссылка — API-проверка недоступна, бот доверяет кнопке")
+    custom = bool((load_dev_settings().get("channel_url") or "").strip())
+    # ВОЛНА 23.09: URL/username канала содержат символы Markdown (_ в
+    # devo_kanal!), текст под parse_mode="Markdown" падал с BadRequest
+    # «Can't parse entities … byte offset 421»: и edit, и фолбэк send —
+    # экран «📢 Канал подписки» не открывался («Канал подписи не
+    # работает»), ссылку нельзя было поменять, гейт проверял не тот
+    # канал. Теперь HTML + экранирование динамики.
+    # ВОЛНА 23.10: статус главного тоггла прямо на экране канала —
+    # разработчик видит и переключает гейт в обоих местах панели.
+    gate_on = is_dev_sub_gate_enabled()
+    text = (
+        "📢 <b>Канал подписки</b>\n\n"
+        f"Обязательная подписка: {'🟢 ВКЛ' if gate_on else '🔴 ВЫКЛ'}\n"
+        f"Текущая ссылка: {_html_esc(url)}\n"
+        f"Проверка подписки: {_html_esc(ch_line)}\n"
+        f"Источник: {'настройка разработчика' if custom else 'дефолт (devo_kanal)'}\n\n"
+        "Ссылка используется в требовании подписки, кнопке «Подписаться» "
+        "и в проверке get_chat_member. Публичная ссылка вида "
+        "https://t.me/имя_канала — проверка подписки работает. "
+        "Приватная (t.me/+…) — бот будет доверять кнопке «Я подписался»."
+    )
+    kb_rows = [[InlineKeyboardButton("✏️ Изменить ссылку",
+                                     callback_data="dev_channel_edit")]]
+    # ВОЛНА 23.10: переключение обязательной подписки с экрана канала.
+    kb_rows.append([InlineKeyboardButton(
+        "🚪 Выключить обязательную подписку" if gate_on
+        else "🚪 Включить обязательную подписку",
+        callback_data="dev_subgate_toggle")])
+    if custom:
+        kb_rows.append([InlineKeyboardButton("↩️ Сбросить на дефолт",
+                                             callback_data="dev_channel_reset")])
+    # ВОЛНА 23.07: живая диагностика доступа бота к каналу — проверяет
+    # ровно то, чем гейтится подписка (видит ли бот канал, админ ли он,
+    # рассинхрон ссылки и username).
+    kb_rows.append([InlineKeyboardButton("🧪 Проверить доступ бота",
+                                         callback_data="dev_channel_probe")])
+    kb_rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="dev_back_panel")])
+    kb = InlineKeyboardMarkup(kb_rows)
+    # ВОЛНА 23.09: безопасный edit (HTML + фолбэк без parse_mode +
+    # фолбэк новым сообщением) — экран панели не может умереть от
+    # неудачного парсинга или нечитаемого старого сообщения.
+    await _safe_edit_html(
+        query, text, bot=context.bot,
+        fallback_chat_id=update.effective_chat.id, reply_markup=kb)
+    return DEV_PANEL
+
+
+async def dev_channel_edit_cb(update, context):
+    """Запрос новой ссылки: следующий текст разработчика = ссылка."""
+    query = update.callback_query
+    await _safe_cb_answer(query)
+    context.user_data["awaiting_channel_link"] = True
+    try:
+        await query.edit_message_text(
+            "✏️ Пришлите новую ссылку на канал.\n\n"
+            "Можно ссылкой (https://t.me/имя_канала), ником (@имя_канала) "
+            "или просто именем (имя_канала). Приватные ссылки вида "
+            "https://t.me/+… тоже принимаются.\n\n"
+            "«❌ Отмена» — выйти без изменений.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ Назад без изменений",
+                                     callback_data="dev_channel")]]))
+    except Exception:
+        pass
+    return DEV_PANEL
+
+
+async def dev_channel_reset_cb(update, context):
+    """Сброс ссылки канала на дефолтную (devo_kanal)."""
+    query = update.callback_query
+    await _safe_cb_answer(query)
+    context.user_data.pop("awaiting_channel_link", None)
+    reset_channel_link()
+    try:
+        await query.edit_message_text(
+            "↩️ Ссылка сброшена на дефолтную:\n" + get_channel_url(),
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ К каналу подписки",
+                                     callback_data="dev_channel")]]))
+    except Exception:
+        pass
+    return DEV_PANEL
+
+
+async def dev_channel_probe_cb(update, context):
+    """ВОЛНА 23.07: живая диагностика канала подписки.
+
+    Проверяет ровно то, чем гейтится подписка: видит ли бот канал,
+    админ ли он в нём, совпадает ли username для get_chat_member со
+    ссылкой из кнопки «Подписаться». Помогает сразу увидеть причины
+    «Я подписался, а бот не пропускает»: бот не админ, канал переименован,
+    ссылка ведёт на один канал, а проверка идёт по другому."""
+    query = update.callback_query
+    await _safe_cb_answer(query)
+    url = get_channel_url()
+    ch_un = get_channel_username()
+    url_un = _extract_channel_username(url)
+    # ВОЛНА 23.09: заголовок без ** — текст уходит через HTML.
+    lines = ["🧪 Диагностика канала подписки\n",
+             f"Ссылка в кнопке: {url}",
+             "Проверка get_chat_member: "
+             + (f"@{ch_un}" if ch_un
+                else "выключена (приватная ссылка)")]
+    if url_un and ch_un and url_un.lower() != ch_un.lower():
+        lines.append(
+            f"⚠️ РАССИНХРОН: кнопка ведёт на @{url_un}, а проверка идёт "
+            f"по @{ch_un}! Подписчики канала из кнопки не пройдут "
+            "проверку. Нажмите «✏️ Изменить ссылку» и пришлите ссылку "
+            "заново.")
+    if not ch_un:
+        lines.append(
+            "ℹ️ Приватная ссылка: API-проверки нет, бот доверяет кнопке "
+            "«Я подписался» — пропускать должно сразу.")
+    else:
+        _sub_bot = getattr(context, "bot", context)
+        try:
+            chat = await _sub_bot.get_chat(f"@{ch_un}")
+            _ch_title = getattr(chat, "title", None)
+            lines.append(
+                f"✅ Бот видит канал @{ch_un}"
+                + (f" («{_ch_title}»)" if _ch_title else ""))
+        except Exception as e:
+            lines.append(
+                f"❌ Бот НЕ видит канал @{ch_un}: {e}. "
+                "Добавьте бота в канал.")
+            chat = None
+        if chat is not None:
+            try:
+                me_member = await _sub_bot.get_chat_member(
+                    chat_id=f"@{ch_un}", user_id=_sub_bot.id)
+                st = getattr(me_member, "status", "?")
+                if st in ("administrator", "creator"):
+                    lines.append(
+                        "✅ Бот — админ канала: проверка подписки "
+                        "работает честно.")
+                elif st == "member":
+                    lines.append(
+                        "⚠️ Бот в канале, но НЕ админ: get_chat_member "
+                        "может не работать — выдайте права админа.")
+                else:
+                    lines.append(
+                        f"⚠️ Статус бота в канале: {st} — ожидали админа.")
+            except Exception as e:
+                lines.append(
+                    f"❌ Не удалось спросить статус бота: {e}. "
+                    "Скорее всего, бот не админ.")
+    lines.append(
+        "\nЕсли всё ✅, а пользователи жалуются — пусть нажмут «✅ Я "
+        f"подписался(ась)» {SUB_GATE_FAILS_LIMIT} раза: сработает "
+        "«лестница доверия», и вам придёт уведомление.")
+    # ВОЛНА 23.09: каждая строка может нести данные ИЗ Telegram
+    # (username, title канала, тексты исключений) — экранируем всё.
+    # Раньше title канала с _ * ` ломал parse_mode="Markdown"
+    # (BadRequest «Can't parse entities … offset 421»).
+    text = "\n".join(_html_esc(_ln) for _ln in lines)
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Проверить снова",
+                              callback_data="dev_channel_probe")],
+        [InlineKeyboardButton("⬅️ К каналу подписки",
+                              callback_data="dev_channel")]])
+    # ВОЛНА 23.09: безопасный edit (HTML + фолбэк без parse_mode +
+    # фолбэк новым сообщением) — экран панели не может умереть от
+    # неудачного парсинга или нечитаемого старого сообщения.
+    await _safe_edit_html(
+        query, text, bot=context.bot,
+        fallback_chat_id=update.effective_chat.id, reply_markup=kb)
+    return DEV_PANEL
+
+
+async def dev_autologin_cb(update, context):
+    """Экран «♻️ Восстановление»: тихое восстановление + ручная рассылка."""
+    query = update.callback_query
+    await _safe_cb_answer(query)
+    s = load_dev_settings()
+    enabled = bool(s.get("autologin_enabled", True))
+    last = s.get("autologin_last") or "—"
+    text = (
+        "♻️ <b>Восстановление после рестарта</b>\n\n"
+        "Сообщений после перезапуска бот <b>не отправляет</b>. "
+        "Восстановление тихое: пользователь пишет боту что угодно — "
+        "меню и диалог возвращаются сами, /start не нужен.\n\n"
+        f"Состояние: {'🟢 ВКЛ' if enabled else '🔴 ВЫКЛ'}\n"
+        f"Последняя ручная рассылка: {_html_esc(str(last))}\n\n"
+        "Кнопка «📤 Отправить меню всем сейчас» — ручная рассылка "
+        "только по вашему нажатию."
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            ("🔕 Выключить тихое восстановление" if enabled
+             else "🔔 Включить тихое восстановление"),
+            callback_data="dev_toggle_autologin")],
+        [InlineKeyboardButton("📤 Отправить меню всем сейчас",
+                              callback_data="dev_autologin_now")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="dev_back_panel")],
+    ])
+    # ВОЛНА 23.09: безопасный edit (HTML + фолбэк без parse_mode +
+    # фолбэк новым сообщением) — экран панели не может умереть от
+    # неудачного парсинга или нечитаемого старого сообщения.
+    await _safe_edit_html(
+        query, text, bot=context.bot,
+        fallback_chat_id=update.effective_chat.id, reply_markup=kb)
+    return DEV_PANEL
+
+
+async def dev_toggle_autologin_cb(update, context):
+    """Тоггл тихого восстановления на экране «♻️ Восстановление»."""
+    query = update.callback_query
+    new_state = toggle_dev_autologin()
+    await _safe_cb_answer(
+        query,
+        "Тихое восстановление: " + ("включено" if new_state else "выключено"),
+        show_alert=False)
+    return await dev_autologin_cb(update, context)
+
+
+async def dev_autologin_now_cb(update, context):
+    """Ручная рассылка главного меню всем активным пользователям."""
+    query = update.callback_query
+    await _safe_cb_answer(query, "Запускаю рассылку меню в фоне…")
+    application = context.application
+    _chat_id = update.effective_chat.id
+
+    async def _bg():
+        try:
+            sent, failed = await send_autologin_menus(application)
+            try:
+                s = load_dev_settings()
+                s["autologin_last"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+                save_dev_settings(s)
+            except Exception:
+                pass
+            await context.bot.send_message(
+                chat_id=_chat_id,
+                text=f"📤 Рассылка меню завершена: отправлено {sent}, "
+                     f"не удалось {failed}.")
+        except Exception as e:
+            logger.error(f"dev_autologin_now: {e}")
+
+    try:
+        _t = asyncio.create_task(_bg())
+        try:
+            application.bot_data.setdefault("_bg_tasks", []).append(_t)
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error(f"dev_autologin_now: запуск задачи: {e}")
+    return DEV_PANEL
+
+
+# ==================== ВОЛНА 23.05: ПАНЕЛЬ «🔁 Проверка подписки» ====================
+
+async def dev_subrecheck_cb(update, context):
+    """Экран «🔁 Проверка подписки»: тогглы, интервал, ручная проверка."""
+    query = update.callback_query
+    await _safe_cb_answer(query)
+    s = load_dev_settings()
+    enabled = bool(s.get("sub_recheck_enabled", True))
+    dm = bool(s.get("sub_recheck_dm", True))
+    hours = get_sub_recheck_hours()
+    last = s.get("sub_recheck_last") or "—"
+    rep = s.get("sub_recheck_report") or "—"
+    text = (
+        "🔁 <b>Повторная проверка подписки</b>\n\n"
+        "Бот сам периодически проверяет через Telegram API, не отписались "
+        "ли пользователи от канала. Отписавшимся уходит напоминание "
+        "«подпишитесь обратно», а при следующем визите бот встретит их "
+        "требованием подписки.\n\n"
+        f"Проверка: {'🟢 ВКЛ' if enabled else '🔴 ВЫКЛ'}\n"
+        f"Интервал: каждые {hours} ч\n"
+        f"Напоминания отписавшимся: {'🟢 ВКЛ' if dm else '🔴 ВЫКЛ'}\n"
+        f"Последняя проверка: {_html_esc(str(last))}\n"
+        f"Итог: {_html_esc(str(rep))}\n\n"
+        "ℹ️ API-проверка работает, когда бот — админ канала с публичной "
+        "ссылкой (@username). Для приватной ссылки бот доверяет кнопке "
+        "«✅ Я подписался(ась)»."
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            "⛔ Выключить проверку" if enabled else "✅ Включить проверку",
+            callback_data="dev_subrecheck_toggle")],
+        [InlineKeyboardButton(f"⏱ Интервал: {hours} ч — сменить",
+                              callback_data="dev_subrecheck_hours")],
+        [InlineKeyboardButton(
+            "🔕 Напоминания: выключить" if dm else "🔔 Напоминания: включить",
+            callback_data="dev_subrecheck_dm")],
+        [InlineKeyboardButton("🔍 Проверить сейчас",
+                              callback_data="dev_subrecheck_now")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="dev_back_panel")],
+    ])
+    # ВОЛНА 23.09: безопасный edit (HTML + фолбэк без parse_mode +
+    # фолбэк новым сообщением) — экран панели не может умереть от
+    # неудачного парсинга или нечитаемого старого сообщения.
+    await _safe_edit_html(
+        query, text, bot=context.bot,
+        fallback_chat_id=update.effective_chat.id, reply_markup=kb)
+    return DEV_PANEL
+
+
+async def dev_subrecheck_toggle_cb(update, context):
+    """Тоггл фоновой проверки подписки."""
+    query = update.callback_query
+    new_state = toggle_dev_sub_recheck()
+    await _safe_cb_answer(
+        query,
+        "Проверка подписки: " + ("включена" if new_state else "выключена"),
+        show_alert=False)
+    return await dev_subrecheck_cb(update, context)
+
+
+async def dev_subrecheck_dm_cb(update, context):
+    """Тоггл напоминаний отписавшимся."""
+    query = update.callback_query
+    new_state = toggle_dev_sub_recheck_dm()
+    await _safe_cb_answer(
+        query,
+        "Напоминания отписавшимся: " + ("включены" if new_state else "выключены"),
+        show_alert=False)
+    return await dev_subrecheck_cb(update, context)
+
+
+async def dev_subrecheck_hours_cb(update, context):
+    """Циклический пресет интервала: 6 → 12 → 24 → 6 часов."""
+    query = update.callback_query
+    new_h = cycle_dev_sub_recheck_hours()
+    await _safe_cb_answer(query, f"Интервал проверки: каждые {new_h} ч",
+                          show_alert=False)
+    return await dev_subrecheck_cb(update, context)
+
+
+async def dev_subrecheck_now_cb(update, context):
+    """Ручная проверка подписок всех пользователей прямо сейчас."""
+    query = update.callback_query
+    await _safe_cb_answer(query, "Запускаю проверку подписок в фоне…")
+    application = context.application
+    _chat_id = update.effective_chat.id
+
+    async def _bg():
+        try:
+            rep = await run_subscription_recheck(application, manual=True)
+            await application.bot.send_message(
+                chat_id=_chat_id, text=_sub_recheck_report_text(rep))
+        except Exception as e:
+            logger.error(f"dev_subrecheck_now: {e}")
+
+    try:
+        _t = asyncio.create_task(_bg())
+        try:
+            application.bot_data.setdefault("_bg_tasks", []).append(_t)
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error(f"dev_subrecheck_now: запуск задачи: {e}")
+    return DEV_PANEL
+
+
+async def dev_panel_text_router(update, context):
+    """ВОЛНА 23.04: текстовый ввод в панели разработчика.
+
+    Пока поднят флаг awaiting_channel_link — текст это НОВАЯ ССЫЛКА
+    КАНАЛА (раньше любой текст в состоянии DEV_PANEL глотался fallback'ом
+    auto_reenter_main_menu и ссылку ввести было невозможно). Остальные
+    тексты — как раньше: возврат в главное меню."""
+    if context.user_data.get("awaiting_channel_link"):
+        message_text = (update.message.text or "").strip()
+        if _GLOBAL_CANCEL_RE.match(message_text):
+            context.user_data.pop("awaiting_channel_link", None)
+            await update.message.reply_text(
+                "Ввод ссылки отменён.",
+                reply_markup=get_developer_keyboard())
+            return DEV_PANEL
+        ok, msg = set_channel_link(message_text)
+        if ok:
+            context.user_data.pop("awaiting_channel_link", None)
+            await update.message.reply_text(
+                "✅ Ссылка на канал обновлена:\n" + msg,
+                reply_markup=get_developer_keyboard())
+        else:
+            await update.message.reply_text(
+                "❌ " + msg + "\n\nПришлите ссылку ещё раз "
+                "(https://t.me/имя_канала, @имя_канала или имя_канала), "
+                "или нажмите «❌ Отмена».")
+        return DEV_PANEL
+    # ВОЛНА 23.10.10: приём ключа/спецификации ИИ-провайдера (кнопки
+    # «🧠 ИИ-провайдеры» → «➕ Добавить провайдера»). Форматы — как в
+    # референсе пользователя: «пресет:ключ», «Имя|протокол|URL|ключ»
+    # или просто ключ выбранного пресета.
+    if context.user_data.get("ai_prov_pending"):
+        return await _dev_ai_text_receive(update, context)
+    return await auto_reenter_main_menu(update, context)
+
 
 # === ВОЛНА 22.13: РАСШИРЕННАЯ СТАТИСТИКА ДЛЯ РАЗРАБОТЧИКА ===
 # «Улучшенная статистика: сколько пользователей пользовались, какой прирост
@@ -57620,11 +64717,137 @@ async def dev_panel_back_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
     return DEV_PANEL
 
+# ==================================
+# === ВОЛНА 23.08: БЕЗОПАСНАЯ ОТПРАВКА + ЛЮБОЙ ФАЙЛ ОТ РАЗРАБОТЧИКА ===
+# ==================================
+# Запрос разработчика: «Добавь чтобы разработчик мог любыми способами
+# кнопками которые есть отправить модно отправить любой файл. Опять ошибки
+# с каналом … BadRequest: Can't parse entities: can't find end of the entity
+# starting at byte offset 421».
+#
+# Две проблемы закрыты:
+#  1) РАССЫЛКИ БОЛЬШЕ НЕ ПАДАЮТ от «Can't parse entities»: текст
+#     разработчика экранируется (html.escape) и шлётся с HTML-подписью;
+#     если Telegram всё же не смог разобрать entities — сообщение
+#     повторяется БЕЗ форматирования (доставка важнее жирного шрифта).
+#  2) ЛЮБОЙ ФАЙЛ через существующие кнопки («🌐 Рассылка всем», «📩
+#     Сообщение всем (без подписи)», «📨 Сообщение классу», «💬 Сообщение
+#     пользователю»): фото, видео, документ, аудио, голосовое, кружок,
+#     стикер, гифка — копируется всем адресатам через copy_message
+#     (без заголовка «Forwarded from»).
+from html import escape as _html_esc
+
+
+async def _safe_send_html(bot, chat_id, text_html, **kwargs):
+    """ВОЛНА 23.08: отправка с HTML-форматированием и честным фолбэком.
+
+    Если Telegram не смог разобрать entities («Can't parse entities» —
+    незакрытые * _ ` & < в тексте), повторяет тем же текстом БЕЗ
+    parse_mode: сообщение доходит в любом виде вместо BadRequest и
+    шторма «🛠 СБОЙ: Обработчик обновления».
+    """
+    try:
+        return await bot.send_message(
+            chat_id=chat_id, text=text_html,
+            parse_mode=ParseMode.HTML, **kwargs)
+    except TGBadRequest as e:
+        if "can't parse entities" not in str(e).lower():
+            raise
+        return await bot.send_message(
+            chat_id=chat_id, text=text_html, **kwargs)
+
+
+async def _safe_edit_html(query, text_html, bot=None,
+                          fallback_chat_id=None, **kwargs):
+    """ВОЛНА 23.09: edit_message_text с HTML и полным набором фолбэков.
+
+    Панельные экраны не должны умирать от парсинга: если Telegram
+    отвечает «Can't parse entities» (незакрытые * _ ` & < в динамике) —
+    повторяем БЕЗ parse_mode; если сообщение не редактируется (старое,
+    удалено) или кнопки битые — шлём текст НОВЫМ сообщением через
+    _safe_send_html (у которого свой фолбэк). «Message is not
+    modified» — не ошибка: текст уже на экране.
+    Возвращает True, если текст дошёл до пользователя (edit или send).
+    """
+    try:
+        await query.edit_message_text(
+            text_html, parse_mode=ParseMode.HTML, **kwargs)
+        return True
+    except TGBadRequest as e:
+        _em = str(e).lower()
+        if "message is not modified" in _em:
+            return True
+        if "can't parse entities" in _em:
+            try:
+                await query.edit_message_text(text_html, **kwargs)
+                return True
+            except Exception:
+                pass
+    except Exception:
+        pass
+    if bot is not None and fallback_chat_id is not None:
+        try:
+            await _safe_send_html(bot, fallback_chat_id, text_html, **kwargs)
+            return True
+        except Exception as e:
+            logger.error(f"_safe_edit_html fallback: {e}")
+    return False
+
+
+def _dev_signature_html():
+    """ВОЛНА 23.08: подпись рассылки от разработчика (HTML)."""
+    return "📢 <b>Сообщение от разработчика:</b>\n\n"
+
+
+async def _dev_copy_message(bot, chat_id, message, sign_prefix=""):
+    """ВОЛНА 23.08: копия ЛЮБОГО сообщения/файла (фото, видео, документ,
+    аудио, голосовое, кружок, стикер, гифка…) всем адресатам — БЕЗ
+    заголовка «Forwarded from». Если у файла есть своя подпись (caption)
+    и задан sign_prefix — подпись разработчика ставится сверху (caption
+    экранируется; при невозможности разбора — фолбэки: сначала копия с
+    исходной подписью без форматирования, доставка важнее оформления).
+    """
+    kwargs = dict(
+        chat_id=chat_id,
+        from_chat_id=message.chat_id,
+        message_id=message.message_id,
+    )
+    caption = getattr(message, "caption", None)
+    # Caption можно поставить только медиа-типам (photo/video/document/
+    # audio/voice/animation) — у кружков, стикеров и прочего его нет.
+    # Если у файла caption и НЕТ, подпись разработчика всё равно
+    # добавляется (файл без caption получает одну подпись).
+    _media_ok = any(
+        getattr(message, _f, None) for _f in
+        ("photo", "video", "document", "audio", "voice", "animation"))
+    if sign_prefix and _media_ok:
+        kwargs["caption"] = sign_prefix + _html_esc(caption or "")
+        kwargs["parse_mode"] = ParseMode.HTML
+    try:
+        return await bot.copy_message(**kwargs)
+    except TGBadRequest as e:
+        if "can't parse entities" not in str(e).lower():
+            raise
+        if "caption" in kwargs:
+            # Фолбэк: копия с ИСХОДНОЙ подписью файла, без нашей подписи
+            # и без форматирования — файл и его описание не теряются.
+            kwargs["caption"] = caption
+            if not caption:
+                kwargs.pop("caption")
+            kwargs.pop("parse_mode", None)
+            return await bot.copy_message(**kwargs)
+        return await bot.copy_message(**kwargs)
+
+
 async def dev_broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    text = "🌐 Введите сообщение для рассылки всем пользователям:"
+    # ВОЛНА 23.08: текст ИЛИ любой файл — уйдёт всем как есть.
+    text = ("🌐 Введите сообщение для рассылки всем пользователям.\n\n"
+            "📎 Или отправьте ЛЮБОЙ файл (фото, видео, документ, аудио, "
+            "голосовое, кружок) — он уйдёт всем как есть, с подписью "
+            "«от разработчика» (своя подпись файла сохранится).")
 
     await query.edit_message_text(text, reply_markup=get_cancel_keyboard())
     return DEV_BROADCAST
@@ -57636,18 +64859,25 @@ async def dev_broadcast_handler(update: Update, context: ContextTypes.DEFAULT_TY
     if str(update.effective_user.id) != str(DEVELOPER_ID):
         await update.message.reply_text("🚫 Только для разработчика.")
         return MAIN_MENU
-    message_text = update.message.text
+    # ВОЛНА 23.08: текст — прежний путь, но БЕЗ «Can't parse entities»
+    # (HTML + экранирование + фолбэк); ЛЮБОЙ файл (фото, видео, документ,
+    # аудио, голосовое, кружок, стикер…) — копия всем через copy_message.
+    _msg = update.message
+    _is_text = bool((_msg.text or "").strip())
+    message_text = _msg.text or ""
+    _sign = _dev_signature_html()
     users = load_users()
 
     sent_count = 0
     for user_id, user in users.items():
         if not user.is_blocked:
             try:
-                await context.bot.send_message(
-                    chat_id=user_id,
-                    text=f"📢 **Сообщение от разработчика:**\n\n{message_text}",
-                    parse_mode=ParseMode.MARKDOWN
-                )
+                if _is_text:
+                    await _safe_send_html(
+                        context.bot, user_id, _sign + _html_esc(message_text))
+                else:
+                    await _dev_copy_message(
+                        context.bot, user_id, _msg, sign_prefix=_sign)
                 sent_count += 1
             except asyncio.CancelledError:
                 raise
@@ -57658,11 +64888,13 @@ async def dev_broadcast_handler(update: Update, context: ContextTypes.DEFAULT_TY
                 if _ra:
                     await asyncio.sleep(min(float(_ra) + 0.5, 60))
                     try:
-                        await context.bot.send_message(
-                            chat_id=user_id,
-                            text=f"📢 **Сообщение от разработчика:**\n\n{message_text}",
-                            parse_mode=ParseMode.MARKDOWN
-                        )
+                        if _is_text:
+                            await _safe_send_html(
+                                context.bot, user_id,
+                                _sign + _html_esc(message_text))
+                        else:
+                            await _dev_copy_message(
+                                context.bot, user_id, _msg, sign_prefix=_sign)
                         sent_count += 1
                     except Exception as e2:
                         logger.error(f"Ошибка рассылки {user_id}: {e2}")
@@ -57700,14 +64932,20 @@ async def dev_class_message_select(update: Update, context: ContextTypes.DEFAULT
 
     class_obj = get_class_by_code(class_code)
 
-    text = f"📨 Введите сообщение для класса '{class_obj.class_name}':"
+    # ВОЛНА 23.08: текст ИЛИ любой файл — уйдёт классу как есть.
+    text = (f"📨 Введите сообщение для класса '{class_obj.class_name}'.\n\n"
+            "📎 Или отправьте ЛЮБОЙ файл (фото, видео, документ, аудио, "
+            "голосовое, кружок) — он уйдёт всем участникам класса.")
 
     await query.edit_message_text(text, reply_markup=get_cancel_keyboard())
     return DEV_CLASS_MESSAGE
 
 @timeout(CONVERSATION_TIMEOUT)
 async def dev_class_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message_text = update.message.text
+    # ВОЛНА 23.08: текст ИЛИ любой файл (фото, видео, документ…).
+    _msg = update.message
+    _is_text = bool((_msg.text or "").strip())
+    message_text = _msg.text or ""
     class_code = context.user_data.get('dev_class_msg_code')
 
     if not class_code:
@@ -57722,11 +64960,16 @@ async def dev_class_message_handler(update: Update, context: ContextTypes.DEFAUL
     sent_count = 0
     for member_id in class_obj.students:
         try:
-            await context.bot.send_message(
-                chat_id=member_id,
-                text=f"📢 **Сообщение от разработчика:**\n\n{message_text}",
-                parse_mode=ParseMode.MARKDOWN
-            )
+            if _is_text:
+                # ВОЛНА 23.08: HTML + экранирование вместо Markdown —
+                # «Can't parse entities» больше не роняет рассылку.
+                await _safe_send_html(
+                    context.bot, member_id,
+                    _dev_signature_html() + _html_esc(message_text))
+            else:
+                await _dev_copy_message(
+                    context.bot, member_id, _msg,
+                    sign_prefix=_dev_signature_html())
             sent_count += 1
         except Exception as e:
             logger.error(f"Ошибка отправки {member_id}: {e}")
@@ -58657,7 +65900,10 @@ async def dev_message_user_pick_handler(update: Update, context: ContextTypes.DE
     if target_user and getattr(target_user, 'username', None):
         target_name += f" (@{target_user.username})"
 
-    text = f"💬 Введите сообщение для пользователя «{target_name}»:"
+    # ВОЛНА 23.08: текст ИЛИ любой файл — уйдёт пользователю как есть.
+    text = (f"💬 Введите сообщение для пользователя «{target_name}».\n\n"
+            "📎 Или отправьте ЛЮБОЙ файл (фото, видео, документ, аудио, "
+            "голосовое, кружок) — он уйдёт этому пользователю.")
     await query.edit_message_text(text, reply_markup=get_cancel_keyboard())
     return DEV_MESSAGE_USER_TEXT
 
@@ -58673,16 +65919,35 @@ async def dev_message_user_text_handler(update: Update, context: ContextTypes.DE
         await update.message.reply_text("Получатель не выбран.")
         return await developer_panel(update, context)
 
-    message_text = update.message.text
-    if not message_text or not message_text.strip():
-        await update.message.reply_text("Введите сообщение:")
+    # ВОЛНА 23.08: текст ИЛИ любой файл.
+    _msg = update.message
+    _is_text = bool((_msg.text or "").strip())
+    message_text = _msg.text or ""
+    if not _is_text and not (getattr(_msg, "caption", None)
+                             or getattr(_msg, "document", None)
+                             or getattr(_msg, "photo", None)
+                             or getattr(_msg, "video", None)
+                             or getattr(_msg, "audio", None)
+                             or getattr(_msg, "voice", None)
+                             or getattr(_msg, "video_note", None)
+                             or getattr(_msg, "animation", None)
+                             or getattr(_msg, "sticker", None)):
+        await update.message.reply_text(
+            "Введите сообщение или отправьте файл:")
         return DEV_MESSAGE_USER_TEXT
 
     try:
-        await context.bot.send_message(
-            chat_id=target_id,
-            text=f"💬 Сообщение от разработчика:\n\n{message_text}"
-        )
+        if _is_text:
+            await context.bot.send_message(
+                chat_id=target_id,
+                text=f"💬 Сообщение от разработчика:\n\n{message_text}"
+            )
+        else:
+            # ВОЛНА 23.08: ЛЮБОЙ файл — копия пользователю без
+            # «Forwarded from», с подписью разработчика.
+            await _dev_copy_message(
+                context.bot, target_id, _msg,
+                sign_prefix="💬 <b>Сообщение от разработчика:</b>\n\n")
         await update.message.reply_text("✅ Сообщение отправлено!")
     except Exception as e:
         logger.error(f"Ошибка отправки сообщения пользователю {target_id}: {e}")
@@ -59944,6 +67209,77 @@ async def add_homework_date_handler(update: Update, context: ContextTypes.DEFAUL
         user = User(user_id)
     text_in = update.message.text.strip()
 
+    # ВОЛНА 23.10.6: ПЕРЕХВАТ ПРАВКИ ДЗ («✏️ Изменить ДЗ») — до всех шагов
+    # добавления: админ прислал НОВЫЙ текст или НОВУЮ дату выбранного пункта.
+    # Если при этом копятся вложения (hw_media_buffer) — текст считается
+    # описанием (семантика волны 22.4), правка подождёт следующее сообщение.
+    _hwed = context.user_data.get('hw_edit')
+    if (isinstance(_hwed, dict) and _hwed.get('await')
+            and not context.user_data.get('hw_media_buffer')):
+        _class_code = context.user_data.get('current_admin_class')
+        if not _class_code or not is_admin_of_class(user_id, _class_code):
+            context.user_data.pop('current_admin_class', None)
+            context.user_data.pop('hw_edit', None)
+            await update.message.reply_text(
+                "⛔ Действие недоступно: вы больше не администратор этого класса.")
+            return await admin_panel(update, context)
+        _class_obj = get_class_by_code(_class_code)
+        _lst, _asg = _hwedit_find(_class_obj, _hwed.get('subject'),
+                                  int(_hwed.get('index') or 0))
+        if _lst is None:
+            context.user_data.pop('hw_edit', None)
+            context.user_data.pop('homework_subject', None)
+            context.user_data.pop('homework_date', None)
+            await update.message.reply_text(
+                "⚠️ Задание не найдено (возможно, его удалили) — правка "
+                "отменена.")
+            return await admin_panel(update, context)
+        if _hwed.get('await') == 'text':
+            rejected = await reject_if_forbidden_chars(update, text_in, ADD_HOMEWORK)
+            if rejected is not None:
+                return rejected
+            _asg['text'] = text_in
+            _asg['edited_at'] = datetime.now().strftime("%Y-%m-%d %H:%M")
+            classes = load_classes()
+            classes[_class_code] = _class_obj
+            save_classes(classes)
+            _log_admin_action(user_id, _class_code,
+                              f"ДЗ изменено (текст, {_hwed.get('subject')})",
+                              text_in[:200])
+            context.user_data.pop('hw_edit', None)
+            context.user_data.pop('homework_subject', None)
+            context.user_data.pop('homework_date', None)
+            await update.message.reply_text(
+                f"✅ Текст задания обновлён!\n\n"
+                f"📚 Предмет: {_hwed.get('subject')}\n"
+                f"📝 Новый текст: {text_in}")
+            return MANAGE_HOMEWORK
+        if _hwed.get('await') == 'date':
+            try:
+                datetime.strptime(text_in, "%Y-%m-%d")
+            except ValueError:
+                await update.message.reply_text(
+                    "Введите дату в формате ГГГГ-ММ-ДД:",
+                    reply_markup=get_cancel_keyboard())
+                return ADD_HOMEWORK
+            _asg['date'] = text_in
+            _asg['edited_at'] = datetime.now().strftime("%Y-%m-%d %H:%M")
+            classes = load_classes()
+            classes[_class_code] = _class_obj
+            save_classes(classes)
+            _log_admin_action(user_id, _class_code,
+                              f"ДЗ изменено (дата, {_hwed.get('subject')})",
+                              text_in[:200])
+            context.user_data.pop('hw_edit', None)
+            context.user_data.pop('homework_subject', None)
+            context.user_data.pop('homework_date', None)
+            await update.message.reply_text(
+                f"✅ Дата задания обновлена: {text_in}\n\n"
+                f"📚 Предмет: {_hwed.get('subject')}")
+            return MANAGE_HOMEWORK
+        # неизвестный await — сбрасываем и идём по обычным шагам
+        context.user_data.pop('hw_edit', None)
+
     # Шаг 1: пользователь вводит имя нового предмета
     if context.user_data.get('adding_new_hw_subject'):
         rejected = await reject_if_forbidden_chars(update, text_in, ADD_HOMEWORK)
@@ -60152,6 +67488,110 @@ async def save_homework_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
 _HW_MEDIA_MAX_FILES = 10   # максимум вложений на один пункт ДЗ
 
+# ═══════════════════════════════════════════════════════════════════════
+# ВОЛНА 23.10.6: ФОТО ДЗ > 2 ШТ. → ОДИН PDF-ФАЙЛ.
+# Просьба пользователя: «если в ДЗ админ кладёт больше 2 фото, то на тот
+# предмет, который он кладёт, эти фото должны собираться в файл и
+# отправляться файлом, чтобы не запутаться; название файла — предмет, на
+# который добавляют ДЗ, и дата добавления».
+# Правило: в пункте ДЗ фото БОЛЬШЕ 2 (3 и более) → все фото собираются в
+# один PDF «Предмет_ГГГГ-ММ-ДД.pdf» (дата ДОБАВЛЕНИЯ) и отправляются
+# ДОКУМЕНТОМ. Остальные типы вложений (видео/аудио/файлы) — как раньше.
+# Фото 1–2 шт. — как раньше, по одному. Сборка кэшируется: повторные
+# показы летят по file_id без перекачки и пересборки.
+# ═══════════════════════════════════════════════════════════════════════
+_HW_PHOTO_BUNDLE_MIN = 3       # больше 2 фото → собираем в PDF
+_HW_PDF_CACHE = collections.OrderedDict()   # md5(file_id-ов) -> file_id PDF
+_HW_PDF_CACHE_MAX = 32
+
+
+def _hw_safe_filename(subject, date_str):
+    """Имя PDF-файла ДЗ: «Предмет_ГГГГ-ММ-ДД.pdf» (без запрещённых символов)."""
+    s = re.sub(r'[\\/:*?"<>|\r\n\t]+', "_", str(subject or "ДЗ")).strip(" ._")
+    s = s[:60] or "ДЗ"
+    d = str(date_str or "")[:10]
+    return f"{s}_{d}.pdf" if d else f"{s}.pdf"
+
+
+def _hw_photos_pdf_bytes(raws):
+    """Синхронно (в отдельном потоке): список байтов фото → один PDF."""
+    Image, _Chops, _Draw, _Filter, _Font, ImageOps, _Stat = _wm_pil()
+    pages = []
+    for raw in raws:
+        if not raw:
+            continue
+        img = Image.open(io.BytesIO(raw))
+        img = ImageOps.exif_transpose(img)
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+        pages.append(img)
+    if not pages:
+        return None
+    buf = io.BytesIO()
+    pages[0].save(buf, "PDF", save_all=True, append_images=pages[1:],
+                  resolution=150.0)
+    return buf.getvalue()
+
+
+async def _hw_download_photo_bytes(context, m):
+    """Скачать фото вложения ДЗ в байты (шифрованное — расшифровать)."""
+    if m.get("sealed"):
+        container = await _vault_botapi_download(context, m["file_id"])
+        _meta, payload = await asyncio.to_thread(_seal_unpack, container)
+        return payload
+    tg_file = await context.bot.get_file(m["file_id"])
+    return bytes(await tg_file.download_as_bytearray())
+
+
+async def _hw_try_send_pdf(context, chat_id, media_list, subject, date_str):
+    """БОЛЬШЕ 2 фото → один PDF-файл «Предмет_дата.pdf» в чат.
+
+    Возвращает список СКЛЕЕННЫХ фото (вызывающий шлёт остальное по одному)
+    или None — не получилось/не нужно (тогда всё как раньше, по одному).
+    Никогда не бросает исключение наружу — только честный None."""
+    try:
+        photos = [m for m in (media_list or [])
+                  if isinstance(m, dict) and m.get("type") == "photo"
+                  and m.get("file_id")]
+        if len(photos) < _HW_PHOTO_BUNDLE_MIN:
+            return None
+        caption = (f"📚 {subject or 'ДЗ'}"
+                   + (f" — {str(date_str)[:10]}" if date_str else "")
+                   + f": {len(photos)} фото одним файлом 📄")
+        key = hashlib.md5("|".join(
+            str(m["file_id"]) for m in photos).encode()).hexdigest()
+        # Кэш: PDF уже собирали — мгновенно по file_id.
+        cached = _HW_PDF_CACHE.get(key)
+        if cached:
+            try:
+                await context.bot.send_document(
+                    chat_id=chat_id, document=cached,
+                    caption=caption[:1024],
+                    filename=_hw_safe_filename(subject, date_str))
+                return photos
+            except Exception:
+                _HW_PDF_CACHE.pop(key, None)
+        # Скачиваем фото (шифрованные — расшифровываем) и клеим PDF.
+        raws = []
+        for m in photos:
+            raws.append(await _hw_download_photo_bytes(context, m))
+        pdf = await asyncio.to_thread(_hw_photos_pdf_bytes, raws)
+        if not pdf:
+            return None
+        sent = await context.bot.send_document(
+            chat_id=chat_id,
+            document=InputFile(pdf, filename=_hw_safe_filename(subject, date_str)),
+            caption=caption[:1024])
+        fid = getattr(getattr(sent, "document", None), "file_id", None)
+        if fid:
+            _HW_PDF_CACHE[key] = fid
+            while len(_HW_PDF_CACHE) > _HW_PDF_CACHE_MAX:
+                _HW_PDF_CACHE.popitem(last=False)
+        return photos
+    except Exception as e:
+        logger.warning(f"hw pdf bundle: {e} — шлю фото по одному")
+        return None
+
 # Читаемые подписи типов вложений (для сводки и маркеров в списке ДЗ).
 _HW_MEDIA_LABELS = {
     "photo": "📷 фото",
@@ -60300,7 +67740,8 @@ async def _send_homework_media(context, chat_id, media_list, max_send=10):
 _HW_SPIN_FRAMES = ("🕐", "🕑", "🕒", "🕓", "🕔", "🕕", "🕖", "🕗", "🕘")
 
 
-async def _hw_media_with_progress(context, chat_id, media_list, max_send=10):
+async def _hw_media_with_progress(context, chat_id, media_list, max_send=10,
+                                  subject=None, hw_date=None):
     """ВОЛНА 22.78: выдача вложений ДЗ с АНИМАЦИЕЙ ЗАГРУЗКИ.
 
     Жалоба: «если пользователь нажал на домашнее задание и там файлы —
@@ -60315,7 +67756,10 @@ async def _hw_media_with_progress(context, chat_id, media_list, max_send=10):
     для шифрованных файлов видна пометка «скачиваю из хранилища и
     расшифровываю». В конце — «✅ Вложения ДЗ загружены: 5/5», и статус
     аккуратно удаляется через несколько секунд. Ошибки одного файла не
-    роняют ни выдачу, ни анимацию."""
+    роняют ни выдачу, ни анимацию.
+    ВОЛНА 23.10.6: если передан subject и в пункте БОЛЬШЕ 2 фото — они
+    собираются в ОДИН PDF-файл «Предмет_дата.pdf» (дата добавления),
+    остальные вложения идут как раньше."""
     files = [m for m in (media_list or [])
              if isinstance(m, dict) and m.get("file_id")][:max_send]
     if not files:
@@ -60329,6 +67773,26 @@ async def _hw_media_with_progress(context, chat_id, media_list, max_send=10):
             text=f"{_HW_SPIN_FRAMES[0]} Загружаю вложения ДЗ… 0/{total}")
     except Exception:
         status = None
+
+    # ВОЛНА 23.10.6: >2 фото → один PDF-файл (чтобы не путаться).
+    bundled = None
+    if subject is not None:
+        if status is not None:
+            try:
+                await status.edit_text(
+                    f"{_HW_SPIN_FRAMES[1]} Собираю фото ДЗ в один файл…")
+            except Exception:
+                pass
+        try:
+            bundled = await _hw_try_send_pdf(context, chat_id, files,
+                                             subject, hw_date)
+        except Exception:
+            bundled = None
+        if bundled:
+            # Склеенные фото больше НЕ отправляем по одному.
+            _bundled_ids = {id(m) for m in bundled}
+            files = [m for m in files if id(m) not in _bundled_ids]
+            total = len(files)
 
     sent = failed = 0
     for _i, _m in enumerate(files, 1):
@@ -60351,11 +67815,18 @@ async def _hw_media_with_progress(context, chat_id, media_list, max_send=10):
         sent += _s
         failed += _f
 
+    if bundled:
+        sent += len(bundled)
+
     if status is not None:
         try:
-            await status.edit_text(
-                f"✅ Вложения ДЗ загружены: {sent}/{total}"
-                + (f" · не удалось: {failed}" if failed else ""))
+            _done = f"✅ Вложения ДЗ загружены: {sent}/{total + len(bundled or [])}"
+            if bundled:
+                _done += (f"\n📄 Фото собраны в один файл: "
+                          f"{_hw_safe_filename(subject, hw_date)}")
+            if failed:
+                _done += f" · не удалось: {failed}"
+            await status.edit_text(_done)
         except Exception:
             pass
 
@@ -60525,6 +67996,71 @@ async def hw_media_done_handler(update: Update, context: ContextTypes.DEFAULT_TY
             logger.warning(f"hw media seal ({_fname}): {e}")
             # Честный фолбэк: исходный file_id (без переупаковки) — ДЗ не теряем.
             enc_buffer.append(m)
+
+    # === ВОЛНА 23.10.6: ПРАВКА — вложения добавляются к СУЩЕСТВУЮЩЕМУ ДЗ ===
+    # («✏️ Изменить ДЗ» → «➕ Добавить фото/файлы»). Новый пункт НЕ создаётся.
+    _hwedit = context.user_data.get('hw_edit')
+    if isinstance(_hwedit, dict) and isinstance(_hwedit.get('subject'), str):
+        _lst, _asg = _hwedit_find(class_obj, _hwedit['subject'],
+                                  int(_hwedit.get('index') or 0))
+        media_snapshot = list(buffer)
+        desc = context.user_data.get('hw_media_desc', '') or ''
+        if _lst is None:
+            _clear_hw_media_context(context)
+            context.user_data.pop('hw_edit', None)
+            await query.edit_message_text(
+                "⚠️ Задание не найдено (возможно, его удалили) — вложения "
+                "НЕ добавлены.")
+            return MANAGE_HOMEWORK
+        _asg.setdefault('media', [])
+        free = _HW_MEDIA_MAX_FILES - len(_asg['media'])
+        if free <= 0:
+            _clear_hw_media_context(context)
+            context.user_data.pop('hw_edit', None)
+            await query.edit_message_text(
+                f"⚠️ У задания уже максимум вложений ({_HW_MEDIA_MAX_FILES}).")
+            return MANAGE_HOMEWORK
+        _added = enc_buffer[:free]
+        _asg['media'].extend(_added)
+        if desc and not str(_asg.get('text') or ''):
+            _asg['text'] = desc
+        _asg['edited_at'] = datetime.now().strftime("%Y-%m-%d %H:%M")
+        classes = load_classes()
+        classes[class_code] = class_obj
+        save_classes(classes)
+        _log_admin_action(
+            user_id, class_code,
+            f"ДЗ изменено (добавлены вложения, {_hwedit['subject']})",
+            _media_summary_line(_added))
+        _clear_hw_media_context(context)
+        context.user_data.pop('hw_edit', None)
+        context.user_data.pop('homework_date', None)
+        context.user_data.pop('homework_subject', None)
+        context.user_data.pop('awaiting_hw_text', None)
+        context.user_data.pop('awaiting_hw_custom_date', None)
+
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Ещё ДЗ", callback_data="add_homework")],
+            [InlineKeyboardButton("⬅️ В админ-панель", callback_data="back_to_admin")],
+            [InlineKeyboardButton("⬅️ В главное меню", callback_data="back_to_main")],
+        ])
+        text = (f"✅ Вложения добавлены к заданию!\n\n"
+                f"📚 Предмет: {_hwedit['subject']}\n"
+                f"📎 Добавлено: {_media_summary_line(_added)}\n"
+                f"📎 Всего вложений: {len(_asg['media'])}")
+        if desc:
+            text += f"\n📝 Описание: {desc}"
+        try:
+            await query.edit_message_text(text, reply_markup=keyboard)
+        except Exception:
+            await update.effective_chat.send_message(text, reply_markup=keyboard)
+        # Показываем добавленное — как при обычном создании (с анимацией).
+        await _hw_media_with_progress(
+            context, update.effective_chat.id, media_snapshot,
+            subject=_hwedit['subject'],
+            hw_date=datetime.now().strftime("%Y-%m-%d"))
+        return MANAGE_HOMEWORK
+
     class_obj.homework[subject].append({
         'text': context.user_data.get('hw_media_desc', '') or '',
         'date': date_str,
@@ -60563,7 +68099,11 @@ async def hw_media_done_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
     # Показываем вложения сразу — админ видит ровно то, что получит класс
     # (22.78: с анимацией загрузки, т.к. вложения только что зашифрованы).
-    await _hw_media_with_progress(context, update.effective_chat.id, media_snapshot)
+    # ВОЛНА 23.10.6: >2 фото → один PDF-файл «Предмет_дата.pdf».
+    await _hw_media_with_progress(
+        context, update.effective_chat.id, media_snapshot,
+        subject=subject,
+        hw_date=datetime.now().strftime("%Y-%m-%d"))
     return MANAGE_HOMEWORK
 
 async def delete_homework_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -60724,8 +68264,11 @@ async def view_homework_handler(update: Update, context: ContextTypes.DEFAULT_TY
     await query.edit_message_text(homework_text, parse_mode="Markdown", reply_markup=get_back_button_keyboard())
     # ВОЛНА 22.4: досылаем вложения пунктов ДЗ (админ видит то же, что и класс).
     # ВОЛНА 22.78: выдача с анимацией загрузки.
-    for _m_list in _iter_assignment_media(class_obj.homework):
-        await _hw_media_with_progress(context, update.effective_chat.id, _m_list)
+    # ВОЛНА 23.10.6: >2 фото пункта → один PDF-файл «Предмет_дата.pdf».
+    for _m_list, _subj, _asg in _iter_assignment_media(class_obj.homework):
+        await _hw_media_with_progress(
+            context, update.effective_chat.id, _m_list,
+            subject=_subj, hw_date=_hw_added_date(_asg))
     return MANAGE_HOMEWORK
 
 async def quick_homework_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -60739,6 +68282,333 @@ async def quick_homework_handler(update: Update, context: ContextTypes.DEFAULT_T
 
     await query.edit_message_text(text, reply_markup=get_cancel_keyboard())
     return ADD_HOMEWORK
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# ВОЛНА 23.10.6: «✏️ ИЗМЕНИТЬ ДЗ» — правка ДОБАВЛЕННОГО задания.
+# Просьба пользователя: «дз ... можно изменить». Админ (или староста)
+# выбирает предмет → задание → меняет: текст, дату, добавляет фото/файлы
+# или убирает ВСЕ вложения. Права перепроверяются на каждом шаге (как у
+# удаления ДЗ, волна 22.72). Ввод текста/даты идёт через состояние
+# ADD_HOMEWORK (перехват в add_homework_date_handler ДО старых шагов),
+# добавление файлов — через существующий буфер вложений ДЗ.
+# ═══════════════════════════════════════════════════════════════════════
+def _hwedit_parse_tail(data, prefix):
+    """Хвост колбэка после префикса → (subject, index). Предмет может
+    содержать подчёркивания — индекс всегда ПОСЛЕДНИЙ токен."""
+    tail = str(data or "")[len(prefix):]
+    try:
+        subj, idx_s = tail.rsplit("_", 1)
+        idx = int(idx_s)
+    except (ValueError, IndexError):
+        return None, -1
+    return subj, idx
+
+
+def _hwedit_find(class_obj, subject, index):
+    """Найти пункт ДЗ: (список, пункт) или (None, None)."""
+    try:
+        lst = class_obj.homework.get(subject)
+        if isinstance(lst, list) and 0 <= index < len(lst) \
+                and isinstance(lst[index], dict):
+            return lst, lst[index]
+    except Exception:
+        pass
+    return None, None
+
+
+def get_homework_edit_keyboard(class_obj):
+    """Список предметов, у которых есть ДЗ, для правки."""
+    keyboard = []
+    for subject, assignments in (class_obj.homework or {}).items():
+        if assignments:
+            keyboard.append([InlineKeyboardButton(
+                f"📚 {subject} ({len(assignments)})",
+                callback_data=f"hweditsub_{subject[:50]}")])
+    keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="manage_homework")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+async def edit_homework_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """«✏️ Изменить ДЗ» — выбор предмета."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = str(query.from_user.id)
+    class_code = context.user_data.get('current_admin_class')
+    # ВОЛНА 22.72 (как у удаления): перепроверка прав на каждом входе.
+    if not class_code or not is_admin_of_class(user_id, class_code):
+        context.user_data.pop('current_admin_class', None)
+        await query.edit_message_text(
+            "⛔ Действие недоступно: вы больше не администратор этого класса.")
+        return ADMIN_PANEL
+
+    class_obj = get_class_by_code(class_code)
+    if not class_obj:
+        await query.edit_message_text("Класс не найден.",
+                                      reply_markup=get_admin_panel_keyboard())
+        return ADMIN_PANEL
+    if not class_obj.homework:
+        await query.edit_message_text(
+            "📝 Домашнее задание не задано — изменять нечего.",
+            reply_markup=get_admin_panel_keyboard())
+        return ADMIN_PANEL
+
+    await query.edit_message_text(
+        "✏️ **Изменение ДЗ**\n\nВыберите предмет:",
+        reply_markup=get_homework_edit_keyboard(class_obj),
+        parse_mode="Markdown")
+    return MANAGE_HOMEWORK
+
+
+async def edit_homework_subject_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """hweditsub_<subject> — список заданий предмета для правки."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = str(query.from_user.id)
+    class_code = context.user_data.get('current_admin_class')
+    if not class_code or not is_admin_of_class(user_id, class_code):
+        context.user_data.pop('current_admin_class', None)
+        await query.edit_message_text(
+            "⛔ Действие недоступно: вы больше не администратор этого класса.")
+        return ADMIN_PANEL
+
+    subject = str(query.data or "")[len("hweditsub_"):]
+    class_obj = get_class_by_code(class_code)
+    if not class_obj:
+        await query.edit_message_text("Класс не найден.",
+                                      reply_markup=get_admin_panel_keyboard())
+        return ADMIN_PANEL
+
+    assignments = class_obj.homework.get(subject) or []
+    keyboard = []
+    for i, a in enumerate(assignments):
+        if not isinstance(a, dict):
+            continue
+        label = (str(a.get('text') or '(без текста)')
+                 .replace("\n", " "))[:40]
+        when = str(a.get('date') or '')
+        media_mark = " 📎" if a.get('media') else ""
+        keyboard.append([InlineKeyboardButton(
+            f"✏️ {i + 1}. {label} · {when}{media_mark}",
+            callback_data=f"hwedit_{subject[:50]}_{i}")])
+    keyboard.append([InlineKeyboardButton("⬅️ К предметам", callback_data="edit_homework")])
+
+    await query.edit_message_text(
+        f"✏️ **Изменение ДЗ — {subject}**\n\nВыберите задание:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown")
+    return MANAGE_HOMEWORK
+
+
+def _hwedit_item_kb(subject, index, a):
+    """Карточка пункта ДЗ с кнопками правки."""
+    n_media = len(a.get('media') or [])
+    kb = [
+        [InlineKeyboardButton("✏️ Текст задания",
+                              callback_data=f"hwedt_txt_{subject[:50]}_{index}")],
+        [InlineKeyboardButton("📅 Дату задания",
+                              callback_data=f"hwedt_date_{subject[:50]}_{index}")],
+    ]
+    if n_media < _HW_MEDIA_MAX_FILES:
+        kb.append([InlineKeyboardButton(
+            "➕ Добавить фото/файлы",
+            callback_data=f"hwedt_add_{subject[:50]}_{index}")])
+    if n_media:
+        kb.append([InlineKeyboardButton(
+            f"🗑 Убрать все вложения ({n_media})",
+            callback_data=f"hwedt_clear_{subject[:50]}_{index}")])
+    kb.append([InlineKeyboardButton("⬅️ К списку заданий", callback_data=f"hweditsub_{subject[:50]}")])
+    kb.append([InlineKeyboardButton("⬅️ В админ-панель", callback_data="back_to_admin")])
+    return InlineKeyboardMarkup(kb)
+
+
+async def edit_homework_item_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """hwedit_<subject>_<i> — карточка задания с кнопками правки."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = str(query.from_user.id)
+    class_code = context.user_data.get('current_admin_class')
+    if not class_code or not is_admin_of_class(user_id, class_code):
+        context.user_data.pop('current_admin_class', None)
+        await query.edit_message_text(
+            "⛔ Действие недоступно: вы больше не администратор этого класса.")
+        return ADMIN_PANEL
+
+    subject, index = _hwedit_parse_tail(query.data, "hwedit_")
+    class_obj = get_class_by_code(class_code)
+    if not class_obj:
+        await query.edit_message_text("Класс не найден.",
+                                      reply_markup=get_admin_panel_keyboard())
+        return ADMIN_PANEL
+    lst, a = _hwedit_find(class_obj, subject, index)
+    if lst is None:
+        await query.edit_message_text("Задание не найдено (уже удалено?).")
+        return await edit_homework_start(update, context)
+
+    media_line = _media_summary_line(a.get('media')) or "нет"
+    edited = str(a.get('edited_at') or '')
+    text = (
+        f"✏️ **Изменение ДЗ**\n\n"
+        f"📚 Предмет: {subject}\n"
+        f"📅 Дата: {a.get('date', 'без даты')}\n"
+        f"📝 Текст: {a.get('text') or '(без текста)'}\n"
+        f"📎 Вложения: {media_line}\n"
+        f"🕒 Добавлено: {a.get('added_at', '?')}"
+        + (f"\n✒️ Изменено: {edited}" if edited else "")
+        + "\n\nЧто изменить?")
+    try:
+        await query.edit_message_text(
+            text, reply_markup=_hwedit_item_kb(subject, index, a),
+            parse_mode="Markdown")
+    except Exception:
+        # Плохая разметка (символы _ * в тексте) — повтор без Markdown.
+        try:
+            await query.edit_message_text(
+                text.replace("**", ""),
+                reply_markup=_hwedit_item_kb(subject, index, a))
+        except Exception:
+            pass
+    return MANAGE_HOMEWORK
+
+
+async def hw_edit_text_start_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """«✏️ Текст задания» — ждём новый текст (перехват в ADD_HOMEWORK)."""
+    query = update.callback_query
+    await query.answer()
+    user_id = str(query.from_user.id)
+    class_code = context.user_data.get('current_admin_class')
+    if not class_code or not is_admin_of_class(user_id, class_code):
+        context.user_data.pop('current_admin_class', None)
+        await query.edit_message_text(
+            "⛔ Действие недоступно: вы больше не администратор этого класса.")
+        return ADMIN_PANEL
+    subject, index = _hwedit_parse_tail(query.data, "hwedt_txt_")
+    class_obj = get_class_by_code(class_code)
+    lst, a = _hwedit_find(class_obj, subject, index)
+    if lst is None:
+        await query.edit_message_text("Задание не найдено (уже удалено?).")
+        return await edit_homework_start(update, context)
+    context.user_data['hw_edit'] = {
+        "subject": subject, "index": index, "await": "text"}
+    # Чтобы «случайные» фото в этот момент не ломали поток — работают как
+    # вложения ДЗ этого же пункта (см. hw_media_done_handler).
+    context.user_data['homework_subject'] = subject
+    context.user_data['homework_date'] = str(a.get('date') or '')
+    await query.edit_message_text(
+        f"📝 Пришлите НОВЫЙ текст задания (предмет: {subject}).\n\n"
+        f"Текущий текст:\n{a.get('text') or '(без текста)'}",
+        reply_markup=get_cancel_keyboard())
+    return ADD_HOMEWORK
+
+
+async def hw_edit_date_start_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """«📅 Дату задания» — ждём новую дату (перехват в ADD_HOMEWORK)."""
+    query = update.callback_query
+    await query.answer()
+    user_id = str(query.from_user.id)
+    class_code = context.user_data.get('current_admin_class')
+    if not class_code or not is_admin_of_class(user_id, class_code):
+        context.user_data.pop('current_admin_class', None)
+        await query.edit_message_text(
+            "⛔ Действие недоступно: вы больше не администратор этого класса.")
+        return ADMIN_PANEL
+    subject, index = _hwedit_parse_tail(query.data, "hwedt_date_")
+    class_obj = get_class_by_code(class_code)
+    lst, a = _hwedit_find(class_obj, subject, index)
+    if lst is None:
+        await query.edit_message_text("Задание не найдено (уже удалено?).")
+        return await edit_homework_start(update, context)
+    context.user_data['hw_edit'] = {
+        "subject": subject, "index": index, "await": "date"}
+    context.user_data['homework_subject'] = subject
+    context.user_data['homework_date'] = str(a.get('date') or '')
+    await query.edit_message_text(
+        f"📅 Введите НОВУЮ дату задания в формате ГГГГ-ММ-ДД.\n\n"
+        f"Текущая дата: {a.get('date') or 'без даты'}",
+        reply_markup=get_cancel_keyboard())
+    return ADD_HOMEWORK
+
+
+async def hw_edit_add_media_start_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """«➕ Добавить фото/файлы» — буфер вложений добавится к ЭТОМУ пункту."""
+    query = update.callback_query
+    await query.answer()
+    user_id = str(query.from_user.id)
+    class_code = context.user_data.get('current_admin_class')
+    if not class_code or not is_admin_of_class(user_id, class_code):
+        context.user_data.pop('current_admin_class', None)
+        await query.edit_message_text(
+            "⛔ Действие недоступно: вы больше не администратор этого класса.")
+        return ADMIN_PANEL
+    subject, index = _hwedit_parse_tail(query.data, "hwedt_add_")
+    class_obj = get_class_by_code(class_code)
+    lst, a = _hwedit_find(class_obj, subject, index)
+    if lst is None:
+        await query.edit_message_text("Задание не найдено (уже удалено?).")
+        return await edit_homework_start(update, context)
+    n_media = len(a.get('media') or [])
+    free = _HW_MEDIA_MAX_FILES - n_media
+    if free <= 0:
+        try:
+            await query.answer(
+                f"У задания уже максимум вложений ({_HW_MEDIA_MAX_FILES}).",
+                show_alert=True)
+        except Exception:
+            pass
+        return await edit_homework_item_cb(update, context)
+    context.user_data['hw_edit'] = {
+        "subject": subject, "index": index}
+    context.user_data['homework_subject'] = subject
+    context.user_data['homework_date'] = str(a.get('date') or '')
+    context.user_data.pop('hw_media_buffer', None)
+    context.user_data.pop('hw_media_desc', None)
+    await query.edit_message_text(
+        f"📎 Пришлите фото/файлы/видео, которые нужно ДОБАВИТЬ к заданию "
+        f"(предмет: {subject}, ещё {free} шт.).\n\n"
+        "Каждое вложение будет зашифровано 🔐. Закончили — «✅ Готово».",
+        reply_markup=_hw_media_confirm_kb())
+    return ADD_HOMEWORK
+
+
+async def hw_edit_clear_media_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """«🗑 Убрать все вложения» — очистить media пункта (мгновенно)."""
+    query = update.callback_query
+    await query.answer()
+    user_id = str(query.from_user.id)
+    class_code = context.user_data.get('current_admin_class')
+    if not class_code or not is_admin_of_class(user_id, class_code):
+        context.user_data.pop('current_admin_class', None)
+        await query.edit_message_text(
+            "⛔ Действие недоступно: вы больше не администратор этого класса.")
+        return ADMIN_PANEL
+    subject, index = _hwedit_parse_tail(query.data, "hwedt_clear_")
+    class_obj = get_class_by_code(class_code)
+    if not class_obj:
+        await query.edit_message_text("Класс не найден.",
+                                      reply_markup=get_admin_panel_keyboard())
+        return ADMIN_PANEL
+    lst, a = _hwedit_find(class_obj, subject, index)
+    if lst is None:
+        await query.edit_message_text("Задание не найдено (уже удалено?).")
+        return await edit_homework_start(update, context)
+    removed = len(a.get('media') or [])
+    a['media'] = []
+    a['edited_at'] = datetime.now().strftime("%Y-%m-%d %H:%M")
+    classes = load_classes()
+    classes[class_code] = class_obj
+    save_classes(classes)
+    _log_admin_action(user_id, class_code,
+                      f"ДЗ изменено (убраны вложения, {subject})",
+                      f"удалено вложений: {removed}")
+    try:
+        await query.answer(f"🗑 Убрано вложений: {removed}", show_alert=False)
+    except Exception:
+        pass
+    # Перерисовываем карточку задания.
+    return await edit_homework_item_cb(update, context)
 
 async def manage_class_users_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -60795,13 +68665,38 @@ async def class_block_user_handler(update: Update, context: ContextTypes.DEFAULT
         if blocked_user_id not in class_obj.blocked_users:
             block_user_in_class(blocked_user_id, class_code, user_id)
 
+            # ВОЛНА 22.98: блокировка в классе ИСКЛЮЧАЕТ из класса —
+            # заблокированный сразу свободен и может создать новый класс или
+            # войти в другой (в ЭТОТ класс вход по коду ему закрыт — см. join).
+            try:
+                if str(blocked_user_id) in [str(s) for s in class_obj.students]:
+                    class_obj.students.remove(str(blocked_user_id))
+                    classes = load_classes()
+                    classes[class_code] = class_obj
+                    save_classes(classes)
+            except Exception as _kick_err:
+                logger.error(f"class_block: не исключил из класса: {_kick_err}")
+
             blocked_user = get_user(blocked_user_id)
             blocked_name = blocked_user.first_name if blocked_user else f"User {blocked_user_id}"
+            if blocked_user is not None:
+                try:
+                    if str(getattr(blocked_user, "class_code", "") or "") == str(class_code):
+                        blocked_user.class_code = None
+                        save_user(blocked_user)
+                except Exception as _cc_err:
+                    logger.error(f"class_block: не очистил class_code: {_cc_err}")
 
             try:
                 await context.bot.send_message(
                     chat_id=blocked_user_id,
-                    text=f"🚫 Вы были заблокированы в классе '{class_obj.class_name}'.\n\nДля разблокировки нужно: {PRICES['unblock']} ⭐"
+                    text=(f"🚫 Вы были заблокированы в классе '{class_obj.class_name}' "
+                          "и исключены из него.\n\n"
+                          "Вы можете создать новый класс или войти в другой "
+                          "по коду класса.\n\n"
+                          f"Для разблокировки нужно: {PRICES['unblock']} ⭐"),
+                    reply_markup=(get_main_menu_keyboard(blocked_user)
+                                  if blocked_user else None)
                 )
             except Exception as e:
                 logger.error(f"Ошибка при уведомлении заблокированного пользователя: {e}")
@@ -63081,6 +70976,7 @@ def _duty_custom_menu_kb():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🤖 ИИ по списку", callback_data="duty_custom_ai"),
          InlineKeyboardButton("📅 Список с датами", callback_data="duty_custom_dates")],
+        [InlineKeyboardButton("🚩 Начать с кого-то", callback_data="duty_custom_start")],
         [InlineKeyboardButton("🔔 Тест уведомления", callback_data="duty_custom_test")],
         [InlineKeyboardButton("🗑 Выключить свой график", callback_data="duty_custom_off")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="duty_admin")],
@@ -63223,6 +71119,130 @@ async def duty_custom_off_cb(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return ADMIN_PANEL
 
 
+async def duty_custom_start_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.96: «🚩 Начать с кого-то» — выбор имени, с которого пойдёт
+    график («список по списку»: выбранный первым, дальше по порядку)."""
+    query = update.callback_query
+    uid = str(query.from_user.id)
+    class_obj = _duty_ensure_admin_class(context, uid)
+    if not class_obj or not _duty_is_admin(uid, class_obj):
+        await query.answer("Только для админов класса.", show_alert=True)
+        return ADMIN_PANEL
+    await query.answer()
+    dc = getattr(class_obj, "duty_custom", None)
+    names = _duty_custom_names(class_obj)
+    if not isinstance(dc, dict) or not names:
+        await query.answer("Сначала загрузите список — «🤖 ИИ по списку».",
+                           show_alert=True)
+        return ADMIN_PANEL
+    if str(dc.get("mode") or "") == "dates":
+        await query.answer(
+            "Этот график задан «📅 Списком с датами» — порядок фиксирован "
+            "вашими датами. «Начать с кого-то» работает для «🤖 ИИ по списку».",
+            show_alert=True)
+        return ADMIN_PANEL
+    rows = []
+    row = []
+    for i, nm in enumerate(names[:100]):
+        row.append(InlineKeyboardButton(
+            f"{i + 1}. {nm[:28]}", callback_data=f"duty_start_{i}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    note = "" if len(names) <= 100 else (
+        f"\n\n⚠️ В списке {len(names)} имён — показаны первые 100.")
+    rows.append([InlineKeyboardButton("⬅️ Назад",
+                                      callback_data="duty_custom_menu")])
+    try:
+        await query.edit_message_text(
+            "🚩 <b>С кого начать список?</b>\n\nВыберите имя — бот пересоберёт "
+            "график: выбранный человек дежурит ПЕРВЫМ, дальше — строго по "
+            "порядку списка («список по списку»)." + note,
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(rows))
+    except Exception:
+        pass
+    return ADMIN_PANEL
+
+
+async def duty_start_pick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.96: выбрано стартовое имя — пересборка графика ПО ПОРЯДКУ
+    списка (без перемешивания), начиная с этого человека."""
+    query = update.callback_query
+    uid = str(query.from_user.id)
+    class_obj = _duty_ensure_admin_class(context, uid)
+    if not class_obj or not _duty_is_admin(uid, class_obj):
+        await query.answer("Только для админов класса.", show_alert=True)
+        return ADMIN_PANEL
+    await query.answer()
+    dc = getattr(class_obj, "duty_custom", None)
+    names = _duty_custom_names(class_obj)
+    if not isinstance(dc, dict) or not names:
+        await query.answer("Список пуст — сначала загрузите график.",
+                           show_alert=True)
+        return ADMIN_PANEL
+    if str(dc.get("mode") or "") == "dates":
+        await query.answer(
+            "График задан «📅 Списком с датами» — порядок менять нельзя.",
+            show_alert=True)
+        return ADMIN_PANEL
+    try:
+        idx = int(query.data.replace("duty_start_", "", 1))
+    except ValueError:
+        idx = -1
+    if idx < 0 or idx >= len(names):
+        await query.answer("Имя не найдено — откройте список заново.",
+                           show_alert=True)
+        return ADMIN_PANEL
+    start_name = names[idx]
+    ordered = names[idx:] + names[:idx]
+    tz = _duty_tz(class_obj)
+    today = (_now_utc() + timedelta(hours=tz)).date()
+    plan = _duty_build_rotation(ordered, class_obj.duty_days,
+                                class_obj.duty_count, today, shuffle=False)
+    class_obj.duty_custom = {"names": names, "plan": plan, "mode": "rotation"}
+    class_obj.duty_today = None
+    class_obj.duty_enabled = True
+    save_class(class_obj)
+    _log_admin_action(uid, class_obj.class_code,
+                      f"Дежурные: график по порядку списка, старт с "
+                      f"«{start_name}» ({len(plan)} дат)")
+    try:
+        await _duty_announce_today_if_due(context.bot, class_obj)
+    except Exception:
+        pass
+    preview_lines = [
+        f"✅ <b>График по порядку списка</b> — {len(names)} чел.",
+        f"🚩 Начали с: <b>{start_name}</b>",
+        "",
+    ]
+    upcoming = sorted(plan.keys())[:10]
+    if upcoming:
+        preview_lines.append("📅 <b>Кто когда дежурит (первые дни):</b>")
+        for k in upcoming:
+            try:
+                d = datetime.strptime(k, "%Y-%m-%d").date()
+                ds = f"{_DUTY_DAYS_RU_FULL[d.weekday()]} {d.strftime('%d.%m')}"
+            except Exception:
+                ds = k
+            preview_lines.append(f"  • {ds} — {', '.join(plan[k])}")
+    preview_lines += [
+        "",
+        "Дальше — «список по списку»: за выбранным человеком дежурят "
+        "остальные в порядке вашего списка. Пересобрать заново — «🚩 Начать "
+        "с кого-то».",
+    ]
+    try:
+        await query.edit_message_text(
+            "\n".join(preview_lines), parse_mode=ParseMode.HTML,
+            reply_markup=_duty_custom_menu_kb())
+    except Exception:
+        pass
+    return ADMIN_PANEL
+
+
 async def _duty_ai_json(system_prompt, user_text, max_tokens=2000):
     """ВОЛНА 22.35: вопрос ИИ (Groq) → словарь JSON. None — ИИ недоступен
     или ответил не JSON (тогда вызывающий использует локальный разбор)."""
@@ -63353,15 +71373,20 @@ def _duty_fallback_dates(raw, today):
     return plan
 
 
-def _duty_build_rotation(names, duty_days, duty_count, today, days_ahead=35):
+def _duty_build_rotation(names, duty_days, duty_count, today, days_ahead=35,
+                         shuffle=True):
     """Ротация имён по учебным дням на days_ahead дней вперёд: «кто как» —
-    по duty_count человек в день, без повторов пока все не подежурят."""
+    по duty_count человек в день, без повторов пока все не подежурят.
+    ВОЛНА 22.96: shuffle=False — «список по списку»: порядок имён сохраняется
+    КАК ЕСТЬ, первый элемент списка дежурит первым (кнопка «🚩 Начать
+    с кого-то» пересобирает график начиная с выбранного человека)."""
     days = sorted({int(d) for d in (duty_days or [])})
     if not names or not days:
         return {}
     need = max(1, min(3, int(duty_count or 1)))
     pool = list(names)
-    random.shuffle(pool)
+    if shuffle:
+        random.shuffle(pool)
     plan = {}
     d = today
     i = 0
@@ -63374,7 +71399,8 @@ def _duty_build_rotation(names, duty_days, duty_count, today, days_ahead=35):
             i += need
             if i >= len(pool):
                 i = 0
-                random.shuffle(pool)
+                if shuffle:
+                    random.shuffle(pool)
         d += timedelta(days=1)
     return plan
 
@@ -63439,7 +71465,8 @@ async def duty_custom_ai_save(update: Update, context: ContextTypes.DEFAULT_TYPE
     today = (_now_utc() + timedelta(hours=tz)).date()
     plan = _duty_build_rotation(names, class_obj.duty_days,
                                 class_obj.duty_count, today)
-    class_obj.duty_custom = {"names": names, "plan": plan}
+    # ВОЛНА 22.96: mode="rotation" — «🚩 Начать с кого-то» доступен.
+    class_obj.duty_custom = {"names": names, "plan": plan, "mode": "rotation"}
     class_obj.duty_today = None
     # ВОЛНА 22.37: ГЛАВНАЯ причина «не приходят уведомления о дежурстве» —
     # график сохранялся, а сама функция оставалась ВЫКЛЮЧЕНОЙ (duty_enabled
@@ -63471,6 +71498,10 @@ async def duty_custom_ai_save(update: Update, context: ContextTypes.DEFAULT_TYPE
         "",
         "Утром в назначенное время бот пришлёт классу: «Сегодня дежурят: …» "
         "— просто имена, без привязки к аккаунтам.",
+        "",
+        "🚩 Хотите, чтобы дежурства шли СТРОГО по порядку списка с конкретного "
+        "человека? Нажмите «🚩 Начать с кого-то» в меню ниже — бот пересоберёт "
+        "график: выбранный человек первый, дальше «список по списку».",
     ]
     await update.message.reply_text(
         "\n".join(preview_lines), parse_mode=ParseMode.HTML,
@@ -63525,7 +71556,9 @@ async def duty_custom_dates_save(update: Update, context: ContextTypes.DEFAULT_T
         for n in plan[k]:
             if n.lower() not in [x.lower() for x in names]:
                 names.append(n)
-    class_obj.duty_custom = {"names": names, "plan": plan}
+    # ВОЛНА 22.96: mode="dates" — порядок фиксирован датами, «🚩 Начать
+    # с кого-то» для такого графика заблокирован (иначе даты затрутся).
+    class_obj.duty_custom = {"names": names, "plan": plan, "mode": "dates"}
     class_obj.duty_today = None
     # ВОЛНА 22.37: см. выше — свой график теперь автоматически включает
     # утренние объявления (иначе список есть, а уведомления не приходят).
@@ -66088,6 +74121,508 @@ async def _bells_buttons_global(update, context):
     return await _bells_ovr_route(update, context)
 
 
+# ==================================
+# === ВОЛНА 23.10.10: ОТДЕЛЬНОЕ РАСПИСАНИЕ/ФОТО НА КОНКРЕТНУЮ ДАТУ ===
+# ==================================
+# Просьба пользователя: «нельзя установить отдельное фото или расписание
+# на отдельный день — нужно добавить». Админ задаёт расписание (текст ИЛИ
+# картинку) на конкретную КАЛЕНДАРНУЮ дату — например, в субботу 31.10.2026
+# уроки идут по расписанию понедельника, или в день контрольной своё фото.
+# В эту дату оно ГЛАВНЕЕ расписания дня недели (тот же приоритет, что у
+# звонков волны 22.85: дата → день недели → база).
+# Хранение: class.schedule_dates["YYYY-MM-DD"] = "текст"
+#                                    | {"image": file_id, "caption": str}.
+# Просмотр: «📅 Сегодня»/«📅 Завтра» подменяют день недели (с пометкой
+# «📌 отдельный день»), «📅 Расписание» — секция «ОТДЕЛЬНЫЕ ДНИ» + картинки.
+
+_SCHDATE_MAX = 60        # потолок дат на класс (как у звонков)
+_SCHDAY_SHORT = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
+
+
+def _schdate_value_ok(v):
+    """Валидно ли значение дня-по-дате: строка-текст или dict-картинка."""
+    if isinstance(v, str):
+        return bool(v.strip())
+    if isinstance(v, dict):
+        return bool(str(v.get("image") or "").strip())
+    return False
+
+
+def _schdate_sorted(class_obj):
+    """Отсортированные валидные даты [(iso, value), ...] (потолок _SCHDATE_MAX)."""
+    sd = getattr(class_obj, 'schedule_dates', None)
+    if not isinstance(sd, dict):
+        return []
+    out = []
+    for k, v in list(sd.items()):
+        iso = str(k)[:10]
+        if _bells_date_ok(iso) and _schdate_value_ok(v):
+            out.append((iso, v))
+    out.sort(key=lambda kv: kv[0])
+    return out[:_SCHDATE_MAX]
+
+
+def _schdate_view(iso, v):
+    """(дата, день-недели, вид) для списков; None, если iso битый."""
+    try:
+        _dt = datetime.strptime(iso, "%Y-%m-%d")
+    except (ValueError, TypeError):
+        return None
+    _dd = _dt.strftime("%d.%m.%Y")
+    _wd = _SCHDAY_SHORT[_dt.weekday()]
+    if isinstance(v, dict):
+        cap = (v.get("caption") or "").strip()
+        return _dd, _wd, ("🖼 картинка" + (f" · {cap[:40]}" if cap else ""))
+    return _dd, _wd, "📄 текст"
+
+
+def _schdate_menu(class_obj):
+    """(текст, клавиатура) экрана «📆 Отдельный день (по дате)»."""
+    rows = []
+    today_iso = datetime.now().strftime("%Y-%m-%d")
+    shown = 0
+    for iso, v in _schdate_sorted(class_obj):
+        view = _schdate_view(iso, v)
+        if not view:
+            continue
+        _dd, _wd, kind = view
+        mark = "📌" if iso >= today_iso else "🗂"
+        rows.append([InlineKeyboardButton(
+            f"{mark} {_dd} ({_wd}) — {kind}",
+            callback_data=f"schdate_set_{iso}")])
+        shown += 1
+    if not shown:
+        txt = ("📆 <b>Отдельный день (по дате)</b>\n\n"
+               "Можно задать СВОЁ расписание — текстом или картинкой — на "
+               "конкретную дату: контрольная, выездное мероприятие, "
+               "«суббота по расписанию понедельника». В эту дату оно "
+               "заменит расписание дня недели в «📅 Сегодня», «📅 Завтра» "
+               "и «📅 Расписание».")
+    else:
+        txt = ("📆 <b>Отдельный день (по дате)</b>\n\n"
+               "У этих дат своё расписание — тапните, чтобы посмотреть, "
+               "заменить или удалить. 📌 — будущее, 🗂 — прошлое:")
+    rows.append([InlineKeyboardButton("➕ Добавить день",
+                                      callback_data="schdate_add")])
+    rows.append([InlineKeyboardButton("⬅️ К расписанию",
+                                      callback_data="edit_schedule")])
+    return txt, InlineKeyboardMarkup(rows)
+
+
+def _schdate_date_screen(class_obj, iso):
+    """(текст, клавиатура) экрана одной даты."""
+    sd = getattr(class_obj, 'schedule_dates', None) or {}
+    v = sd.get(iso)
+    view = _schdate_view(iso, v if v is not None else "")
+    if not view:
+        return None, None
+    _dd, _wd, _kind = view
+    if isinstance(v, dict) and v.get("image"):
+        cap = (v.get("caption") or "").strip()
+        cur = "🖼 КАРТИНКА расписания" + (f"\n📝 Подпись: {cap[:400]}" if cap else "")
+    elif isinstance(v, str) and v.strip():
+        cur = str(v).strip()[:1500]
+    else:
+        cur = "своего расписания нет — работает день недели"
+    txt = (f"📆 <b>{_dd}</b> ({_wd}) — отдельный день\n\n"
+           f"{cur}\n\n"
+           "В эту дату расписание выше ГЛАВНЕЕ дня недели (и в "
+           "«📅 Сегодня/Завтра», и в «📅 Расписание»).")
+    rows = [[InlineKeyboardButton("✍️ Задать расписание",
+                                  callback_data=f"schdate_in_{iso}")]]
+    if _schdate_value_ok(v):
+        rows.append([InlineKeyboardButton("🗑 Удалить день",
+                                          callback_data=f"schdate_del_{iso}")])
+    rows.append([InlineKeyboardButton("⬅️ К датам", callback_data="schdate_menu")])
+    return txt, InlineKeyboardMarkup(rows)
+
+
+def _schdate_set_value(class_obj, iso, value, uid):
+    """Записать значение дня-по-дате и сохранить класс. Возвращает True/False."""
+    try:
+        if not isinstance(getattr(class_obj, 'schedule_dates', None), dict):
+            class_obj.schedule_dates = {}
+        if iso not in class_obj.schedule_dates:
+            if len(_schdate_sorted(class_obj)) >= _SCHDATE_MAX:
+                return False
+        class_obj.schedule_dates[iso] = value
+        classes = load_classes()
+        classes[class_obj.class_code] = class_obj
+        return bool(save_classes(classes))
+    except Exception as e:
+        logger.error(f"schdate set: {e}")
+        return False
+
+
+async def _schdate_ask_content(query, context, iso, uid):
+    """Спросить расписание на дату (текст ИЛИ фото)."""
+    try:
+        _dd = datetime.strptime(iso, "%Y-%m-%d").strftime("%d.%m.%Y")
+    except (ValueError, TypeError):
+        _dd = iso
+    ask = (
+        f"✍️ Пришлите расписание на {_dd} — текстом (одним сообщением) "
+        "или КАРТИНКОЙ (можно с подписью).\n\n"
+        "Оно заменит расписание дня недели в эту дату.\n"
+        "«отмена» — не менять."
+    )
+    try:
+        await query.message.edit_text(ask)
+    except Exception:
+        try:
+            await context.bot.send_message(chat_id=int(uid), text=ask)
+        except Exception:
+            pass
+
+
+async def _schdate_ovr_route(update, context):
+    """ВОЛНА 23.10.10: маршрутизатор отдельных дней (по датам).
+    data: schdate_menu | schdate_add | schdate_set_<iso> |
+    schdate_in_<iso> | schdate_del_<iso>."""
+    query = update.callback_query
+    data = query.data or ""
+    uid = str(query.from_user.id)
+    class_obj = _ct_admin_class(query, context)
+    if class_obj is None:
+        try:
+            await query.answer("Только для админа класса.", show_alert=True)
+        except Exception:
+            pass
+        return ADMIN_PANEL
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+    if data == "schdate_menu":
+        txt, kb = _schdate_menu(class_obj)
+        try:
+            await query.edit_message_text(
+                txt, reply_markup=kb, parse_mode=ParseMode.HTML)
+        except Exception:
+            try:
+                await context.bot.send_message(
+                    chat_id=int(uid), text=txt, reply_markup=kb)
+            except Exception:
+                pass
+        return ADMIN_PANEL
+
+    if data == "schdate_add":
+        user = get_user(uid)
+        if user is None:
+            user = User(uid)
+        user.schdate_pending = {"ts": time.time(), "target": "date:new"}
+        save_user(user)
+        ask = (
+            "📆 Пришлите ДАТУ, на которую нужно своё расписание:\n"
+            "• ДД.ММ.ГГГГ (например, 31.10.2026)\n"
+            "• или ДД.ММ — год подставлю сам (ближайшая будущая дата)\n\n"
+            "«отмена» — выйти."
+        )
+        try:
+            await query.message.edit_text(ask)
+        except Exception:
+            try:
+                await context.bot.send_message(chat_id=int(uid), text=ask)
+            except Exception:
+                pass
+        return ADMIN_PANEL
+
+    if data.startswith("schdate_del_"):
+        _iso = data.replace("schdate_del_", "", 1)
+        if not _bells_date_ok(_iso[:10]):
+            return ADMIN_PANEL
+        _iso = _iso[:10]
+        sd = getattr(class_obj, 'schedule_dates', None)
+        if isinstance(sd, dict) and _iso in sd:
+            sd.pop(_iso, None)
+            class_obj.schedule_dates = sd
+            classes = load_classes()
+            classes[class_obj.class_code] = class_obj
+            save_classes(classes)
+            try:
+                _dd = datetime.strptime(_iso, "%Y-%m-%d").strftime("%d.%m.%Y")
+                _log_admin_action(uid, class_obj.class_code,
+                                  f"Отдельный день {_dd}", "удалён")
+            except Exception:
+                pass
+        txt, kb = _schdate_menu(class_obj)
+        try:
+            await query.edit_message_text(
+                txt, reply_markup=kb, parse_mode=ParseMode.HTML)
+        except Exception:
+            try:
+                await context.bot.send_message(
+                    chat_id=int(uid), text=txt, reply_markup=kb)
+            except Exception:
+                pass
+        return ADMIN_PANEL
+
+    if data.startswith("schdate_in_"):
+        _iso = data.replace("schdate_in_", "", 1)[:10]
+        if not _bells_date_ok(_iso):
+            return ADMIN_PANEL
+        user = get_user(uid)
+        if user is None:
+            user = User(uid)
+        user.schdate_pending = {"ts": time.time(), "target": f"date:{_iso}"}
+        save_user(user)
+        _schdate_ask_content(query, context, _iso, uid)
+        return ADMIN_PANEL
+
+    if data.startswith("schdate_set_"):
+        _iso = data.replace("schdate_set_", "", 1)[:10]
+        if not _bells_date_ok(_iso):
+            return ADMIN_PANEL
+        txt, kb = _schdate_date_screen(class_obj, _iso)
+        if txt is None:
+            return ADMIN_PANEL
+        try:
+            await query.edit_message_text(
+                txt, reply_markup=kb, parse_mode=ParseMode.HTML)
+        except Exception:
+            try:
+                await context.bot.send_message(
+                    chat_id=int(uid), text=txt, reply_markup=kb)
+            except Exception:
+                pass
+        return ADMIN_PANEL
+
+    return ADMIN_PANEL
+
+
+class _SchdatePendingFilter(filters.MessageFilter):
+    """Текст ждёт отдельный день-по-дате: живёт персистентный флаг
+    user.schdate_pending (паттерн bells/duty/ctm — переживает рестарт)."""
+    def filter(self, message):
+        try:
+            if not message.from_user:
+                return False
+            u = get_user(str(message.from_user.id))
+            if u is None:
+                return False
+            pend = getattr(u, "schdate_pending", None)
+            if not isinstance(pend, dict):
+                return False
+            if (time.time() - float(pend.get("ts") or 0)) > 3 * 3600:
+                return False
+            return True
+        except Exception:
+            return False
+
+
+_SCHDATE_PENDING_FILTER = _SchdatePendingFilter()
+
+
+class _SchdatePhotoFilter(filters.MessageFilter):
+    """Картинка для отдельного дня-по-дате: pending с готовой датой."""
+    def filter(self, message):
+        try:
+            if not message.from_user:
+                return False
+            u = get_user(str(message.from_user.id))
+            if u is None:
+                return False
+            pend = getattr(u, "schdate_pending", None)
+            if not isinstance(pend, dict):
+                return False
+            tgt = str(pend.get("target") or "")
+            if not tgt.startswith("date:") or tgt == "date:new":
+                return False
+            if (time.time() - float(pend.get("ts") or 0)) > 3 * 3600:
+                return False
+            return True
+        except Exception:
+            return False
+
+
+_SCHDATE_PHOTO_FILTER = _SchdatePhotoFilter()
+
+
+def _schdate_resolve_class(update, context, uid):
+    """Класс админа для ввода дня-по-дате (или None)."""
+    code = None
+    try:
+        code = context.user_data.get('current_admin_class')
+    except Exception:
+        code = None
+    class_obj = get_class_by_code(code) if code else None
+    if class_obj and uid in (class_obj.admins or []):
+        return class_obj
+    cand = _admin_class_for_uid(uid)
+    if cand is not None:
+        return cand
+    return None
+
+
+async def _schdate_text_handler(update, context):
+    """Глобальный приёмчик текста отдельного дня (вне FSM): дата или расписание."""
+    if not update.message or not update.effective_user:
+        return
+    uid = str(update.effective_user.id)
+    user = get_user(uid)
+    if user is None:
+        return
+    pend = getattr(user, "schdate_pending", None)
+    if not isinstance(pend, dict):
+        return
+    try:
+        if (time.time() - float(pend.get("ts") or 0)) > 3 * 3600:
+            user.schdate_pending = None
+            save_user(user)
+            return
+    except Exception:
+        user.schdate_pending = None
+        save_user(user)
+        return
+    raw = (update.message.text or "").strip()
+    if raw.lower() in ("отмена", "cancel", "/cancel"):
+        user.schdate_pending = None
+        save_user(user)
+        await update.message.reply_text("Отдельный день отменён.")
+        return
+
+    tgt = str(pend.get("target") or "")
+
+    if tgt == "date:new":
+        # Первый шаг: прислали САМУ ДАТУ.
+        iso = _bells_date_from_text(raw)
+        if not iso:
+            await update.message.reply_text(
+                "❓ Не понял дату. Пришлите её в формате ДД.ММ.ГГГГ (или "
+                "ДД.ММ — год подставлю сам), например: 31.10.2026\n"
+                "«отмена» — выйти.")
+            return
+        pend["target"] = f"date:{iso}"
+        save_user(user)
+        try:
+            _dd = datetime.strptime(iso, "%Y-%m-%d").strftime("%d.%m.%Y")
+        except ValueError:
+            _dd = iso
+        await update.message.reply_text(
+            f"📅 Дата: {_dd}. Теперь пришлите расписание на эту дату — "
+            "текстом (одним сообщением) или КАРТИНКОЙ (можно с подписью).\n"
+            "«отмена» — выйти.")
+        return
+
+    # Второй шаг: текст расписания на дату.
+    iso = tgt.replace("date:", "", 1)[:10]
+    if not _bells_date_ok(iso):
+        user.schdate_pending = None
+        save_user(user)
+        await update.message.reply_text(
+            "Дата потерялась — начните заново: «📅 Редактировать "
+            "расписание» → «📆 Отдельный день (по дате)».")
+        return
+    if not raw:
+        await update.message.reply_text(
+            "❌ Расписание не может быть пустым. Введите текст, пришлите "
+            "картинку или напишите «отмена».")
+        return
+    if await reject_if_forbidden_chars(update, raw, True) is not None:
+        return
+    class_obj = _schdate_resolve_class(update, context, uid)
+    if class_obj is None:
+        user.schdate_pending = None
+        save_user(user)
+        await update.message.reply_text(
+            "Вы больше не админ класса — отдельный день отменён.")
+        return
+    try:
+        _dd = datetime.strptime(iso, "%Y-%m-%d").strftime("%d.%m.%Y")
+    except ValueError:
+        _dd = iso
+    ok = _schdate_set_value(class_obj, iso, raw[:4000], uid)
+    if ok:
+        _log_admin_action(uid, class_obj.class_code,
+                          f"Отдельный день {_dd}", f"текст: {raw[:200]}")
+        user.schdate_pending = None
+        save_user(user)
+        await update.message.reply_text(
+            f"✅ Расписание на {_dd} сохранено!\n\n{raw[:1500]}\n\n"
+            "В эту дату оно главнее дня недели — ученики увидят его в "
+            "«📅 Сегодня/Завтра» и «📅 Расписание».",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ К датам",
+                                      callback_data="schdate_menu")],
+            ]))
+    elif len(_schdate_sorted(class_obj)) >= _SCHDATE_MAX:
+        await update.message.reply_text(
+            f"⚠️ Уже задано {_SCHDATE_MAX} отдельных дней — удалите "
+            "какие-нибудь старые, чтобы добавить новые.")
+    else:
+        await update.message.reply_text(
+            "❌ Не удалось сохранить (ошибка записи файла). Попробуйте ещё раз.")
+
+
+async def _schdate_photo_handler(update, context):
+    """Глобальный приёмчик КАРТИНКИ отдельного дня (вне FSM)."""
+    if not update.message or not update.effective_user:
+        return
+    uid = str(update.effective_user.id)
+    user = get_user(uid)
+    if user is None:
+        return
+    pend = getattr(user, "schdate_pending", None)
+    if not isinstance(pend, dict):
+        return
+    tgt = str(pend.get("target") or "")
+    iso = tgt.replace("date:", "", 1)[:10]
+    if tgt == "date:new" or not _bells_date_ok(iso):
+        return
+    msg = update.message
+    photo = getattr(msg, "photo", None)
+    doc = getattr(msg, "document", None)
+    is_doc_image = bool(
+        doc is not None
+        and str(getattr(doc, "mime_type", "") or "").startswith("image/"))
+    if not photo and not is_doc_image:
+        await msg.reply_text(
+            "Пришлите ИЗОБРАЖЕНИЕ расписания (фото) — либо введите текст "
+            "расписания сообщением, либо напишите «отмена».")
+        return
+    caption = (msg.caption or "").strip()
+    if caption:
+        if await reject_if_forbidden_chars(update, caption, True) is not None:
+            return
+    class_obj = _schdate_resolve_class(update, context, uid)
+    if class_obj is None:
+        user.schdate_pending = None
+        save_user(user)
+        await msg.reply_text(
+            "Вы больше не админ класса — отдельный день отменён.")
+        return
+    try:
+        _dd = datetime.strptime(iso, "%Y-%m-%d").strftime("%d.%m.%Y")
+    except ValueError:
+        _dd = iso
+    file_id = (photo[-1].file_id if photo else doc.file_id)
+    value = {"image": file_id, "caption": caption[:800]}
+    ok = _schdate_set_value(class_obj, iso, value, uid)
+    if ok:
+        _log_admin_action(uid, class_obj.class_code,
+                          f"Отдельный день {_dd}",
+                          f"КАРТИНКА{': ' + caption[:180] if caption else ''}")
+        user.schdate_pending = None
+        save_user(user)
+        await msg.reply_text(
+            f"✅ Расписание на {_dd} сохранено КАРТИНКОЙ!"
+            + (f"\n📝 Подпись: {caption}" if caption else "")
+            + "\n\nВ эту дату оно главнее дня недели — ученики увидят его "
+              "в «📅 Сегодня/Завтра» и «📅 Расписание».",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ К датам",
+                                      callback_data="schdate_menu")],
+            ]))
+    elif len(_schdate_sorted(class_obj)) >= _SCHDATE_MAX:
+        await msg.reply_text(
+            f"⚠️ Уже задано {_SCHDATE_MAX} отдельных дней — удалите "
+            "какие-нибудь старые, чтобы добавить новые.")
+    else:
+        await msg.reply_text(
+            "❌ Не удалось сохранить (ошибка записи файла). Попробуйте ещё раз.")
+
+
 class _BellsBulkFilter(filters.MessageFilter):
     """ВОЛНА 22.41: текст — это список звонков, только если админ ранее
     нажал «📜 Ввести весь список» (флаг user.bells_pending жив)."""
@@ -66494,6 +75029,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return MAIN_MENU
         _cb_pf["sent"] = True
 
+    # ВОЛНА 23.09: кнопка «✅ Я подписался(ась)» уходит в свой обработчик
+    # ДО общего query.answer() — обработчик сам решает, чем отвечать:
+    # alert «Подписка не найдена…» при отказе или молчаливый ответ при
+    # пуске. Общий answer ниже отвечал на колбэк первым, повторный
+    # answer с alert падал тихо, и отказ в разговоре выглядел как
+    # мёртвая кнопка («проверка подписки не работает»).
+    if data == "check_subscription":
+        await check_subscription_handler(update, context)
+        return MAIN_MENU
+
     # ВОЛНА 22.78: ответ на колбэк — БЕЗОПАСНЫЙ. Когда бот занят (идёт
     # загрузка файла, медленная сеть, очередь обновлений), нажатие кнопки
     # доходит с задержкой и Telegram отвечает на answer() ошибкой «Query is
@@ -66508,15 +75053,25 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
     # Обязательная подписка на канал: не пускаем пользователя никуда, пока
-    # он не подписан. Исключение — сама кнопка проверки подписки и кнопка
-    # разблокировки аккаунта (чтобы можно было оплатить разблок).
-    if data != "check_subscription" and data != "unblock_self":
+    # он не подписан. Исключение — кнопка разблокировки аккаунта (чтобы
+    # можно было оплатить разблок).
+    # ВОЛНА 23.10.5 (аудит «я зарегистрировался — бот просит регистрацию
+    # заново»): кнопки ЦЕПОЧКИ РЕГИСТРАЦИИ гейтом больше НЕ перепроверяются.
+    # Гейт уже прошёл на /start (аккаунт создаётся только подписанным), а
+    # повторная проверка на каждом шаге при гонке Telegram (лаг вступления
+    # в канал / флуд API) ПОГЛОЩАЛА клик: «Я прочитал инструкцию» превращался
+    # в «подпишитесь на канал», шаг терялся, и регистрация начиналась
+    # заново. Все «рабочие» кнопки (меню, файлы, классы) проверяются
+    # как раньше.
+    _REG_CHAIN_CALLBACKS = frozenset({
+        "instructions_read", "accept_disclaimer", "decline_disclaimer",
+        "pdn_accept", "pdn_decline", "pdn_privacy_full", "back_to_pdn",
+        "parent_consent_yes", "parent_consent_no",
+        "skip_city", "skip_birthday",
+    })
+    if data != "unblock_self" and data not in _REG_CHAIN_CALLBACKS:
         if not await ensure_subscribed(update, context):
             return MAIN_MENU
-
-    if data == "check_subscription":
-        await check_subscription_handler(update, context)
-        return MAIN_MENU
 
     # ВОЛНА 22.27: возрастной гейт 13+. Если по указанному ДР пользователю
     # меньше 13 — ЛЮБЫЕ колбэки, кроме поддержки/подписки/разблока, закрыты
@@ -66544,6 +75099,22 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
         return MAIN_MENU
+
+    # ВОЛНА 23.10.11 («ИИ иногда отвечает, когда я просто пользуюсь
+    # ботом»): любое нажатие inline-кнопки бота, КРОМЕ кнопок самого
+    # ИИ-чата, выходит из режима ИИ — режим больше не «просачивается» в
+    # обычную работу (история диалога при этом сохраняется).
+    if context.user_data.get('ai_mode') and isinstance(data, str):
+        if not (data.startswith("ai_persona_") or data.startswith("ai_model_")
+                or data.startswith("ai_ownkey_") or data.startswith("ai_pick_")
+                or data.startswith("dev_ai_")
+                or data in ("ai_exit_now", "ai_go_chat", "ai_stop_gen",
+                            "check_subscription")):
+            context.user_data['ai_mode'] = False
+            # ВОЛНА 23.10.12: кнопка бота нажата ПОКА ИИ ДУМАЕТ — отменяем
+            # генерацию по-настоящему (черновик и «три точки» погасит
+            # сообщение, которое отправит сама кнопка).
+            _ai_cancel_active(str(query.from_user.id))
 
     # ВОЛНА 22.4: маршрутизатор pult_* удалён вместе с Пультом.
 
@@ -66614,6 +75185,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await _safe_cb_answer(query, "Ошибка")
         return MAIN_MENU
+    elif data == "open_stars":
+        # ВОЛНА 23.00: «⭐ Звезды» из ⚙️ Настроек — тот же stars_menu, что и
+        # из главного меню (умеет открытие по callback_query: edit_message_text).
+        return await stars_menu(update, context)
 
     # === Смена режима личности ИИ (normal / hamlo / warm) ===
     if data.startswith("ai_persona_"):
@@ -66657,6 +75232,84 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
         return MAIN_MENU
+
+    # === ВОЛНА 23.10.10/23.10.11: ИИ-провайдеры + свой API-ключ ===
+    if data.startswith("dev_ai_"):
+        return await _dev_ai_route(update, context)
+    # ВОЛНА 23.10.11: выход из ИИ по inline-кнопке под ответом.
+    # ВОЛНА 23.10.12: ⏹ — остановить ГЕНЕРАЦИЮ, оставаясь в режиме ИИ
+    # (кнопка висит под анимацией «думает», пока черновики недоступны).
+    if data == "ai_stop_gen":
+        _sg_uid = str(query.from_user.id)
+        _AI_LAST_ACT[_sg_uid] = time.time()
+        _stopped = _ai_cancel_active(_sg_uid)
+        try:
+            await query.answer("⏹ Остановлено" if _stopped
+                               else "Сейчас ничего не генерируется")
+        except Exception:
+            pass
+        if _stopped:
+            try:
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text="⏹ Генерация остановлена. Режим ИИ включён — "
+                         "задайте новый вопрос.",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("❌ Выйти из ИИ",
+                                             callback_data="ai_exit_now"),
+                        InlineKeyboardButton("☰ Меню",
+                                             callback_data="back_to_main"),
+                    ]]))
+            except Exception:
+                pass
+        return MAIN_MENU
+    if data == "ai_exit_now":
+        _xu = str(query.from_user.id)
+        context.user_data['ai_mode'] = False
+        # ВОЛНА 23.10.12: отменяем идущую генерацию — сообщение ниже
+        # гасит черновик и «три точки» у поля ввода.
+        _AI_LAST_ACT.pop(_xu, None)
+        _ai_cancel_active(_xu)
+        try:
+            user_conversations.pop(_xu, None)
+        except Exception:
+            pass
+        try:
+            await query.answer("👋 Вы вышли из режима ai")
+        except Exception:
+            pass
+        _xu_user = get_user(_xu)
+        try:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="👋 Вы вышли из режима ai. Пользуйтесь кнопками бота как обычно.",
+                reply_markup=get_main_menu_keyboard(_xu_user) if _xu_user else None)
+        except Exception:
+            pass
+        return MAIN_MENU
+    if data == "ai_go_chat":
+        context.user_data['ai_mode'] = True
+        _AI_LAST_ACT[str(query.from_user.id)] = time.time()
+        try:
+            await query.answer("🤖 Режим ai активирован")
+        except Exception:
+            pass
+        try:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="🤖 Режим ai активирован! Напишите вопрос — я отвечу.\n"
+                     "Выход — кнопка «❌ Выход из ai» или «❌ Выйти из ИИ» под ответом.",
+                reply_markup=ReplyKeyboardMarkup([["❌ Выход из ai"]],
+                                                 resize_keyboard=True))
+        except Exception:
+            pass
+        return MAIN_MENU
+    # ВОЛНА 23.10.11: личный выбор модели УДАЛЁН (модель ставит
+    # разработчик); «🔑 Свой API-ключ» — новый экран; старые кнопки
+    # ai_model_* открывают его же.
+    if (data.startswith("ai_ownkey_") or data.startswith("ai_pick_")
+            or data.startswith("ai_model_")):
+        return await _ai_ownkey_route(update, context)
 
     # === Сброс статистики Stars (история переводов больше не ведётся) ===
     if data == "dev_reset_stars":
@@ -66908,8 +75561,80 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await sol_list_cb(update, context)
     elif data.startswith("sol_view_"):
         return await sol_view_cb(update, context)
+    elif data.startswith("sol_delv_") or data.startswith("sol_del_"):
+        # ВОЛНА 22.97: админ удаляет решение из базы
+        return await sol_del_cb(update, context)
+    elif data.startswith("solc_add_"):
+        # ВОЛНА 23.10.7: написать комментарий под решением.
+        return await solc_add_cb(update, context)
+    elif data.startswith("solc_edit_"):
+        # ВОЛНА 23.10.7: изменить запись (комментарий) под решением.
+        return await solc_edit_cb(update, context)
+    elif data.startswith("solc_del_"):
+        # ВОЛНА 23.10.7: удалить запись (комментарий) под решением.
+        return await solc_del_cb(update, context)
+    elif data.startswith("solc_"):
+        # ВОЛНА 23.10.7: экран комментариев решения (порядок веток важен:
+        # solc_add_/solc_edit_/solc_del_ выше, здесь — чистое solc_<id>).
+        return await solc_menu_cb(update, context)
+    elif data.startswith("soledit_sub_"):
+        # ВОЛНА 23.10.6: изменить предмет решения.
+        return await soledit_sub_start_cb(update, context)
+    elif data.startswith("soledit_files_"):
+        # ВОЛНА 23.10.6: заменить файлы решения.
+        return await soledit_files_start_cb(update, context)
+    elif data == "soledit_done":
+        # ВОЛНА 23.10.6: «✅ Готово» — заменить файлы решения.
+        return await soledit_done_cb(update, context)
+    elif data == "soledit_cancel":
+        # ВОЛНА 23.10.6: отмена правки решения.
+        return await soledit_cancel_cb(update, context)
+    elif data.startswith("soledit_"):
+        # ВОЛНА 23.10.6: меню правки решения (автор/староста).
+        return await soledit_menu_cb(update, context)
     elif data == "sol_toggle_notify":
         return await sol_toggle_notify_cb(update, context)
+    elif data == "toggle_watermark":
+        # ВОЛНА 23.03: тоггл водяного знака на фото расписания.
+        return await toggle_watermark_cb(update, context)
+    elif data == "btn_style_menu":
+        # ВОЛНА 23.10.6: меню «🎨 Цвет кнопок» (личная настройка).
+        return await btn_style_menu_cb(update, context)
+    elif data.startswith("btn_style_set_"):
+        # ВОЛНА 23.10.6: выбор базового цвета кнопок.
+        return await btn_style_set_cb(update, context)
+    elif data == "btn_style_autocolor":
+        # ВОЛНА 23.10.6: тоггл автоцвета (отмена/подтверждение).
+        return await btn_style_autocolor_cb(update, context)
+    elif data == "btn_ovr_menu":
+        # ВОЛНА 23.10.7: список правил «цвет конкретной кнопки».
+        return await btn_ovr_menu_cb(update, context)
+    elif data == "btn_ovr_add":
+        # ВОЛНА 23.10.9: ручной ввод текста кнопки УДАЛЁН (осталась
+        # панель). Старые сообщения с этой кнопкой открывают панель.
+        return await btn_ovr_panel_cb(update, context)
+    elif data.startswith("btn_ovr_set_"):
+        # ВОЛНА 23.10.7: выбор цвета для правила.
+        return await btn_ovr_set_cb(update, context)
+    elif data.startswith("btn_ovr_pick_"):
+        # ВОЛНА 23.10.7: смена цвета существующего правила.
+        return await btn_ovr_pick_cb(update, context)
+    elif data.startswith("btn_ovr_del_"):
+        # ВОЛНА 23.10.7: удаление правила.
+        return await btn_ovr_del_cb(update, context)
+    elif data == "btn_ovr_panel" or data.startswith("btn_ovr_panel_"):
+        # ВОЛНА 23.10.8: панель всех кнопок бота (страница №N).
+        return await btn_ovr_panel_cb(update, context)
+    elif data.startswith("btn_ovr_psel_"):
+        # ВОЛНА 23.10.8: в панели выбрана кнопка — предлагаем цвет.
+        return await btn_ovr_psel_cb(update, context)
+    elif data == "btn_ovr_noop":
+        # ВОЛНА 23.10.8: индикатор страницы «N/M» — просто гасим часики.
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        return USER_SETTINGS
     elif data == "toggle_spend_privacy":
         # ВОЛНА 22.73: приватность в топе трат (⚙️ Настройки).
         return await toggle_spend_privacy_cb(update, context)
@@ -67080,6 +75805,59 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown"
             )
         return DEV_PANEL
+    # === ВОЛНА 23.04: канал подписки + автозапуск ===
+    elif data == "dev_channel":
+        return await dev_channel_cb(update, context)
+    elif data == "dev_channel_edit":
+        return await dev_channel_edit_cb(update, context)
+    elif data == "dev_channel_reset":
+        return await dev_channel_reset_cb(update, context)
+    elif data == "dev_channel_probe":
+        return await dev_channel_probe_cb(update, context)
+    elif data == "dev_autologin":
+        return await dev_autologin_cb(update, context)
+    elif data == "dev_toggle_autologin":
+        return await dev_toggle_autologin_cb(update, context)
+    elif data == "dev_autologin_now":
+        return await dev_autologin_now_cb(update, context)
+    elif data == "dev_subrecheck":
+        return await dev_subrecheck_cb(update, context)
+    elif data == "dev_subrecheck_toggle":
+        return await dev_subrecheck_toggle_cb(update, context)
+    elif data == "dev_subrecheck_dm":
+        return await dev_subrecheck_dm_cb(update, context)
+    elif data == "dev_subrecheck_hours":
+        return await dev_subrecheck_hours_cb(update, context)
+    elif data == "dev_subrecheck_now":
+        return await dev_subrecheck_now_cb(update, context)
+    elif data == "dev_subgate":
+        # ВОЛНА 23.10: главный тоггл обязательной подписки из панели —
+        # одно нажатие включает/выключает требование подписки для всех.
+        new_state = toggle_dev_sub_gate()
+        await _safe_cb_answer(
+            update.callback_query,
+            "🚪 Обязательная подписка: "
+            + ("ВКЛЮЧЕНА — бот снова требует подписку на канал."
+               if new_state else
+               "ВЫКЛЮЧЕНА — бот больше не требует подписку на канал."),
+            show_alert=True)
+        try:
+            await update.callback_query.edit_message_reply_markup(
+                reply_markup=get_developer_keyboard()
+            )
+        except Exception:
+            # Не удалось обновить только клавиатуру — перерисовываем панель.
+            await update.callback_query.edit_message_text(
+                "🛠️ **Панель разработчика**\n\nВыберите действие:",
+                reply_markup=get_developer_keyboard(),
+                parse_mode="Markdown"
+            )
+        return DEV_PANEL
+    elif data == "dev_subgate_toggle":
+        # ВОЛНА 23.10: тоггл с экрана «📢 Канал подписки» — переключаем
+        # и перерисовываем этот же экран (статус и надпись обновятся).
+        toggle_dev_sub_gate()
+        return await dev_channel_cb(update, context)
     elif data.startswith("dev_class_msg_"):
         return await dev_class_message_select(update, context)
     elif data.startswith("dev_delete_class_"):
@@ -67384,6 +76162,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "send_class_message":
         return await send_class_message_start(update, context)
+    # ВОЛНА 23.10.7: личное сообщение КОНКРЕТНОМУ участнику (админ класса).
+    elif data == "adm_msg_menu":
+        return await adm_msg_menu_cb(update, context)
+    elif data.startswith("admmsg_"):
+        return await adm_msg_pick_cb(update, context)
     # ВОЛНА 22.30: настройки ДЕЖУРНЫХ (админ-панель → «🕐 Дежурные»).
     elif data == "duty_admin":
         return await duty_admin_menu_cb(update, context)
@@ -67420,6 +76203,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await duty_custom_test_cb(update, context)
     elif data == "duty_custom_off":
         return await duty_custom_off_cb(update, context)
+    elif data == "duty_custom_start":
+        # ВОЛНА 22.96: «🚩 Начать с кого-то» — список имён на выбор
+        return await duty_custom_start_cb(update, context)
+    elif data.startswith("duty_start_"):
+        return await duty_start_pick_cb(update, context)
     # ВОЛНА 22.66: «Расписание с сайтов» (админ-панель → 🌐)
     elif data == "schmon_menu":
         return await schmon_menu_cb(update, context)
@@ -67439,10 +76227,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await schmon_text_cb(update, context)
     elif data.startswith("schall:"):
         return await schmon_all_cb(update, context)
+    elif data.startswith("schwh:"):
+        # ВОЛНА 23.10.6: запись из истории расписаний (последние 2 дня).
+        return await schweb_history_cb(update, context)
     elif data.startswith("schdel:"):
         return await schmon_del_cb(update, context)
     elif data == "edit_schedule":
         return await edit_schedule_start(update, context)
+    elif data.startswith("schdate_"):
+        # ВОЛНА 23.10.10: отдельное расписание/фото на конкретную ДАТУ.
+        return await _schdate_ovr_route(update, context)
     elif data == "edit_teachers":
         return await edit_teachers_start(update, context)
     elif data == "edit_bells":
@@ -67524,6 +76318,27 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await delete_homework_start(update, context)
     elif data == "view_homework":
         return await view_homework_handler(update, context)
+    elif data == "edit_homework":
+        # ВОЛНА 23.10.6: «✏️ Изменить ДЗ» — правка добавленного задания.
+        return await edit_homework_start(update, context)
+    elif data.startswith("hweditsub_"):
+        # ВОЛНА 23.10.6: выбор предмета для правки ДЗ.
+        return await edit_homework_subject_cb(update, context)
+    elif data.startswith("hwedt_txt_"):
+        # ВОЛНА 23.10.6: правка текста пункта ДЗ.
+        return await hw_edit_text_start_cb(update, context)
+    elif data.startswith("hwedt_date_"):
+        # ВОЛНА 23.10.6: правка даты пункта ДЗ.
+        return await hw_edit_date_start_cb(update, context)
+    elif data.startswith("hwedt_add_"):
+        # ВОЛНА 23.10.6: добавление фото/файлов к пункту ДЗ.
+        return await hw_edit_add_media_start_cb(update, context)
+    elif data.startswith("hwedt_clear_"):
+        # ВОЛНА 23.10.6: убрать все вложения пункта ДЗ.
+        return await hw_edit_clear_media_cb(update, context)
+    elif data.startswith("hwedit_"):
+        # ВОЛНА 23.10.6: карточка пункта ДЗ с кнопками правки.
+        return await edit_homework_item_cb(update, context)
     elif data == "hw_new_subject":
         return await hw_new_subject_start(update, context)
     elif data == "hw_delete_subject_list":
@@ -67922,6 +76737,11 @@ async def cancel_action_handler(update: Update, context: ContextTypes.DEFAULT_TY
         'anon_target', 'quick_admin_class', 'broadcast_text',
         # ВОЛНА 22.4: буфер вложений ДЗ тоже стирается при отмене.
         'hw_media_buffer', 'hw_media_desc',
+        # ВОЛНА 23.10.6: режим правки ДЗ («✏️ Изменить ДЗ»).
+        'hw_edit',
+        # ВОЛНА 23.10.7: буферы новых режимов — правило цвета кнопки (🎯),
+        # личное сообщение админа (✉️), комментарий под решением (💬).
+        'btn_ovr_pending', 'adm_msg_pending', 'sol_comment_pending',
     ]
     for key in temp_keys:
         context.user_data.pop(key, None)
@@ -69061,9 +77881,13 @@ async def enter_city_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     регистрация считается завершённой (`setup_completed = True`).
     """
     user_id = str(update.effective_user.id)
-    user = get_user(user_id)
-    if not user:
-        user = User(user_id)
+    # ВОЛНА 23.10.4: при пропавшей записи создаём профиль на месте
+    # (_ensure_user_record, с user_code) — раньше здесь мог появиться
+    # «голый» User без user_code, а сбой чтения базы оборачивался ошибкой.
+    user = _ensure_user_record(
+        user_id,
+        getattr(update.effective_user, "username", ""),
+        getattr(update.effective_user, "first_name", ""))
     city_input = update.message.text.strip()
 
     # Проверяем на запрещённые символы — соблюдаем общую политику бота.
@@ -69160,12 +77984,25 @@ async def skip_birthday_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
     except Exception:
         pass
-    user = get_user(str(query.from_user.id))
-    if not user:
-        await query.edit_message_text("Профиль не найден. Начните с /start")
-        return ConversationHandler.END
+    # ВОЛНА 23.10.4: пропавший профиль — НЕ тупик «Профиль не найден»:
+    # создаём запись на месте; даты в ней не будет — ниже честная просьба
+    # ввести дату, регистрация продолжается.
+    try:
+        user = _ensure_user_record(str(query.from_user.id),
+                                   query.from_user.username,
+                                   query.from_user.first_name)
+    except Exception as e:
+        logger.error(f"skip_birthday_cb: _ensure_user_record: {e}")
+        await _dev_safe_edit(query,
+                             "⚠️ Не удалось открыть профиль. Нажмите кнопку "
+                             "ещё раз — обычно помогает сразу; если нет, "
+                             "нажмите /start.")
+        return None
     if not user.birthday:
-        await query.edit_message_text(
+        # ВОЛНА 23.10.4: защищённый показ (двойное нажатие / старое
+        # сообщение больше не дают «⚠️ Произошла ошибка»).
+        await _dev_safe_edit(
+            query,
             "🎂 Пропустить дату рождения больше нельзя — она обязательна "
             "(по ней проверяется возраст 13+).\n\n"
             "Введите вашу реальную дату рождения в формате ГГГГ-ММ-ДД "
@@ -69182,21 +78019,45 @@ async def skip_city_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Город не сохраняется — погода по городу просто не работает. Часовой
     пояс ставится дефолтным UTC+3 (тот же fallback, что в
     enter_city_handler при сбое определения). Город можно добавить позже:
-    ⚙️ Настройки → 🌦 Настройки погоды → 🏙 Город."""
+    ⚙️ Настройки → 🌦 Настройки погоды → 🏙 Город.
+
+    ВОЛНА 23.10.4: нажатие «⏭ Пропустить» больше не может закончиться
+    «⚠️ Произошла ошибка»:
+      • пропавший профиль — НЕ тупик: пересоздаём на месте
+        (_ensure_user_record, как на согласиях в 23.10.3) и штатно
+        завершаем регистрацию;
+      • сбой сохранения не прерывает флоу (город и так необязателен);
+      • показ экрана классов под защитой: любой сбой edit компенсируется
+        досылом, а не текстом ошибки (жалоба: «хочу пропустить город —
+        выдаёт ошибку»)."""
     query = update.callback_query
     try:
         await query.answer()
     except Exception:
         pass
-    user = get_user(str(query.from_user.id))
-    if not user:
-        await query.edit_message_text("Профиль не найден. Начните с /start")
-        return ConversationHandler.END
+    # ВОЛНА 23.10.4: самовосстановление профиля вместо тупика
+    # «Профиль не найден. Начните с /start».
+    try:
+        user = _ensure_user_record(str(query.from_user.id),
+                                   query.from_user.username,
+                                   query.from_user.first_name)
+    except Exception as e:
+        logger.error(f"skip_city_cb: _ensure_user_record: {e}")
+        await _dev_safe_edit(query,
+                             "⚠️ Не удалось открыть профиль. Нажмите "
+                             "«⏭ Пропустить» ещё раз — обычно помогает "
+                             "сразу; если нет, нажмите /start.")
+        return None
     if not user.city:
         user.timezone = 3  # дефолт UTC+3 — как fallback в enter_city_handler
         user.set_time = datetime.now().isoformat()
         user.setup_completed = True
-        save_user(user)
+        # ВОЛНА 23.10.4: сбой сохранения больше НЕ показывается как ошибка —
+        # город необязателен, данные досохранятся на следующих шагах.
+        try:
+            save_user(user)
+        except Exception as e:
+            logger.error(f"skip_city_cb: save_user не удался: {e}")
         # ВОЛНА 22.73: путь «⏭ Пропустить город» тоже завершает регистрацию —
         # начисляем реферальный бонус здесь (раньше приглашающий ждал бы
         # следующего /start или не получал звёзды вовсе).
@@ -69226,7 +78087,22 @@ async def skip_city_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception:
         pass
-    await class_management(update, context)
+    # ВОЛНА 23.10.4: показ экрана классов под внешней страховкой —
+    # даже если внутренние защиты не сработали, пользователь увидит
+    # меню, а не «⚠️ Произошла ошибка».
+    try:
+        await class_management(update, context)
+    except Exception as e:
+        logger.error(f"skip_city_cb: class_management не показался: {e}")
+        try:
+            await context.bot.send_message(
+                chat_id=int(user.user_id),
+                text="🎓 Управление классами доступно в главном меню — "
+                     "откройте его кнопкой ниже.",
+                reply_markup=get_main_menu_keyboard(user))
+        except Exception as e2:
+            logger.error(f"skip_city_cb: досыл меню: {e2}")
+        return MAIN_MENU
     return CLASS_MANAGEMENT
 
 
@@ -69394,9 +78270,11 @@ async def change_city_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     ПУНКТ 10: при смене города часовой пояс пересчитывается автоматически.
     """
     user_id = str(update.effective_user.id)
-    user = get_user(user_id)
-    if not user:
-        user = User(user_id)
+    # ВОЛНА 23.10.4: самовосстановление профиля (см. enter_city_handler).
+    user = _ensure_user_record(
+        user_id,
+        getattr(update.effective_user, "username", ""),
+        getattr(update.effective_user, "first_name", ""))
     city_input = update.message.text.strip()
     err = await reject_if_forbidden_chars(update, city_input, CHANGE_CITY)
     if err:
@@ -69903,9 +78781,12 @@ async def dev_instant_broadcast_start(update: Update, context: ContextTypes.DEFA
     if str(query.from_user.id) != DEVELOPER_ID:
         await query.edit_message_text("Доступ запрещён.")
         return MAIN_MENU
+    # ВОЛНА 23.08: текст ИЛИ любой файл — уйдёт всем как есть, без подписи.
     await query.edit_message_text(
         "📩 Введите сообщение, которое будет отправлено всем пользователям "
-        "БЕЗ подписи разработчика (как обычное уведомление):",
+        "БЕЗ подписи разработчика (как обычное уведомление).\n\n"
+        "📎 Или отправьте ЛЮБОЙ файл (фото, видео, документ, аудио, "
+        "голосовое, кружок) — он уйдёт всем как есть, без подписи.",
         reply_markup=get_cancel_keyboard()
     )
     return DEV_INSTANT_BROADCAST
@@ -69918,14 +78799,21 @@ async def dev_instant_broadcast_handler(update: Update, context: ContextTypes.DE
     if user_id != DEVELOPER_ID:
         await update.message.reply_text("Доступ запрещён.")
         return MAIN_MENU
-    message_text = update.message.text
+    # ВОЛНА 23.08: текст — прежний путь; ЛЮБОЙ файл — копия всем как
+    # есть (без подписи, как и обещает кнопка).
+    _msg = update.message
+    _is_text = bool((_msg.text or "").strip())
+    message_text = _msg.text or ""
     users = load_users()
     sent = 0
     for uid, user in users.items():
         if getattr(user, 'is_blocked', False):
             continue
         try:
-            await context.bot.send_message(chat_id=int(uid), text=message_text)
+            if _is_text:
+                await context.bot.send_message(chat_id=int(uid), text=message_text)
+            else:
+                await _dev_copy_message(context.bot, int(uid), _msg)
             sent += 1
         except Exception as e:
             logger.error(f"Ошибка анонимной рассылки {uid}: {e}")
@@ -70794,6 +79682,13 @@ async def sol_list_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
     entries = [e for e in _sol_alive_entries(class_obj.class_code)
                if isinstance(e, dict) and e.get("status") == "approved"]
+    # ВОЛНА 22.97: удалять решения может админ класса (или разработчик).
+    _sol_admin = (
+        str(query.from_user.id) == str(DEVELOPER_ID)
+        or str(query.from_user.id) in [str(a) for a in (class_obj.admins or [])])
+    # ВОЛНА 22.98: СВОЁ решение может удалить и его автор (real_author —
+    # бот знает автора даже анонимного решения).
+    _sol_viewer = str(query.from_user.id)
     if not entries:
         try:
             await query.edit_message_text(
@@ -70812,9 +79707,18 @@ async def sol_list_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # ВОЛНА 22.73: пометка многотомных записей (несколько файлов).
         _n_files = len(e.get("files") or []) or (1 if e.get("file") else 0)
         _multi = f" 📎×{_n_files}" if _n_files > 1 else ""
-        kb.append([InlineKeyboardButton(
+        _row = [InlineKeyboardButton(
             f"📘 {_flag}{_label}{_multi} · {e.get('ts', '')}",
-            callback_data=f"sol_view_{e['id']}")])
+            callback_data=f"sol_view_{e['id']}")]
+        # ВОЛНА 22.97: админу — кнопка удаления прямо в списке базы.
+        # ВОЛНА 22.98: автору — у ЕГО решения тоже.
+        # ВОЛНА 23.10.6: там же — «✏️» (правка предмета/файлов).
+        if _sol_admin or str(e.get("real_author") or e.get("author") or "") == _sol_viewer:
+            _row.append(InlineKeyboardButton(
+                "✏️", callback_data=f"soledit_{e['id']}"))
+            _row.append(InlineKeyboardButton(
+                "🗑", callback_data=f"sol_del_{e['id']}"))
+        kb.append(_row)
     kb.append([InlineKeyboardButton("⬅️ В меню базы", callback_data="sol_menu")])
     try:
         await query.edit_message_text(
@@ -70864,11 +79768,31 @@ async def sol_view_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _cap = (f"📘 {entry.get('subject') or 'Без предмета'} · "
             f"{_sol_author_label(entry)} · {entry.get('ts', '')}"
             + (f" · ⏳ удалится: {_sol_ttl_label(entry.get('ttl_h'))}"
-               if entry.get("ttl_h") else ""))
+               if entry.get("ttl_h") else "")
+            + (" · ✏️ изменено" if entry.get("edited") else ""))
     # ВОЛНА 22.27: под выданным решением — кнопка жалобы разработчику.
-    _rep_kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("🚨 Пожаловаться",
-                             callback_data=f"rep_sol_{sol_id}")]])
+    # ВОЛНА 23.10.7: + «💬 Комментарии» — обсуждение решения классом
+    # (написать/изменить запись может любой участник класса).
+    _rep_rows = [[
+        InlineKeyboardButton(
+            "💬 Комментарии: " + str(len(_sol_comments_get(entry))),
+            callback_data=f"solc_{sol_id}")],
+        [InlineKeyboardButton("🚨 Пожаловаться",
+                              callback_data=f"rep_sol_{sol_id}")]]
+    # ВОЛНА 22.97: админ класса может удалить решение (все файлы) сразу
+    # при просмотре — не дожидаясь срока хранения.
+    if (str(query.from_user.id) == str(DEVELOPER_ID)
+            or (class_obj is not None
+                and str(query.from_user.id) in [str(a) for a in (class_obj.admins or [])])
+            or str(entry.get("real_author") or entry.get("author") or "") == str(query.from_user.id)):
+        # ВОЛНА 22.98: кнопка видна админу класса И АВТОРУ решения.
+        # ВОЛНА 23.10.6: + «✏️ Изменить» (предмет/файлы) — тем же.
+        _rep_rows.insert(0, [
+            InlineKeyboardButton("✏️ Изменить",
+                                 callback_data=f"soledit_{sol_id}"),
+            InlineKeyboardButton("🗑 Удалить",
+                                 callback_data=f"sol_delv_{sol_id}")])
+    _rep_kb = InlineKeyboardMarkup(_rep_rows)
     # ВОЛНА 22.73: статус «расшифровываю» — видно сразу, до сетевой работы.
     _status_msg = None
     if any(f.get("ftype") == "seal" for f in _entry_files):
@@ -70950,6 +79874,1352 @@ async def sol_view_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
     return MAIN_MENU
+
+
+async def sol_del_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 22.97: админ класса удаляет решение из базы — вместе со всеми
+    его файлами (шифры стираются и из канала-хранилища). Два входа:
+    «🗑» в списке базы (sol_del_) и «🗑 Удалить решение» под открытым
+    файлом (sol_delv_). Не ждём срока хранения — удаление сразу.
+    ВОЛНА 22.98: СВОЁ решение может удалить и его АВТОР (real_author) —
+    в том числе анонимного (бот знает автора, класс — нет)."""
+    query = update.callback_query
+    _uid = str(query.from_user.id)
+    if query.data.startswith("sol_delv_"):
+        sol_id = query.data[len("sol_delv_"):]
+    else:
+        sol_id = query.data[len("sol_del_"):]
+    entry = _sol_find_entry(sol_id)
+    if entry is None:
+        await query.answer("Решение не найдено (уже удалено?).",
+                           show_alert=True)
+        return MAIN_MENU
+    class_obj = get_class_by_code(entry.get("class_code"))
+    # ВОЛНА 22.98: удалять может админ класса ИЛИ сам автор решения.
+    _sol_is_admin = (_uid == str(DEVELOPER_ID)
+                     or (class_obj is not None
+                         and _uid in [str(a) for a in (class_obj.admins or [])]))
+    _sol_is_author = (_uid == str(entry.get("real_author")
+                                  or entry.get("author") or ""))
+    if not _sol_is_admin and not _sol_is_author:
+        await query.answer("Удалить решение может админ класса или его автор.",
+                           show_alert=True)
+        return MAIN_MENU
+    _code = entry.get("class_code")
+    _all = _solutions_all()
+    if _code in _all:
+        _all[_code] = [e for e in _all[_code]
+                       if not (isinstance(e, dict) and e.get("id") == sol_id)]
+    _solutions_save()
+    await _sol_delete_channel_file(context, entry)
+    _log_admin_action(_uid, _code,
+                      "Решение УДАЛЕНО админом" if _sol_is_admin
+                      else "Решение удалено автором",
+                      str(entry.get("subject") or "")[:150])
+    if query.data.startswith("sol_del_"):
+        # «🗑» в списке базы: подтверждаем и перерисовываем список
+        try:
+            await query.answer("🗑 Решение удалено — файлы тоже.")
+        except Exception:
+            pass
+        try:
+            return await sol_list_cb(update, context)
+        except Exception:
+            return MAIN_MENU
+    # «🗑 Удалить решение» под открытым файлом: убираем сообщение с файлом
+    try:
+        await query.answer("🗑 Решение удалено — файлы тоже.", show_alert=True)
+    except Exception:
+        pass
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+    return MAIN_MENU
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# ВОЛНА 23.10.6: «✏️ ИЗМЕНИТЬ» РЕШЕНИЕ в базе класса.
+# Просьба пользователя: «решения добавленные ... можно изменить». Меняет
+# АВТОР решения (real_author — в т.ч. анонимного) или староста/разработчик:
+#   • 📘 предмет — быстрая правка текстом;
+#   • 📎 полная ЗАМЕНА файлов — новые шифруются и заливаются в канал,
+#     старые шифры удаляются. Если FILES заменяет АВТОР (не староста) у
+#     уже одобренного решения — оно возвращается на модерацию (нельзя
+#     подменить содержимое после проверки старосты).
+# ═══════════════════════════════════════════════════════════════════════
+def _sol_can_edit(entry, uid, class_obj):
+    """Право на правку решения: автор, староста класса или разработчик."""
+    return (str(uid) == str(DEVELOPER_ID)
+            or (class_obj is not None
+                and str(uid) in [str(a) for a in (class_obj.admins or [])])
+            or str(uid) == str(entry.get("real_author")
+                              or entry.get("author") or ""))
+
+
+def _soledit_menu_kb(entry):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📘 Изменить предмет",
+                              callback_data=f"soledit_sub_{entry.get('id')}")],
+        [InlineKeyboardButton("📎 Заменить файлы",
+                              callback_data=f"soledit_files_{entry.get('id')}")],
+        [InlineKeyboardButton("⬅️ К базе решений", callback_data="sol_list")],
+    ])
+
+
+async def soledit_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """soledit_<id> — меню правки решения."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    sol_id = str(query.data or "")[len("soledit_"):]
+    entry = _sol_find_entry(sol_id)
+    user = get_user(str(query.from_user.id))
+    class_obj = get_class_by_code(entry.get("class_code")) if entry else None
+    if (entry is None or user is None or class_obj is None
+            or not _sol_can_edit(entry, str(query.from_user.id), class_obj)):
+        try:
+            await query.answer("Изменять решение может его автор или староста.",
+                               show_alert=True)
+        except Exception:
+            pass
+        return MAIN_MENU
+    _n_files = len(entry.get("files") or []) or (1 if entry.get("file") else 0)
+    text = ("✏️ ИЗМЕНЕНИЕ РЕШЕНИЯ\n\n"
+            "📘 " + (entry.get("subject") or "Без предмета")
+            + "\nот " + _sol_author_label(entry)
+            + " · " + str(entry.get("ts", ""))
+            + "\n📎 Файлов: " + str(_n_files)
+            + (" · ✏️ уже изменялось" if entry.get("edited") else "")
+            + "\n\nЧто изменить?")
+    try:
+        await query.edit_message_text(text, reply_markup=_soledit_menu_kb(entry))
+    except Exception:
+        await context.bot.send_message(
+            chat_id=query.from_user.id, text=text,
+            reply_markup=_soledit_menu_kb(entry))
+    return MAIN_MENU
+
+
+async def soledit_sub_start_cb(update: Update,
+                               context: ContextTypes.DEFAULT_TYPE):
+    """soledit_sub_<id> — ждём новый предмет (состояние SOL_EDIT_SUBJECT)."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    sol_id = str(query.data or "")[len("soledit_sub_"):]
+    entry = _sol_find_entry(sol_id)
+    class_obj = get_class_by_code(entry.get("class_code")) if entry else None
+    if (entry is None or class_obj is None
+            or not _sol_can_edit(entry, str(query.from_user.id), class_obj)):
+        try:
+            await query.answer("Изменять решение может его автор или староста.",
+                               show_alert=True)
+        except Exception:
+            pass
+        return MAIN_MENU
+    context.user_data['sol_edit_pending'] = {"sol_id": sol_id}
+    await query.message.reply_text(
+        "📘 Введите НОВЫЙ предмет решения (например, «Алгебра»).\n"
+        "Отправьте «-» (дефис), чтобы убрать предмет.\n\n"
+        "Текущий предмет: " + (entry.get("subject") or "не указан"),
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("❌ Отмена", callback_data="soledit_cancel")]]))
+    return SOL_EDIT_SUBJECT
+
+
+@timeout(CONVERSATION_TIMEOUT)
+async def sol_edit_subject_save(update: Update,
+                                context: ContextTypes.DEFAULT_TYPE):
+    """Состояние SOL_EDIT_SUBJECT: сохранить новый предмет решения."""
+    msg = update.message
+    pend = context.user_data.get('sol_edit_pending')
+    entry = _sol_find_entry((pend or {}).get("sol_id")) if pend else None
+    class_obj = get_class_by_code(entry.get("class_code")) if entry else None
+    if (entry is None or class_obj is None
+            or not _sol_can_edit(entry, str(update.effective_user.id), class_obj)):
+        context.user_data.pop('sol_edit_pending', None)
+        await msg.reply_text("Сессия потеряна — решение уже недоступно.")
+        return MAIN_MENU
+    text_in = (msg.text or "").strip()
+    if not text_in:
+        await msg.reply_text(
+            "📘 Пришлите предмет текстом (или «-», чтобы убрать):",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ Отмена", callback_data="soledit_cancel")]]))
+        return SOL_EDIT_SUBJECT
+    entry["subject"] = ("" if text_in == "-" else text_in[:_SOL_SUBJECT_MAX])
+    entry["edited"] = True
+    _solutions_save()
+    context.user_data.pop('sol_edit_pending', None)
+    await msg.reply_text(
+        "✅ Предмет решения обновлён: "
+        + (entry.get("subject") or "без предмета"))
+    return MAIN_MENU
+
+
+async def soledit_files_start_cb(update: Update,
+                                 context: ContextTypes.DEFAULT_TYPE):
+    """soledit_files_<id> — принимаем новые файлы (состояние SOL_EDIT_FILES)."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    sol_id = str(query.data or "")[len("soledit_files_"):]
+    entry = _sol_find_entry(sol_id)
+    class_obj = get_class_by_code(entry.get("class_code")) if entry else None
+    if (entry is None or class_obj is None
+            or not _sol_can_edit(entry, str(query.from_user.id), class_obj)):
+        try:
+            await query.answer("Изменять решение может его автор или староста.",
+                               show_alert=True)
+        except Exception:
+            pass
+        return MAIN_MENU
+    context.user_data['sol_edit_pending'] = {"sol_id": sol_id, "new_files": []}
+    await query.message.reply_text(
+        "📎 Пришлите НОВЫЕ файлы решения (фото или документы, до "
+        f"{_SOL_MAX_FILES} шт.) — они ПОЛНОСТЬЮ заменят текущие.\n\n"
+        "Старые файлы будут удалены из хранилища. Закончили — «✅ Готово».",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Готово", callback_data="soledit_done"),
+             InlineKeyboardButton("❌ Отмена", callback_data="soledit_cancel")],
+        ]))
+    return SOL_EDIT_FILES
+
+
+@timeout(CONVERSATION_TIMEOUT)
+async def sol_edit_files_receive(update: Update,
+                                 context: ContextTypes.DEFAULT_TYPE):
+    """Состояние SOL_EDIT_FILES: копим новые файлы решения."""
+    msg = update.message
+    pend = context.user_data.get('sol_edit_pending')
+    entry = _sol_find_entry((pend or {}).get("sol_id")) if pend else None
+    class_obj = get_class_by_code(entry.get("class_code")) if entry else None
+    if (entry is None or class_obj is None
+            or not _sol_can_edit(entry, str(update.effective_user.id), class_obj)):
+        context.user_data.pop('sol_edit_pending', None)
+        await msg.reply_text("Сессия потеряна — решение уже недоступно.")
+        return MAIN_MENU
+    if not (msg.photo or msg.document):
+        await msg.reply_text(
+            "❌ Нужен ФОТО или ФАЙЛ одним сообщением. Закончили — «✅ Готово».",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Готово", callback_data="soledit_done"),
+                 InlineKeyboardButton("❌ Отмена", callback_data="soledit_cancel")],
+            ]))
+        return SOL_EDIT_FILES
+    if msg.photo:
+        _fid = msg.photo[-1].file_id
+        _mime = "image/jpeg"
+        _fname = "photo.jpg"
+        _ftype = "photo"
+        _size = int(getattr(msg.photo[-1], "file_size", 0) or 0)
+    else:
+        _doc = msg.document
+        _fid = _doc.file_id
+        _mime = str(getattr(_doc, "mime_type", "") or "")
+        _fname = str(getattr(_doc, "file_name", "") or "file.bin")[:120]
+        _ftype = "document"
+        _size = int(getattr(_doc, "file_size", 0) or 0)
+    if _size > VAULT_MAX_FILE_BYTES:
+        await msg.reply_text(
+            "❌ Файл больше 20 МБ — бот не сможет скачать его для шифрования. "
+            "Пришлите файл поменьше или нажмите «❌ Отмена».")
+        return SOL_EDIT_FILES
+    files = pend.setdefault("new_files", [])
+    if len(files) >= _SOL_MAX_FILES:
+        await msg.reply_text(
+            f"⚠️ Максимум {_SOL_MAX_FILES} файлов. Нажмите «✅ Готово».")
+        return SOL_EDIT_FILES
+    _sfuid = _media_fuid(msg)
+    if _sfuid and any(isinstance(f, dict) and f.get("fuid") == _sfuid
+                      for f in files):
+        await msg.reply_text("⏳ Этот файл уже добавлен — дубль не нужен.")
+        return SOL_EDIT_FILES
+    files.append({
+        "ftype": _ftype, "fid": _fid, "mime": _mime,
+        "fname": _fname, "size": _size, "fuid": _sfuid,
+    })
+    context.user_data['sol_edit_pending'] = pend
+    await msg.reply_text(
+        f"✅ Файл {len(files)}/{_SOL_MAX_FILES} получен.\n\n"
+        "Пришлите ещё — или нажмите «✅ Готово» для замены.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Готово", callback_data="soledit_done"),
+             InlineKeyboardButton("❌ Отмена", callback_data="soledit_cancel")],
+        ]))
+    return SOL_EDIT_FILES
+
+
+async def soledit_done_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """«✅ Готово» — заменить файлы решения: новые зашифровать и залить,
+    старые удалить из канала. Автор (не староста) у одобренного решения
+    отправляет его на ПОВТОРНУЮ модерацию."""
+    query = update.callback_query
+    try:
+        await query.answer("Заменяю файлы…")
+    except Exception:
+        pass
+    pend = context.user_data.get('sol_edit_pending')
+    entry = _sol_find_entry((pend or {}).get("sol_id")) if pend else None
+    _uid = str(query.from_user.id)
+    class_obj = get_class_by_code(entry.get("class_code")) if entry else None
+    _new_files = [f for f in ((pend or {}).get("new_files") or [])
+                  if isinstance(f, dict) and f.get("fid")]
+    if (entry is None or class_obj is None
+            or not _sol_can_edit(entry, _uid, class_obj)):
+        context.user_data.pop('sol_edit_pending', None)
+        await query.edit_message_text(
+            "Сессия потеряна — решение уже недоступно.")
+        return MAIN_MENU
+    if not _new_files:
+        await query.edit_message_text(
+            "⚠️ Вы не прислали ни одного файла — файлы не заменены.\n"
+            "Пришлите фото/файл или нажмите «❌ Отмена».")
+        return SOL_EDIT_FILES
+    channels = get_cloud_channel_ids()
+    if not channels:
+        context.user_data.pop('sol_edit_pending', None)
+        await query.edit_message_text(
+            "❌ Хранилище не настроено (нет cloud-каналов) — заменить файлы "
+            "не могу. Попросите разработчика подключить канал.")
+        return MAIN_MENU
+    try:
+        await query.edit_message_text(
+            f"🔒 Шифрую новые файлы ({len(_new_files)} шт.) и кладу в "
+            "хранилище… (несколько секунд)")
+    except Exception:
+        pass
+    _stored = []
+    try:
+        for _idx, _f in enumerate(_new_files, 1):
+            raw = await _vault_botapi_download(context, _f["fid"])
+            if not raw:
+                raise RuntimeError(f"файл {_idx} пуст")
+            sealed = await asyncio.to_thread(
+                _seal_pack, raw, _f.get("fname") or "file.bin",
+                _f.get("mime") or "", "sol")
+            raw = b""
+            _up = await _storage_upload_document(
+                context, sealed, filename=f"sol_{_sol_gen_id()}.dvf",
+                caption="", channel_id=channels[0])
+            sealed = b""
+            if not _up:
+                raise RuntimeError(f"хранилище не приняло файл {_idx}")
+            _stored.append({
+                "ch": int(_up.get("channel_id") or channels[0]),
+                "mid": int(_up.get("message_id") or 0),
+                "fid": str(_up.get("file_id") or ""),
+                "ftype": "seal",
+                "name": _f.get("fname") or "file.bin",
+                "mime": _f.get("mime") or "",
+                "kind": _f.get("ftype") or "document",
+            })
+    except Exception as e:
+        logger.error(f"solutions: замена файлов не удалась: {e}")
+        # Новые шифры могли частично залечься — чистим за собой.
+        await _sol_delete_channel_file(context, {"files": _stored})
+        await query.edit_message_text(
+            "❌ Не смог скачать/зашифровать новые файлы. Старое решение "
+            "НЕ тронуто — попробуйте ещё раз.")
+        return MAIN_MENU
+    # Старые шифры больше не нужны — удаляем из канала-хранилища.
+    await _sol_delete_channel_file(context, entry)
+    entry["files"] = _stored
+    entry["file"] = dict(_stored[0])
+    entry["edited"] = True
+    # Кто правит: староста/разработчик или автор?
+    _is_admin_editor = (_uid == str(DEVELOPER_ID)
+                        or _uid in [str(a) for a in (class_obj.admins or [])])
+    if not _is_admin_editor and entry.get("status") == "approved":
+        # Автор подменил содержимое после одобрения — на повторную проверку.
+        entry["status"] = "pending"
+        entry["approved_by"] = ""
+        _solutions_save()
+        _card = ("🛡 МОДЕРАЦИЯ ИЗМЕНЁННОГО РЕШЕНИЯ — класс «"
+                 + class_obj.class_name + "»\n\n"
+                 "📘 " + (entry.get("subject") or "Без предмета")
+                 + "\nот " + _sol_author_label(entry)
+                 + " · " + str(entry.get("ts", ""))
+                 + "\n✏️ Автор заменил файлы — проверьте ещё раз."
+                 + "\n⏳ Удалить: " + _sol_ttl_label(entry.get("ttl_h"))
+                 + "\n\nОпубликовать в общей базе класса?")
+        _card_kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Одобрить", callback_data=f"sol_appr_{entry['id']}"),
+             InlineKeyboardButton("❌ Отклонить", callback_data=f"sol_rej_{entry['id']}")],
+            [InlineKeyboardButton(f"⏳ Срок: {_sol_ttl_label(entry.get('ttl_h'))}",
+                                  callback_data=f"sol_ttlmod_{entry['id']}")]])
+        for admin_uid in dict.fromkeys([str(a) for a in class_obj.admins]):
+            try:
+                await context.bot.send_message(
+                    chat_id=int(admin_uid), text=_card, reply_markup=_card_kb)
+                await asyncio.sleep(0.05)
+            except Exception:
+                pass
+        await query.edit_message_text(
+            f"✅ Файлы решения заменены ({len(_stored)} шт.).\n"
+            "Решение отправлено старосте на ПОВТОРНУЮ модерацию — после "
+            "одобрения оно снова появится в базе.")
+    else:
+        _solutions_save()
+        await query.edit_message_text(
+            f"✅ Файлы решения заменены ({len(_stored)} шт.) — старые "
+            "удалены из хранилища.")
+    context.user_data.pop('sol_edit_pending', None)
+    return MAIN_MENU
+
+
+async def soledit_cancel_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """«❌ Отмена» правки решения.
+    ВОЛНА 23.10.7: эта же кнопка отменяет ввод комментария под решением —
+    чистим и его буфер, чтобы не висел мёртвым грузом."""
+    query = update.callback_query
+    try:
+        await query.answer("Отменено.")
+    except Exception:
+        pass
+    context.user_data.pop('sol_edit_pending', None)
+    context.user_data.pop('sol_comment_pending', None)
+    try:
+        await query.edit_message_text("❌ Изменение решения отменено.")
+    except Exception:
+        pass
+    return MAIN_MENU
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# ВОЛНА 23.10.7: КОММЕНТАРИИ ПОД РЕШЕНИЯМИ. Любой участник класса может
+# написать запись под решением (💬 под открытым файлом), изменить СВОЮ
+# запись (админ класса — любую) или удалить её. Комментарии живут в самой
+# записи решения (умирают вместе с ней по сроку хранения) и видны всему
+# классу: «кто-то что-то написал — и это видно всем».
+# ═══════════════════════════════════════════════════════════════════════
+_SOL_COMMENT_MAX = 500        # максимум символов в комментарии
+_SOL_COMMENT_MAX_COUNT = 30   # максимум комментариев на одно решение
+
+
+def _sol_comment_gen_id():
+    # 22.72-паттерн: secrets вместо random
+    return "c_" + secrets.token_hex(4)
+
+
+def _sol_comments_get(entry):
+    """Комментарии решения (санитизация НА МЕСТЕ, возвращаются живые ссылки
+    на dict-записи — их правка сохраняется через _solutions_save())."""
+    if not isinstance(entry, dict):
+        return []
+    raw = entry.get("comments")
+    if not isinstance(raw, list):
+        raw = []
+        entry["comments"] = raw
+    out = []
+    for c in raw:
+        if not isinstance(c, dict):
+            continue
+        if not str(c.get("id") or ""):
+            c["id"] = _sol_comment_gen_id()
+        c["uid"] = str(c.get("uid") or "")
+        c["name"] = str(c.get("name") or "Участник")[:64]
+        c["text"] = str(c.get("text") or "")[:_SOL_COMMENT_MAX]
+        c["ts"] = str(c.get("ts") or "")
+        c["edited"] = bool(c.get("edited"))
+        out.append(c)
+    return out
+
+
+def _sol_comment_can_view(entry, uid):
+    """Комментарии видит участник класса этого решения (+ админ/разработчик)."""
+    if str(uid) == str(DEVELOPER_ID):
+        return True
+    if not isinstance(entry, dict) or entry.get("status") != "approved":
+        return False
+    co = get_class_by_user(str(uid))
+    if co is not None and co.class_code == entry.get("class_code"):
+        return True
+    return is_admin_of_class(str(uid), entry.get("class_code"))
+
+
+def _sol_comment_can_moderate(entry, comment, uid):
+    """Править/удалять комментарий может его АВТОР, админ класса или дев."""
+    if str(uid) == str(DEVELOPER_ID):
+        return True
+    if str(comment.get("uid") or "") == str(uid):
+        return True
+    return is_admin_of_class(str(uid), entry.get("class_code"))
+
+
+def _sol_comments_caption(entry):
+    """Текст экрана комментариев решения (нумерованный список)."""
+    cl = _sol_comments_get(entry)
+    lines = ["💬 КОММЕНТАРИИ · "
+             + str(entry.get("subject") or "Без предмета")]
+    if not cl:
+        lines.append("\nПока никто ничего не написал. Будьте первым — "
+                     "нажмите «✍️ Написать».")
+    for i, c in enumerate(cl, 1):
+        lines.append(f"\n{i}. {c['name']} · {c['ts']}"
+                     + (" · ✏️ изменён" if c.get("edited") else ""))
+        lines.append(str(c.get("text") or ""))
+    return "\n".join(lines)[:4000]
+
+
+def _sol_comment_kb(entry, uid):
+    """Клавиатура экрана комментариев: написать + правка своих/админских."""
+    sid = entry.get("id")
+    rows = [[InlineKeyboardButton(
+        "✍️ Написать", callback_data=f"solc_add_{sid}")]]
+    for i, c in enumerate(_sol_comments_get(entry), 1):
+        if _sol_comment_can_moderate(entry, c, uid):
+            rows.append([
+                InlineKeyboardButton(
+                    f"✏️ Изменить {i}",
+                    callback_data=f"solc_edit_{sid}_{c['id']}"),
+                InlineKeyboardButton(
+                    f"🗑 {i}",
+                    callback_data=f"solc_del_{sid}_{c['id']}"),
+            ])
+    rows.append([InlineKeyboardButton(
+        "⬅️ К базе решений", callback_data="sol_list")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def solc_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """solc_<sol_id> — экран комментариев решения."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    sol_id = str(query.data or "")[len("solc_"):]
+    entry = _sol_find_entry(sol_id)
+    uid = str(query.from_user.id)
+    _exp = entry.get("expire_ts") if entry else None
+    if (entry is None or not _sol_comment_can_view(entry, uid)
+            or (_exp and float(_exp) < time.time())):
+        try:
+            await query.answer(
+                "Комментарии доступны участникам класса этого решения.",
+                show_alert=True)
+        except Exception:
+            pass
+        return MAIN_MENU
+    try:
+        await query.edit_message_text(
+            _sol_comments_caption(entry),
+            reply_markup=_sol_comment_kb(entry, uid))
+    except Exception:
+        await context.bot.send_message(
+            chat_id=uid, text=_sol_comments_caption(entry),
+            reply_markup=_sol_comment_kb(entry, uid))
+    return MAIN_MENU
+
+
+async def _solc_send_screen(context, entry, uid, chat_id=None):
+    """Отправить ЭКРАМ комментариев отдельным сообщением (после ввода)."""
+    try:
+        await context.bot.send_message(
+            chat_id=(chat_id or uid),
+            text=_sol_comments_caption(entry),
+            reply_markup=_sol_comment_kb(entry, uid))
+    except Exception as e:
+        logger.error(f"solc: не удалось показать комментарии: {e}")
+
+
+async def solc_add_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """solc_add_<sol_id> — ждём текст комментария (SOL_COMMENT_TEXT)."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    sol_id = str(query.data or "")[len("solc_add_"):]
+    entry = _sol_find_entry(sol_id)
+    uid = str(query.from_user.id)
+    if entry is None or not _sol_comment_can_view(entry, uid):
+        try:
+            await query.answer(
+                "Комментарии доступны участникам класса этого решения.",
+                show_alert=True)
+        except Exception:
+            pass
+        return MAIN_MENU
+    if len(_sol_comments_get(entry)) >= _SOL_COMMENT_MAX_COUNT:
+        try:
+            await query.answer(
+                f"Уже {_SOL_COMMENT_MAX_COUNT} комментариев — лимит.",
+                show_alert=True)
+        except Exception:
+            pass
+        return await solc_menu_cb(update, context)
+    context.user_data['sol_comment_pending'] = {"sol_id": sol_id}
+    try:
+        await query.message.reply_text(
+            "💬 Напишите комментарий под решением — его увидит весь класс "
+            f"(до {_SOL_COMMENT_MAX} символов).",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ Отмена",
+                                     callback_data="soledit_cancel")]]))
+    except Exception:
+        pass
+    return SOL_COMMENT_TEXT
+
+
+@timeout(CONVERSATION_TIMEOUT)
+async def sol_comment_text_handler(update: Update,
+                                   context: ContextTypes.DEFAULT_TYPE):
+    """Состояние SOL_COMMENT_TEXT: сохранить новый комментарий."""
+    msg = update.message
+    uid = str(update.effective_user.id)
+    pend = context.user_data.get('sol_comment_pending')
+    entry = _sol_find_entry((pend or {}).get("sol_id")) if pend else None
+    if entry is None or not _sol_comment_can_view(entry, uid):
+        context.user_data.pop('sol_comment_pending', None)
+        await msg.reply_text("Сессия потеряна — решение уже недоступно.")
+        return MAIN_MENU
+    text_in = (msg.text or "").strip()
+    if not text_in:
+        await msg.reply_text(
+            "💬 Комментарий пустой — пришлите текст (или «❌ Отмена»).",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ Отмена",
+                                     callback_data="soledit_cancel")]]))
+        return SOL_COMMENT_TEXT
+    if len(text_in) > _SOL_COMMENT_MAX:
+        await msg.reply_text(
+            f"⚠️ Слишком длинно — до {_SOL_COMMENT_MAX} символов. "
+            "Пришлите короче.")
+        return SOL_COMMENT_TEXT
+    rejected = await reject_if_forbidden_chars(
+        update, text_in, SOL_COMMENT_TEXT)
+    if rejected is not None:
+        return rejected
+    comments = _sol_comments_get(entry)
+    if len(comments) >= _SOL_COMMENT_MAX_COUNT:
+        context.user_data.pop('sol_comment_pending', None)
+        await msg.reply_text(
+            f"⚠️ Уже {_SOL_COMMENT_MAX_COUNT} комментариев — новые не "
+            "принимаются.")
+        return MAIN_MENU
+    user = get_user(uid) or User(uid)
+    comments.append({
+        "id": _sol_comment_gen_id(),
+        "uid": uid,
+        "name": str(getattr(user, 'first_name', '') or "Участник")[:64],
+        "text": text_in,
+        "ts": datetime.now().strftime("%d.%m %H:%M"),
+        "edited": False,
+    })
+    entry["comments"] = comments
+    _solutions_save()
+    context.user_data.pop('sol_comment_pending', None)
+    await msg.reply_text("✅ Комментарий добавлен.")
+    await _solc_send_screen(context, entry, uid, chat_id=msg.chat_id)
+    return MAIN_MENU
+
+
+def _solc_parse_sid_cid(data, prefix):
+    """Разбор 'solc_edit_/solc_del_' + sol_id + '_' + comment_id.
+    sol_id = 'sol_'+hex(8), comment_id = 'c_'+hex(8) — разделитель '_c_'
+    однозначен (в hex нет подчёркиваний)."""
+    rest = str(data or "")[len(prefix):]
+    sid, sep, tail = rest.partition("_c_")
+    if not sep or not sid.startswith("sol_") or not tail:
+        return None, None
+    return sid, "c_" + tail
+
+
+async def solc_edit_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """solc_edit_<sol_id>_<comment_id> — правим существующую запись."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    sol_id, cid = _solc_parse_sid_cid(query.data, "solc_edit_")
+    entry = _sol_find_entry(sol_id) if sol_id else None
+    uid = str(query.from_user.id)
+    if entry is None or not _sol_comment_can_view(entry, uid):
+        try:
+            await query.answer("Решение уже недоступно.", show_alert=True)
+        except Exception:
+            pass
+        return MAIN_MENU
+    comment = next((c for c in _sol_comments_get(entry)
+                    if c.get("id") == cid), None)
+    if comment is None or not _sol_comment_can_moderate(entry, comment, uid):
+        try:
+            await query.answer(
+                "Изменять запись может её автор или староста класса.",
+                show_alert=True)
+        except Exception:
+            pass
+        return await solc_menu_cb(update, context)
+    context.user_data['sol_comment_pending'] = {
+        "sol_id": sol_id, "comment_id": cid}
+    try:
+        await query.message.reply_text(
+            "✏️ Текущая запись:\n" + str(comment.get("text") or "")
+            + "\n\nПришлите НОВЫЙ текст записи (она заменит старую):",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ Отмена",
+                                     callback_data="soledit_cancel")]]))
+    except Exception:
+        pass
+    return SOL_COMMENT_EDIT
+
+
+@timeout(CONVERSATION_TIMEOUT)
+async def sol_comment_edit_handler(update: Update,
+                                   context: ContextTypes.DEFAULT_TYPE):
+    """Состояние SOL_COMMENT_EDIT: сохранить новый текст записи."""
+    msg = update.message
+    uid = str(update.effective_user.id)
+    pend = context.user_data.get('sol_comment_pending')
+    entry = _sol_find_entry((pend or {}).get("sol_id")) if pend else None
+    comment = None
+    if entry is not None:
+        comment = next((c for c in _sol_comments_get(entry)
+                        if c.get("id") == (pend or {}).get("comment_id")), None)
+    if (entry is None or comment is None
+            or not _sol_comment_can_moderate(entry, comment, uid)):
+        context.user_data.pop('sol_comment_pending', None)
+        await msg.reply_text("Сессия потеряна — запись уже недоступна.")
+        return MAIN_MENU
+    text_in = (msg.text or "").strip()
+    if not text_in:
+        await msg.reply_text(
+            "✏️ Пришлите новый текст записи (или «❌ Отмена»).",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ Отмена",
+                                     callback_data="soledit_cancel")]]))
+        return SOL_COMMENT_EDIT
+    if len(text_in) > _SOL_COMMENT_MAX:
+        await msg.reply_text(
+            f"⚠️ Слишком длинно — до {_SOL_COMMENT_MAX} символов. "
+            "Пришлите короче.")
+        return SOL_COMMENT_EDIT
+    rejected = await reject_if_forbidden_chars(
+        update, text_in, SOL_COMMENT_EDIT)
+    if rejected is not None:
+        return rejected
+    comment["text"] = text_in
+    comment["edited"] = True
+    _solutions_save()
+    context.user_data.pop('sol_comment_pending', None)
+    await msg.reply_text("✅ Запись изменена.")
+    await _solc_send_screen(context, entry, uid, chat_id=msg.chat_id)
+    return MAIN_MENU
+
+
+async def solc_del_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """solc_del_<sol_id>_<comment_id> — удалить запись под решением."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    sol_id, cid = _solc_parse_sid_cid(query.data, "solc_del_")
+    entry = _sol_find_entry(sol_id) if sol_id else None
+    uid = str(query.from_user.id)
+    if entry is None or not _sol_comment_can_view(entry, uid):
+        try:
+            await query.answer("Решение уже недоступно.", show_alert=True)
+        except Exception:
+            pass
+        return MAIN_MENU
+    comments = _sol_comments_get(entry)
+    comment = next((c for c in comments if c.get("id") == cid), None)
+    if comment is None or not _sol_comment_can_moderate(entry, comment, uid):
+        try:
+            await query.answer(
+                "Удалять запись может её автор или староста класса.",
+                show_alert=True)
+        except Exception:
+            pass
+        return await solc_menu_cb(update, context)
+    entry["comments"] = [c for c in comments if c.get("id") != cid]
+    _solutions_save()
+    try:
+        await query.answer("Запись удалена.", show_alert=False)
+    except Exception:
+        pass
+    # Экран комментариев обновляем на месте (мы в колбэке этого экрана).
+    try:
+        await query.edit_message_text(
+            _sol_comments_caption(entry),
+            reply_markup=_sol_comment_kb(entry, uid))
+    except Exception:
+        await _solc_send_screen(context, entry, uid)
+    return MAIN_MENU
+
+
+async def toggle_watermark_cb(update: Update,
+                              context: ContextTypes.DEFAULT_TYPE):
+    """ВОЛНА 23.03: тоггл водяного знака на фото расписания (⚙️ Настройки).
+
+    ВКЛ (по умолчанию) — фото расписания/звонков приходят со знаком
+    «DEVORKS+ / @DEVO_WORKS_BOT». ВЫКЛ — фото уходят как есть.
+    Настройка личная: действует на фото, которые бот отправляет вам.
+    """
+    query = update.callback_query
+    await query.answer()
+    user_id = str(query.from_user.id)
+    user = get_user(user_id)
+    if not user:
+        user = User(user_id)
+    user.watermark_enabled = not bool(getattr(user, "watermark_enabled", True))
+    save_user(user)
+    return await user_settings(update, context)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# ВОЛНА 23.10.6: «🎨 Цвет кнопок» — меню личных цветов inline-кнопок.
+# ═══════════════════════════════════════════════════════════════════════
+def _btn_style_menu_kb(user):
+    """Клавиатура меню «🎨 Цвет кнопок» (⚙️ Настройки)."""
+    cur = str(getattr(user, "button_style", "") or "")
+    if cur not in _BTN_STYLES_ALLOWED:
+        cur = ""
+    auto = bool(getattr(user, "button_autocolor", True))
+    rows = []
+    for key in _BTN_STYLES_ALLOWED:
+        mark = "🔸 " if key == cur else ""
+        rows.append([InlineKeyboardButton(
+            mark + _BTN_STYLE_LABELS[key],
+            callback_data="btn_style_set_" + (key or "none"))])
+    rows.append([InlineKeyboardButton(
+        "🚦 Отмена — красные, подтверждение — зелёные: "
+        + ("вкл" if auto else "выкл"),
+        callback_data="btn_style_autocolor")])
+    # ВОЛНА 23.10.7: правила цвета КОНКРЕТНЫХ кнопок (текст → цвет).
+    rows.append([InlineKeyboardButton(
+        "🎯 Цвет конкретной кнопки · " + str(len(_btn_ovr_list(user))),
+        callback_data="btn_ovr_menu")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_to_settings")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def btn_style_menu_cb(update: Update,
+                            context: ContextTypes.DEFAULT_TYPE):
+    """«🎨 Цвет кнопок» — показать меню выбора цвета."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    user = get_user(str(query.from_user.id)) or User(str(query.from_user.id))
+    auto = bool(getattr(user, "button_autocolor", True))
+    _ovr_n = len(_btn_ovr_list(user))
+    text = (
+        "🎨 ЦВЕТА КНОПОК (Bot API 9.4)\n\n"
+        "Выберите цвет, в который будут окрашены ВСЕ кнопки бота — "
+        "настройка личная, её видите только вы:\n"
+        "• 🔵 Синий • 🟢 Зелёный • 🔴 Красный • ⚪ Обычный\n\n"
+        "🚦 АВТОЦВЕТ (" + ("сейчас ВКЛ)" if auto else "сейчас ВЫКЛ)") + " —\n"
+        "• кнопки ОТМЕНЫ («❌ Отмена», «Отменить»…) — всегда 🔴 красные;\n"
+        "• кнопки ПОДТВЕРЖДЕНИЯ («✅ Готово», «Подтвердить»…) — всегда "
+        "🟢 зелёные.\n"
+        "Автоцвет можно выключить — тогда все кнопки одного выбранного "
+        "цвета.\n\n"
+        "🎯 ЦВЕТ КОНКРЕТНОЙ КНОПКИ (правил: " + str(_ovr_n) + ") —\n"
+        "откройте панель кнопок (состав — по вашему статусу: обычным "
+        "основные, админам — ещё и админские, разработчику — все) "
+        "и покрасьте любую — например, все «📅» — синими. Личное "
+        "правило главнее автоцвета и базового цвета.\n\n"
+        "⚠️ Цвета видят обновлённые Telegram (версии с Bot API 9.4, "
+        "декабрь 2025). В старых приложениях кнопки выглядят как обычно — "
+        "ошибок нет.")
+    try:
+        await query.edit_message_text(text, reply_markup=_btn_style_menu_kb(user))
+    except Exception:
+        await context.bot.send_message(
+            chat_id=query.from_user.id, text=text,
+            reply_markup=_btn_style_menu_kb(user))
+    return USER_SETTINGS
+
+
+async def btn_style_set_cb(update: Update,
+                           context: ContextTypes.DEFAULT_TYPE):
+    """Выбор базового цвета кнопок: btn_style_set_<none|primary|success|danger>."""
+    query = update.callback_query
+    key = (query.data or "")[len("btn_style_set_"):]
+    style = "" if key == "none" else key
+    if style not in _BTN_STYLES_ALLOWED:
+        style = ""
+    user = get_user(str(query.from_user.id)) or User(str(query.from_user.id))
+    user.button_style = style
+    save_user(user)
+    _BTN_PREF_CACHE.pop(str(query.from_user.id), None)
+    label = _BTN_STYLE_LABELS.get(style, "⚪ Обычный")
+    try:
+        await query.answer(f"Цвет кнопок: {label} 🎨", show_alert=False)
+    except Exception:
+        pass
+    return await btn_style_menu_cb(update, context)
+
+
+async def btn_style_autocolor_cb(update: Update,
+                                 context: ContextTypes.DEFAULT_TYPE):
+    """Тоггл автоцвета: отмена → красные, подтверждение → зелёные."""
+    query = update.callback_query
+    user = get_user(str(query.from_user.id)) or User(str(query.from_user.id))
+    user.button_autocolor = not bool(getattr(user, "button_autocolor", True))
+    save_user(user)
+    _BTN_PREF_CACHE.pop(str(query.from_user.id), None)
+    try:
+        await query.answer(
+            "Автоцвет: " + ("вкл ✅" if user.button_autocolor else "выкл ⚪"),
+            show_alert=False)
+    except Exception:
+        pass
+    return await btn_style_menu_cb(update, context)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# ВОЛНА 23.10.7: «🎯 Цвет конкретной кнопки» — личные правила цвета
+# отдельных кнопок (текст кнопки → цвет). Правило главнее автоцвета и
+# базового цвета: пользователь сам решает, как выглядит КАЖДАЯ кнопка.
+# ═══════════════════════════════════════════════════════════════════════
+def _btn_ovr_list(user):
+    """Санитизированный dict правил цвета кнопок пользователя."""
+    return _btn_ovr_sanitize(getattr(user, "button_overrides", None))
+
+
+def _btn_ovr_menu_kb(user):
+    """Клавиатура списка правил «цвет конкретной кнопки»."""
+    ovr = _btn_ovr_list(user)
+    rows = []
+    for i, k in enumerate(list(ovr.keys())):
+        label = _BTN_STYLE_LABELS.get(str(ovr.get(k) or ""), "⚪ Обычный")
+        rows.append([InlineKeyboardButton(
+            f"{label} · «{str(k)[:40]}»",
+            callback_data=f"btn_ovr_pick_{i}")])
+    # ВОЛНА 23.10.9: панель зависит от СТАТУСА пользователя — обычным
+    # доступны обычные кнопки, админам ещё и админские, разработчику все.
+    # Подпись честно показывает, сколько кнопок доступно именно вам.
+    role = _btn_panel_role(user)
+    rows.append([InlineKeyboardButton(
+        ("🎨 Панель всех кнопок · " if role == "dev"
+         else "🎨 Панель кнопок · ")
+        + str(len(_btn_panel_texts_for(role))),
+        callback_data="btn_ovr_panel_0")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="btn_style_menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _btn_ovr_color_kb(del_idx=None):
+    """Выбор цвета для правила (del_idx — кнопка удаления существующего)."""
+    rows = []
+    for key in _BTN_STYLES_ALLOWED:
+        rows.append([InlineKeyboardButton(
+            _BTN_STYLE_LABELS[key],
+            callback_data="btn_ovr_set_" + (key or "none"))])
+    if del_idx is not None:
+        rows.append([InlineKeyboardButton(
+            "🗑 Удалить правило", callback_data=f"btn_ovr_del_{del_idx}")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="btn_ovr_menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def btn_ovr_menu_cb(update: Update,
+                          context: ContextTypes.DEFAULT_TYPE):
+    """«🎯 Цвет конкретной кнопки» — список личных правил цвета."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    # ВОЛНА 23.10.7: заход в меню = отмена незавершённого ввода текста
+    # кнопки (буфер больше не нужен, при новом добавлении он создастся заново).
+    context.user_data.pop('btn_ovr_pending', None)
+    user = get_user(str(query.from_user.id)) or User(str(query.from_user.id))
+    ovr = _btn_ovr_list(user)
+    if ovr:
+        lines = ["🎯 ЦВЕТ КОНКРЕТНЫХ КНОПОК — ваши правила:\n"]
+        for k, v in ovr.items():
+            lines.append("• " + _BTN_STYLE_LABELS.get(str(v or ""), "⚪ Обычный")
+                         + " — «" + str(k) + "»")
+        body = ("\n".join(lines)
+                + "\n\nНажмите на правило, чтобы изменить цвет или удалить "
+                  "его. Правило красит ВСЕ кнопки, в тексте которых есть "
+                  "ваша фраза (без учёта регистра) — например, «Отмена» "
+                  "закрасит и «❌ Отмена»."
+                  "\n\nПокрасить ещё кнопку — «🎨 Панель кнопок» ниже: "
+                  "кнопки, доступные вашему статусу, постранично.")
+    else:
+        role = _btn_panel_role(user)
+        body = ("🎯 ЦВЕТ КОНКРЕТНЫХ КНОПОК\n\n"
+                "Нажмите «🎨 Панель кнопок» ниже — откроется список "
+                "кнопок, доступных вашему статусу ("
+                + str(len(_btn_panel_texts_for(role))) + " шт. — "
+                + _BTN_PANEL_ROLE_TITLES[role]
+                + "). Выберите любую и назначьте ей цвет.\n\n"
+                "Правило красит все кнопки с таким текстом (регистр не "
+                "важен) и главнее автоцвета: можно сделать «❌ Отмена» "
+                "обычной или покрасить «📅» в синий при любом базовом цвете.")
+    try:
+        await query.edit_message_text(body, reply_markup=_btn_ovr_menu_kb(user))
+    except Exception:
+        await context.bot.send_message(
+            chat_id=query.from_user.id, text=body,
+            reply_markup=_btn_ovr_menu_kb(user))
+    return USER_SETTINGS
+
+
+def _btn_ovr_lookup_exact_new(ovr, text_in):
+    """Ключ правила с ТОЧНО таким же нормализованным текстом (или None)."""
+    t = _btn_ovr_key(text_in)
+    for k in ovr.keys():
+        if _btn_ovr_key(k) == t:
+            return k
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# ВОЛНА 23.10.8: ПАНЕЛЬ ВСЕХ КНОПОК для покраски отдельных кнопок.
+# Запрос пользователя: «покрас отдельной кнопки — нужно, чтобы вылезала
+# панель со всеми кнопками, пользователь выбрал, какие кнопки каким
+# цветом». Панель построена на реестре _BTN_PANEL_TEXTS (все статические
+# тексты inline-кнопок бота). Выбранной кнопке назначается личное
+# правило цвета с её ТОЧНЫМ текстом — длиннейшее совпадение в
+# _btn_ovr_lookup побеждает, поэтому правило панели перекрывает и
+# автоцвет, и базовый цвет, и более короткие правила.
+# ═══════════════════════════════════════════════════════════════════════
+_BTN_PANEL_PER_PAGE = 24      # кнопок на страницу (2 колонки × 12 рядов)
+_BTN_PANEL_COLS = 2
+_BTN_PANEL_MARK = {           # маркер уже покрашенной кнопки в панели
+    "": "⚪", "primary": "🔵", "success": "🟢", "danger": "🔴",
+}
+
+
+_BTN_PANEL_BY_ROLE = {}       # кэш отфильтрованных списков по роли
+
+# Подпись набора кнопок для каждой роли (текст в панели и меню).
+_BTN_PANEL_ROLE_TITLES = {
+    "user": "обычные кнопки",
+    "admin": "обычные + админские кнопки",
+    "dev": "все кнопки бота",
+}
+
+
+def _btn_panel_role(user):
+    """ВОЛНА 23.10.9: статус пользователя для панели покраски.
+
+    'dev'   — разработчик (DEVELOPER_ID);
+    'admin' — админ или создатель хотя бы одного активного класса;
+    'user'  — все остальные. Панель покраски показывает кнопки смотря
+    на статус: обычным — обычные, админам — ещё и админские,
+    разработчику — все."""
+    uid = str(getattr(user, "user_id", "") or "")
+    if not uid:
+        uid = str(user or "")
+    if DEVELOPER_ID and uid == str(DEVELOPER_ID):
+        return "dev"
+    try:
+        classes = load_classes() or {}
+        for c in classes.values():
+            if not getattr(c, "is_active", True):
+                continue
+            if uid in (getattr(c, "admins", None) or []):
+                return "admin"
+            if str(getattr(c, "creator_id", "") or "") == uid:
+                return "admin"
+    except Exception as e:
+        logger.warning(f"btn_panel_role: {e}")
+    return "user"
+
+
+def _btn_panel_texts_for(role):
+    """ВОЛНА 23.10.9: тексты кнопок, доступные роли (в порядке реестра).
+
+    user — всё, кроме админских и кнопок разработчика; admin — ещё и
+    админские; dev — весь реестр. Результат кэшируется по роли."""
+    role = role if role in ("dev", "admin") else "user"
+    cached = _BTN_PANEL_BY_ROLE.get(role)
+    if cached is None:
+        if role == "dev":
+            cached = _BTN_PANEL_TEXTS
+        elif role == "admin":
+            cached = tuple(t for t in _BTN_PANEL_TEXTS
+                           if t not in _BTN_PANEL_DEV)
+        else:
+            cached = tuple(t for t in _BTN_PANEL_TEXTS
+                           if t not in _BTN_PANEL_DEV
+                           and t not in _BTN_PANEL_ADMIN)
+        _BTN_PANEL_BY_ROLE[role] = cached
+    return cached
+
+
+def _btn_panel_crc(texts):
+    """ВОЛНА 23.10.9: короткая подпись списка кнопок роли.
+
+    Вшивается в callback выбора (btn_ovr_psel_<idx>_<crc>): после смены
+    роли или обновления реестра старый клик НЕ укажет на чужую кнопку —
+    бот просто перерисует панель."""
+    return hashlib.md5("\n".join(texts).encode("utf-8")).hexdigest()[:8]
+
+
+def _btn_panel_pages(role="user"):
+    """Число страниц панели кнопок для роли пользователя."""
+    n = len(_btn_panel_texts_for(role))
+    return max(1, (n + _BTN_PANEL_PER_PAGE - 1) // _BTN_PANEL_PER_PAGE)
+
+
+def _btn_panel_page_kb(user, page):
+    """Клавиатура-страница панели: сетка кнопок + навигация + назад.
+
+    ВОЛНА 23.10.9: список кнопок фильтруется по СТАТУСУ пользователя
+    (обычный / админ / разработчик); в callback выбора вшита подпись
+    списка (crc) — защита от клика по устаревшей панели."""
+    ovr = _btn_ovr_list(user)
+    role = _btn_panel_role(user)
+    texts = _btn_panel_texts_for(role)
+    crc = _btn_panel_crc(texts)
+    pages = _btn_panel_pages(role)
+    try:
+        page = max(0, min(int(page), pages - 1))
+    except (TypeError, ValueError):
+        page = 0
+    start = page * _BTN_PANEL_PER_PAGE
+    chunk = texts[start:start + _BTN_PANEL_PER_PAGE]
+    rows, row = [], []
+    for j, t in enumerate(chunk):
+        idx = start + j
+        st = _btn_ovr_lookup(t, ovr)
+        mark = _BTN_PANEL_MARK.get(str(st or "")) if st is not None else None
+        label = (str(mark) + " " + t) if mark else t
+        if len(label) > 40:
+            label = label[:39] + "…"
+        row.append(InlineKeyboardButton(
+            label, callback_data=f"btn_ovr_psel_{idx}_{crc}"))
+        if len(row) >= _BTN_PANEL_COLS:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(
+            "⬅️", callback_data=f"btn_ovr_panel_{page - 1}"))
+    nav.append(InlineKeyboardButton(
+        f"{page + 1}/{pages}", callback_data="btn_ovr_noop"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton(
+            "➡️", callback_data=f"btn_ovr_panel_{page + 1}"))
+    rows.append(nav)
+    rows.append([InlineKeyboardButton(
+        "⬅️ К правилам", callback_data="btn_ovr_menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def btn_ovr_panel_cb(update: Update,
+                           context: ContextTypes.DEFAULT_TYPE):
+    """Панель кнопок — страница №N (btn_ovr_panel_<page>).
+
+    ВОЛНА 23.10.9: состав кнопок зависит от статуса пользователя
+    (обычный / админ / разработчик) — _btn_panel_texts_for."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    try:
+        page = int(str(query.data or "")[len("btn_ovr_panel_"):])
+    except (TypeError, ValueError):
+        page = 0
+    user = get_user(str(query.from_user.id)) or User(str(query.from_user.id))
+    role = _btn_panel_role(user)
+    texts = _btn_panel_texts_for(role)
+    pages = _btn_panel_pages(role)
+    page = max(0, min(page, pages - 1))
+    body = (
+        "🎨 ПАНЕЛЬ КНОПОК — " + str(len(texts)) + " шт.\n\n"
+        "Страница " + str(page + 1) + " из " + str(pages)
+        + ". Нажмите на кнопку — и выберите её цвет.\n\n"
+        "• показаны кнопки вашего статуса: "
+        + _BTN_PANEL_ROLE_TITLES[role] + ";\n"
+        "• цвет применяется ко всем кнопкам с таким текстом;\n"
+        "• уже покрашенные отмечены: 🔴 🟢 🔵 ⚪;\n"
+        "• правило личное — его видите только вы.")
+    try:
+        await query.edit_message_text(
+            body, reply_markup=_btn_panel_page_kb(user, page))
+    except Exception:
+        await context.bot.send_message(
+            chat_id=query.from_user.id, text=body,
+            reply_markup=_btn_panel_page_kb(user, page))
+    return USER_SETTINGS
+
+
+async def btn_ovr_psel_cb(update: Update,
+                          context: ContextTypes.DEFAULT_TYPE):
+    """btn_ovr_psel_<idx>_<crc> — в панели выбрана кнопка: предлагаем цвет.
+
+    ВОЛНА 23.10.9: idx указывает в список кнопок РОЛИ пользователя;
+    crc — подпись этого списка. Несовпадение (смена роли/обновление
+    реестра/старый формат без crc) — безопасно перерисовываем панель,
+    чтобы клик не «попал» в чужую кнопку."""
+    query = update.callback_query
+    payload = str(query.data or "")[len("btn_ovr_psel_"):]
+    idx_s, _, crc_in = payload.partition("_")
+    try:
+        idx = int(idx_s)
+    except (TypeError, ValueError):
+        idx = -1
+    user = get_user(str(query.from_user.id)) or User(str(query.from_user.id))
+    role = _btn_panel_role(user)
+    texts = _btn_panel_texts_for(role)
+    if (idx < 0 or idx >= len(texts) or not crc_in
+            or crc_in != _btn_panel_crc(texts)):
+        # Клик по старой панели (после обновления бота или смены роли) —
+        # честно показываем панель заново, кнопку не «угадываем».
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        return await btn_ovr_panel_cb(update, context)
+    text = texts[idx]
+    uid = str(query.from_user.id)
+    ovr = _btn_ovr_list(user)
+    if len(ovr) >= _BTN_OVR_MAX and \
+            _btn_ovr_lookup_exact_new(ovr, text) is None:
+        try:
+            await query.answer(
+                f"Уже {_BTN_OVR_MAX} правил — удалите лишнее.",
+                show_alert=True)
+        except Exception:
+            pass
+        return await btn_ovr_menu_cb(update, context)
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    context.user_data['btn_ovr_pending'] = {"text": text}
+    # Если точное правило для этой кнопки уже есть — дадим и «🗑 Удалить».
+    del_idx = None
+    for i, k in enumerate(list(ovr.keys())):
+        if _btn_ovr_key(k) == _btn_ovr_key(text):
+            del_idx = i
+            break
+    body = ("🎯 Кнопка «" + str(text)[:48] + "» — выберите цвет:\n"
+            "(правило перекроет автоцвет и базовый цвет)")
+    kb = _btn_ovr_color_kb(del_idx=del_idx)
+    try:
+        await query.edit_message_text(body, reply_markup=kb)
+    except Exception:
+        await context.bot.send_message(
+            chat_id=query.from_user.id, text=body, reply_markup=kb)
+    return USER_SETTINGS
+
+
+async def btn_ovr_set_cb(update: Update,
+                         context: ContextTypes.DEFAULT_TYPE):
+    """btn_ovr_set_<none|primary|success|danger> — сохранить правило цвета."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    key_in = (query.data or "")[len("btn_ovr_set_"):]
+    style = "" if key_in == "none" else key_in
+    if style not in _BTN_STYLES_ALLOWED:
+        style = ""
+    uid = str(query.from_user.id)
+    pend = context.user_data.get('btn_ovr_pending') or {}
+    text_in = str(pend.get("text") or "").strip()
+    if not text_in or len(text_in) > _BTN_OVR_TEXT_MAX:
+        # Контекст потерян (рестарт/давний клик) — просто показываем меню.
+        return await btn_ovr_menu_cb(update, context)
+    user = get_user(uid) or User(uid)
+    ovr = _btn_ovr_list(user)
+    # Дубли по нормализации убираем: «Отмена» и «отмена» — одно правило.
+    for k in list(ovr.keys()):
+        if k != text_in and _btn_ovr_key(k) == _btn_ovr_key(text_in):
+            ovr.pop(k, None)
+    if len(ovr) >= _BTN_OVR_MAX and _btn_ovr_lookup_exact_new(ovr, text_in) is None:
+        context.user_data.pop('btn_ovr_pending', None)
+        try:
+            await query.answer(
+                f"Уже {_BTN_OVR_MAX} правил — удалите лишнее.", show_alert=True)
+        except Exception:
+            pass
+        return await btn_ovr_menu_cb(update, context)
+    ovr[text_in] = style
+    user.button_overrides = ovr
+    save_user(user)
+    _BTN_PREF_CACHE.pop(uid, None)
+    context.user_data.pop('btn_ovr_pending', None)
+    try:
+        await query.answer("Правило цвета сохранено 🎨", show_alert=False)
+    except Exception:
+        pass
+    return await btn_ovr_menu_cb(update, context)
+
+
+async def btn_ovr_pick_cb(update: Update,
+                          context: ContextTypes.DEFAULT_TYPE):
+    """btn_ovr_pick_<idx> — изменить цвет существующего правила."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    try:
+        idx = int(str(query.data or "")[len("btn_ovr_pick_"):])
+    except (TypeError, ValueError):
+        idx = -1
+    user = get_user(str(query.from_user.id)) or User(str(query.from_user.id))
+    keys = list(_btn_ovr_list(user).keys())
+    if idx < 0 or idx >= len(keys):
+        return await btn_ovr_menu_cb(update, context)
+    context.user_data['btn_ovr_pending'] = {"text": keys[idx]}
+    try:
+        await query.edit_message_text(
+            "🎯 Кнопки с текстом «" + str(keys[idx])[:48]
+            + "» — выберите новый цвет:",
+            reply_markup=_btn_ovr_color_kb(del_idx=idx))
+    except Exception:
+        await context.bot.send_message(
+            chat_id=query.from_user.id,
+            text="🎯 Кнопки с текстом «" + str(keys[idx])[:48]
+                 + "» — выберите новый цвет:",
+            reply_markup=_btn_ovr_color_kb(del_idx=idx))
+    return USER_SETTINGS
+
+
+async def btn_ovr_del_cb(update: Update,
+                         context: ContextTypes.DEFAULT_TYPE):
+    """btn_ovr_del_<idx> — удалить правило цвета конкретной кнопки."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    try:
+        idx = int(str(query.data or "")[len("btn_ovr_del_"):])
+    except (TypeError, ValueError):
+        idx = -1
+    uid = str(query.from_user.id)
+    user = get_user(uid) or User(uid)
+    ovr = _btn_ovr_list(user)
+    keys = list(ovr.keys())
+    if 0 <= idx < len(keys):
+        ovr.pop(keys[idx], None)
+        user.button_overrides = ovr
+        save_user(user)
+        _BTN_PREF_CACHE.pop(uid, None)
+    context.user_data.pop('btn_ovr_pending', None)
+    try:
+        await query.answer("Правило удалено.", show_alert=False)
+    except Exception:
+        pass
+    return await btn_ovr_menu_cb(update, context)
 
 
 async def sol_toggle_notify_cb(update: Update,
@@ -73707,6 +83977,336 @@ async def _unified_notification_tick_locked(context):
             logger.error(f"unified_tick: save log failed: {e}")
 
 
+# ==================================
+# === ВОЛНА 23.04: АВТОВХОД ПОСЛЕ РЕСТАРТА ===
+# ==================================
+# «Бот каждые 15 минут перезапускается поэтому каждый раз приходится
+# писать старт придумай что то чтобы это было автоматически». АВТО-
+# РАССЫЛКА после рестарта удалена (ВОЛНА 23.06, запрос разработчика:
+# «Не нужно отправлять сообщение то что было был перезапущен»):
+# восстановление тихое — страховочный роутер (ВОЛНА 23.04) возвращает
+# меню при первом же сообщении пользователя. send_autologin_menus
+# остался ТОЛЬКО для ручной кнопки «📤 Отправить меню всем сейчас».
+
+AUTOLOGIN_SEND_PAUSE = 0.05  # пауза между отправками (анти-флуд Telegram)
+
+
+async def send_autologin_menus(application):
+    """ВОЛНА 23.06: РУЧНАЯ рассылка меню (панель → «📤 Отправить меню
+    всем сейчас»). Автоматического запуска после рестарта больше нет.
+
+    Возвращает (sent, failed). Пропускает: без setup_completed,
+    заблокированных, с нарушением возрастного гейта 13+."""
+    sent = failed = 0
+    try:
+        users = load_users()
+    except Exception as e:
+        logger.error(f"send_autologin_menus: load_users: {e}")
+        return 0, 0
+    for uid, user in users.items():
+        try:
+            if not getattr(user, "setup_completed", False):
+                continue
+            if is_user_blocked(uid) or _age_gate_violation(user):
+                continue
+            try:
+                await application.bot.send_message(
+                    chat_id=int(uid),
+                    text=(
+                        "👋 Бот на связи!\n\n"
+                        "Меню ниже — все данные на месте."),
+                    reply_markup=get_main_menu_keyboard(user),
+                )
+                sent += 1
+            except Exception:
+                # Forbidden (пользователь заблокировал бота) и т. п. —
+                # не роняем цикл рассылки.
+                failed += 1
+            await asyncio.sleep(AUTOLOGIN_SEND_PAUSE)
+        except Exception as e:
+            failed += 1
+            logger.error(f"send_autologin_menus uid={uid}: {e}")
+    logger.info(f"Ручная рассылка меню: отправлено {sent}, не удалось {failed}.")
+    return sent, failed
+
+
+# ВОЛНА 23.06: автоматическая рассылка после рестарта УДАЛЕНА по
+# запросу разработчика («Не нужно отправлять сообщение то что было был
+# перезапущен»). Восстановление тихое: страховочный текстовый роутер
+# (ВОЛНА 23.04) возвращает меню и FSM-состояние при первом же сообщении
+# пользователя; тоггл — панель → «♻️ Восстановление». Ручная рассылка —
+# только кнопкой «📤 Отправить меню всем сейчас» (send_autologin_menus).
+
+
+# ==================================
+# === ВОЛНА 23.05: ПОВТОРНАЯ ПРОВЕРКА ПОДПИСКИ (фоновый свип) ===
+# ==================================
+# Пользователь мог отписаться от канала ПОСЛЕ регистрации. Раньше бот
+# замечал это только когда сам пользователь постучится (API-проверка в
+# гейте). Теперь бот САМ периодически проверяет всех зарегистрированных
+# пользователей: отписавшимся уходит напоминание «подпишитесь обратно»,
+# а при следующем визите гейт подписки встретит их раньше.
+
+SUB_RECHECK_TICK_SECONDS = 300       # тик планировщика: раз в 5 минут
+SUB_RECHECK_PAUSE = 0.4              # пауза между get_chat_member (анти-флуд)
+SUB_RECHECK_MAX_PER_SWEEP = 300      # предохранитель: максимум юзеров за свип
+SUB_RECHECK_DM_COOLDOWN_HOURS = 24   # одному юзеру — не чаще раза в сутки
+SUB_RECHECK_FAILS_ABORT = 3          # подряд cannot_verify → свип прерывается
+
+
+def subscription_recheck_keyboard():
+    """Клавиатура напоминания отписавшемуся: ссылка на канал + кнопка
+    «Я подписался» — работает и в этом сообщении (глобальный обработчик
+    check_subscription ловит её в любом чате)."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📢 Подписаться на канал", url=_gate_channel_url())],
+        [InlineKeyboardButton("✅ Я подписался(ась)", callback_data="check_subscription")],
+    ])
+
+
+def _sub_recheck_dm_text():
+    return (
+        "👋 Мы заметили, что вы отписались от нашего канала.\n\n"
+        "📢 Чтобы бот продолжил работать, подпишитесь обратно:\n"
+        f"{_gate_channel_url()}\n\n"
+        "После подписки нажмите кнопку ниже или просто напишите боту /start."
+    )
+
+
+def subscription_recheck_due() -> bool:
+    """Пора ли запускать очередной свип (по тогглу и интервалу разработчика)."""
+    try:
+        if not is_dev_sub_recheck_enabled():
+            return False
+        try:
+            s = load_dev_settings()
+        except Exception:
+            s = {}
+        last = (s.get("sub_recheck_last") or "").strip()
+        if not last:
+            return True
+        try:
+            last_dt = datetime.strptime(last, "%Y-%m-%d %H:%M")
+        except Exception:
+            return True
+        return (datetime.now() - last_dt) >= timedelta(
+            hours=get_sub_recheck_hours())
+    except Exception:
+        return False
+
+
+def _sub_recheck_persist(report):
+    """Пишет итог свипа в dev-настройки (метка времени + краткий итог)."""
+    try:
+        s = load_dev_settings()
+        s["sub_recheck_last"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+        if report.get("aborted"):
+            s["sub_recheck_report"] = "прервано: " + str(report["aborted"])
+        else:
+            s["sub_recheck_report"] = (
+                f"проверено {report.get('checked', 0)}, "
+                f"отписались {report.get('left', 0)}, "
+                f"напоминаний {report.get('dm', 0)}")
+        save_dev_settings(s)
+    except Exception as e:
+        logger.error(f"_sub_recheck_persist: {e}")
+
+
+def _sub_recheck_report_text(rep):
+    """Короткий человекочитаемый отчёт по свипу (для разработчика)."""
+    if not isinstance(rep, dict):
+        return "🔁 Проверка подписки: нет данных."
+    lines = ["🔁 Проверка подписки завершена."]
+    if rep.get("aborted"):
+        reasons = {
+            "disabled": "выключена в панели разработчика",
+            "gate_disabled": ("пропущена — обязательная подписка выключена "
+                              "в панели («🚪 Обязательная подписка»)"),
+            "no_username": ("API-проверка недоступна — канал приватный или "
+                            "username не задан (панель → «📢 Канал подписки»)"),
+            "no_users": "пользователи не найдены",
+            "load_users": "не удалось загрузить пользователей",
+            "cannot_verify": ("прервана — Telegram не даёт проверить подписку "
+                              "(добавьте бота админом канала?)"),
+            "error": "прервана внутренней ошибкой (см. лог)",
+        }
+        lines.append("⚠️ " + reasons.get(str(rep["aborted"]), str(rep["aborted"])))
+    else:
+        extra = ""
+        if rep.get("skipped"):
+            extra += f", пропущено {rep['skipped']}"
+        if rep.get("failed"):
+            extra += f", ошибок доставки {rep['failed']}"
+        lines.append(
+            f"Проверено: {rep.get('checked', 0)}, "
+            f"отписались: {rep.get('left', 0)}, "
+            f"напоминаний: {rep.get('dm', 0)}, "
+            f"вернулись: {rep.get('back', 0)}" + extra)
+    return "\n".join(lines)
+
+
+async def _sub_recheck_dev_maybe_report(application, report, manual=False):
+    """Отчёт разработчику: при ручном запуске — всегда, при фоновом —
+    только если есть находки (отписавшиеся) или свип прервался."""
+    try:
+        if not DEVELOPER_ID:
+            return
+        interesting = manual or report.get("left") or report.get("aborted")
+        if not interesting:
+            return
+        await application.bot.send_message(
+            chat_id=int(DEVELOPER_ID),
+            text=_sub_recheck_report_text(report))
+    except Exception as e:
+        logger.error(f"_sub_recheck_dev_maybe_report: {e}")
+
+
+async def run_subscription_recheck(application, manual=False):
+    """ВОЛНА 23.05: один проход по всем зарегистрированным пользователям.
+
+    Для каждого — API-проверка членства в канале:
+      • отписавшимся — напоминание «подпишитесь обратно» (если включён
+        тоггл напоминаний; одному пользователю не чаще раза в сутки);
+      • вернувшимся в канал — сброс анти-спам-метки;
+      • подряд идущие cannot_verify прерывают свип (бот не админ канала).
+    Итог пишется в dev-настройки (sub_recheck_last/sub_recheck_report).
+    Возвращает словарь со статистикой."""
+    report = {"checked": 0, "left": 0, "dm": 0, "back": 0, "skipped": 0,
+              "failed": 0, "aborted": ""}
+    try:
+        # Не мешаем boot-восстановлению базы (ВОЛНА 23.02): пока база не
+        # поднята, свип бессмыслен и не должен трогать sub_recheck_last.
+        if _CDB_BOOT_RESTORE_STARTED and not _CDB_BOOT_RESTORE_DONE:
+            report["aborted"] = "boot_restore"
+            return report
+        # ВОЛНА 23.10: обязательная подписка выключена разработчиком — свип
+        # бессмыслен (гейт никого не просит подписаться). Прерываем и авто-,
+        # и ручной запуск: «Проверить сейчас» честно отчитается о причине.
+        if not is_dev_sub_gate_enabled():
+            report["aborted"] = "gate_disabled"
+            _sub_recheck_persist(report)
+            await _sub_recheck_dev_maybe_report(application, report, manual)
+            return report
+        if not manual and not is_dev_sub_recheck_enabled():
+            report["aborted"] = "disabled"
+            return report
+        if not get_channel_username():
+            report["aborted"] = "no_username"
+            _sub_recheck_persist(report)
+            await _sub_recheck_dev_maybe_report(application, report, manual)
+            return report
+        try:
+            users = load_users()
+        except Exception as e:
+            logger.error(f"run_subscription_recheck: load_users: {e}")
+            report["aborted"] = "load_users"
+            return report
+        if not users:
+            report["aborted"] = "no_users"
+            _sub_recheck_persist(report)
+            await _sub_recheck_dev_maybe_report(application, report, manual)
+            return report
+
+        bot = application.bot
+        dev_id = str(DEVELOPER_ID) if DEVELOPER_ID else ""
+        dm_text = _sub_recheck_dm_text()
+        dm_kb = subscription_recheck_keyboard()
+        dm_enabled = is_dev_sub_recheck_dm_enabled()
+        fails_in_row = 0
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        for uid in sorted(users.keys(), key=lambda x: str(x))[
+                :SUB_RECHECK_MAX_PER_SWEEP]:
+            user = users[uid]
+            try:
+                if not getattr(user, "setup_completed", False):
+                    continue
+                if dev_id and str(uid) == dev_id:
+                    continue
+                if is_user_blocked(str(uid)) or _age_gate_violation(user):
+                    continue
+            except Exception:
+                continue
+            try:
+                api_result = await _check_subscription_via_api(uid, bot)
+            except Exception:
+                api_result = "cannot_verify"
+            report["checked"] += 1
+            if api_result == "cannot_verify":
+                report["skipped"] += 1
+                fails_in_row += 1
+                if fails_in_row >= SUB_RECHECK_FAILS_ABORT:
+                    report["aborted"] = "cannot_verify"
+                    break
+                await asyncio.sleep(SUB_RECHECK_PAUSE)
+                continue
+            fails_in_row = 0
+            # ВОЛНА 23.10.5: синхронизируем кэш гейта с результатом свипа.
+            _sub_check_cache_put(uid, api_result == "subscribed")
+            if api_result == "not_subscribed":
+                report["left"] += 1
+                if dm_enabled:
+                    can_dm = True
+                    last_dm = getattr(user, "sub_left_notified_at", None) or ""
+                    if last_dm:
+                        try:
+                            can_dm = (datetime.now() - datetime.strptime(
+                                last_dm, "%Y-%m-%d %H:%M:%S")
+                            ) >= timedelta(hours=SUB_RECHECK_DM_COOLDOWN_HOURS)
+                        except Exception:
+                            can_dm = True
+                    if can_dm:
+                        try:
+                            await bot.send_message(
+                                chat_id=int(uid), text=dm_text,
+                                reply_markup=dm_kb)
+                            user.sub_left_notified_at = now_str
+                            try:
+                                save_user(user)
+                            except Exception:
+                                pass
+                            report["dm"] += 1
+                        except Exception:
+                            report["failed"] += 1
+            else:
+                # subscribed — пользователь вернулся в канал: сбрасываем
+                # анти-спам-метку, чтобы при следующей отписке напоминание
+                # пришло снова.
+                if getattr(user, "sub_left_notified_at", None):
+                    user.sub_left_notified_at = None
+                    try:
+                        save_user(user)
+                    except Exception:
+                        pass
+                    report["back"] += 1
+            await asyncio.sleep(SUB_RECHECK_PAUSE)
+        _sub_recheck_persist(report)
+        await _sub_recheck_dev_maybe_report(application, report, manual)
+        return report
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.error(f"run_subscription_recheck: {e}")
+        if not report["aborted"]:
+            report["aborted"] = "error"
+        return report
+
+
+async def _sub_recheck_tick(context):
+    """Джоба-тик (каждые 5 минут): подошёл срок — запускает свип подписки."""
+    try:
+        if not subscription_recheck_due():
+            return
+        rep = await run_subscription_recheck(context.application, manual=False)
+        if rep and rep.get("left"):
+            logger.info(
+                "Свип подписки: отписавшихся %s, напоминаний %s.",
+                rep.get("left"), rep.get("dm"))
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.error(f"_sub_recheck_tick: {e}")
+
+
 async def _post_init(application):
     """Запускается один раз после инициализации Application.
 
@@ -73720,6 +84320,29 @@ async def _post_init(application):
     # === ШАГ 0 (ВОЛНА 22.21): Application → веб-API мини-аппа «DEVO+ Облако». ===
     global _MINIAPP_PTB_APP
     _MINIAPP_PTB_APP = application
+
+    # === ШАГ 0.5 (ВОЛНА 23.10.10): интерфейс — ТОЛЬКО кнопки, без «/». ===
+    # Просьба пользователя: «все команды / должны быть через кнопки в
+    # клавиатуре или кнопки в чате без /». Все функции бота доступны
+    # кнопками (главное меню + inline); меню «/»-команд очищаем, чтобы
+    # ничего не подталкивало печатать команды. Сами команды (/start,
+    # /restore, /cancel) продолжают работать для совместимости — у каждой
+    # есть кнопочный эквивалент: меню/«⬅️ Назад» и «❌ Отмена».
+    try:
+        await application.bot.set_my_commands([])
+        logger.info("Меню «/»-команд очищено — управление только кнопками.")
+    except Exception as e:
+        logger.warning(f"Не удалось очистить меню команд: {e}")
+
+    # === ШАГ 0.6 (ВОЛНА 23.10.12): дворник режима ИИ ===
+    # Автовыход из ИИ после N минут бездействия (env AI_IDLE_TIMEOUT_MIN)
+    # и отмена зависших генераций — страховка от вечных «трёх точек».
+    try:
+        application.create_task(_ai_idle_sweeper(application))
+        logger.info("AI-дворник запущен (автовыход через %d мин)."
+                    % (_AI_IDLE_TIMEOUT // 60))
+    except Exception as e:
+        logger.warning(f"Не удалось запустить AI-дворник: {e}")
 
     # === ШАГ 1: ЕДИНЫЙ ТИКЕР УВЕДОМЛЕНИЙ — регистрируем САМЫМ ПЕРВЫМ. ===
     # Это критичный шаг: если он не выполнится, утро/вечер/праздники не
@@ -73805,8 +84428,10 @@ async def _post_init(application):
             logger.info(f"env-бутстрап: подключено каналов из окружения: {_env_added}")
     except Exception as e:
         logger.error(f"env-бутстрап хранилища упал: {e}")
+    _cdb_boot_task = None
     try:
         _cdb_task = asyncio.create_task(_cdb_restore_on_boot(application))
+        _cdb_boot_task = _cdb_task
         try:
             application.bot_data.setdefault("_bg_tasks", []).append(_cdb_task)
         except Exception:
@@ -74199,6 +84824,35 @@ async def _post_init(application):
             logger.info("mini app: кнопка меню → «☁️ DECLOUD+» (%s).", MINIAPP_URL)
         except Exception as e:
             logger.warning("mini app: set_chat_menu_button не удался: %s", e)
+
+    # === ШАГ 15 (ВОЛНА 23.06): тихое восстановление после рестарта.
+    # Сообщений пользователям НЕ отправляем (запрос разработчика: «Не
+    # нужно отправлять сообщение то что было был перезапущен»).
+    # Восстановление тихое: пользователь пишет боту что угодно —
+    # страховочный роутер (ВОЛНА 23.04) вернёт меню и FSM-состояние.
+    try:
+        logger.info(
+            "Тихое восстановление активно: сообщений после рестарта "
+            "не отправляем.")
+    except Exception as e:
+        logger.error(f"autologin boot: {e}")
+
+    # === ШАГ 16 (ВОЛНА 23.05): повторная проверка подписки.
+    # Тик каждые 5 минут: если подошёл интервал — свип всех пользователей.
+    # Отписавшимся уходит напоминание; доступ гейтит и так API-first
+    # проверка при любом визите.
+    try:
+        _sr_jq = application.job_queue
+        if _sr_jq is not None:
+            _sr_jq.run_repeating(
+                _sub_recheck_tick, interval=SUB_RECHECK_TICK_SECONDS,
+                first=120, name="sub_recheck_tick")
+            logger.info("Повторная проверка подписки запланирована (тик 300 с).")
+        else:
+            logger.warning(
+                "job_queue недоступен — повторная проверка подписки выключена.")
+    except Exception as e:
+        logger.error(f"sub recheck: регистрация тика: {e}")
 
     logger.info("post_init: все шаги инициализации завершены.")
 
@@ -74680,6 +85334,15 @@ def main():
     from telegram.ext import Defaults
     from telegram.request import HTTPXRequest
 
+    # ВОЛНА 23.10.6: цвета inline-кнопок (Bot API 9.4, поле style).
+    # Патч ставится ДО создания Application: каждый send_*/edit_* с
+    # клавиатурой честно красит кнопки под ЛИЧНЫЕ настройки получателя.
+    # Любая ошибка стилизации глушится — отправка не ломается никогда.
+    try:
+        _install_button_style_patches()
+    except Exception as e:
+        logger.error(f"btn style patches не установлены: {e}")
+
     # Один раз чистим существующие JSON от запрещённых символов, чтобы старые
     # расписания/ДЗ с `/` и т.п. перестали ронять отображение/редактирование.
     try:
@@ -74788,6 +85451,15 @@ def main():
                 MessageHandler((filters.PHOTO | filters.Document.ALL
                                 | filters.VIDEO) & ~filters.COMMAND,
                                send_class_message_media_handler),
+                CallbackQueryHandler(handle_callback),
+            ],
+            # === ВОЛНА 23.10.7: ЛИЧНОЕ сообщение КОНКРЕТНОМУ участнику ===
+            ADMIN_DM_TEXT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND,
+                               admin_dm_text_handler),
+                MessageHandler((filters.PHOTO | filters.Document.ALL
+                                | filters.VIDEO) & ~filters.COMMAND,
+                               admin_dm_media_handler),
                 CallbackQueryHandler(handle_callback),
             ],
             EDIT_SCHEDULE: [
@@ -75061,14 +85733,22 @@ def main():
                 CallbackQueryHandler(handle_callback),
             ],
             DEV_PANEL: [
+                # ВОЛНА 23.04: текстовый ввод в панели — ссылка канала
+                # (флаг awaiting_channel_link), иначе возврат в меню.
+                MessageHandler(filters.TEXT & ~filters.COMMAND,
+                               dev_panel_text_router),
                 CallbackQueryHandler(handle_callback),
             ],
             DEV_BROADCAST: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, dev_broadcast_handler),
+                # ВОЛНА 23.08: текст ИЛИ любой файл — принимаем любые
+                # некомандные сообщения.
+                MessageHandler(~filters.COMMAND, dev_broadcast_handler),
                 CallbackQueryHandler(handle_callback),
             ],
             DEV_CLASS_MESSAGE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, dev_class_message_handler),
+                # ВОЛНА 23.08: текст ИЛИ любой файл — принимаем любые
+                # некомандные сообщения.
+                MessageHandler(~filters.COMMAND, dev_class_message_handler),
                 CallbackQueryHandler(handle_callback),
             ],
             DEV_DELETE_CLASS: [
@@ -75165,7 +85845,9 @@ def main():
                 CallbackQueryHandler(handle_callback),
             ],
             DEV_MESSAGE_USER_TEXT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, dev_message_user_text_handler),
+                # ВОЛНА 23.08: текст ИЛИ любой файл — принимаем любые
+                # некомандные сообщения.
+                MessageHandler(~filters.COMMAND, dev_message_user_text_handler),
                 CallbackQueryHandler(handle_callback),
             ],
             CREATE_GLOBAL_BUTTON: [
@@ -75252,7 +85934,9 @@ def main():
                 CallbackQueryHandler(handle_callback),
             ],
             DEV_INSTANT_BROADCAST: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, dev_instant_broadcast_handler),
+                # ВОЛНА 23.08: текст ИЛИ любой файл — принимаем любые
+                # некомандные сообщения.
+                MessageHandler(~filters.COMMAND, dev_instant_broadcast_handler),
                 CallbackQueryHandler(handle_callback),
             ],
             # === НОВЫЕ состояния (тема, поддержка, dev grant) ===
@@ -75396,6 +86080,28 @@ def main():
                                sol_file_receive),
                 CallbackQueryHandler(handle_callback),
             ],
+            # === ВОЛНА 23.10.6: правка ДОБАВЛЕННОГО решения (автор/староста) ===
+            SOL_EDIT_SUBJECT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND,
+                               sol_edit_subject_save),
+                CallbackQueryHandler(handle_callback),
+            ],
+            SOL_EDIT_FILES: [
+                MessageHandler((filters.PHOTO | filters.Document.ALL) & ~filters.COMMAND,
+                               sol_edit_files_receive),
+                CallbackQueryHandler(handle_callback),
+            ],
+            # === ВОЛНА 23.10.7: комментарии под решением (класс) ===
+            SOL_COMMENT_TEXT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND,
+                               sol_comment_text_handler),
+                CallbackQueryHandler(handle_callback),
+            ],
+            SOL_COMMENT_EDIT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND,
+                               sol_comment_edit_handler),
+                CallbackQueryHandler(handle_callback),
+            ],
             # === ВОЛНА 22.12: ввод в менеджере share-ссылок и PIN получателя ===
             SHARE_INPUT_WAIT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, share_input_receive),
@@ -75431,6 +86137,9 @@ def main():
         # отвечать до следующего /start.
         allow_reentry=True,
     )
+    # ВОЛНА 23.04: ссылка на ConversationHandler для страховочного
+    # текстового роутера (восстановление FSM-состояния после рестарта).
+    globals()["_CONV_HANDLER_REF"] = conv_handler
 
     # ==================================
     # === БЫСТРЫЕ КОМАНДЫ ИЗ ЛЮБОГО СОСТОЯНИЯ ===
@@ -75486,7 +86195,7 @@ def main():
     # handle_callback, «отмена» текстом — через глобальную отмену.
     def _inject_upload_busy(states_dict):
         _busy_states = (SEND_CLASS_MESSAGE, ADD_HOMEWORK,
-                        QUICK_ADD_HOMEWORK, SOL_WAIT_FILE,
+                        QUICK_ADD_HOMEWORK, SOL_WAIT_FILE, SOL_EDIT_FILES,
                         CLOUD_UPLOAD_WAIT, VAULT_PUT_WAIT,
                         EDIT_SCHEDULE_CONTENT, DEV_STORAGE_RESTORE,
                         BELLS_PHOTO_WAIT, CREATE_PB_PHOTO_WAIT,
@@ -75610,6 +86319,18 @@ def main():
         & _BELLS_BULK_FILTER,
         _bells_bulk_text_handler))
 
+    # ВОЛНА 23.10.10: отдельные расписания по ДАТАМ — ввод даты/текста и
+    # приём картинки вне FSM (паттерн bells/duty/ctm): переживает потерю
+    # состояния после рестарта/деплоя бота.
+    application.add_handler(MessageHandler(
+        filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND
+        & _SCHDATE_PENDING_FILTER,
+        _schdate_text_handler))
+    application.add_handler(MessageHandler(
+        (filters.PHOTO | filters.Document.IMAGE) & filters.ChatType.PRIVATE
+        & _SCHDATE_PHOTO_FILTER,
+        _schdate_photo_handler))
+
     # ВОЛНА 22.67: название класса («➕ Создать класс») вне FSM — переживает
     # потерю состояния после рестарта/деплоя бота. Тот же персистентный
     # паттерн, что у duty/ct/bells: флаг user.cls_pending в базе.
@@ -75641,6 +86362,24 @@ def main():
         global_cancel_handler,
     ))
 
+    # === ВОЛНА 23.04: страховочный текстовый роутер (state=None) ===
+    # После рестарта FSM-состояние теряется, а entry_points принципиально
+    # не содержат текстовых хендлеров — кнопки главного меню молчали, и
+    # приходилось каждый раз писать /start. Хендлер добавлен ПОСЛЕ
+    # ConversationHandler: срабатывает ТОЛЬКО когда активного диалога нет
+    # (пока разговор жив — раньше перехватывают state-хендлеры и fallback).
+    application.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
+        out_of_conversation_text_handler,
+    ))
+
+    # ⏹ ВОЛНА 23.10.12: РОДНАЯ кнопка остановки в черновике ИИ (Bot API
+    # 9.3+ can_stop → апдейт stopped_message_generation). PTB 21.6 про это
+    # поле не знает, но кладёт его в api_kwargs — забираем оттуда. Группа
+    # -3: раньше всех, до voice-middleware и ConversationHandler.
+    application.add_handler(
+        TypeHandler(Update, _ai_on_stopped_generation), group=-3
+    )
     # 🎙 ГОЛОСОВОЙ ВВОД: расшифровка голосовых/аудио (Groq Whisper) в группе -1,
     # ДО ConversationHandler — к моменту выбора состояния сообщение уже
     # превращено в текст, поэтому голосом можно управлять ЛЮБЫМ разделом:
@@ -75648,6 +86387,15 @@ def main():
     # middleware честно отвечает и глушит апдейт, не ломая FSM.
     application.add_handler(
         TypeHandler(Update, _voice_transcription_middleware), group=-1
+    )
+    # ВОЛНА 23.10: правка сообщения = повторный ввод (группа -2 — раньше
+    # voice-middleware и ConversationHandler). Фикс «при вводе дня рождения
+    # иногда вылетает ошибка "попробуйте ещё раз или нажмите старт"»:
+    # правка даты приходила с update.message=None и роняла текстовые хендлеры.
+    # В группе может выполняться только ОДИН сработавший хендлер, поэтому
+    # шим живёт в СВОЕЙ группе -2, а не рядом с voice-middleware.
+    application.add_handler(
+        TypeHandler(Update, _edited_message_middleware), group=-2
     )
     # ВОЛНА 22.50: напоминание о недогруженных файлах (группа 1) — бежит
     # параллельно основному потоку: пользователь вернулся в Telegram после
@@ -75731,14 +86479,84 @@ def main():
     # ------------------------------------------------------------------------
 
     application.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
+        allowed_updates=Update.ALL_TYPES + ["stopped_message_generation"],
+        # ИСПРАВЛЕНО (ВОЛНА 23.04): drop_pending_updates=True выбрасывал ВСЕ
+        # сообщения, отправленные боту во время простоя (рестарт каждые
+        # 15 минут) — «/start» в этот момент пропадал навсегда, и бот
+        # выглядел «не отвечающим». Теперь пропущенные апдейты подхватываются
+        # сразу после старта: /start и кнопки, отправленные в простой,
+        # обрабатываются, а автовход (ШАГ 15) возвращает меню всем.
+        drop_pending_updates=False,
         # poll_interval=0.0 — сразу запрашиваем следующий long-poll апдейт без задержки,
         # чтобы бот реагировал мгновенно. timeout=30 — long-poll держит соединение,
         # так что лишних HTTP-запросов это не создаёт.
         poll_interval=0.0,
         timeout=30,
     )
+
+# ==================================
+# === ВОЛНА 23.04: СТРАХОВОЧНЫЙ ТЕКСТОВЫЙ РОУТЕР ===
+# ==================================
+_CONV_HANDLER_REF = None
+
+
+def _restore_conversation_state(update, state):
+    """ВОЛНА 23.04: возвращает пользователя в FSM-разговор — пишет
+    состояние, которое вернул handle_main_menu, в ConversationHandler.
+    Без этого после рестарта (state=None) продолжение под-диалога
+    (название класса и т. п.) снова уходило бы в тишину."""
+    try:
+        conv = globals().get("_CONV_HANDLER_REF")
+        if conv is None or update is None or state is None:
+            return
+        key = (update.effective_chat.id, update.effective_user.id)
+        if state == ConversationHandler.END:
+            conv._conversations.pop(key, None)
+        else:
+            conv._conversations[key] = state
+    except Exception as e:
+        logger.error(f"_restore_conversation_state: {e}")
+
+
+async def out_of_conversation_text_handler(update, context):
+    """ВОЛНА 23.04/23.06: тексты БЕЗ активного диалога (после рестарта
+    бот теряет FSM-состояние). Регистрируется ПОСЛЕ ConversationHandler,
+    поэтому не мешает обычным веткам: пока разговор жив, до этого
+    хендлера дело не доходит. Логика: завершённая регистрация →
+    handle_main_menu (кнопки меню работают сразу, /start не нужен);
+    иначе — подсказка отправить /start. Тихое восстановление гейтится
+    тогглом «♻️ Восстановление» (панель): ВЫКЛ → всегда подсказка
+    /start, никаких авто-меню."""
+    try:
+        eff_user = update.effective_user
+        eff_msg = getattr(update, "message", None)
+        if not eff_user or not eff_msg:
+            return
+        uid = str(eff_user.id)
+        user = get_user(uid)
+        if user is None or not getattr(user, "setup_completed", False):
+            try:
+                await eff_msg.reply_text(
+                    "Отправьте /start, чтобы начать работу с ботом.")
+            except Exception:
+                pass
+            return
+        if is_user_blocked(uid):
+            return
+        if not is_dev_autologin_enabled():
+            # ВОЛНА 23.06: тихое восстановление выключено разработчиком.
+            try:
+                await eff_msg.reply_text(
+                    "Отправьте /start, чтобы открыть меню.")
+            except Exception:
+                pass
+            return
+        result_state = await handle_main_menu(update, context)
+        if isinstance(result_state, int):
+            _restore_conversation_state(update, result_state)
+    except Exception as e:
+        logger.error(f"out_of_conversation_text_handler: {e}")
+
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     import traceback
@@ -75775,9 +86593,12 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if user_id:
                 user = get_user(str(user_id))
                 keyboard = get_main_menu_keyboard(user) if user else None
+                # ВОЛНА 23.10: текст раньше пугал «нажмите /start» даже когда
+                # ничего не сломалось насовсем; теперь спокойнее и с подсказкой.
                 await context.bot.send_message(
                     chat_id=user_id,
-                    text="Попробуйте ещё раз или нажмите /start",
+                    text="⚠️ Произошла ошибка. Попробуйте ещё раз — "
+                         "нажмите /start, если ошибка повторится.",
                     reply_markup=keyboard
                 )
         except Exception:
