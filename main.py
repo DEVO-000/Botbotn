@@ -2887,6 +2887,14 @@ class User:
         # потом пишет, что нет прав к админке»). Теперь название доведёт
         # глобальный приёмник _cls_pending_text_handler.
         self.cls_pending = None
+        # ВОЛНА 23.10.22: бот ждёт от админа ССЫЛКУ на расписание («🌐
+        # Расписание с сайтов» → «➕ Добавить ссылку»). {"ts": epoch,
+        # "cls": class_code} или None. ПЕРСИСТЕНТЕН (TTL 2 ч): после
+        # рестарта/деплоя HF Space FSM-состояние SCHEDMON_URL умирало, и
+        # присланная ссылка молча пропадала в меню-роутере («бот не
+        # принимает ссылки»). Теперь её доведёт до schmon_url_handler
+        # глобальный приёмник _schmon_pending_text_handler.
+        self.schmon_pending = None
         # ВОЛНА 22.86: ОЧЕРЕДЬ «ЖДЁТ ОТПРАВКИ» — файлы, присланные в чат МИМО
         # режимов (глобальный роутер 22.57), больше НЕ грузятся сразу: они
         # копятся здесь и уезжают в облако ТОЛЬКО по кнопке «📤 Отправить».
@@ -3185,6 +3193,8 @@ class User:
             'bells_pending': getattr(self, 'bells_pending', None),
             # ВОЛНА 22.67: ожидаемое название класса (переживает рестарт)
             'cls_pending': getattr(self, 'cls_pending', None),
+            # ВОЛНА 23.10.22: ожидаемая ссылка расписания (переживает рестарт)
+            'schmon_pending': getattr(self, 'schmon_pending', None),
             # ВОЛНА 22.86: очередь файлов «ждёт отправки» (переживает рестарт)
             'bg_pending': (getattr(self, 'bg_pending', None)
                            if isinstance(getattr(self, 'bg_pending', None), list)
@@ -5025,7 +5035,7 @@ def build_referral_link(bot_username, user_id):
 # версии/сборки БОЛЬШЕ НЕТ. Маркер остался только для разработки: пишется в
 # лог на старте (logger.info) и проверяется автотестами — так по-прежнему
 # видно, какая сборка реально крутится на сервере, не показывая её людям.
-BOT_BUILD = "23.10.21"
+BOT_BUILD = "23.10.22"
 
 # ВОЛНА 23.10.21: глобальная ссылка на PTB Application (None до старта).
 # Жалоба с прода: «name 'application' is not defined» сыпалась в логи.
@@ -62058,6 +62068,11 @@ SCHEDMON_MAX_FILE_MB = 49           # лимит Bot API на файл (с за�
 SCHEDMON_MAX_PHOTO_MB = 10          # лимит Telegram sendPhoto
 SCHEDMON_MIN_IMAGE_BYTES = 12 * 1024  # отсекаем иконки и мелкие картинки
 SCHEDMON_MAX_FILES_PER_NOTIFY = 5
+# ВОЛНА 23.10.22: как часто сверять СОДЕРЖИМОЕ прямой ссылки на файл, чьи
+# заголовки (ETag/Content-Length) не меняются: школьные серверы нередко
+# отдают ту же длину, а расписание внутри уже новое («бот не шлёт новые
+# расписания»). Чаще 30 минут не качаем — берегём трафик.
+SCHEDMON_DEEP_RECHECK_SEC = 1800
 SCHEDMON_DEEPSEEK_MODEL = "deepseek-chat"
 SCHEDMON_DEEPSEEK_MAX_CHARS = 30000
 SCHEDMON_DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
@@ -62072,7 +62087,10 @@ SCHEDMON_INFO_KEYS = ("chat", "h", "ch", "title", "errors", "files", "sig",
                       "sch", "sent", "cand", "sel", "day", "nday",
                       "next_check", "added_by", "added_ts",
                       # ВОЛНА 22.77: на какой день это расписание
-                      "sched_day", "sched_label")
+                      "sched_day", "sched_label",
+                      # ВОЛНА 23.10.22: когда последний раз сверяли
+                      # содержимое файла с «немыми» заголовками
+                      "deep_ts")
 
 _SCHMON_TLS = threading.local()
 
@@ -62217,7 +62235,11 @@ def schmon_extract_url(text):
         return "https://" + _SCHMON_URL_TAIL.sub("", m.group(0))
     m = _SCHMON_BARE.match(t)
     if m:
-        return "https://" + m.group(1) + (m.group(2) or "")
+        # ВОЛНА 23.10.22: хвостовая пунктуация (автоточка Telegram и пр.)
+        # срезается и здесь — раньше «school1.ru/rasp.html.» уходила на
+        # сервер с точкой и ловила 404 («бот не принимает ссылку»).
+        return "https://" + m.group(1) + _SCHMON_URL_TAIL.sub(
+            "", m.group(2) or "")
     return None
 
 
@@ -62256,13 +62278,89 @@ def schmon_host_of(url):
 
 
 # --------------------------- чтение страниц ---------------------------------
+def _schmon_is_ssl_error(e):
+    """ВОЛНА 23.10.22: похоже ли исключение на проблему SSL-сертификата
+    школьного сайта (просроченный/самоподписанный сертификат — обычное
+    дело для школ, и раньше любая такая ссылка «не принималась»)."""
+    if e is None:
+        return False
+    if "SSL" in type(e).__name__:
+        return True
+    s = str(e).lower()
+    return "certificate" in s or "ssl" in s or "handshake" in s
+
+
+def _schmon_insecure_ok():
+    try:
+        import urllib3 as _u3
+        _u3.disable_warnings(_u3.exceptions.InsecureRequestWarning)
+    except Exception:
+        pass
+
+
+def _schmon_get_compat(session, url, **kw):
+    """ВОЛНА 23.10.22: GET с фолбэком под школьные сайты: первая попытка —
+    с проверкой сертификата, при SSL-ошибке — повтор без проверки (мы
+    читаем публичные расписания, а не проводим платежи)."""
+    try:
+        return session.get(url, **kw)
+    except Exception as e:
+        if not _schmon_is_ssl_error(e):
+            raise
+        _schmon_insecure_ok()
+        kw["verify"] = False
+        return session.get(url, **kw)
+
+
+def _schmon_head_compat(session, url, **kw):
+    """ВОЛНА 23.10.22: HEAD с тем же SSL-фолбэком."""
+    try:
+        return session.head(url, **kw)
+    except Exception as e:
+        if not _schmon_is_ssl_error(e):
+            raise
+        _schmon_insecure_ok()
+        kw["verify"] = False
+        return session.head(url, **kw)
+
+
+def _schmon_fetch_error_reason(e):
+    """ВОЛНА 23.10.22: человекочитаемая ПРИЧИНА сбоя («сайт ответил 403»,
+    «таймаут», «SSL») — раньше админ видел безликое «Не удалось открыть
+    страницу» и не понимал, что делать."""
+    try:
+        if _sch_requests is not None:
+            ex = _sch_requests.exceptions
+            if isinstance(e, ex.HTTPError):
+                code = getattr(getattr(e, "response", None),
+                               "status_code", 0)
+                if code in (401, 403):
+                    return ("сайт ответил %d — блокирует автоматические "
+                            "запросы (иногда и зарубежные серверы)" % code)
+                if code == 404:
+                    return "страница не найдена (404) — проверьте адрес"
+                if isinstance(code, int) and code >= 500:
+                    return "сервер сайта временно недоступен (%s)" % code
+                return "сайт ответил %s" % code
+            if isinstance(e, (ex.Timeout, ex.ConnectTimeout,
+                              ex.ReadTimeout)):
+                return "сайт не отвечает (таймаут)"
+            if isinstance(e, ex.ConnectionError):
+                return "не удаётся подключиться к сайту"
+    except Exception:
+        pass
+    s = str(e) or type(e).__name__
+    return s[:120]
+
+
 def schmon_fetch_page(url):
     s = _schmon_session()
-    r = s.get(url, timeout=30)
+    r = _schmon_get_compat(s, url, timeout=30)
     if r.encoding in (None, "ISO-8859-1") and r.apparent_encoding:
         r.encoding = r.apparent_encoding
     r.raise_for_status()
-    return r.text
+    # ВОЛНА 23.10.22: гигантская страница не должна ронять бота.
+    return r.text[:5 * 1024 * 1024]
 
 
 def schmon_norm_html(text):
@@ -62821,20 +62919,27 @@ def schmon_find_image_links(page_url, html_text, limit=8, anchors=None):
             page_url, attrs.get("src") or attrs.get("data-src") or "")
         if not full or not schmon_image_kind(full) or full in urls:
             continue
-        if not _schmon_same_site(page_url, full):
-            continue
+        # ВОЛНА 23.10.22: картинка с ЧУЖОГО домена (CDN/файлохранилище)
+        # тоже источник — если alt/title прямо называют её расписанием.
         if _schmon_is_schedule_named(full, attrs.get("alt"), attrs.get("title")):
             urls.append(full)
+            continue
+        if not _schmon_same_site(page_url, full):
+            continue
     # <a href="....jpg">Расписание</a>
     for full, txt in anchors.items():
         if len(urls) >= limit:
             break
         if not schmon_image_kind(full) or full in urls:
             continue
-        if not _schmon_same_site(page_url, full):
-            continue
+        # ВОЛНА 23.10.22: ссылка на картинку-расписание с чужого домена —
+        # тоже источник (раньше требовался тот же сайт, и расписания на
+        # CDN терялись).
         if _schmon_is_schedule_named(full, txt):
             urls.append(full)
+            continue
+        if not _schmon_same_site(page_url, full):
+            continue
     return urls
 
 
@@ -62861,7 +62966,8 @@ def schmon_find_schedule_sources(page_url, html_text, limit=8):
 
 def schmon_file_meta_signature(url):
     try:
-        r = _schmon_session().head(url, timeout=15, allow_redirects=True)
+        r = _schmon_head_compat(_schmon_session(), url, timeout=15,
+                                allow_redirects=True)
         if r.status_code == 200:
             parts = [str(r.headers.get(k) or "")
                      for k in ("ETag", "Last-Modified", "Content-Length")]
@@ -62874,7 +62980,8 @@ def schmon_file_meta_signature(url):
 
 def schmon_file_deep_signature(url):
     try:
-        r = _schmon_session().get(url, timeout=60, stream=True)
+        r = _schmon_get_compat(_schmon_session(), url, timeout=60,
+                               stream=True)
         if r.status_code != 200:
             return ""
         data = b""
@@ -62917,7 +63024,8 @@ def schmon_download_file(url, referer=None):
             real = (r0.json() or {}).get("href") or real
             headers = {}
         s = _schmon_session()
-        r = s.get(real, timeout=120, stream=True, headers=headers)
+        r = _schmon_get_compat(s, real, timeout=120, stream=True,
+                               headers=headers)
         if r.status_code != 200:
             return None
         if "text/html" in (r.headers.get("Content-Type") or "").lower():
@@ -62947,7 +63055,18 @@ def _schmon_collect_file_sigs(page_url, html_text, old_files=None, deep_all=Fals
             out[f] = {"m": prev["m"], "d": prev.get("d", "")}
             continue
         if m:
-            d = ""
+            # ВОЛНА 23.10.22: сервер дал ETag/Last-Modified/Content-Length.
+            # Раньше содержимое НЕ сверялось НИКОГДА: заголовки те же (та
+            # же длина у новой картинки расписания) — бот «не видел»
+            # обновление и молчал. Теперь при первом сборе (deep_all) и
+            # при изменении страницы проверяем и СОДЕРЖИМОЕ. Без повода
+            # (страница не менялась) — не качаем, но старую deep-подпись
+            # ПЕРЕНОСИМ, чтобы не терять накопленное знание о файле.
+            if deep_all:
+                d = schmon_file_deep_signature(f)
+            else:
+                d = ((prev or {}).get("d") or ""
+                     if (prev or {}).get("m") == m else "")
         elif deep_all or prev is None:
             d = schmon_file_deep_signature(f)
         else:
@@ -63498,8 +63617,18 @@ async def _schmon_check_file_url(app, class_code, url, info):
     при их отсутствии — за md5 содержимого."""
     old = info.get("sig") if isinstance(info.get("sig"), dict) else None
     m = await asyncio.to_thread(schmon_file_meta_signature, url)
+    _now = time.time()
     if m:
         d = (old or {}).get("d", "")
+        # ВОЛНА 23.10.22: заголовки не изменились — раз в 30 минут сверяем
+        # и СОДЕРЖИМОЕ: серверы школ часто отдают стабильный Content-Length,
+        # а расписание внутри уже новое. Качаем редко, мониторинг каждые
+        # 5 минут остаётся дешёвым.
+        if old and old.get("m") == m and (
+                _now - float(info.get("deep_ts") or 0)
+                > SCHEDMON_DEEP_RECHECK_SEC):
+            d = await asyncio.to_thread(schmon_file_deep_signature, url)
+            info["deep_ts"] = _now
     else:
         d = await asyncio.to_thread(schmon_file_deep_signature, url)
     if old is None:
@@ -63898,6 +64027,14 @@ async def schmon_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return MAIN_MENU
     context.user_data['current_admin_class'] = class_obj.class_code
     context.user_data.pop('schmon_wait_url', None)
+    # ВОЛНА 23.10.22: зашли в меню — ожидание ссылки больше не актуально.
+    try:
+        _spu = get_user(uid)
+        if _spu is not None and getattr(_spu, "schmon_pending", None):
+            _spu.schmon_pending = None
+            save_user(_spu)
+    except Exception:
+        pass
     try:
         if _sch_requests is None:
             await query.edit_message_text(
@@ -63934,6 +64071,16 @@ async def schmon_add_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return MAIN_MENU
     context.user_data['current_admin_class'] = class_obj.class_code
     context.user_data['schmon_wait_url'] = True
+    # ВОЛНА 23.10.22: ПЕРСИСТЕНТНОЕ ожидание ссылки — переживает рестарт
+    # Space (FSM умирает, флаг в базе жив). TTL 2 ч.
+    try:
+        _spu = get_user(uid)
+        if _spu is not None:
+            _spu.schmon_pending = {"ts": time.time(),
+                                   "cls": class_obj.class_code}
+            save_user(_spu)
+    except Exception:
+        pass
     try:
         await query.edit_message_text(
             "🌐 Пришлите ссылку на страницу с расписанием.\n\n"
@@ -63974,6 +64121,14 @@ async def schmon_url_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return SCHEDMON_URL
 
     context.user_data['schmon_wait_url'] = False
+    # ВОЛНА 23.10.22: ссылку получили — снимаем персистентное ожидание.
+    try:
+        _spu = get_user(uid)
+        if _spu is not None and getattr(_spu, "schmon_pending", None):
+            _spu.schmon_pending = None
+            save_user(_spu)
+    except Exception:
+        pass
 
     if _sch_requests is None:
         await update.message.reply_text(
@@ -64044,10 +64199,13 @@ async def schmon_url_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 "(не чаще 1 раза в день)." % schmon_short_name(url))
             return ADMIN_PANEL
         html_text = await asyncio.to_thread(schmon_fetch_page, url)
-    except Exception:
+    except Exception as _e:
+        # ВОЛНА 23.10.22: показываем ПРИЧИНУ (403/404/таймаут/SSL) —
+        # админ понимает, что делать, а не гадает, «почему не принимает».
         await wait_msg.edit_text(
-            "⚠ Не удалось открыть страницу. Проверьте ссылку и попробуйте "
-            "ещё раз. Ссылка НЕ добавлена.")
+            "⚠ Не удалось открыть страницу. Причина: %s\n\n"
+            "Проверьте ссылку и попробуйте ещё раз. Ссылка НЕ добавлена."
+            % _schmon_fetch_error_reason(_e))
         return ADMIN_PANEL
 
     h, ch = schmon_page_hashes(html_text)
@@ -78751,6 +78909,127 @@ async def _cls_pending_text_handler(update: Update,
     await _cls_pending_finalize(update, context, user, raw)
 
 
+# ==================================
+# === ВОЛНА 23.10.22: ССЫЛКА РАСПИСАНИЯ ВНЕ FSM ===
+# ==================================
+# Жалоба: «бот почему-то ссылки на расписания не принимает». Корень:
+# «➕ Добавить ссылку» ставит FSM в SCHEDMON_URL, но рестарт/деплой HF
+# Space (бесплатный тариф засыпает и пересобирается) СТИРАЕТ FSM —
+# присланная админом ссылка уходила в меню-роутер и молча пропадала.
+# Лечится как cls/duty/ct/bells: персистентный флаг user.schmon_pending
+# (TTL 2 ч) + глобальный приёмник ниже — доводит ссылку до
+# schmon_url_handler даже после потери состояния.
+
+_SCHMON_PENDING_CANCEL_RE = None  # ленивый word-фильтр отмены
+
+
+class _SchmonPendingFilter(filters.MessageFilter):
+    """Текст можно считать ССЫЛКОЙ на расписание, только если админ
+    ранее нажал «➕ Добавить ссылку» (флаг user.schmon_pending жив,
+    TTL 2 ч)."""
+    def filter(self, message):
+        try:
+            if not message.from_user:
+                return False
+            u = get_user(str(message.from_user.id))
+            if not (u and isinstance(getattr(u, "schmon_pending", None),
+                                     dict)):
+                return False
+            try:
+                return (time.time()
+                        - float(u.schmon_pending.get("ts") or 0)
+                        <= 2 * 3600)
+            except Exception:
+                return False
+        except Exception:
+            return False
+
+
+_SCHMON_PENDING_FILTER = _SchmonPendingFilter()
+
+
+async def _schmon_pending_text_handler(update,
+                                       context: ContextTypes.DEFAULT_TYPE):
+    """Глобальный приёмник ССЫЛКИ «Расписание с сайтов» вне FSM.
+
+    Срабатывает, только если админ ранее нажал «➕ Добавить ссылку»
+    (флаг user.schmon_pending), а FSM-состояние потеряно (рестарт/деплой
+    бота). Когда FSM жив, апдейт первым забирает ConversationHandler —
+    двойной обработки нет."""
+    if not update.message or not update.effective_user:
+        return
+    uid = str(update.effective_user.id)
+    user = get_user(uid)
+    if user is None:
+        return
+    # Ввод вне FSM — под гейтом обязательной подписки.
+    if not await ensure_subscribed(update, context):
+        return
+    pend = getattr(user, "schmon_pending", None)
+    if not isinstance(pend, dict):
+        return
+
+    raw = (update.message.text or "").strip()
+
+    # Отмена — снимаем ожидание (в т.ч. кнопки меню: пользователь ушёл
+    # в другое место, ссылку он вводить не собирается).
+    global _SCHMON_PENDING_CANCEL_RE
+    if _SCHMON_PENDING_CANCEL_RE is None:
+        try:
+            _SCHMON_PENDING_CANCEL_RE = re.compile(
+                "^(❌ ?(отмена|отменить)|отмена|cancel|/cancel|/start)$",
+                re.IGNORECASE)
+        except Exception:
+            _SCHMON_PENDING_CANCEL_RE = None
+    if not raw or (_SCHMON_PENDING_CANCEL_RE
+                   and _SCHMON_PENDING_CANCEL_RE.match(raw)):
+        user.schmon_pending = None
+        save_user(user)
+        try:
+            await update.message.reply_text(
+                "Добавление ссылки отменено.",
+                reply_markup=get_main_menu_keyboard(user))
+        except Exception:
+            pass
+        return
+
+    # Кнопки главного меню — не ссылка: снимаем ожидание и отдаём текст
+    # штатному меню (иначе кнопка «📅 Расписание» «съедалась» бы ожиданием).
+    if raw in QUICK_COMMANDS or raw in ALL_MAIN_MENU_BUTTONS:
+        user.schmon_pending = None
+        save_user(user)
+        try:
+            await handle_main_menu(update, context)
+        except Exception:
+            pass
+        return
+
+    # Не похоже на ссылку — ожидание ОСТАЁТСЯ живым (как в FSM-потоке):
+    # рестарт больше не ломает диалог, бот подсказывает и ждёт дальше.
+    if not schmon_extract_url(raw):
+        try:
+            await update.message.reply_text(
+                "Не похоже на ссылку. Пришлите адрес страницы (начинается "
+                "с http или www), либо напишите «отмена».")
+        except Exception:
+            pass
+        return
+
+    # Ссылка получена — доводим тем же кодом, что и в FSM.
+    cls_code = str(pend.get("cls") or "")
+    if cls_code:
+        context.user_data['current_admin_class'] = cls_code
+    context.user_data['schmon_wait_url'] = True
+    user.schmon_pending = None
+    save_user(user)
+    try:
+        ret = await schmon_url_handler(update, context)
+    except Exception:
+        ret = None
+    if isinstance(ret, int):
+        _restore_conversation_state(update, ret)
+
+
 # === ВОЛНА 22.27/22.28: возрастной гейт 13+ ===
 # 22.28: ДР ОБЯЗАТЕЛЕН — экрана «можно продолжить без даты» (_AGE_ASK_*)
 # больше нет; все без ДР направляются на ввод даты. Экран отказа получил
@@ -90475,6 +90754,15 @@ def main():
         filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND
         & _CLS_PENDING_FILTER,
         _cls_pending_text_handler))
+
+    # ВОЛНА 23.10.22: ссылка «Расписание с сайтов» вне FSM (паттерн
+    # cls/duty/ct/bells): «➕ Добавить ссылку» + рестарт Space больше не
+    # теряют присланную админом ссылку — глобальный приёмник доводит её
+    # до schmon_url_handler по персистентному флагу user.schmon_pending.
+    application.add_handler(MessageHandler(
+        filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND
+        & _SCHMON_PENDING_FILTER,
+        _schmon_pending_text_handler))
 
     # 📤 ВОЛНА 22.57: ГЛОБАЛЬНЫЙ РОУТЕР «ФАЙЛ В ЧАТЕ = ФАЙЛ В ОБЛАКЕ».
     # Стоит ПОСЛЕ ConversationHandler: медиа забирают FSM-состояния
